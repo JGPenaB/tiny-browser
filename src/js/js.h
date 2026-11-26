@@ -604,10 +604,12 @@ public:
     JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr;
     JSObject *asyncIteratorProto = nullptr, *asyncGeneratorProto = nullptr, *asyncFromSyncProto = nullptr;
     JSObject* genReturnSignal = nullptr;  // thrown inside a generator to make it return through its finally blocks
+    Value arrayCtorValue, arraySpeciesGetter;  // the built-in Array and the getter of Array[Symbol.species]
+    std::vector<JSObject*> joinStack;     // arrays whose join() is running, to stop self-reference
     Value arrayValuesFn, arrayIterNextFn;  // the original Array.prototype.values and array iterator next
     Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
-    Symbol* symUnscopables = nullptr;
+    Symbol *symUnscopables = nullptr, *symIsConcatSpreadable = nullptr;
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
            *symToStringTag = nullptr, *symSpecies = nullptr;
     Value regexpCtor, promiseCtor;

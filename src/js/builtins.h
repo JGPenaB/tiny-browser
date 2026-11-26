@@ -27,6 +27,7 @@ void setupDate(Vm& vm);
 void setupRegExp(Vm& vm);
 void setupTypedArrays(Vm& vm);
 void setupModules(Vm& vm);
+void setupArrayMethods(Vm& vm, JSObject* proto, JSNative* ctor);
 void setupAsyncIteration(Vm& vm);
 
 // Regular expression hooks used by the String.prototype methods (regexp.cpp).

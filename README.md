@@ -80,6 +80,9 @@ JavaScript engine speed, after the spec-compliance work and without a JIT: hidde
 lazy function parsing plus an on-disk bytecode cache, computed-goto style dispatch. Values are already NaN-boxed. Later
 candidates: generational GC, superinstructions, background parsing.
 
+WebAssembly: an engine written from scratch (an interpreter, no JIT), reached through the JavaScript `WebAssembly`
+API, with a global switch and a per-site switch to turn it off, the same way JavaScript can be turned off.
+
 Small features slotted between the engine steps: resource monitor (CPU, RAM, GPU, VRAM, GPU temperature, plus a network
 monitor), private windows, reader mode, page screenshots, RSS reader, translate selection, a frameless window with the tabs
 in the title strip, and a headless mode driven by JSON commands for automated scripts and AI agents.

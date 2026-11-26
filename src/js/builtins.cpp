@@ -1350,6 +1350,7 @@ void Vm::setupGlobals() {
     symIterator = sym("Symbol.iterator");
     symAsyncIterator = sym("Symbol.asyncIterator");
     symUnscopables = sym("Symbol.unscopables");
+    symIsConcatSpreadable = sym("Symbol.isConcatSpreadable");
     symHasInstance = sym("Symbol.hasInstance");
     symToPrimitive = sym("Symbol.toPrimitive");
     symToStringTag = sym("Symbol.toStringTag");
@@ -1419,26 +1420,10 @@ void Vm::setupGlobals() {
 
     // Array
     JSNative* arrayC = makeCtor(vm, "Array", arrayCtor, 1, arrayProto);
-    defFn(arrayC, "isArray", arrayIsArray, 1);
-    defFn(arrayC, "of", arrayOf, 0);
-    defFn(arrayC, "from", arrayFrom, 1);
-    struct {
-        const char* name;
-        NativeFn fn;
-        int len;
-    } arrayFns[] = {
-        {"push", arrayPush, 1}, {"pop", arrayPop, 0}, {"shift", arrayShift, 0}, {"unshift", arrayUnshift, 1},
-        {"splice", arraySplice, 2}, {"reverse", arrayReverse, 0}, {"fill", arrayFill, 1}, {"sort", arraySort, 1},
-        {"toSorted", arrayToSorted, 1}, {"toReversed", arrayToReversed, 0}, {"with", arrayWith, 2}, {"slice", arraySlice, 2},
-        {"concat", arrayConcat, 1}, {"join", arrayJoin, 1}, {"toString", arrayToString, 0}, {"toLocaleString", arrayToString, 0},
-        {"indexOf", arrayIndexOf, 1}, {"lastIndexOf", arrayLastIndexOf, 1}, {"includes", arrayIncludes, 1},
-        {"forEach", arrayForEach, 1}, {"map", arrayMap, 1}, {"filter", arrayFilter, 1}, {"some", arraySome, 1},
-        {"every", arrayEvery, 1}, {"find", arrayFind, 1}, {"findIndex", arrayFindIndex, 1}, {"findLast", arrayFindLast, 1},
-        {"findLastIndex", arrayFindLastIndex, 1}, {"reduce", arrayReduce, 1}, {"reduceRight", arrayReduceRight, 1},
-        {"flat", arrayFlat, 0}, {"flatMap", arrayFlatMap, 1}, {"at", arrayAt, 1}, {"keys", arrayKeys, 0},
-        {"entries", arrayEntries, 0},
-    };
-    for (auto& f : arrayFns) defFn(arrayProto, f.name, f.fn, f.len);
+    arrayCtorValue = V(arrayC);
+    setupArrayMethods(vm, arrayProto, arrayC);
+    defFn(arrayProto, "keys", arrayKeys, 0);
+    defFn(arrayProto, "entries", arrayEntries, 0);
     JSNative* values = defFn(arrayProto, "values", arrayValues, 0);
     defineOwn(arrayProto, PropKey::of(symIterator), V(values), PF_W | PF_C);
     arrayValuesFn = V(values);
@@ -1475,6 +1460,7 @@ void Vm::setupGlobals() {
     def(symbolC, "iterator", V(symIterator), 0);
     def(symbolC, "asyncIterator", V(symAsyncIterator), 0);
     def(symbolC, "unscopables", V(symUnscopables), 0);
+    def(symbolC, "isConcatSpreadable", V(symIsConcatSpreadable), 0);
     def(symbolC, "hasInstance", V(symHasInstance), 0);
     def(symbolC, "toPrimitive", V(symToPrimitive), 0);
     def(symbolC, "toStringTag", V(symToStringTag), 0);

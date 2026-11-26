@@ -450,6 +450,8 @@ void Vm::markRoots(Gc& g) {
     g.mark(importHook);
     g.mark(evalFn);
     g.mark(arrayValuesFn);
+    g.mark(arrayCtorValue);
+    g.mark(arraySpeciesGetter);
     g.mark(arrayIterNextFn);
     g.mark(asyncIteratorProto);
     g.mark(asyncGeneratorProto);
