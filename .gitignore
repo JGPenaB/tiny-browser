@@ -1,0 +1,40 @@
+# Build output
+build/
+out/
+*.obj
+*.pdb
+*.ilk
+*.exe
+CMakeUserPresets.json
+
+# Editor and assistant state
+.claude/
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Browser profile data and anything secret (the real profile lives in %APPDATA%\TinyBrowser,
+# these patterns are a safety net for test vaults and copies made inside the repo)
+passwords.dat
+cookies.dat
+bookmarks.tsv
+sites.tsv
+*.dat
+*.vault
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+
+# Test and screenshot artifacts
+*.png
+*.png.txt
+selftest.txt
+__pycache__/
+*.pyc
+
+# Windows
+Thumbs.db
+Desktop.ini

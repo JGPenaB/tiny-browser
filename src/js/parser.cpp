@@ -1,0 +1,1873 @@
+// Lexer and recursive-descent parser. Produces an AST with identifiers already resolved to variables.
+#include <cstdlib>
+
+#include "parse.h"
+
+namespace tb::js {
+
+namespace {
+
+struct Tok {
+    enum T : uint8_t { End, Ident, Num, Str, Templ, Regex, Punct, Private } type = End;
+    uint8_t p = P_None;
+    bool nl = false, tail = false, esc = false;
+    uint32_t pos = 0, end = 0, line = 1;
+    double num = 0;
+    JSString* str = nullptr;
+    JSString* raw = nullptr;
+};
+
+bool isWs(char16_t c) {
+    return c == ' ' || c == '\t' || c == 0x0B || c == 0x0C || c == 0xA0 || c == 0xFEFF || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+           c == 0x202F || c == 0x205F || c == 0x3000;
+}
+bool isLt(char16_t c) { return c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029; }
+bool isDigit(char16_t c) { return c >= '0' && c <= '9'; }
+bool idStart(char16_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_' || (c >= 0x80 && !isWs(c) && !isLt(c));
+}
+bool idPart(char16_t c) { return idStart(c) || isDigit(c) || c == 0x200C || c == 0x200D; }
+int hexVal(char16_t c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+void appendCp(std::u16string& o, uint32_t cp) {
+    if (cp < 0x10000) o += (char16_t)cp;
+    else {
+        cp -= 0x10000;
+        o += (char16_t)(0xD800 + (cp >> 10));
+        o += (char16_t)(0xDC00 + (cp & 0x3FF));
+    }
+}
+
+class Lexer {
+public:
+    Vm& vm;
+    const std::u16string& s;
+    size_t pos = 0;
+    uint32_t line = 1;
+    Lexer(Vm& v, const std::u16string& src) : vm(v), s(src) {}
+    [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, line}; }
+
+    bool skipSpace() {
+        bool nl = false;
+        size_t n = s.size();
+        while (pos < n) {
+            char16_t c = s[pos];
+            if (isWs(c)) ++pos;
+            else if (isLt(c)) {
+                if (c == '\n') ++line;
+                else if (c == '\r' && !(pos + 1 < n && s[pos + 1] == '\n')) ++line;
+                nl = true;
+                ++pos;
+            } else if (c == '/' && pos + 1 < n && s[pos + 1] == '/') {
+                while (pos < n && !isLt(s[pos])) ++pos;
+            } else if (c == '/' && pos + 1 < n && s[pos + 1] == '*') {
+                pos += 2;
+                while (pos < n && !(s[pos] == '*' && pos + 1 < n && s[pos + 1] == '/')) {
+                    if (s[pos] == '\n') {
+                        ++line;
+                        nl = true;
+                    }
+                    ++pos;
+                }
+                if (pos >= n) fail("Unterminated comment");
+                pos += 2;
+            } else if (c == '<' && s.compare(pos, 4, u"<!--") == 0) {
+                while (pos < n && !isLt(s[pos])) ++pos;
+            } else if (c == '-' && nl && s.compare(pos, 3, u"-->") == 0) {
+                while (pos < n && !isLt(s[pos])) ++pos;
+            } else
+                break;
+        }
+        return nl;
+    }
+
+    void escape(std::u16string& out) {
+        size_t n = s.size();
+        if (pos >= n) fail("Bad escape");
+        char16_t c = s[pos++];
+        switch (c) {
+            case 'n': out += u'\n'; break;
+            case 't': out += u'\t'; break;
+            case 'r': out += u'\r'; break;
+            case 'b': out += u'\b'; break;
+            case 'f': out += u'\f'; break;
+            case 'v': out += u'\v'; break;
+            case 'x': {
+                int a = pos + 1 < n ? hexVal(s[pos]) : -1, b = pos + 1 < n ? hexVal(s[pos + 1]) : -1;
+                if (a < 0 || b < 0) fail("Bad \\x escape");
+                out += (char16_t)(a * 16 + b);
+                pos += 2;
+                break;
+            }
+            case 'u': {
+                uint32_t cp = 0;
+                if (pos < n && s[pos] == '{') {
+                    ++pos;
+                    while (pos < n && s[pos] != '}') {
+                        int h = hexVal(s[pos++]);
+                        if (h < 0) fail("Bad unicode escape");
+                        cp = cp * 16 + h;
+                    }
+                    ++pos;
+                } else {
+                    for (int i = 0; i < 4; ++i) {
+                        int h = pos < n ? hexVal(s[pos++]) : -1;
+                        if (h < 0) fail("Bad unicode escape");
+                        cp = cp * 16 + h;
+                    }
+                }
+                appendCp(out, cp > 0x10FFFF ? 0xFFFD : cp);
+                break;
+            }
+            case '\r':
+                if (pos < n && s[pos] == '\n') ++pos;
+                ++line;
+                break;
+            case '\n': ++line; break;
+            case 0x2028:
+            case 0x2029: break;
+            default:
+                if (c >= '0' && c <= '7') {
+                    int v = c - '0';
+                    if (!(c == '0' && !(pos < n && isDigit(s[pos])))) {
+                        for (int i = 0; i < 2 && pos < n && s[pos] >= '0' && s[pos] <= '7' && v * 8 + (s[pos] - '0') < 256; ++i)
+                            v = v * 8 + (s[pos++] - '0');
+                    }
+                    out += (char16_t)v;
+                } else
+                    out += c;
+        }
+    }
+
+    Tok templ(size_t from) {  // scans template characters; `from` is just after ` or }
+        Tok t;
+        t.type = Tok::Templ;
+        t.pos = (uint32_t)from;
+        t.line = line;
+        pos = from;
+        size_t n = s.size();
+        std::u16string cooked, raw;
+        for (;;) {
+            if (pos >= n) fail("Unterminated template literal");
+            char16_t c = s[pos];
+            if (c == '`') {
+                ++pos;
+                t.tail = true;
+                break;
+            }
+            if (c == '$' && pos + 1 < n && s[pos + 1] == '{') {
+                pos += 2;
+                break;
+            }
+            if (c == '\\') {
+                size_t st = pos++;
+                escape(cooked);
+                raw.append(s, st, pos - st);
+                continue;
+            }
+            if (c == '\r') {
+                ++pos;
+                if (pos < n && s[pos] == '\n') ++pos;
+                ++line;
+                cooked += u'\n';
+                raw += u'\n';
+                continue;
+            }
+            if (c == '\n') ++line;
+            cooked += c;
+            raw += c;
+            ++pos;
+        }
+        t.str = vm.atom(cooked);
+        t.raw = vm.atom(raw);
+        t.end = (uint32_t)pos;
+        return t;
+    }
+
+    Tok regex(size_t start) {
+        Tok t;
+        t.type = Tok::Regex;
+        t.pos = (uint32_t)start;
+        t.line = line;
+        pos = start + 1;
+        size_t n = s.size();
+        bool cls = false;
+        size_t st = pos;
+        for (;;) {
+            if (pos >= n || isLt(s[pos])) fail("Unterminated regular expression");
+            char16_t c = s[pos];
+            if (c == '\\') {
+                pos += 2;
+                continue;
+            }
+            if (c == '[') cls = true;
+            else if (c == ']') cls = false;
+            else if (c == '/' && !cls) break;
+            ++pos;
+        }
+        t.str = vm.atom(std::u16string_view(s).substr(st, pos - st));
+        ++pos;
+        size_t fs = pos;
+        while (pos < n && idPart(s[pos])) ++pos;
+        t.raw = vm.atom(std::u16string_view(s).substr(fs, pos - fs));
+        t.end = (uint32_t)pos;
+        return t;
+    }
+
+    Tok next() {
+        Tok t;
+        t.nl = skipSpace();
+        t.pos = (uint32_t)pos;
+        t.line = line;
+        size_t n = s.size();
+        if (pos >= n) {
+            t.end = (uint32_t)pos;
+            return t;
+        }
+        char16_t c = s[pos];
+        if (idStart(c) || c == '\\') {
+            std::u16string id;
+            while (pos < n && (idPart(s[pos]) || s[pos] == '\\')) {
+                if (s[pos] == '\\') {
+                    ++pos;
+                    if (pos >= n || s[pos] != 'u') fail("Bad identifier escape");
+                    escape(id);
+                    t.esc = true;
+                } else
+                    id += s[pos++];
+            }
+            t.type = Tok::Ident;
+            t.str = vm.atom(id);
+        } else if (isDigit(c) || (c == '.' && pos + 1 < n && isDigit(s[pos + 1]))) {
+            t.type = Tok::Num;
+            t.num = number();
+        } else if (c == '"' || c == '\'') {
+            ++pos;
+            std::u16string v;
+            for (;;) {
+                if (pos >= n) fail("Unterminated string");
+                char16_t ch = s[pos++];
+                if (ch == c) break;
+                if (ch == '\n' || ch == '\r') fail("Unterminated string");
+                if (ch == '\\') escape(v);
+                else v += ch;
+            }
+            t.type = Tok::Str;
+            t.str = vm.atom(v);
+        } else if (c == '`') {
+            uint32_t p0 = t.pos;
+            bool nl = t.nl;
+            t = templ(pos + 1);
+            t.pos = p0;
+            t.nl = nl;
+            return t;
+        } else if (c == '#' && pos + 1 < n && idStart(s[pos + 1])) {
+            size_t st = pos++;
+            while (pos < n && idPart(s[pos])) ++pos;
+            t.type = Tok::Private;
+            t.str = vm.atom(std::u16string_view(s).substr(st, pos - st));
+        } else {
+            t.type = Tok::Punct;
+            t.p = punct();
+        }
+        t.end = (uint32_t)pos;
+        return t;
+    }
+
+private:
+    double number() {
+        size_t n = s.size();
+        char16_t c = s[pos];
+        auto radix = [&](int r) {
+            pos += 2;
+            double v = 0;
+            bool any = false;
+            while (pos < n) {
+                if (s[pos] == '_') {
+                    ++pos;
+                    continue;
+                }
+                int h = hexVal(s[pos]);
+                if (h < 0 || h >= r) break;
+                v = v * r + h;
+                any = true;
+                ++pos;
+            }
+            if (!any) fail("Invalid number");
+            if (pos < n && s[pos] == 'n') ++pos;
+            return v;
+        };
+        if (c == '0' && pos + 1 < n) {
+            char16_t x = s[pos + 1] | 0x20;
+            if (x == 'x') return radix(16);
+            if (x == 'o') return radix(8);
+            if (x == 'b') return radix(2);
+            if (isDigit(s[pos + 1])) {  // legacy octal, unless a digit is 8 or 9
+                size_t e = pos;
+                bool oct = true;
+                while (e < n && isDigit(s[e])) {
+                    if (s[e] > '7') oct = false;
+                    ++e;
+                }
+                if (oct) {
+                    double v = 0;
+                    while (pos < e) v = v * 8 + (s[pos++] - '0');
+                    return v;
+                }
+            }
+        }
+        std::string buf;
+        auto digits = [&] {
+            while (pos < n && (isDigit(s[pos]) || s[pos] == '_')) {
+                if (s[pos] != '_') buf += (char)s[pos];
+                ++pos;
+            }
+        };
+        digits();
+        if (pos < n && s[pos] == '.') {
+            buf += '.';
+            ++pos;
+            digits();
+        }
+        if (pos < n && (s[pos] == 'e' || s[pos] == 'E')) {
+            size_t save = pos;
+            std::string ex = "e";
+            ++pos;
+            if (pos < n && (s[pos] == '+' || s[pos] == '-')) ex += (char)s[pos++];
+            if (pos < n && isDigit(s[pos])) {
+                buf += ex;
+                digits();
+            } else
+                pos = save;
+        }
+        if (pos < n && s[pos] == 'n') ++pos;  // BigInt literals are read as numbers for now
+        if (pos < n && idStart(s[pos])) fail("Invalid number");
+        return strtod(buf.c_str(), nullptr);
+    }
+
+    uint8_t punct() {
+        size_t n = s.size();
+        char16_t c = s[pos++];
+        auto eat = [&](char16_t x) {
+            if (pos < n && s[pos] == x) {
+                ++pos;
+                return true;
+            }
+            return false;
+        };
+        switch (c) {
+            case '{': return P_LBrace;
+            case '}': return P_RBrace;
+            case '(': return P_LParen;
+            case ')': return P_RParen;
+            case '[': return P_LBrack;
+            case ']': return P_RBrack;
+            case ';': return P_Semi;
+            case ',': return P_Comma;
+            case '~': return P_Tilde;
+            case ':': return P_Colon;
+            case '.':
+                if (pos + 1 < n && s[pos] == '.' && s[pos + 1] == '.') {
+                    pos += 2;
+                    return P_Ellipsis;
+                }
+                return P_Dot;
+            case '<':
+                if (eat('<')) return eat('=') ? P_ShlEq : P_Shl;
+                return eat('=') ? P_Le : P_Lt;
+            case '>':
+                if (eat('>')) {
+                    if (eat('>')) return eat('=') ? P_UShrEq : P_UShr;
+                    return eat('=') ? P_ShrEq : P_Shr;
+                }
+                return eat('=') ? P_Ge : P_Gt;
+            case '=':
+                if (eat('=')) return eat('=') ? P_SEq : P_EqEq;
+                return eat('>') ? P_Arrow : P_Assign;
+            case '!':
+                if (eat('=')) return eat('=') ? P_SNe : P_Ne;
+                return P_Bang;
+            case '+':
+                if (eat('+')) return P_Inc;
+                return eat('=') ? P_PlusEq : P_Plus;
+            case '-':
+                if (eat('-')) return P_Dec;
+                return eat('=') ? P_MinusEq : P_Minus;
+            case '*':
+                if (eat('*')) return eat('=') ? P_StarStarEq : P_StarStar;
+                return eat('=') ? P_StarEq : P_Star;
+            case '/': return eat('=') ? P_SlashEq : P_Slash;
+            case '%': return eat('=') ? P_PercentEq : P_Percent;
+            case '&':
+                if (eat('&')) return eat('=') ? P_AndAndEq : P_AndAnd;
+                return eat('=') ? P_AmpEq : P_Amp;
+            case '|':
+                if (eat('|')) return eat('=') ? P_OrOrEq : P_OrOr;
+                return eat('=') ? P_PipeEq : P_Pipe;
+            case '^': return eat('=') ? P_CaretEq : P_Caret;
+            case '?':
+                if (eat('?')) return eat('=') ? P_QQEq : P_QQ;
+                if (pos < n && s[pos] == '.' && !(pos + 1 < n && isDigit(s[pos + 1]))) {
+                    ++pos;
+                    return P_QDot;
+                }
+                return P_Question;
+        }
+        fail("Unexpected character");
+    }
+};
+
+// ============================================================================ parser
+
+class Parser {
+public:
+    Parser(Vm& v, Ast& a) : vm(v), ast(a), s(*a.src), lx(v, *a.src) {
+        const char* names[] = {"var", "let", "const", "function", "class", "if", "else", "for", "while", "do", "return", "break",
+                               "continue", "throw", "try", "catch", "finally", "switch", "case", "default", "new", "delete", "typeof",
+                               "void", "in", "instanceof", "this", "super", "null", "true", "false", "async", "await", "yield", "of",
+                               "get", "set", "static", "extends", "debugger", "import", "export", "with", "enum", "constructor",
+                               "arguments", "target", "use strict", "__proto__"};
+        JSString** slots[] = {&k.var_, &k.let_, &k.const_, &k.function_, &k.class_, &k.if_, &k.else_, &k.for_, &k.while_, &k.do_, &k.return_,
+                              &k.break_, &k.continue_, &k.throw_, &k.try_, &k.catch_, &k.finally_, &k.switch_, &k.case_, &k.default_, &k.new_,
+                              &k.delete_, &k.typeof_, &k.void_, &k.in_, &k.instanceof_, &k.this_, &k.super_, &k.null_, &k.true_, &k.false_,
+                              &k.async_, &k.await_, &k.yield_, &k.of_, &k.get_, &k.set_, &k.static_, &k.extends_, &k.debugger_, &k.import_,
+                              &k.export_, &k.with_, &k.enum_, &k.constructor_, &k.arguments_, &k.target_, &k.useStrict, &k.proto_};
+        for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) *slots[i] = vm.atom(names[i]);
+        JSString* res[] = {k.var_, k.const_, k.function_, k.class_, k.if_, k.else_, k.for_, k.while_, k.do_, k.return_, k.break_,
+                           k.continue_, k.throw_, k.try_, k.catch_, k.finally_, k.switch_, k.case_, k.default_, k.new_, k.delete_,
+                           k.typeof_, k.void_, k.in_, k.instanceof_, k.this_, k.super_, k.null_, k.true_, k.false_, k.debugger_,
+                           k.import_, k.export_, k.with_, k.enum_};
+        for (JSString* r : res) reserved[r] = true;
+    }
+
+    void program() {
+        FunctionInfo& f = ast.fns.emplace_back();
+        ast.top = &f;
+        fn = &f;
+        Scope* g = open(Scope::Global);
+        g->fn = &f;
+        f.scope = g;
+        advance();
+        directives(f);
+        while (t.type != Tok::End) f.body.push_back(statement());
+        f.srcEnd = (uint32_t)s.size();
+        close(g);
+    }
+
+private:
+    struct KW {
+        JSString *var_, *let_, *const_, *function_, *class_, *if_, *else_, *for_, *while_, *do_, *return_, *break_, *continue_,
+            *throw_, *try_, *catch_, *finally_, *switch_, *case_, *default_, *new_, *delete_, *typeof_, *void_, *in_, *instanceof_,
+            *this_, *super_, *null_, *true_, *false_, *async_, *await_, *yield_, *of_, *get_, *set_, *static_, *extends_, *debugger_,
+            *import_, *export_, *with_, *enum_, *constructor_, *arguments_, *target_, *useStrict, *proto_;
+    } k;
+    Vm& vm;
+    Ast& ast;
+    const std::u16string& s;
+    Lexer lx;
+    Tok t;
+    uint32_t prevEnd = 0;
+    Scope* scope = nullptr;
+    FunctionInfo* fn = nullptr;
+    std::unordered_map<JSString*, bool> reserved;
+    std::vector<Variable*> declaredNow;
+
+    [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, t.line}; }
+    [[noreturn]] void unexpected() {
+        if (t.type == Tok::End) fail("Unexpected end of input");
+        std::string what = utf16to8(std::u16string_view(s).substr(t.pos, std::min<size_t>(t.end - t.pos, 20)));
+        fail("Unexpected token '" + what + "'");
+    }
+    void advance() {
+        prevEnd = t.end;
+        t = lx.next();
+    }
+    Tok peek(int n = 1) {
+        size_t p = lx.pos;
+        uint32_t l = lx.line;
+        Tok r;
+        for (int i = 0; i < n; ++i) r = lx.next();
+        lx.pos = p;
+        lx.line = l;
+        return r;
+    }
+    bool isP(uint8_t p) const { return t.type == Tok::Punct && t.p == p; }
+    bool eatP(uint8_t p) {
+        if (!isP(p)) return false;
+        advance();
+        return true;
+    }
+    void expectP(uint8_t p) {
+        if (!eatP(p)) unexpected();
+    }
+    bool isK(JSString* kw) const { return t.type == Tok::Ident && t.str == kw && !t.esc; }
+    bool eatK(JSString* kw) {
+        if (!isK(kw)) return false;
+        advance();
+        return true;
+    }
+    void semi() {
+        if (eatP(P_Semi)) return;
+        if (isP(P_RBrace) || t.type == Tok::End || t.nl) return;
+        unexpected();
+    }
+    bool isRes(JSString* a) const { return reserved.count(a) != 0; }
+    Node* mk(N type) {
+        Node& n = ast.nodes.emplace_back();
+        n.type = type;
+        n.line = t.line;
+        n.pos = t.pos;
+        return &n;
+    }
+
+    // ---------------------------------------------------------------- scopes
+    Scope* open(Scope::K kind) {
+        Scope& sc = ast.scopes.emplace_back();
+        sc.kind = kind;
+        sc.parent = scope;
+        sc.fn = fn;
+        scope = &sc;
+        return &sc;
+    }
+    Scope* fnScope(Scope* sc) {
+        while (sc->kind != Scope::Function && sc->kind != Scope::Global) sc = sc->parent;
+        return sc;
+    }
+    Variable* newVar(Scope* sc, JSString* name, uint8_t kind) {
+        Variable& v = ast.vars.emplace_back();
+        v.name = name;
+        v.kind = kind;
+        v.scope = sc;
+        v.isGlobal = sc->kind == Scope::Global;
+        v.declEnd = 0xFFFFFFFF;
+        sc->vars.push_back(&v);
+        declaredNow.push_back(&v);
+        return &v;
+    }
+    Variable* declare(JSString* name, uint8_t kind) {
+        if (kind == VK_VAR || (kind == VK_FUNC && (scope->kind == Scope::Function || scope->kind == Scope::Global))) {
+            Scope* fs = fnScope(scope);
+            if (Variable* v = fs->find(name)) {
+                if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)
+                    fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+                if (kind == VK_FUNC && v->kind == VK_VAR) v->kind = VK_FUNC;
+                return v;
+            }
+            Variable* v = newVar(fs, name, kind);
+            v->declEnd = 0;
+            return v;
+        }
+        if (Variable* v = scope->find(name)) {
+            if (v->kind == VK_PARAM && kind == VK_PARAM) return v;  // duplicate parameter names (sloppy mode)
+            if (!(v->kind == VK_PSEUDO)) fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+        }
+        Variable* v = newVar(scope, name, kind);
+        if (kind == VK_PARAM || kind == VK_FUNC || kind == VK_CATCH || kind == VK_FUNCNAME) v->declEnd = 0;
+        return v;
+    }
+    void reference(Node* ident) { scope->refs.push_back({ident, false}); }
+
+    void close(Scope* sc) {
+        for (auto& [node, crossed] : sc->refs) {
+            Variable* v = sc->find(node->str);
+            if (!v && sc->kind == Scope::Function && node->str == k.arguments_ && !sc->fn->isArrow && !(node->flags & NF_PRIVATE)) {
+                v = newVar(sc, k.arguments_, VK_PSEUDO);
+                v->declEnd = 0;
+                sc->fn->argsVar = v;
+            }
+            if (v) {
+                node->var = v;
+                if (crossed) v->captured = true;
+                if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)
+                    if (crossed || node->pos < v->declEnd) v->needsTdz = true;
+            } else if (sc->parent) {
+                sc->parent->refs.push_back({node, crossed || sc->kind == Scope::Function});
+            } else if (node->flags & NF_PRIVATE) {
+                throw SyntaxErr{"Private field '" + utf16to8(node->str->s) + "' must be declared in an enclosing class", node->line};
+            }
+        }
+        sc->refs.clear();
+        scope = sc->parent;
+    }
+
+    Node* identRef(JSString* name) {
+        Node* n = mk(N::Ident);
+        n->str = name;
+        reference(n);
+        return n;
+    }
+
+    // `this`, `new.target`: inside arrows they belong to the nearest non-arrow function.
+    Variable* pseudo(Variable* FunctionInfo::*slot, const char* name) {
+        FunctionInfo* f = fn;
+        bool crossed = false;
+        while (f->isArrow && f->parent) {
+            f = f->parent;
+            crossed = true;
+        }
+        if (!crossed) return nullptr;
+        if (!(f->*slot)) {
+            Variable& v = ast.vars.emplace_back();
+            v.name = vm.atom(name);
+            v.kind = VK_PSEUDO;
+            v.scope = f->scope;
+            v.declEnd = 0;
+            f->scope->vars.push_back(&v);
+            f->*slot = &v;
+        }
+        (f->*slot)->captured = true;
+        return f->*slot;
+    }
+
+    void finishDecl(size_t mark) {
+        for (size_t i = mark; i < declaredNow.size(); ++i)
+            if (declaredNow[i]->declEnd == 0xFFFFFFFF) declaredNow[i]->declEnd = prevEnd;
+        declaredNow.resize(mark);
+    }
+
+    // ---------------------------------------------------------------- statements
+    void directives(FunctionInfo& f) {
+        while (t.type == Tok::Str) {
+            Tok nx = peek();
+            if (!(nx.type == Tok::End || nx.nl || (nx.type == Tok::Punct && (nx.p == P_Semi || nx.p == P_RBrace)))) break;
+            if (t.str == k.useStrict) f.strict = true;
+            f.body.push_back(statement());
+        }
+    }
+
+    Node* statement() {
+        if (isP(P_LBrace)) return block(true);
+        if (isP(P_Semi)) {
+            Node* e = mk(N::Empty);
+            advance();
+            return e;
+        }
+        if (t.type == Tok::Ident && !t.esc) {
+            JSString* w = t.str;
+            if (w == k.var_ || w == k.const_) {
+                Node* d = varDecl(w == k.var_ ? VK_VAR : VK_CONST, true);
+                semi();
+                return d;
+            }
+            if (w == k.let_) {
+                Tok nx = peek();
+                if ((nx.type == Tok::Ident && nx.str != k.in_ && nx.str != k.instanceof_) ||
+                    (nx.type == Tok::Punct && (nx.p == P_LBrack || nx.p == P_LBrace))) {
+                    Node* d = varDecl(VK_LET, true);
+                    semi();
+                    return d;
+                }
+            }
+            if (w == k.function_) return functionDecl(false);
+            if (w == k.async_) {
+                Tok nx = peek();
+                if (nx.type == Tok::Ident && nx.str == k.function_ && !nx.nl) {
+                    advance();
+                    return functionDecl(true);
+                }
+            }
+            if (w == k.class_) return classNode(true);
+            if (w == k.if_) return ifStmt();
+            if (w == k.for_) return forStmt();
+            if (w == k.while_) {
+                Node* n = mk(N::While);
+                advance();
+                expectP(P_LParen);
+                n->a = expression();
+                expectP(P_RParen);
+                n->d = statement();
+                return n;
+            }
+            if (w == k.do_) {
+                Node* n = mk(N::DoWhile);
+                advance();
+                n->d = statement();
+                if (!eatK(k.while_)) unexpected();
+                expectP(P_LParen);
+                n->a = expression();
+                expectP(P_RParen);
+                eatP(P_Semi);
+                return n;
+            }
+            if (w == k.return_) {
+                Node* n = mk(N::Return);
+                advance();
+                if (!isP(P_Semi) && !isP(P_RBrace) && t.type != Tok::End && !t.nl) n->a = expression();
+                semi();
+                return n;
+            }
+            if (w == k.break_ || w == k.continue_) {
+                Node* n = mk(w == k.break_ ? N::Break : N::Continue);
+                advance();
+                if (t.type == Tok::Ident && !t.nl && !isRes(t.str)) {
+                    n->str = t.str;
+                    advance();
+                }
+                semi();
+                return n;
+            }
+            if (w == k.throw_) {
+                Node* n = mk(N::Throw);
+                advance();
+                if (t.nl) fail("Illegal newline after throw");
+                n->a = expression();
+                semi();
+                return n;
+            }
+            if (w == k.try_) return tryStmt();
+            if (w == k.switch_) return switchStmt();
+            if (w == k.debugger_) {
+                Node* n = mk(N::Debugger);
+                advance();
+                semi();
+                return n;
+            }
+            if (w == k.import_) {
+                Tok nx = peek();
+                if (!(nx.type == Tok::Punct && (nx.p == P_LParen || nx.p == P_Dot))) fail("import declarations are not supported yet");
+            }
+            if (w == k.export_) fail("export declarations are not supported yet");
+            if (w == k.with_) fail("'with' statements are not supported");
+            if (!isRes(w)) {
+                Tok nx = peek();
+                if (nx.type == Tok::Punct && nx.p == P_Colon) {
+                    Node* n = mk(N::Labeled);
+                    n->str = w;
+                    advance();
+                    advance();
+                    n->a = statement();
+                    return n;
+                }
+            }
+        }
+        Node* e = mk(N::ExprStmt);
+        e->a = expression();
+        semi();
+        return e;
+    }
+
+    Node* block(bool newScope) {
+        Node* b = mk(N::Block);
+        expectP(P_LBrace);
+        Scope* sc = newScope ? open(Scope::Block) : nullptr;
+        while (!isP(P_RBrace)) {
+            if (t.type == Tok::End) unexpected();
+            b->list.push_back(statement());
+        }
+        advance();
+        if (sc) {
+            b->scope = sc;
+            close(sc);
+        }
+        return b;
+    }
+
+    Node* varDecl(uint8_t kind, bool in) {
+        Node* d = mk(N::VarDecl);
+        d->op = kind;
+        advance();
+        do {
+            size_t mark = declaredNow.size();
+            Node* decl = mk(N::Declarator);
+            decl->a = bindingTarget(kind);
+            if (eatP(P_Assign)) {
+                decl->b = assign(in);
+                nameFn(decl->b, decl->a->type == N::Ident ? decl->a->str : nullptr);
+            }
+            finishDecl(mark);
+            d->list.push_back(decl);
+        } while (eatP(P_Comma));
+        return d;
+    }
+
+    Node* bindingIdent(uint8_t kind) {
+        if (t.type != Tok::Ident || isRes(t.str)) unexpected();
+        Node* n = mk(N::Ident);
+        n->str = t.str;
+        n->var = declare(t.str, kind);
+        advance();
+        return n;
+    }
+
+    Node* bindingTarget(uint8_t kind) {
+        if (isP(P_LBrack)) {
+            Node* p = mk(N::ArrayPat);
+            advance();
+            while (!isP(P_RBrack)) {
+                if (isP(P_Comma)) {
+                    p->list.push_back(mk(N::Hole));
+                    advance();
+                    continue;
+                }
+                if (isP(P_Ellipsis)) {
+                    Node* r = mk(N::Rest);
+                    advance();
+                    r->a = bindingTarget(kind);
+                    p->list.push_back(r);
+                } else {
+                    p->list.push_back(bindingElement(kind));
+                }
+                if (!isP(P_RBrack)) expectP(P_Comma);
+            }
+            advance();
+            return p;
+        }
+        if (isP(P_LBrace)) {
+            Node* p = mk(N::ObjectPat);
+            advance();
+            while (!isP(P_RBrace)) {
+                if (isP(P_Ellipsis)) {
+                    Node* r = mk(N::Rest);
+                    advance();
+                    r->a = bindingTarget(kind);
+                    p->list.push_back(r);
+                } else {
+                    Node* pr = mk(N::Property);
+                    bool isIdent = t.type == Tok::Ident;
+                    JSString* name = t.str;
+                    pr->a = propertyName(pr);
+                    if (eatP(P_Colon)) {
+                        pr->b = bindingElement(kind);
+                    } else {
+                        if (!isIdent || isRes(name)) unexpected();
+                        Node* id = mk(N::Ident);
+                        id->str = name;
+                        id->var = declare(name, kind);
+                        pr->flags |= NF_SHORTHAND;
+                        if (eatP(P_Assign)) {
+                            Node* ap = mk(N::AssignPat);
+                            ap->a = id;
+                            ap->b = assign();
+                            nameFn(ap->b, name);
+                            pr->b = ap;
+                        } else
+                            pr->b = id;
+                    }
+                    p->list.push_back(pr);
+                }
+                if (!isP(P_RBrace)) expectP(P_Comma);
+            }
+            advance();
+            return p;
+        }
+        return bindingIdent(kind);
+    }
+
+    Node* bindingElement(uint8_t kind) {
+        Node* target = bindingTarget(kind);
+        if (eatP(P_Assign)) {
+            Node* ap = mk(N::AssignPat);
+            ap->a = target;
+            ap->b = assign();
+            nameFn(ap->b, target->type == N::Ident ? target->str : nullptr);
+            return ap;
+        }
+        return target;
+    }
+
+    Node* ifStmt() {
+        Node* n = mk(N::If);
+        advance();
+        expectP(P_LParen);
+        n->a = expression();
+        expectP(P_RParen);
+        n->b = statement();
+        if (eatK(k.else_)) n->c = statement();
+        return n;
+    }
+
+    Node* forStmt() {
+        Node* n = mk(N::For);
+        advance();
+        if (isK(k.await_)) fail("for await is not supported yet");
+        expectP(P_LParen);
+        Scope* sc = open(Scope::For);
+        n->scope = sc;
+        Node* init = nullptr;
+        size_t mark = declaredNow.size();
+        bool isDecl = false;
+        if (isP(P_Semi)) {
+        } else if (isK(k.var_) || isK(k.const_) || (isK(k.let_) && peek().type != Tok::Punct) ||
+                   (isK(k.let_) && (peek().p == P_LBrack || peek().p == P_LBrace))) {
+            init = varDecl(isK(k.var_) ? VK_VAR : isK(k.let_) ? VK_LET : VK_CONST, false);
+            isDecl = true;
+        } else {
+            init = expression(false);
+        }
+        if (init && (isK(k.of_) || isK(k.in_))) {
+            n->type = isK(k.of_) ? N::ForOf : N::ForIn;
+            advance();
+            if (isDecl) {
+                finishDecl(mark);
+                if (init->list.size() != 1) fail("Invalid left-hand side in for-loop");
+                // the loop variable is initialised by the loop itself
+                for (Variable* v : sc->vars) v->declEnd = 0;
+            } else
+                init = toPattern(init);
+            n->a = init;
+            n->b = n->type == N::ForOf ? assign() : expression();
+            expectP(P_RParen);
+            n->d = statement();
+            close(sc);
+            return n;
+        }
+        finishDecl(mark);
+        if (init && !isDecl) {
+            Node* es = mk(N::ExprStmt);
+            es->a = init;
+            init = es;
+        }
+        n->a = init;
+        expectP(P_Semi);
+        if (!isP(P_Semi)) n->b = expression();
+        expectP(P_Semi);
+        if (!isP(P_RParen)) n->c = expression();
+        expectP(P_RParen);
+        n->d = statement();
+        close(sc);
+        return n;
+    }
+
+    Node* tryStmt() {
+        Node* n = mk(N::Try);
+        advance();
+        n->a = block(true);
+        if (eatK(k.catch_)) {
+            Scope* sc = open(Scope::Catch);
+            n->scope = sc;
+            if (eatP(P_LParen)) {
+                size_t mark = declaredNow.size();
+                n->b = bindingTarget(VK_CATCH);
+                finishDecl(mark);
+                expectP(P_RParen);
+            }
+            n->c = block(true);
+            close(sc);
+        }
+        if (eatK(k.finally_)) n->d = block(true);
+        if (!n->c && !n->d) fail("Missing catch or finally after try");
+        return n;
+    }
+
+    Node* switchStmt() {
+        Node* n = mk(N::Switch);
+        advance();
+        expectP(P_LParen);
+        n->a = expression();
+        expectP(P_RParen);
+        expectP(P_LBrace);
+        Scope* sc = open(Scope::Block);
+        n->scope = sc;
+        while (!isP(P_RBrace)) {
+            Node* c = mk(N::Case);
+            if (eatK(k.case_)) c->a = expression();
+            else if (!eatK(k.default_)) unexpected();
+            else c->flags = 1;
+            expectP(P_Colon);
+            while (!isP(P_RBrace) && !isK(k.case_) && !isK(k.default_)) {
+                if (t.type == Tok::End) unexpected();
+                c->list.push_back(statement());
+            }
+            n->list.push_back(c);
+        }
+        advance();
+        close(sc);
+        return n;
+    }
+
+    // ---------------------------------------------------------------- functions
+    Node* functionDecl(bool isAsync) {
+        uint32_t start = t.pos;
+        uint32_t line = t.line;
+        advance();  // function
+        bool gen = eatP(P_Star);
+        if (t.type != Tok::Ident || isRes(t.str)) unexpected();
+        JSString* name = t.str;
+        Variable* v = declare(name, VK_FUNC);
+        advance();
+        Node* n = functionRest(name, start, isAsync, gen, false);
+        n->fn->isDecl = true;
+        n->fn->line = line;
+        n->var = v;
+        scope->funcDecls.push_back(n);
+        return n;
+    }
+
+    FunctionInfo* beginFn(JSString* name, uint32_t start) {
+        FunctionInfo& f = ast.fns.emplace_back();
+        f.name = name;
+        f.srcStart = start;
+        f.line = t.line;
+        f.parent = fn;
+        f.strict = fn->strict;
+        fn = &f;
+        Scope* fs = open(Scope::Function);
+        fs->fn = &f;
+        f.scope = fs;
+        return &f;
+    }
+    void endFn(FunctionInfo* f) {
+        f->srcEnd = prevEnd;
+        close(f->scope);
+        fn = f->parent;
+    }
+
+    void params(FunctionInfo& f) {
+        bool simple = true;
+        while (!isP(P_RParen)) {
+            size_t mark = declaredNow.size();
+            if (isP(P_Ellipsis)) {
+                Node* r = mk(N::Rest);
+                advance();
+                r->a = bindingTarget(VK_PARAM);
+                f.params.push_back(r);
+                simple = false;
+            } else {
+                Node* p = bindingElement(VK_PARAM);
+                if (p->type != N::Ident) simple = false;
+                if (simple) f.length = (int)f.params.size() + 1;
+                f.params.push_back(p);
+            }
+            finishDecl(mark);
+            if (!isP(P_RParen)) expectP(P_Comma);
+        }
+    }
+
+    void body(FunctionInfo& f) {
+        expectP(P_LBrace);
+        directives(f);
+        while (!isP(P_RBrace)) {
+            if (t.type == Tok::End) unexpected();
+            f.body.push_back(statement());
+        }
+        advance();
+    }
+
+    // Parses "(params) { body }" for a function whose keyword/name have been consumed.
+    Node* functionRest(JSString* name, uint32_t start, bool isAsync, bool gen, bool isExpr, uint8_t methodKind = 0) {
+        Node* n = mk(N::Function);
+        FunctionInfo* f = beginFn(name, start);
+        f->isAsync = isAsync;
+        f->isGenerator = gen;
+        if (methodKind) {
+            f->isMethod = true;
+            f->isGetter = methodKind == 2;
+            f->isSetter = methodKind == 3;
+        }
+        if (isExpr && name) {
+            f->selfVar = newVar(f->scope, name, VK_FUNCNAME);
+            f->selfVar->declEnd = 0;
+        }
+        expectP(P_LParen);
+        params(*f);
+        expectP(P_RParen);
+        body(*f);
+        endFn(f);
+        n->fn = f;
+        n->str = name;
+        return n;
+    }
+
+    Node* arrow(bool isAsync, uint32_t start) {
+        Node* n = mk(N::Function);
+        FunctionInfo* f = beginFn(nullptr, start);
+        f->isArrow = true;
+        f->isAsync = isAsync;
+        if (isP(P_LParen)) {
+            advance();
+            params(*f);
+            expectP(P_RParen);
+        } else {
+            f->params.push_back(bindingIdent(VK_PARAM));
+            f->params.back()->var->declEnd = 0;
+            f->length = 1;
+        }
+        if (!isP(P_Arrow) || t.nl) unexpected();
+        advance();
+        if (isP(P_LBrace)) {
+            body(*f);
+        } else {
+            Node* r = mk(N::Return);
+            r->a = assign();
+            f->body.push_back(r);
+            f->exprBody = true;
+        }
+        endFn(f);
+        n->fn = f;
+        return n;
+    }
+
+    // Decides whether the parenthesis at `p` starts an arrow function's parameter list.
+    bool arrowAhead(size_t p) {
+        size_t n = s.size(), i = p + 1;
+        while (i < n && (isWs(s[i]) || isLt(s[i]))) ++i;
+        if (i >= n) return false;
+        char16_t f = s[i];
+        if (!(idStart(f) || f == ')' || f == '[' || f == '{' || f == '.' || f == '/')) return false;
+        if (s.compare(i, 8, u"function") == 0 && !(i + 8 < n && idPart(s[i + 8]))) return false;
+        int depth = 0;
+        char16_t prev = '(';
+        for (i = p; i < n; ++i) {
+            char16_t c = s[i];
+            if (c == '(' || c == '[' || c == '{') {
+                ++depth;
+                prev = c;
+            } else if (c == ')' || c == ']' || c == '}') {
+                if (--depth == 0) {
+                    size_t j = i + 1;
+                    for (;;) {
+                        while (j < n && isWs(s[j])) ++j;
+                        if (j + 1 < n && s[j] == '/' && s[j + 1] == '*') {
+                            size_t e = s.find(u"*/", j + 2);
+                            if (e == std::u16string::npos) return false;
+                            j = e + 2;
+                        } else
+                            break;
+                    }
+                    return j + 1 < n && s[j] == '=' && s[j + 1] == '>';
+                }
+                prev = c;
+            } else if (c == '"' || c == '\'') {
+                for (++i; i < n && s[i] != c; ++i)
+                    if (s[i] == '\\') ++i;
+                prev = 'a';
+            } else if (c == '`') {
+                i = skipTemplate(i);
+                prev = 'a';
+            } else if (c == '/') {
+                if (i + 1 < n && s[i + 1] == '/') {
+                    while (i < n && !isLt(s[i])) ++i;
+                } else if (i + 1 < n && s[i + 1] == '*') {
+                    size_t e = s.find(u"*/", i + 2);
+                    if (e == std::u16string::npos) return false;
+                    i = e + 1;
+                } else if (prev == '(' || prev == ',' || prev == '=' || prev == ':' || prev == '[' || prev == '!' || prev == '&' ||
+                           prev == '|' || prev == '?' || prev == '{' || prev == '}' || prev == ';' || prev == '+' || prev == '-' ||
+                           prev == '*' || prev == '%' || prev == '<' || prev == '>' || prev == '~' || prev == '^') {
+                    bool cls = false;
+                    for (++i; i < n && !isLt(s[i]); ++i) {
+                        if (s[i] == '\\') ++i;
+                        else if (s[i] == '[') cls = true;
+                        else if (s[i] == ']') cls = false;
+                        else if (s[i] == '/' && !cls) break;
+                    }
+                    prev = 'a';
+                } else
+                    prev = c;
+            } else if (!isWs(c) && !isLt(c)) {
+                prev = c;
+            }
+        }
+        return false;
+    }
+    size_t skipTemplate(size_t i) {  // s[i] == '`'; returns the index of the closing backtick
+        size_t n = s.size();
+        for (++i; i < n; ++i) {
+            if (s[i] == '\\') ++i;
+            else if (s[i] == '`') return i;
+            else if (s[i] == '$' && i + 1 < n && s[i + 1] == '{') {
+                int depth = 1;
+                for (i += 2; i < n && depth > 0; ++i) {
+                    char16_t c = s[i];
+                    if (c == '{') ++depth;
+                    else if (c == '}') --depth;
+                    else if (c == '`') i = skipTemplate(i);
+                    else if (c == '"' || c == '\'') {
+                        for (++i; i < n && s[i] != c; ++i)
+                            if (s[i] == '\\') ++i;
+                    }
+                }
+                --i;
+            }
+        }
+        return n;
+    }
+
+    void nameFn(Node* value, JSString* name) {
+        if (!value || !name) return;
+        if (value->type == N::Function && !value->fn->name) value->fn->name = name;
+        else if (value->type == N::Class && !value->str) value->str2 = name;
+    }
+
+    // ---------------------------------------------------------------- classes
+    Node* classNode(bool isDecl) {
+        Node* n = mk(N::Class);
+        advance();  // class
+        Variable* outer = nullptr;
+        if (t.type == Tok::Ident && !isK(k.extends_) && !isRes(t.str)) {
+            n->str = t.str;
+            if (isDecl) {
+                size_t mark = declaredNow.size();
+                outer = declare(t.str, VK_CLASS);
+                advance();
+                finishDecl(mark);
+            } else
+                advance();
+        } else if (isDecl)
+            unexpected();
+        bool savedStrict = fn->strict;
+        fn->strict = true;
+        if (eatK(k.extends_)) n->a = lhs();
+        Scope* cs = open(Scope::Class);
+        n->scope = cs;
+        if (n->str && !isDecl) {  // a named class expression binds its name inside the class body
+            n->var = newVar(cs, n->str, VK_CONST);
+            n->var->declEnd = 0;
+        } else
+            n->var = outer;
+        expectP(P_LBrace);
+        while (!isP(P_RBrace)) {
+            if (eatP(P_Semi)) continue;
+            if (t.type == Tok::End) unexpected();
+            n->list.push_back(classMember(n));
+        }
+        advance();
+        close(cs);
+        fn->strict = savedStrict;
+        return n;
+    }
+
+    Node* classMember(Node* cls) {
+        Node* m = mk(N::Property);
+        uint32_t start = t.pos;
+        bool isStatic = false, isAsync = false, gen = false;
+        uint8_t kind = PK_METHOD;
+        auto nameFollows = [&] {
+            Tok nx = peek();
+            return !(nx.type == Tok::Punct && (nx.p == P_LParen || nx.p == P_Assign || nx.p == P_Semi || nx.p == P_RBrace)) && nx.type != Tok::End;
+        };
+        if (isK(k.static_) && nameFollows()) {
+            isStatic = true;
+            advance();
+            if (isP(P_LBrace)) fail("Class static blocks are not supported yet");
+        }
+        if (isK(k.async_) && nameFollows() && !peek().nl) {
+            isAsync = true;
+            advance();
+        }
+        if (eatP(P_Star)) gen = true;
+        if ((isK(k.get_) || isK(k.set_)) && nameFollows()) {
+            kind = isK(k.get_) ? PK_GET : PK_SET;
+            advance();
+        }
+        if (isStatic) m->flags |= NF_STATIC;
+        JSString* keyName = nullptr;
+        if (t.type == Tok::Private) {
+            Node* id = mk(N::Ident);
+            id->str = t.str;
+            Variable* v = scope->find(t.str);
+            if (!v) {
+                v = newVar(scope, t.str, VK_PRIVATE);
+                v->declEnd = 0;
+            }
+            id->var = v;
+            m->a = id;
+            m->flags |= NF_PRIVATE | NF_COMPUTED;
+            advance();
+        } else {
+            if (t.type == Tok::Ident || t.type == Tok::Str) keyName = t.str;
+            m->a = propertyName(m);
+        }
+        if (isP(P_LParen)) {
+            bool isCtor = !isStatic && kind == PK_METHOD && keyName == k.constructor_ && !(m->flags & NF_COMPUTED);
+            m->op = kind;
+            m->b = functionRest((m->flags & NF_COMPUTED) ? nullptr : keyName, start, isAsync, gen, false, kind == PK_GET ? 2 : kind == PK_SET ? 3 : 1);
+            m->b->fn->strict = true;
+            if (isCtor) {
+                m->b->fn->isClassCtor = true;
+                m->b->fn->isDerived = cls->a != nullptr;
+                m->b->fn->isMethod = false;
+                m->b->fn->name = cls->str;
+                cls->c = m->b;
+                m->op = 255;  // not a regular member
+            }
+            return m;
+        }
+        // field: the initialiser is compiled as a small method so `this` refers to the instance (or the class).
+        m->op = PK_FIELD;
+        FunctionInfo* f = beginFn(nullptr, t.pos);
+        f->isMethod = true;
+        f->isFieldInit = true;
+        f->strict = true;
+        if (eatP(P_Assign)) {
+            Node* r = mk(N::Return);
+            r->a = assign();
+            f->body.push_back(r);
+            nameFn(r->a, keyName);
+        }
+        endFn(f);
+        Node* fnNode = mk(N::Function);
+        fnNode->fn = f;
+        m->b = f->body.empty() ? nullptr : fnNode;
+        semi();
+        return m;
+    }
+
+    // Property name in an object literal, class body or pattern. Sets NF_COMPUTED on `owner` when needed.
+    Node* propertyName(Node* owner) {
+        if (t.type == Tok::Ident || t.type == Tok::Str) {
+            Node* n = mk(N::Str);
+            n->str = t.str;
+            advance();
+            return n;
+        }
+        if (t.type == Tok::Num) {
+            Node* n = mk(N::Str);
+            n->str = vm.atomOf(vm.numberToString(t.num));
+            advance();
+            return n;
+        }
+        if (isP(P_LBrack)) {
+            advance();
+            Node* e = assign();
+            expectP(P_RBrack);
+            owner->flags |= NF_COMPUTED;
+            return e;
+        }
+        unexpected();
+    }
+
+    // ---------------------------------------------------------------- expressions
+    Node* expression(bool in = true) {
+        Node* e = assign(in);
+        if (!isP(P_Comma)) return e;
+        Node* seq = mk(N::Seq);
+        seq->list.push_back(e);
+        while (eatP(P_Comma)) seq->list.push_back(assign(in));
+        return seq;
+    }
+
+    Node* assign(bool in = true) {
+        uint32_t start = t.pos;
+        if (t.type == Tok::Ident && !t.esc) {
+            if (t.str == k.async_) {
+                Tok nx = peek();
+                if (!nx.nl) {
+                    if (nx.type == Tok::Ident && !isRes(nx.str)) {
+                        Tok n2 = peek(2);
+                        if (n2.type == Tok::Punct && n2.p == P_Arrow) {
+                            advance();
+                            return arrow(true, start);
+                        }
+                    } else if (nx.type == Tok::Punct && nx.p == P_LParen && arrowAhead(nx.pos)) {
+                        advance();
+                        return arrow(true, start);
+                    }
+                }
+            } else if (t.str == k.yield_ && fn->isGenerator) {
+                Node* y = mk(N::Yield);
+                advance();
+                if (!t.nl && !isP(P_RParen) && !isP(P_RBrack) && !isP(P_RBrace) && !isP(P_Comma) && !isP(P_Semi) && !isP(P_Colon) &&
+                    t.type != Tok::End) {
+                    if (eatP(P_Star)) y->flags |= NF_DELEGATE;
+                    y->a = assign(in);
+                }
+                return y;
+            } else if (!isRes(t.str)) {
+                Tok nx = peek();
+                if (nx.type == Tok::Punct && nx.p == P_Arrow && !nx.nl) return arrow(false, start);
+            }
+        } else if (isP(P_LParen) && arrowAhead(t.pos)) {
+            return arrow(false, start);
+        }
+        Node* left = conditional(in);
+        if (t.type == Tok::Punct && t.p >= P_Assign && t.p <= P_QQEq) {
+            Node* n = mk(N::Assign);
+            n->op = t.p;
+            if (n->op == P_Assign) left = toPattern(left);
+            else if (left->type != N::Ident && left->type != N::Member && left->type != N::Index) fail("Invalid assignment target");
+            n->a = left;
+            advance();
+            n->b = assign(in);
+            if (left->type == N::Ident) nameFn(n->b, left->str);
+            return n;
+        }
+        return left;
+    }
+
+    Node* conditional(bool in) {
+        Node* c = binary(0, in);
+        if (!isP(P_Question)) return c;
+        Node* n = mk(N::Cond);
+        advance();
+        n->a = c;
+        n->b = assign(true);
+        expectP(P_Colon);
+        n->c = assign(in);
+        return n;
+    }
+
+    int precOf(bool in, uint8_t& op) {
+        if (t.type == Tok::Punct) {
+            op = t.p;
+            switch (t.p) {
+                case P_QQ: return 1;
+                case P_OrOr: return 2;
+                case P_AndAnd: return 3;
+                case P_Pipe: return 4;
+                case P_Caret: return 5;
+                case P_Amp: return 6;
+                case P_EqEq: case P_Ne: case P_SEq: case P_SNe: return 7;
+                case P_Lt: case P_Gt: case P_Le: case P_Ge: return 8;
+                case P_Shl: case P_Shr: case P_UShr: return 9;
+                case P_Plus: case P_Minus: return 10;
+                case P_Star: case P_Slash: case P_Percent: return 11;
+                case P_StarStar: return 12;
+            }
+            return -1;
+        }
+        if (t.type == Tok::Ident && !t.esc) {
+            if (t.str == k.instanceof_) {
+                op = P_InstanceOf;
+                return 8;
+            }
+            if (t.str == k.in_ && in) {
+                op = P_In;
+                return 8;
+            }
+        }
+        return -1;
+    }
+
+    Node* binary(int minPrec, bool in) {
+        Node* left = unary();
+        for (;;) {
+            uint8_t op = P_None;
+            int prec = precOf(in, op);
+            if (prec < 0 || prec < minPrec) break;
+            Node* n = mk((op == P_AndAnd || op == P_OrOr || op == P_QQ) ? N::Logical : N::Binary);
+            n->op = op;
+            advance();
+            n->a = left;
+            n->b = op == P_StarStar ? binary(prec, in) : binary(prec + 1, in);
+            left = n;
+        }
+        return left;
+    }
+
+    Node* unary() {
+        if (t.type == Tok::Punct) {
+            if (t.p == P_Bang || t.p == P_Tilde || t.p == P_Plus || t.p == P_Minus) {
+                Node* n = mk(N::Unary);
+                n->op = t.p;
+                advance();
+                n->a = unary();
+                if (n->a->type == N::Num && (n->op == P_Minus || n->op == P_Plus)) {  // fold numeric literals
+                    n->a->num = n->op == P_Minus ? -n->a->num : n->a->num;
+                    return n->a;
+                }
+                return n;
+            }
+            if (t.p == P_Inc || t.p == P_Dec) {
+                Node* n = mk(N::Update);
+                n->op = t.p;
+                n->flags = NF_PREFIX;
+                advance();
+                n->a = unary();
+                if (n->a->type != N::Ident && n->a->type != N::Member && n->a->type != N::Index) fail("Invalid update target");
+                return n;
+            }
+        } else if (t.type == Tok::Ident && !t.esc) {
+            if (t.str == k.typeof_ || t.str == k.void_ || t.str == k.delete_) {
+                Node* n = mk(N::Unary);
+                n->op = t.str == k.typeof_ ? P_Typeof : t.str == k.void_ ? P_Void : P_Delete;
+                advance();
+                n->a = unary();
+                return n;
+            }
+            if (t.str == k.await_ && fn->isAsync) {
+                Node* n = mk(N::Await);
+                advance();
+                n->a = unary();
+                return n;
+            }
+        }
+        Node* e = lhs();
+        if (!t.nl && (isP(P_Inc) || isP(P_Dec))) {
+            if (e->type != N::Ident && e->type != N::Member && e->type != N::Index) fail("Invalid update target");
+            Node* n = mk(N::Update);
+            n->op = t.p;
+            n->a = e;
+            advance();
+            return n;
+        }
+        return e;
+    }
+
+    void arguments(Node* call) {
+        expectP(P_LParen);
+        while (!isP(P_RParen)) {
+            if (isP(P_Ellipsis)) {
+                Node* sp = mk(N::Spread);
+                advance();
+                sp->a = assign();
+                call->list.push_back(sp);
+            } else
+                call->list.push_back(assign());
+            if (!isP(P_RParen)) expectP(P_Comma);
+        }
+        advance();
+    }
+
+    Node* memberName(Node* obj, bool optional) {
+        if (t.type == Tok::Private) {
+            Node* n = mk(N::Index);
+            n->a = obj;
+            Node* id = mk(N::Ident);
+            id->str = t.str;
+            id->flags = NF_PRIVATE;
+            reference(id);
+            n->b = id;
+            n->flags = NF_PRIVATE | (optional ? NF_OPTIONAL : 0);
+            advance();
+            return n;
+        }
+        if (t.type != Tok::Ident) unexpected();
+        Node* n = mk(N::Member);
+        n->a = obj;
+        n->str = t.str;
+        if (optional) n->flags = NF_OPTIONAL;
+        advance();
+        return n;
+    }
+
+    Node* lhs() {
+        Node* e;
+        if (isK(k.new_)) {
+            e = newExpr();
+        } else if (isK(k.super_)) {
+            e = mk(N::Super);
+            e->var = pseudo(&FunctionInfo::thisVar, "this");
+            fn->usesSuper = true;
+            advance();
+            if (!isP(P_Dot) && !isP(P_LBrack) && !isP(P_LParen)) unexpected();
+        } else if (isK(k.import_)) {
+            fail("import() is not supported yet");
+        } else {
+            e = primary();
+        }
+        bool chain = false;
+        for (;;) {
+            if (isP(P_Dot)) {
+                advance();
+                e = memberName(e, false);
+            } else if (isP(P_QDot)) {
+                advance();
+                chain = true;
+                if (isP(P_LParen)) {
+                    Node* c = mk(N::Call);
+                    c->a = e;
+                    c->flags = NF_OPTIONAL;
+                    arguments(c);
+                    e = c;
+                } else if (isP(P_LBrack)) {
+                    Node* n = mk(N::Index);
+                    advance();
+                    n->a = e;
+                    n->b = expression();
+                    n->flags = NF_OPTIONAL;
+                    expectP(P_RBrack);
+                    e = n;
+                } else
+                    e = memberName(e, true);
+            } else if (isP(P_LBrack)) {
+                Node* n = mk(N::Index);
+                advance();
+                n->a = e;
+                n->b = expression();
+                expectP(P_RBrack);
+                e = n;
+            } else if (isP(P_LParen)) {
+                Node* c = mk(N::Call);
+                c->a = e;
+                arguments(c);
+                e = c;
+            } else if (t.type == Tok::Templ) {
+                Node* tt = mk(N::TaggedTemplate);
+                tt->a = e;
+                tt->b = templateLit();
+                e = tt;
+            } else
+                break;
+        }
+        if (chain) {
+            Node* oc = mk(N::OptChain);
+            oc->a = e;
+            return oc;
+        }
+        return e;
+    }
+
+    Node* newExpr() {
+        Node* n = mk(N::New);
+        advance();  // new
+        if (isP(P_Dot)) {
+            advance();
+            if (!isK(k.target_)) unexpected();
+            advance();
+            n->type = N::NewTarget;
+            n->var = pseudo(&FunctionInfo::newTargetVar, "new.target");
+            return n;
+        }
+        Node* callee = isK(k.new_) ? newExpr() : primary();
+        for (;;) {
+            if (isP(P_Dot)) {
+                advance();
+                callee = memberName(callee, false);
+            } else if (isP(P_LBrack)) {
+                Node* ix = mk(N::Index);
+                advance();
+                ix->a = callee;
+                ix->b = expression();
+                expectP(P_RBrack);
+                callee = ix;
+            } else
+                break;
+        }
+        n->a = callee;
+        if (isP(P_LParen)) arguments(n);
+        return n;
+    }
+
+    Node* templateLit() {
+        Node* n = mk(N::Template);
+        for (;;) {
+            n->strs.push_back(t.str);
+            n->strs.push_back(t.raw);
+            if (t.tail) {
+                advance();
+                break;
+            }
+            advance();
+            n->list.push_back(expression());
+            if (!isP(P_RBrace)) unexpected();
+            bool nl = t.nl;
+            t = lx.templ(t.pos + 1);
+            t.nl = nl;
+        }
+        return n;
+    }
+
+    Node* primary() {
+        switch (t.type) {
+            case Tok::Num: {
+                Node* n = mk(N::Num);
+                n->num = t.num;
+                advance();
+                return n;
+            }
+            case Tok::Str: {
+                Node* n = mk(N::Str);
+                n->str = t.str;
+                advance();
+                return n;
+            }
+            case Tok::Templ: return templateLit();
+            case Tok::Private: fail("Unexpected private name");
+            case Tok::Punct:
+                if (t.p == P_LParen) {
+                    advance();
+                    Node* e = expression();
+                    expectP(P_RParen);
+                    e->flags |= NF_PAREN;
+                    return e;
+                }
+                if (t.p == P_LBrack) return arrayLit();
+                if (t.p == P_LBrace) return objectLit();
+                if (t.p == P_Slash || t.p == P_SlashEq) {
+                    bool nl = t.nl;
+                    t = lx.regex(t.pos);
+                    t.nl = nl;
+                    Node* n = mk(N::Regex);
+                    n->str = t.str;
+                    n->str2 = t.raw;
+                    advance();
+                    return n;
+                }
+                unexpected();
+            case Tok::Ident: {
+                JSString* w = t.str;
+                if (!t.esc) {
+                    if (w == k.this_) {
+                        Node* n = mk(N::This);
+                        n->var = pseudo(&FunctionInfo::thisVar, "this");
+                        advance();
+                        return n;
+                    }
+                    if (w == k.null_ || w == k.true_ || w == k.false_) {
+                        Node* n = mk(w == k.null_ ? N::Null : w == k.true_ ? N::True : N::False);
+                        advance();
+                        return n;
+                    }
+                    if (w == k.function_) {
+                        uint32_t start = t.pos;
+                        advance();
+                        bool gen = eatP(P_Star);
+                        JSString* name = nullptr;
+                        if (t.type == Tok::Ident && !isRes(t.str)) {
+                            name = t.str;
+                            advance();
+                        }
+                        return functionRest(name, start, false, gen, true);
+                    }
+                    if (w == k.async_) {
+                        Tok nx = peek();
+                        if (nx.type == Tok::Ident && nx.str == k.function_ && !nx.nl) {
+                            uint32_t start = t.pos;
+                            advance();
+                            advance();
+                            bool gen = eatP(P_Star);
+                            JSString* name = nullptr;
+                            if (t.type == Tok::Ident && !isRes(t.str)) {
+                                name = t.str;
+                                advance();
+                            }
+                            return functionRest(name, start, true, gen, true);
+                        }
+                    }
+                    if (w == k.class_) return classNode(false);
+                    if (isRes(w)) unexpected();
+                }
+                Node* n = identRef(w);
+                advance();
+                return n;
+            }
+            default: unexpected();
+        }
+    }
+
+    Node* arrayLit() {
+        Node* a = mk(N::Array);
+        advance();
+        while (!isP(P_RBrack)) {
+            if (isP(P_Comma)) {
+                a->list.push_back(mk(N::Hole));
+                advance();
+                continue;
+            }
+            if (isP(P_Ellipsis)) {
+                Node* sp = mk(N::Spread);
+                advance();
+                sp->a = assign();
+                a->list.push_back(sp);
+            } else
+                a->list.push_back(assign());
+            if (!isP(P_RBrack)) expectP(P_Comma);
+        }
+        advance();
+        return a;
+    }
+
+    Node* objectLit() {
+        Node* o = mk(N::Object);
+        advance();
+        while (!isP(P_RBrace)) {
+            Node* p = mk(N::Property);
+            uint32_t start = t.pos;
+            if (isP(P_Ellipsis)) {
+                advance();
+                p->op = PK_SPREAD;
+                p->a = assign();
+            } else {
+                bool isAsync = false, gen = false;
+                uint8_t kind = PK_INIT;
+                auto nameFollows = [&] {
+                    Tok nx = peek();
+                    return !(nx.type == Tok::Punct && (nx.p == P_LParen || nx.p == P_Colon || nx.p == P_Comma || nx.p == P_RBrace || nx.p == P_Assign));
+                };
+                if (isK(k.async_) && nameFollows() && !peek().nl) {
+                    isAsync = true;
+                    advance();
+                }
+                if (eatP(P_Star)) gen = true;
+                if ((isK(k.get_) || isK(k.set_)) && nameFollows()) {
+                    kind = isK(k.get_) ? PK_GET : PK_SET;
+                    advance();
+                }
+                bool isIdent = t.type == Tok::Ident && !t.esc;
+                JSString* name = (t.type == Tok::Ident || t.type == Tok::Str) ? t.str : nullptr;
+                p->a = propertyName(p);
+                if (isP(P_LParen)) {
+                    p->op = kind == PK_INIT ? PK_METHOD : kind;
+                    p->b = functionRest((p->flags & NF_COMPUTED) ? nullptr : name, start, isAsync, gen, false, kind == PK_GET ? 2 : kind == PK_SET ? 3 : 1);
+                } else if (eatP(P_Colon)) {
+                    p->op = PK_INIT;
+                    p->b = assign();
+                    if (!(p->flags & NF_COMPUTED)) nameFn(p->b, name);
+                } else {
+                    if (!isIdent || isRes(name) || (p->flags & NF_COMPUTED)) unexpected();
+                    p->op = PK_INIT;
+                    p->flags |= NF_SHORTHAND;
+                    Node* id = identRef(name);
+                    if (isP(P_Assign)) {  // only valid when the literal turns out to be a destructuring pattern
+                        advance();
+                        Node* ap = mk(N::AssignPat);
+                        ap->a = id;
+                        ap->b = assign();
+                        p->b = ap;
+                    } else
+                        p->b = id;
+                }
+            }
+            o->list.push_back(p);
+            if (!isP(P_RBrace)) expectP(P_Comma);
+        }
+        advance();
+        return o;
+    }
+
+    // Reinterprets an expression as an assignment target (destructuring patterns included).
+    Node* toPattern(Node* n) {
+        switch (n->type) {
+            case N::Ident:
+            case N::Member:
+            case N::Index:
+            case N::ArrayPat:
+            case N::ObjectPat:
+            case N::AssignPat:
+            case N::Hole: return n;
+            case N::Array:
+                n->type = N::ArrayPat;
+                for (Node*& e : n->list) {
+                    if (e->type == N::Spread) {
+                        e->type = N::Rest;
+                        e->a = toPattern(e->a);
+                    } else
+                        e = toPattern(e);
+                }
+                return n;
+            case N::Object:
+                n->type = N::ObjectPat;
+                for (Node*& p : n->list) {
+                    if (p->op == PK_SPREAD) {
+                        p->type = N::Rest;
+                        p->a = toPattern(p->a);
+                    } else if (p->op == PK_INIT)
+                        p->b = toPattern(p->b);
+                    else
+                        fail("Invalid destructuring target");
+                }
+                return n;
+            case N::Assign:
+                if (n->op != P_Assign) break;
+                n->type = N::AssignPat;
+                n->a = toPattern(n->a);
+                return n;
+            default: break;
+        }
+        fail("Invalid assignment target");
+    }
+};
+
+}  // namespace
+
+void parseScript(Vm& vm, Ast& ast, bool, const std::u16string*) {
+    Parser p(vm, ast);
+    p.program();
+}
+
+}  // namespace tb::js
