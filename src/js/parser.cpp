@@ -2,6 +2,7 @@
 #include <cstdlib>
 
 #include "parse.h"
+#include "regex.h"
 
 namespace tb::js {
 
@@ -24,9 +25,13 @@ bool isWs(char16_t c) {
 bool isLt(char16_t c) { return c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029; }
 bool isDigit(char16_t c) { return c >= '0' && c <= '9'; }
 bool idStart(char16_t c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_' || (c >= 0x80 && !isWs(c) && !isLt(c));
+    if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_';
+    return unicodeIdStart(c);
 }
-bool idPart(char16_t c) { return idStart(c) || isDigit(c) || c == 0x200C || c == 0x200D; }
+bool idPart(char16_t c) {
+    if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_' || isDigit(c);
+    return c == 0x200C || c == 0x200D || unicodeIdContinue(c);
+}
 int hexVal(char16_t c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -51,9 +56,28 @@ public:
     Lexer(Vm& v, const std::u16string& src) : vm(v), s(src) {}
     [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, line}; }
 
+    // IdentifierName: letters, digits, $ and _, with \uXXXX escapes that must themselves spell a valid character.
+    void name(std::u16string& id, bool& escaped) {
+        size_t n = s.size(), first = id.size();
+        while (pos < n && (idPart(s[pos]) || s[pos] == '\\')) {
+            size_t at = id.size();
+            if (s[pos] == '\\') {
+                ++pos;
+                if (pos >= n || s[pos] != 'u') fail("Invalid Unicode escape sequence");
+                escape(id);
+                escaped = true;
+            } else
+                id += s[pos++];
+            char16_t ch = id[at];
+            if (at == first ? !idStart(ch) : !idPart(ch)) fail("Invalid or unexpected token");
+        }
+    }
+
     bool skipSpace() {
         bool nl = false;
         size_t n = s.size();
+        if (pos == 0 && s.compare(0, 2, u"#!") == 0)  // hashbang comment: only at the very start
+            while (pos < n && !isLt(s[pos])) ++pos;
         while (pos < n) {
             char16_t c = s[pos];
             if (isWs(c)) ++pos;
@@ -231,15 +255,7 @@ public:
         char16_t c = s[pos];
         if (idStart(c) || c == '\\') {
             std::u16string id;
-            while (pos < n && (idPart(s[pos]) || s[pos] == '\\')) {
-                if (s[pos] == '\\') {
-                    ++pos;
-                    if (pos >= n || s[pos] != 'u') fail("Bad identifier escape");
-                    escape(id);
-                    t.esc = true;
-                } else
-                    id += s[pos++];
-            }
+            name(id, t.esc);
             t.type = Tok::Ident;
             t.str = vm.atom(id);
         } else if (isDigit(c) || (c == '.' && pos + 1 < n && isDigit(s[pos + 1]))) {
@@ -265,11 +281,13 @@ public:
             t.pos = p0;
             t.nl = nl;
             return t;
-        } else if (c == '#' && pos + 1 < n && idStart(s[pos + 1])) {
-            size_t st = pos++;
-            while (pos < n && idPart(s[pos])) ++pos;
+        } else if (c == '#' && pos + 1 < n && (idStart(s[pos + 1]) || s[pos + 1] == '\\')) {
+            ++pos;
+            std::u16string id = u"#";
+            bool esc = false;
+            name(id, esc);
             t.type = Tok::Private;
-            t.str = vm.atom(std::u16string_view(s).substr(st, pos - st));
+            t.str = vm.atom(id);
         } else {
             t.type = Tok::Punct;
             t.p = punct();

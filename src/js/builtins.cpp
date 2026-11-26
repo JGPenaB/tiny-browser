@@ -1188,6 +1188,8 @@ JSFN(reflectApply) {
 JSFN(reflectConstruct) {
     std::vector<Value> args;
     RootScope rs(ci.vm, args);
+    if (!ci.vm.isConstructor(ci.arg(0))) ci.vm.throwError(Err::TypeError, "Reflect.construct: the target is not a constructor");
+    if (ci.argc > 2 && !ci.vm.isConstructor(ci.args[2])) ci.vm.throwError(Err::TypeError, "Reflect.construct: newTarget is not a constructor");
     spreadArgs(ci.vm, ci.arg(1), args);
     return ci.vm.construct(ci.arg(0), args.data(), (int)args.size(), ci.argc > 2 ? ci.args[2] : ci.arg(0));
 }

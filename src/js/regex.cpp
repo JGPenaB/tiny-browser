@@ -1068,4 +1068,25 @@ bool regexExec(const RegexProgram& p, const std::u16string& s, size_t from, bool
     return false;
 }
 
+bool unicodeIdStart(char16_t c) {
+    if (c >= 0xD800 && c <= 0xDFFF) return true;  // half of a supplementary character: letters, mostly
+    if (c == 0x2118 || c == 0x212E || c == 0x309B || c == 0x309C || c == 0x1885 || c == 0x1886) return true;  // Other_ID_Start
+    WORD t1 = 0, t3 = 0;
+    wchar_t w = (wchar_t)c;
+    GetStringTypeW(CT_CTYPE1, &w, 1, &t1);
+    if (!(t1 & C1_ALPHA)) return false;
+    GetStringTypeW(CT_CTYPE3, &w, 1, &t3);
+    return !(t3 & (C3_NONSPACING | C3_VOWELMARK)) || (t3 & C3_ALPHA);
+}
+bool unicodeIdContinue(char16_t c) {
+    if (unicodeIdStart(c)) return true;
+    if (c == 0xB7 || c == 0x387 || (c >= 0x1369 && c <= 0x1371) || c == 0x19DA) return true;  // Other_ID_Continue
+    if (c == 0x203F || c == 0x2040 || c == 0x2054 || c == 0xFE33 || c == 0xFE34 || (c >= 0xFE4D && c <= 0xFE4F) || c == 0xFF3F) return true;
+    WORD t1 = 0, t3 = 0;
+    wchar_t w = (wchar_t)c;
+    GetStringTypeW(CT_CTYPE1, &w, 1, &t1);
+    GetStringTypeW(CT_CTYPE3, &w, 1, &t3);
+    return (t1 & (C1_ALPHA | C1_DIGIT)) || (t3 & (C3_NONSPACING | C3_VOWELMARK | C3_DIACRITIC));
+}
+
 }  // namespace tb::js

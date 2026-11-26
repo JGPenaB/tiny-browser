@@ -145,7 +145,7 @@ struct PropKey {
 };
 
 enum : uint8_t { PF_W = 1, PF_E = 2, PF_C = 4, PF_ACC = 8, PF_ALL = 7 };
-enum : uint8_t { OF_NOEXT = 1, OF_FROZEN = 2, OF_CTOR = 4 };
+enum : uint8_t { OF_NOEXT = 1, OF_FROZEN = 2, OF_CTOR = 4, OF_NO_NAME = 8, OF_NO_LENGTH = 16 };  // the last two: a function whose name/length was deleted
 
 struct Prop {
     PropKey key;

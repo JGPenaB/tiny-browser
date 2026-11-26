@@ -23,4 +23,8 @@ const std::vector<std::pair<std::u16string, int>>& regexGroupNames(const RegexPr
 // start,end pair of offsets for every group, -1 for groups that took no part in the match.
 bool regexExec(const RegexProgram& p, const std::u16string& s, size_t from, bool sticky, std::vector<int>& caps);
 
+// Unicode ID_Start and ID_Continue for code units outside ASCII (identifiers, ECMA-262 12.7).
+bool unicodeIdStart(char16_t c);
+bool unicodeIdContinue(char16_t c);
+
 }  // namespace tb::js

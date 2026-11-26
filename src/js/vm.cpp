@@ -915,11 +915,11 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
                 out = {k, v, PF_W};
                 return true;
             }
-            if (k.cell() == vm.a.name) {
+            if (k.cell() == vm.a.name && !(o->oflags & OF_NO_NAME)) {
                 out = {k, Value::cell(f->code->name ? f->code->name : vm.a.empty), PF_C};
                 return true;
             }
-            if (k.cell() == vm.a.length) {
+            if (k.cell() == vm.a.length && !(o->oflags & OF_NO_LENGTH)) {
                 out = {k, Value::i32(f->code->length), PF_C};
                 return true;
             }
@@ -928,11 +928,11 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
         case Cls::Native: {
             if (k.isIndex()) return false;
             JSNative* n = (JSNative*)o;
-            if (k.cell() == vm.a.name) {
+            if (k.cell() == vm.a.name && !(o->oflags & OF_NO_NAME)) {
                 out = {k, Value::cell(n->name ? n->name : vm.a.empty), PF_C};
                 return true;
             }
-            if (k.cell() == vm.a.length) {
+            if (k.cell() == vm.a.length && !(o->oflags & OF_NO_LENGTH)) {
                 out = {k, Value::i32(n->length), PF_C};
                 return true;
             }
@@ -1191,6 +1191,12 @@ bool Vm::del(JSObject* o, PropKey k) {
     }
     Prop* p = o->find(k);
     if (!p) {
+        if ((o->cls == Cls::Function || o->cls == Cls::Native) && !k.isIndex() && !k.isSymbol()) {
+            // a function's name and length are configurable: deleting one leaves a mark, since neither is stored
+            if (k.cell() == a.name) o->oflags |= OF_NO_NAME;
+            if (k.cell() == a.length) o->oflags |= OF_NO_LENGTH;
+            if (k.cell() == a.name || k.cell() == a.length) return true;
+        }
         // a property that exists without being stored (an array's length, a string's characters) cannot go
         Prop vp;
         if (o->cls != Cls::Host && virtualProp(*this, o, k, vp) && !(vp.flags & PF_C)) return false;

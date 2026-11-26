@@ -22,6 +22,14 @@ var $262 = {
   createRealm: function () { throw new Test262Error('createRealm is not supported'); },
   agent: { start: function () { throw new Test262Error('agents are not supported'); } }
 };
+__modules.host.resolve = function (specifier, referrer) {
+  if (!/^\.{1,2}\//.test(specifier)) throw new TypeError("Cannot resolve module specifier '" + specifier + "'");
+  var parts = referrer.split('/');
+  parts.pop();
+  specifier.split('/').forEach(function (p) { if (p === '..') parts.pop(); else if (p !== '.' && p !== '') parts.push(p); });
+  return parts.join('/');
+};
+__modules.host.fetch = function (url) { return new Promise(function (resolve) { resolve(__readFile(url)); }); };
 """
 
 
@@ -66,6 +74,15 @@ def build(path):
     info = meta(src)
     if "raw" in info["flags"]:
         return src, info
+    if "module" in info["flags"]:  # the harness runs as a script, then the test is loaded as a module from its own file
+        parts = [HOST, harness("assert.js"), harness("sta.js")]
+        if "async" in info["flags"]:
+            parts.append(harness("doneprintHandle.js"))
+        for inc in info["includes"]:
+            parts.append(harness(inc))
+        parts.append("__modules.load(%s).then(function (m) { return __modules.run(m); }).catch(function (e) { setTimeout(function () { throw e; }, 0); });"
+                     % repr(path.replace("\\", "/")))
+        return "\n".join(parts), info
     parts = [HOST, harness("assert.js"), harness("sta.js")]
     if "async" in info["flags"]:
         parts.append(harness("doneprintHandle.js"))
@@ -89,9 +106,6 @@ def run_chunk(tests):
             except Exception as e:  # a harness file that does not exist, unreadable test...
                 results[rel] = (False, "runner: " + str(e))
                 continue
-            if "module" in info["flags"]:
-                results[rel] = (None, "module tests are not run yet")
-                continue
             f = os.path.join(tmp, "%d.js" % i)
             with open(f, "w", encoding="utf-8", newline="\n") as out:
                 out.write(body)
@@ -99,7 +113,7 @@ def run_chunk(tests):
         while todo:
             listing, outp = os.path.join(tmp, "list.txt"), os.path.join(tmp, "out.txt")
             with open(listing, "w", encoding="utf-8", newline="\n") as lf:
-                lf.write("\n".join(f for _, f, _ in todo))
+                lf.write("\n".join(f + "\t" + os.path.join(suite, "test", rel).replace("\\", "/") for rel, f, _ in todo))
             if os.path.exists(outp):
                 os.remove(outp)
             try:

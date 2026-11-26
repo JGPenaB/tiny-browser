@@ -69,6 +69,13 @@ static bool readFile(const std::wstring& path, std::string& bytes) {
     return true;
 }
 
+static Value readFileFn(CallInfo& ci) {  // __readFile(path): the text of a file, for loading modules from disk
+    std::u16string wide = ci.vm.toStr16(ci.arg(0));
+    std::string bytes;
+    if (!readFile(std::wstring(wide.begin(), wide.end()), bytes)) ci.vm.throwError(Err::TypeError, "Cannot read %s", utf16to8(wide).c_str());
+    return ci.vm.strv(utf8to16(bytes));
+}
+
 // Runs one script in a fresh engine, with its timers, writing console output to `out`. limitMs > 0 stops a
 // script that runs too long. Returns true when it failed with an uncaught error.
 static bool runOne(const std::string& bytes, const std::string& name, HANDLE out, double limitMs) {
@@ -87,6 +94,7 @@ static bool runOne(const std::string& bytes, const std::string& name, HANDLE out
     vm.defFn(vm.global, "clearTimeout", clearTimerFn, 1);
     vm.defFn(vm.global, "clearInterval", clearTimerFn, 1);
     vm.def(vm.global, "print", vm.get(vm.get(V(vm.global), "console"), "log"));
+    vm.defFn(vm.global, "__readFile", readFileFn, 1);
     double started = tick();
     if (limitMs > 0) vm.deadlineTick = GetTickCount64() + (ULONGLONG)limitMs;
 
@@ -170,13 +178,21 @@ int runJsBatch(const std::wstring& listPath, const std::wstring& outPath) {
         pos = nl + 1;
         while (!path.empty() && (path.back() == '\r' || path.back() == ' ')) path.pop_back();
         if (path.empty()) continue;
+        // "file<TAB>name": run the file under another name, the one its relative imports are resolved against
+        std::string name;
+        size_t tab = path.find('\t');
+        if (tab != std::string::npos) {
+            name = path.substr(tab + 1);
+            path.resize(tab);
+        }
         put("### " + path + "\n");
         std::string bytes;
         std::u16string wide = utf8to16(path);
         bool failed = true;
         if (readFile(std::wstring(wide.begin(), wide.end()), bytes)) {
             size_t slash = path.find_last_of("/\\");
-            failed = runOne(bytes, slash == std::string::npos ? path : path.substr(slash + 1), out, 10000);
+            if (name.empty()) name = slash == std::string::npos ? path : path.substr(slash + 1);
+            failed = runOne(bytes, name, out, 10000);
         } else
             put("Uncaught could not read the file\n");
         put(failed ? "### end 1\n" : "### end 0\n");
