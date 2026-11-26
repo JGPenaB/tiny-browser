@@ -2143,9 +2143,9 @@ Value Vm::runFrames(size_t base) {
                         }
                         break;
                     }
-                    case OP_DeclGlobalVar: {
+                    case OP_DeclGlobalVar: {  // a: declared by eval, which makes the property configurable
                         PropKey k = KEYK(i.bx);
-                        if (!global->find(k)) global->add(k, Value::undef(), PF_W | PF_E);
+                        if (!global->find(k)) global->add(k, Value::undef(), (uint8_t)(PF_W | PF_E | (i.a ? PF_C : 0)));
                         break;
                     }
                     case OP_DeclGlobalLet: {
@@ -2898,6 +2898,32 @@ Value Vm::runFrames(size_t base) {
                         defineOwn(ctor, toKey(R(i.b)), v, PF_ALL);
                         break;
                     }
+                    case OP_ScopeHas: {
+                        Value o = R(i.b);
+                        bool found = false;
+                        if (o.isObject()) {
+                            fr->pc = pc;
+                            PropKey k = toKey(R(i.c));
+                            found = has(o.asObject(), k);
+                            if (found && o.asObject()->proto) {  // names an object asks to be left out of `with`
+                                Value blocked = getObj(o.asObject(), PropKey::of(symUnscopables), o);
+                                if (blocked.isObject() && toBool(getObj(blocked.asObject(), k, blocked))) found = false;
+                            }
+                        }
+                        R(i.a) = Value::boolean(found);
+                        break;
+                    }
+                    case OP_NewScopeObj: R(i.a) = Value::cell(newObject(nullptr)); break;
+                    case OP_ScopeDeclare: {
+                        JSObject* o = R(i.a).asObject();
+                        PropKey k = toKey(R(i.b));
+                        if (!o->find(k)) o->add(k, Value::undef(), PF_ALL);
+                        break;
+                    }
+                    case OP_ToObject:
+                        fr->pc = pc;
+                        R(i.a) = Value::cell(toObject(R(i.b)));
+                        break;
                     case OP_DirectEval: {
                         uint32_t site = (pc++)->bx;
                         Value callee = R(i.b);

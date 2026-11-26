@@ -74,6 +74,10 @@ enum Op : uint16_t {
     OP_DelegateCall,    // yield*: a = result of next/throw/return on the inner iterator at b (b+2 received, b+3 mode)
     OP_DelegateResult,  // yield*: read the result at b+4: c = done, a = final value when done
     OP_YieldDelegate,   // yield b from inside yield*; the resumption lands in a (value) and a+1 (mode)
+    OP_ScopeHas,      // a = the scope object b has a binding named c (for `with`: honours Symbol.unscopables)
+    OP_NewScopeObj,   // a = a fresh object without a prototype, for variables created by eval
+    OP_ScopeDeclare,  // the scope object a gets a property named b, undefined, unless it has one
+    OP_ToObject,      // a = ToObject(b)
     OP_DirectEval,  // a = call b with c arguments; when b is the built-in eval, run the text in this scope (site: next word)
     OP_ClassInit,   // run the static block b with `this` set to the class a
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope

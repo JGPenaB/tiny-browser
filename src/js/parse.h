@@ -22,12 +22,12 @@ enum class N : uint8_t {
     Unary, Update, Binary, Logical, Assign, Cond, Call, New, Member, Index, OptChain, Spread, Seq, Yield, Await, Hole,
     ArrayPat, ObjectPat, AssignPat, Rest,
     VarDecl, Declarator, ExprStmt, Block, Empty, If, For, ForIn, ForOf, While, DoWhile, Return, Break, Continue, Throw,
-    Try, Switch, Case, Labeled, Debugger, Program, ImportCall
+    Try, Switch, Case, Labeled, Debugger, Program, ImportCall, With
 };
 
 enum : uint16_t {
     NF_COMPUTED = 1, NF_STATIC = 2, NF_SHORTHAND = 4, NF_OPTIONAL = 8, NF_PREFIX = 16, NF_DELEGATE = 32, NF_PRIVATE = 64,
-    NF_PAREN = 128, NF_EXPRBODY = 256, NF_AWAIT = 512, NF_EVAL = 1024, NF_TRAILING = 2048
+    NF_PAREN = 128, NF_EXPRBODY = 256, NF_AWAIT = 512, NF_EVAL = 1024, NF_TRAILING = 2048, NF_DYN = 4096
 };
 enum : uint8_t { PK_INIT, PK_GET, PK_SET, PK_METHOD, PK_SPREAD, PK_FIELD, PK_STATIC_BLOCK };
 enum : uint8_t { VK_VAR, VK_LET, VK_CONST, VK_PARAM, VK_FUNC, VK_CLASS, VK_CATCH, VK_FUNCNAME, VK_PSEUDO, VK_PRIVATE, VK_IMPORT };
@@ -42,6 +42,7 @@ struct Variable {
     int reg = -1, slot = -1;
     Scope* scope = nullptr;
     uint32_t declEnd = 0;
+    bool annexB = false;              // a `var` that exists only because a block-level function shares its name
     Variable* importNs = nullptr;     // VK_IMPORT: the variable holding the source module's namespace
     JSString* importName = nullptr;  // VK_IMPORT: the export it stands for (null: the namespace itself)
 };
@@ -64,7 +65,8 @@ struct Node {
 };
 
 struct Scope {
-    enum K : uint8_t { Global, Function, Block, Catch, Class, For } kind = Block;
+    enum K : uint8_t { Global, Function, Block, Catch, Class, For, With } kind = Block;
+    Variable* withVar = nullptr;  // With: the hidden variable holding the object
     Scope* parent = nullptr;
     FunctionInfo* fn = nullptr;
     std::vector<Variable*> vars;
@@ -102,6 +104,7 @@ struct FunctionInfo {
          isFieldInit = false, isEvalBody = false, isStaticBlock = false, simpleParams = true, dupParams = false,
          hasUseStrict = false, strictNames = false;
     Variable *thisVar = nullptr, *argsVar = nullptr, *selfVar = nullptr, *newTargetVar = nullptr;
+    Variable* evalVars = nullptr;  // sloppy function with a direct eval: holds the object of variables eval creates
     uint32_t srcStart = 0, srcEnd = 0, line = 0;
     int length = 0;
     FunctionInfo* parent = nullptr;
@@ -128,6 +131,11 @@ struct Ast {
         int request;
         JSString* name;
     };
+    // Names that may be found at run time in a `with` object or among eval-made variables: for each such
+    // identifier, the hidden variables holding those objects, innermost first.
+    std::unordered_map<Node*, std::vector<Variable*>> dyn;
+    std::vector<JSString*> evalDynVars;  // direct eval in a function: the new `var`s it declares there
+    Variable* evalDynTarget = nullptr;   // and the caller's variable that holds them
     FunctionInfo* evalFn = nullptr;      // direct eval: the function the eval code is compiled as
     std::vector<Scope*> evalScopes;      // and the caller's scopes it runs inside, outermost first
     std::vector<Variable*> evalGlobals;  // global variables the eval code declares

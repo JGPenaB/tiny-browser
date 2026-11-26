@@ -78,6 +78,7 @@ private:
     std::string file_;
     Fn* f = nullptr;
     std::vector<Scope*> chain;  // scopes that own a runtime context, innermost last
+    int evalObjReg = -1;        // eval code: the register holding the caller's object of eval-made variables
     uint32_t curLine = 1;
 
     [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, curLine}; }
@@ -274,9 +275,25 @@ private:
             emit(OP_Yield, t, t);
             f->nextReg--;
         }
-        if (info->isEvalBody)
+        if (info->isEvalBody) {
             for (Variable* v : ast.evalGlobals)
-                if (v->kind == VK_VAR) emitX(OP_DeclGlobalVar, 0, kstr(v->name));
+                if (v->kind == VK_VAR) emitX(OP_DeclGlobalVar, 1, kstr(v->name));
+            if (ast.evalDynTarget) {
+                Variable* ev = ast.evalDynTarget;
+                evalObjReg = newReg();
+                int name = newReg();
+                emit(OP_GetCtx, evalObjReg, depthOf(ev), ev->slot);
+                size_t have = jump(OP_JmpNotUndef, evalObjReg);
+                emit(OP_NewScopeObj, evalObjReg);
+                emit(OP_SetCtx, evalObjReg, depthOf(ev), ev->slot);
+                patch(have);
+                for (JSString* nm : ast.evalDynVars) {
+                    emitX(OP_LoadK, name, kstr(nm));
+                    emit(OP_ScopeDeclare, evalObjReg, name);
+                }
+                f->nextReg--;
+            }
+        }
         hoist(sc);
         if (info->isEvalBody) {  // the value of eval(...) is the value of its last expression statement
             int result = newReg();
@@ -366,7 +383,13 @@ private:
         for (Node* fd : sc->funcDecls) {
             int t = newReg();
             closure(fd->fn, t);
-            storeVar(fd->var, fd->str, t, true);
+            if (!fd->var && evalObjReg >= 0 && f->info->isEvalBody) {  // a function eval adds to its caller
+                int name = newReg();
+                emitX(OP_LoadK, name, kstr(fd->str));
+                emit(OP_SetElem, evalObjReg, name, t);
+                f->nextReg--;
+            } else
+                storeVar(fd->var, fd->str, t, true);
             f->nextReg--;
         }
     }
@@ -531,6 +554,7 @@ private:
             case N::False: emit(OP_LoadFalse, need()); return dst;
             case N::Hole: emit(OP_LoadUndef, need()); return dst;
             case N::Ident: {
+                if (const std::vector<Variable*>* dl = dynOf(n)) return dynLoad(n, *dl, dst);
                 Variable* v = n->var;
                 if (!v || v->isGlobal) {
                     need();
@@ -657,7 +681,9 @@ private:
                 int mark = f->nextReg;
                 switch (n->op) {
                     case P_Typeof:
-                        if (n->a->type == N::Ident && (!n->a->var || n->a->var->isGlobal)) {
+                        if (n->a->type == N::Ident && dynOf(n->a)) {
+                            dynLoad(n->a, *dynOf(n->a), dst, 1);
+                        } else if (n->a->type == N::Ident && (!n->a->var || n->a->var->isGlobal)) {
                             emitX(OP_GetGlobalTypeof, dst, kstr(n->a->str));
                         } else
                             emit(OP_Typeof, dst, expr(n->a));
@@ -681,6 +707,8 @@ private:
                             int o = expr(t->a);
                             if (t->flags & NF_OPTIONAL) bail(o);
                             emit(OP_DelElem, dst, o, expr(t->b));
+                        } else if (t->type == N::Ident && dynOf(t)) {
+                            dynLoad(t, *dynOf(t), dst, 2);
                         } else {
                             expr(n->a);
                             emit(OP_LoadTrue, dst);
@@ -910,6 +938,9 @@ private:
             else if (c->b->type == N::Str && !(c->flags & NF_PRIVATE)) getProp(base, base + 1, c->b->str);
             else emit(OP_GetElem, base, base + 1, expr(c->b));
             f->nextReg = m2;
+        } else if (c->type == N::Ident && dynOf(c)) {  // a function found in a `with` object is called on that object
+            emit(OP_LoadUndef, base + 1);
+            dynLoad(c, *dynOf(c), base, 0, base + 1);
         } else {
             expr(c, base);
             emit(OP_LoadUndef, base + 1);
@@ -966,6 +997,72 @@ private:
         return dst;
     }
 
+    // ---- names that may live in a `with` object or among the variables a direct eval created
+    const std::vector<Variable*>* dynOf(Node* n) {
+        if (!(n->flags & NF_DYN)) return nullptr;
+        auto it = ast.dyn.find(n);
+        return it == ast.dyn.end() ? nullptr : &it->second;
+    }
+    void loadScopeObj(Variable* d, int dst) {
+        if (d->captured) emit(OP_GetCtx, dst, depthOf(d), d->slot);
+        else emit(OP_Move, dst, d->reg);
+    }
+    // mode 0: read into dst (thisReg >= 0: also the `this` a call gets), 1: typeof, 2: delete
+    int dynLoad(Node* n, const std::vector<Variable*>& dl, int dst, int mode = 0, int thisReg = -1) {
+        if (dst < 0) dst = newReg();
+        int mark = f->nextReg;
+        int o = newReg(), flag = newReg(), name = newReg();
+        emitX(OP_LoadK, name, kstr(n->str));
+        std::vector<size_t> done;
+        for (Variable* d : dl) {
+            loadScopeObj(d, o);
+            emit(OP_ScopeHas, flag, o, name);
+            size_t next = jump(OP_JmpF, flag);
+            if (mode == 2) emit(OP_DelElem, dst, o, name);
+            else emit(OP_GetElem, dst, o, name);
+            if (mode == 1) emit(OP_Typeof, dst, dst);
+            if (thisReg >= 0 && d->scope->kind == Scope::With) emit(OP_Move, thisReg, o);
+            done.push_back(jump(OP_Jmp));
+            patch(next);
+        }
+        n->flags &= ~NF_DYN;  // not found there: the ordinary lookup
+        if (mode == 1) {
+            if (!n->var || n->var->isGlobal) emitX(OP_GetGlobalTypeof, dst, kstr(n->str));
+            else emit(OP_Typeof, dst, expr(n));
+        } else if (mode == 2) {
+            emit(n->var ? OP_LoadFalse : OP_LoadTrue, dst);
+        } else {
+            int r = expr(n, dst);
+            if (r != dst) emit(OP_Move, dst, r);
+        }
+        n->flags |= NF_DYN;
+        for (size_t j : done) patch(j);
+        f->nextReg = mark;
+        return dst;
+    }
+    void storeIdent(Node* id, int src, bool init) {
+        const std::vector<Variable*>* dl = dynOf(id);
+        if (!dl) {
+            storeVar(id->var, id->str, src, init);
+            return;
+        }
+        int mark = f->nextReg;
+        int o = newReg(), flag = newReg(), name = newReg();
+        emitX(OP_LoadK, name, kstr(id->str));
+        std::vector<size_t> done;
+        for (Variable* d : *dl) {
+            loadScopeObj(d, o);
+            emit(OP_ScopeHas, flag, o, name);
+            size_t next = jump(OP_JmpF, flag);
+            emit(OP_SetElem, o, name, src);
+            done.push_back(jump(OP_Jmp));
+            patch(next);
+        }
+        storeVar(id->var, id->str, src, init);
+        for (size_t j : done) patch(j);
+        f->nextReg = mark;
+    }
+
     // Records what a direct eval at this point can see: every scope with a context, outermost first.
     uint32_t evalSite() {
         EvalSite site;
@@ -976,12 +1073,15 @@ private:
             es.isGlobal = sc->kind == Scope::Global;
             es.isClass = sc->kind == Scope::Class;
             es.isArrow = es.isFunction && sc->fn->isArrow;
+            es.isWith = sc->kind == Scope::With;
             for (Variable* v : sc->vars) {
                 if (v->isGlobal || !v->captured || v->kind == VK_IMPORT) continue;
                 bool owner = es.isFunction || es.isGlobal;
                 if (owner && v == sc->fn->thisVar) es.thisVar = (int)es.vars.size();
                 if (owner && v == sc->fn->argsVar) es.argsVar = (int)es.vars.size();
                 if (owner && v == sc->fn->newTargetVar) es.newTargetVar = (int)es.vars.size();
+                if (es.isFunction && v == sc->fn->evalVars) es.evalVars = (int)es.vars.size();
+                if (es.isWith && v == sc->withVar) es.withVar = (int)es.vars.size();
                 es.vars.push_back({v->name, (uint16_t)v->slot, v->kind, v->needsTdz});
             }
             site.scopes.push_back(std::move(es));
@@ -994,7 +1094,7 @@ private:
         Op op = n->op == P_Inc ? OP_Inc : OP_Dec;
         bool prefix = (n->flags & NF_PREFIX) || discard;
         Node* t = n->a;
-        if (t->type == N::Ident && t->var && !t->var->captured && !t->var->isGlobal && t->var->kind != VK_CONST) {
+        if (t->type == N::Ident && t->var && !t->var->captured && !t->var->isGlobal && t->var->kind != VK_CONST && !(t->flags & NF_DYN)) {
             int r = t->var->reg;
             if (prefix) {
                 emit(op, r, r);
@@ -1014,7 +1114,7 @@ private:
             int cur = expr(t);
             emit(OP_ToNumeric, oldv, cur);
             emit(op, newv, oldv);
-            storeVar(t->var, t->str, newv, false);
+            storeIdent(t, newv, false);
         } else if (t->type == N::Member) {
             int o = expr(t->a);
             getProp(oldv, o, t->str);
@@ -1041,7 +1141,7 @@ private:
             if (t->type == N::Ident) {
                 Variable* v = t->var;
                 if (v && !v->captured && !v->isGlobal && v->kind != VK_CONST && v->kind != VK_FUNCNAME && v->kind != VK_PRIVATE &&
-                    directOk(n->b) && !mentions(n->b, v)) {
+                    !(t->flags & NF_DYN) && directOk(n->b) && !mentions(n->b, v)) {
                     expr(n->b, v->reg);
                     if (dst < 0 || dst == v->reg) return v->reg;
                     emit(OP_Move, dst, v->reg);
@@ -1050,7 +1150,7 @@ private:
                 if (dst < 0) dst = newReg();
                 int mark = f->nextReg;
                 int r = expr(n->b);
-                storeVar(v, t->str, r, false);
+                storeIdent(t, r, false);
                 if (r != dst) emit(OP_Move, dst, r);
                 f->nextReg = mark;
                 return dst;
@@ -1111,7 +1211,7 @@ private:
             int r = expr(n->b);
             emit(binop(n->op), cur, cur, r);
         }
-        if (t->type == N::Ident) storeVar(t->var, t->str, cur, false);
+        if (t->type == N::Ident) storeIdent(t, cur, false);
         else if (t->type == N::Member) setProp(o, t->str, cur);
         else emit(OP_SetElem, o, k, cur);
         if (logical) patch(skip);
@@ -1278,7 +1378,7 @@ private:
     void bindTarget(Node* t, int src, bool init) {
         int mark = f->nextReg;
         switch (t->type) {
-            case N::Ident: storeVar(t->var, t->str, src, init); break;
+            case N::Ident: storeIdent(t, src, init); break;
             case N::Member: {
                 int o = expr(t->a);
                 setProp(o, t->str, src);
@@ -1489,8 +1589,8 @@ private:
             if (d->b) {
                 if (t->type == N::Ident) {
                     Variable* v = t->var;
-                    if (v && !v->captured && !v->isGlobal && directOk(d->b) && !mentions(d->b, v)) expr(d->b, v->reg);
-                    else storeVar(v, t->str, expr(d->b), true);
+                    if (v && !v->captured && !v->isGlobal && !(t->flags & NF_DYN) && directOk(d->b) && !mentions(d->b, v)) expr(d->b, v->reg);
+                    else storeIdent(t, expr(d->b), true);
                 } else {
                     bindTarget(t, expr(d->b), true);
                 }
@@ -1590,6 +1690,14 @@ private:
             case N::ExprStmt: effect(n->a); break;
             case N::VarDecl: varDecl(n); break;
             case N::Function:
+                // Annex B.3.3: reaching a block-level function declaration copies it to the function-level var
+                if (n->var && n->var2 && (n->var2->kind == VK_VAR || n->var2->kind == VK_FUNC)) {
+                    int r = newReg();
+                    if (n->var->captured) emit(OP_GetCtx, r, depthOf(n->var), n->var->slot);
+                    else emit(OP_Move, r, n->var->reg);
+                    storeVar(n->var2, n->var2->name, r, false);
+                }
+                break;
             case N::Empty:
             case N::Debugger: break;
             case N::Class: {
@@ -1677,6 +1785,15 @@ private:
             case N::Continue: jumpOut(n); break;
             case N::Throw: emit(OP_Throw, expr(n->a)); break;
             case N::Try: tryStmt(n); break;
+            case N::With: {
+                int o = newReg();
+                emit(OP_ToObject, o, expr(n->a));
+                ScopeMark sm = enterScope(n->scope);
+                storeVar(n->var, n->var->name, o, true);
+                stmt(n->d);
+                exitScope(sm);
+                break;
+            }
             case N::Switch: {
                 int d = newReg();
                 expr(n->a, d);

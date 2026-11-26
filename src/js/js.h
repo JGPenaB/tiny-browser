@@ -228,8 +228,9 @@ struct EvalScope {
         bool tdz;
     };
     std::vector<Var> vars;
-    bool isFunction = false, isArrow = false, isClass = false, isGlobal = false;
+    bool isFunction = false, isArrow = false, isClass = false, isGlobal = false, isWith = false;
     int thisVar = -1, argsVar = -1, newTargetVar = -1;  // positions in vars, for `this`, `arguments` and new.target
+    int withVar = -1, evalVars = -1;                    // the object of a `with`; the object holding eval-made vars
 };
 struct EvalSite {
     std::vector<EvalScope> scopes;
@@ -606,6 +607,7 @@ public:
     Value arrayValuesFn, arrayIterNextFn;  // the original Array.prototype.values and array iterator next
     Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
+    Symbol* symUnscopables = nullptr;
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
            *symToStringTag = nullptr, *symSpecies = nullptr;
     Value regexpCtor, promiseCtor;

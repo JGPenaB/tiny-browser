@@ -527,7 +527,7 @@ public:
                 f.scope = sc;
                 evalVarScope = sc;  // arrow functions keep their own `var`s too
             } else if (!es.isGlobal)
-                sc = open(es.isClass ? Scope::Class : Scope::Block);
+                sc = open(es.isWith ? Scope::With : es.isClass ? Scope::Class : Scope::Block);
             sc->hasCtx = true;
             ast.evalScopes.push_back(sc);
             for (size_t i = 0; i < es.vars.size(); ++i) {
@@ -540,6 +540,8 @@ public:
                 if ((int)i == es.thisVar) sc->fn->thisVar = v;
                 if ((int)i == es.argsVar) sc->fn->argsVar = v;
                 if ((int)i == es.newTargetVar) sc->fn->newTargetVar = v;
+                if ((int)i == es.evalVars) sc->fn->evalVars = v;
+                if ((int)i == es.withVar) sc->withVar = v;
             }
         }
         declaredNow.clear();
@@ -579,6 +581,13 @@ private:
             }
             (owner->*slot)->captured = true;
         };
+        if (!fn->strict && fn->scope && fn->scope->kind == Scope::Function && !fn->evalVars) {
+            Variable* v = newVar(fn->scope, vm.atom("%evalvars"), VK_VAR);  // starts out undefined
+            v->declEnd = 0;
+            v->captured = true;
+            declaredNow.pop_back();
+            fn->evalVars = v;
+        }
         force(&FunctionInfo::thisVar, vm.atom("this"));
         if (owner->scope->kind == Scope::Function && !owner->isArrow) {
             if (!owner->scope->find(k.arguments_)) force(&FunctionInfo::argsVar, k.arguments_);
@@ -927,6 +936,14 @@ private:
                 if (fn->strict || !(ifBody || labelled)) fail("In this context a function can only be declared at the top level or inside a block");
                 Tok nx = peek();
                 if (nx.type == Tok::Punct && nx.p == P_Star) fail("Generators can only be declared at the top level or inside a block");
+                if (ifBody) {  // Annex B.3.4: as if the declaration stood in a block of its own
+                    Node* b = mk(N::Block);
+                    Scope* sc = open(Scope::Block);
+                    b->list.push_back(statement());
+                    b->scope = sc;
+                    close(sc);
+                    return b;
+                }
             }
             if (w == k.async_) {
                 Tok nx = peek();
@@ -1036,6 +1053,13 @@ private:
                     ast.evalGlobals.push_back(v);
                     return v;
                 }
+                if (evalVarScope->fn->evalVars) {  // a new variable of the calling function: it lives in an object there
+                    bool known = false;
+                    for (JSString* n : ast.evalDynVars) known = known || n == name;
+                    if (!known) ast.evalDynVars.push_back(name);
+                    ast.evalDynTarget = evalVarScope->fn->evalVars;
+                    return nullptr;
+                }
             }
             if (kind == VK_VAR)
                 for (Scope* sc = scope; sc != fs; sc = sc->parent) {
@@ -1055,6 +1079,14 @@ private:
             return v;
         }
         if (Variable* v = scope->find(name)) {
+            if (v->annexB && (kind == VK_LET || kind == VK_CONST || kind == VK_CLASS)) {
+                // the name turns out to be lexical here, so the block-level function does not become a var after all
+                v->annexB = false;
+                v->kind = kind;
+                v->declEnd = 0xFFFFFFFF;
+                declaredNow.push_back(v);
+                return v;
+            }
             if (v->kind == VK_PARAM && kind == VK_PARAM) {  // duplicate parameter names: sloppy functions with plain parameters only
                 fn->dupParams = true;
                 return v;
@@ -1075,6 +1107,14 @@ private:
     }
     void reference(Node* ident) { scope->refs.push_back({ident, false}); }
 
+    void noteDynamic(Scope* sc, Node* node, bool crossed) {
+        if (node->flags & NF_PRIVATE) return;
+        Variable* dv = sc->kind == Scope::With ? sc->withVar : sc->kind == Scope::Function && sc->fn->evalVars ? sc->fn->evalVars : nullptr;
+        if (!dv) return;
+        ast.dyn[node].push_back(dv);
+        node->flags |= NF_DYN;
+        if (crossed || sc->kind == Scope::Function) dv->captured = true;
+    }
     void close(Scope* sc) {
         if (sc->hasEval)
             for (Variable* v : sc->vars) {
@@ -1096,10 +1136,12 @@ private:
                     if (crossed || node->pos < v->declEnd) v->needsTdz = true;
                 if (v->kind == VK_PARAM && v->declEnd != 0xFFFFFFFF && node->pos < v->declEnd) v->needsTdz = true;
             } else if (sc->parent) {
+                noteDynamic(sc, node, crossed);
                 sc->parent->refs.push_back({node, crossed || sc->kind == Scope::Function});
             } else if (node->flags & NF_PRIVATE) {
                 throw SyntaxErr{"Private field '" + utf16to8(node->str->s) + "' must be declared in an enclosing class", node->line};
-            }
+            } else
+                noteDynamic(sc, node, crossed);
         }
         sc->refs.clear();
         scope = sc->parent;
@@ -1257,7 +1299,24 @@ private:
                 if (!atModuleTop()) fail("Unexpected token 'export'");
                 return exportDecl();
             }
-            if (w == k.with_) fail("'with' statements are not supported");
+            if (w == k.with_) {  // with (object) statement: names are looked up on the object first (14.11)
+                if (fn->strict) fail("Strict mode code may not include a with statement");
+                Node* n = mk(N::With);
+                advance();
+                expectP(P_LParen);
+                n->a = expression();
+                expectP(P_RParen);
+                Scope* sc = open(Scope::With);
+                Variable* wv = newVar(sc, vm.atom("%with"), VK_LET);
+                wv->declEnd = 0;
+                declaredNow.pop_back();
+                sc->withVar = wv;
+                n->scope = sc;
+                n->var = wv;
+                n->d = subStatement();
+                close(sc);
+                return n;
+            }
             if (!isRes(w)) {
                 Tok nx = peek();
                 if (nx.type == Tok::Punct && nx.p == P_Colon) {
@@ -1325,16 +1384,55 @@ private:
         return d;
     }
 
+    // Annex B.3.3: in sloppy code a function declared in a block is also a `var` of the enclosing function (or
+    // the global object), unless a let, const, class or parameter of that name stands in the way.
+    Variable* annexBVar(JSString* name) {
+        if (fn->strict) return nullptr;
+        Scope* fs = fnScope(scope);
+        if (scope == fs) return nullptr;
+        for (Scope* sc = scope->parent; sc && sc != fs; sc = sc->parent) {
+            Variable* v = sc->find(name);
+            if (v && (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS || v->kind == VK_FUNC)) return nullptr;
+        }
+        if (evalScope && fs == evalScope) {  // eval code: the var belongs to the code that called eval
+            if (Variable* v = evalVarScope->find(name)) return v->kind == VK_VAR || v->kind == VK_FUNC ? v : nullptr;
+            if (evalVarScope->kind != Scope::Global) return nullptr;
+            Variable* v = newVar(evalVarScope, name, VK_VAR);
+            v->declEnd = 0;
+            ast.evalGlobals.push_back(v);
+            return v;
+        }
+        if (Variable* v = fs->find(name)) return v->kind == VK_VAR || (v->kind == VK_FUNC && v->scope == fs) ? v : nullptr;
+        Variable* v = newVar(fs, name, VK_VAR);
+        v->declEnd = 0;
+        v->annexB = true;
+        return v;
+    }
+
     Node* bindingIdent(uint8_t kind) {
         if (t.type != Tok::Ident || isRes(t.str)) unexpected();
         checkBinding(t.str, t.esc, kind);
         Node* n = mk(N::Ident);
         n->str = t.str;
         n->var = declare(t.str, kind);
+        bound(n, kind);
         advance();
         return n;
     }
 
+    // A `var` declared inside `with` assigns through the object, and one made by eval is found at run time.
+    void bound(Node* n, uint8_t kind) {
+        if (!n->var) {
+            reference(n);
+            return;
+        }
+        if (kind != VK_VAR) return;
+        for (Scope* sc = scope; sc && sc != n->var->scope; sc = sc->parent)
+            if (sc->kind == Scope::With && sc->withVar) {
+                ast.dyn[n].push_back(sc->withVar);
+                n->flags |= NF_DYN;
+            }
+    }
     void checkBinding(JSString* name, bool escaped, uint8_t kind) {
         checkName(name, escaped);
         if (isEvalOrArguments(name)) {
@@ -1392,6 +1490,7 @@ private:
                         Node* id = mk(N::Ident);
                         id->str = name;
                         id->var = declare(name, kind);
+                        bound(id, kind);
                         pr->flags |= NF_SHORTHAND;
                         if (eatP(P_Assign)) {
                             Node* ap = mk(N::AssignPat);
@@ -1563,10 +1662,12 @@ private:
             v = declare(name, VK_FUNC);
             advance();
         }
+        Variable* outer = !isAsync && !gen && !anonymousDefault ? annexBVar(name) : nullptr;
         Node* n = functionRest(name, start, isAsync, gen, false);
         n->fn->isDecl = true;
         n->fn->line = line;
         n->var = v;
+        n->var2 = outer != v ? outer : nullptr;
         scope->funcDecls.push_back(n);
         return n;
     }

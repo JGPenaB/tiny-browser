@@ -1349,6 +1349,7 @@ void Vm::setupGlobals() {
     auto sym = [&](const char* name) { return newSymbol(str(name)); };
     symIterator = sym("Symbol.iterator");
     symAsyncIterator = sym("Symbol.asyncIterator");
+    symUnscopables = sym("Symbol.unscopables");
     symHasInstance = sym("Symbol.hasInstance");
     symToPrimitive = sym("Symbol.toPrimitive");
     symToStringTag = sym("Symbol.toStringTag");
@@ -1441,6 +1442,13 @@ void Vm::setupGlobals() {
     JSNative* values = defFn(arrayProto, "values", arrayValues, 0);
     defineOwn(arrayProto, PropKey::of(symIterator), V(values), PF_W | PF_C);
     arrayValuesFn = V(values);
+    {  // Array.prototype[Symbol.unscopables]: method names that `with (array)` must not capture (23.1.3.38)
+        JSObject* u = newObject(nullptr);
+        for (const char* n : {"at", "copyWithin", "entries", "fill", "find", "findIndex", "findLast", "findLastIndex", "flat", "flatMap", "includes", "keys",
+                              "toReversed", "toSorted", "toSpliced", "values"})
+            u->add(PropKey::of(atom(n)), Value::boolean(true), PF_ALL);
+        defineOwn(arrayProto, PropKey::of(symUnscopables), V(u), PF_C);
+    }
 
     // Errors
     JSNative* errorC = nullptr;
@@ -1466,6 +1474,7 @@ void Vm::setupGlobals() {
     defFn(symbolC, "keyFor", symbolKeyFor, 1);
     def(symbolC, "iterator", V(symIterator), 0);
     def(symbolC, "asyncIterator", V(symAsyncIterator), 0);
+    def(symbolC, "unscopables", V(symUnscopables), 0);
     def(symbolC, "hasInstance", V(symHasInstance), 0);
     def(symbolC, "toPrimitive", V(symToPrimitive), 0);
     def(symbolC, "toStringTag", V(symToStringTag), 0);
