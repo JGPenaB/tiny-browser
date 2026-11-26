@@ -116,6 +116,7 @@ void flattenRope(JSString* s);
 
 struct Symbol : Cell {
     JSString* desc = nullptr;
+    bool isPrivate = false;  // a class's #name: never listed among an object's keys, never seen by a proxy
     Symbol() { kind = CK::Symbol; }
     void trace(Gc&) override;
 };
@@ -268,6 +269,7 @@ struct JSFunction : JSObject {
     Context* ctx = nullptr;
     JSObject* home = nullptr;  // [[HomeObject]] for super lookups
     Value fields;              // class field initialisers: array of key, function pairs
+    Value privates;            // private methods and accessors given to each instance: key, kind, function triples
     JSFunction() { cls = Cls::Function; }
     void trace(Gc&) override;
 };
@@ -552,6 +554,7 @@ public:
     bool set(Value target, PropKey k, Value v);  // false when the assignment did not happen ([[Set]] returned false)
     [[noreturn]] void failedSet(Value target, PropKey k);  // the TypeError strict code gets for that
     bool setObj(JSObject* o, PropKey k, Value v, Value receiver);
+    void addPrivateMember(JSObject* o, PropKey k, int kind, Value fn);
     bool getOwnDesc(JSObject* o, PropKey k, PropDesc& d);
     bool compatibleDesc(bool extensible, const PropDesc& d, bool exists, const PropDesc& current);
     // the object's internal methods that are not plain property access (10.1.1 to 10.1.4), proxy-aware

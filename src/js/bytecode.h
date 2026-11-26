@@ -74,6 +74,10 @@ enum Op : uint16_t {
     OP_DelegateCall,    // yield*: a = result of next/throw/return on the inner iterator at b (b+2 received, b+3 mode)
     OP_DelegateResult,  // yield*: read the result at b+4: c = done, a = final value when done
     OP_YieldDelegate,   // yield b from inside yield*; the resumption lands in a (value) and a+1 (mode)
+    OP_GetPrivate,   // a = b.#c: the object must have the private member (ECMA-262 7.3.31 PrivateGet)
+    OP_SetPrivate,   // a.#b = c (7.3.32 PrivateSet)
+    OP_HasPrivate,   // a = #b in c
+    OP_PrivMethod,   // class a gets the private method/getter/setter b = c; the next word: kind (0 method, 1 get, 2 set), +4 static
     OP_ScopeHas,      // a = the scope object b has a binding named c (for `with`: honours Symbol.unscopables)
     OP_NewScopeObj,   // a = a fresh object without a prototype, for variables created by eval
     OP_ScopeDeclare,  // the scope object a gets a property named b, undefined, unless it has one

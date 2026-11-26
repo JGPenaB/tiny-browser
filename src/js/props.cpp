@@ -316,10 +316,14 @@ bool Vm::setIntegrity(JSObject* o, bool frozen) {
     o->oflags |= OF_NOEXT;
     if (isArrayLike(o)) o->oflags |= frozen ? (OF_FROZEN | OF_SEALED) : OF_SEALED;  // covers the dense elements
     else if (frozen) o->oflags |= OF_FROZEN;
-    for (auto& p : o->props) {
-        p.flags &= ~PF_C;
-        if (frozen && !(p.flags & PF_ACC)) p.flags &= ~PF_W;
-    }
+    auto fix = [&] {  // private members are not properties: freezing leaves them alone
+        for (auto& p : o->props) {
+            if (p.key.isSymbol() && ((Symbol*)p.key.cell())->isPrivate) continue;
+            p.flags &= ~PF_C;
+            if (frozen && !(p.flags & PF_ACC)) p.flags &= ~PF_W;
+        }
+    };
+    fix();
     if (o->cls == Cls::Function || o->cls == Cls::Native) {  // name and length exist without being stored
         for (JSString* n : {a.name, a.length}) {
             Prop p{};
@@ -327,10 +331,7 @@ bool Vm::setIntegrity(JSObject* o, bool frozen) {
             if (!o->find(k) && getOwn(o, k, p)) o->add(k, p.val, 0);
         }
         if (o->cls == Cls::Function) fnProtoProp((JSFunction*)o);
-        for (auto& p : o->props) {
-            p.flags &= ~PF_C;
-            if (frozen && !(p.flags & PF_ACC)) p.flags &= ~PF_W;
-        }
+        fix();
     }
     return true;
 }

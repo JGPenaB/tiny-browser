@@ -217,6 +217,7 @@ void JSFunction::trace(Gc& g) {
     g.mark(ctx);
     g.mark(home);
     g.mark(fields);
+    g.mark(privates);
 }
 void JSNative::trace(Gc& g) {
     JSObject::trace(g);
@@ -1318,7 +1319,7 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
     }
     if (symbols)
         for (auto& p : o->props)
-            if (p.key.isSymbol() && (!onlyEnumerable || (p.flags & PF_E))) out.push_back(p.key);
+            if (p.key.isSymbol() && !((Symbol*)p.key.cell())->isPrivate && (!onlyEnumerable || (p.flags & PF_E))) out.push_back(p.key);
 }
 
 uint32_t Vm::lengthOf(Value v) {
@@ -1465,13 +1466,45 @@ Value Vm::call(Value fn, Value thisv, const Value* args, int argc) {
     throwError(Err::TypeError, "%s is not a function", utf16to8(inspect(fn, 0)).c_str());
 }
 
+// PrivateMethodOrAccessorAdd (7.3.30): kind 0 method, 1 getter, 2 setter
+void Vm::addPrivateMember(JSObject* o, PropKey k, int kind, Value fn) {
+    Prop* p = o->find(k);
+    if (kind == 0) {
+        if (p) throwError(Err::TypeError, "Cannot initialize private methods of a class twice on the same object");
+        o->add(k, fn, 0);
+        return;
+    }
+    Accessor* acc;
+    if (p) {
+        if (!(p->flags & PF_ACC)) throwError(Err::TypeError, "Cannot initialize private methods of a class twice on the same object");
+        acc = (Accessor*)p->val.asCell();
+        if (!(kind == 1 ? acc->get : acc->set).isUndef()) throwError(Err::TypeError, "Cannot initialize private methods of a class twice on the same object");
+    } else {
+        acc = alloc<Accessor>();
+        o->add(k, Value::cell(acc), PF_ACC);
+    }
+    (kind == 1 ? acc->get : acc->set) = fn;
+}
+
+// InitializeInstanceElements (7.3.34): private methods first, then the fields in order
 void Vm::initFields(JSFunction* f, Value obj) {
+    if (f->privates.isObject()) {
+        JSArray* list = (JSArray*)f->privates.asObject();
+        for (size_t i = 0; i + 2 < list->elems.size(); i += 3) addPrivateMember(obj.asObject(), toKey(list->elems[i]), list->elems[i + 1].asInt(), list->elems[i + 2]);
+    }
     if (!f->fields.isObject()) return;
     JSArray* arr = (JSArray*)f->fields.asObject();
     for (size_t i = 0; i + 1 < arr->elems.size(); i += 2) {
         Value fnv = arr->elems[i + 1];
         Value v = fnv.isUndef() ? Value::undef() : call(fnv, obj, nullptr, 0);
-        defineOwn(obj.asObject(), toKey(arr->elems[i]), v, PF_ALL);
+        PropKey k = toKey(arr->elems[i]);
+        if (k.isSymbol() && ((Symbol*)k.cell())->isPrivate) {  // PrivateFieldAdd: once per object, hidden, writable
+            JSObject* o = obj.asObject();
+            if (o->find(k)) throwError(Err::TypeError, "Cannot initialize a private field twice on the same object");
+            o->add(k, v, PF_W);
+            continue;
+        }
+        if (!defineOwn(obj.asObject(), k, v, PF_ALL)) throwError(Err::TypeError, "Cannot define a class field: the object is not extensible");
     }
 }
 
@@ -3006,7 +3039,66 @@ Value Vm::runFrames(size_t base) {
                         R(i.a) = call(importHook, Value::undef(), args, 3);
                         break;
                     }
-                    case OP_NewPrivate: R(i.a) = Value::cell(newSymbol(K[i.bx].asString())); break;
+                    case OP_NewPrivate: {
+                        Symbol* sym = newSymbol(K[i.bx].asString());
+                        sym->isPrivate = true;
+                        R(i.a) = Value::cell(sym);
+                        break;
+                    }
+                    case OP_PrivMethod: {
+                        uint32_t how = (pc++)->bx;
+                        JSFunction* ctor = (JSFunction*)R(i.a).asCell();
+                        Value fnv = R(i.c);
+                        if (how & 4) {  // static: the class itself has it
+                            if (fnv.isObject() && fnv.asObject()->cls == Cls::Function) ((JSFunction*)fnv.asObject())->home = ctor;
+                            addPrivateMember(ctor, toKey(R(i.b)), (int)(how & 3), fnv);
+                        } else {
+                            if (fnv.isObject() && fnv.asObject()->cls == Cls::Function) ((JSFunction*)fnv.asObject())->home = ctor->home;
+                            if (!ctor->privates.isObject()) ctor->privates = Value::cell(newArray());
+                            JSArray* list = (JSArray*)ctor->privates.asObject();
+                            list->elems.push_back(R(i.b));
+                            list->elems.push_back(Value::i32((int32_t)(how & 3)));
+                            list->elems.push_back(fnv);
+                        }
+                        break;
+                    }
+                    case OP_GetPrivate: {
+                        Value o = R(i.b);
+                        fr->pc = pc;
+                        PropKey k = toKey(R(i.c));
+                        Prop* p = o.isObject() ? o.asObject()->find(k) : nullptr;
+                        if (!p) throwError(Err::TypeError, "Cannot read private member %s from an object whose class did not declare it", keyName(*this, k).c_str());
+                        if (p->flags & PF_ACC) {
+                            Accessor* acc = (Accessor*)p->val.asCell();
+                            if (acc->get.isUndef()) throwError(Err::TypeError, "Private member %s was defined without a getter", keyName(*this, k).c_str());
+                            R(i.a) = call(acc->get, o, nullptr, 0);
+                        } else
+                            R(i.a) = p->val;
+                        break;
+                    }
+                    case OP_SetPrivate: {
+                        Value o = R(i.a);
+                        fr->pc = pc;
+                        PropKey k = toKey(R(i.b));
+                        Prop* p = o.isObject() ? o.asObject()->find(k) : nullptr;
+                        if (!p) throwError(Err::TypeError, "Cannot write private member %s to an object whose class did not declare it", keyName(*this, k).c_str());
+                        if (p->flags & PF_ACC) {
+                            Accessor* acc = (Accessor*)p->val.asCell();
+                            if (acc->set.isUndef()) throwError(Err::TypeError, "Private member %s was defined without a setter", keyName(*this, k).c_str());
+                            Value v = R(i.c);
+                            call(acc->set, o, &v, 1);
+                        } else if (!(p->flags & PF_W))
+                            throwError(Err::TypeError, "Private method %s is not writable", keyName(*this, k).c_str());
+                        else
+                            p->val = R(i.c);
+                        break;
+                    }
+                    case OP_HasPrivate: {
+                        Value o = R(i.c);
+                        if (!o.isObject()) throwError(Err::TypeError, "Cannot use 'in' operator to search for a private member in a non-object");
+                        R(i.a) = Value::boolean(o.asObject()->find(toKey(R(i.b))) != nullptr);
+                        break;
+                    }
                     case OP_Yield:
                     case OP_YieldDelegate:
                     case OP_Await: {

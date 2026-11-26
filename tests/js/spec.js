@@ -89,4 +89,19 @@ test("direct eval sees the caller's scope", function () {
   try { throw 7; } catch (err) { eq(eval("err + 1"), 8); }
   (0, eval)("var madeByIndirectEval = 1"); eq(typeof madeByIndirectEval, "number"); delete globalThis.madeByIndirectEval;
 });
+test("private members follow the brand rules", function () {
+  class A { #f = 1; #m() { return "m"; } get #g() { return "g"; } set #s(v) { this.#f = v; } static #sf = 5; static #sm() { return A.#sf; }
+    read(o) { return o.#f; } write(o, v) { o.#f = v; } call(o) { return o.#m(); } getter(o) { return o.#g; } setter(o, v) { o.#s = v; return o.#f; }
+    assignMethod(o) { o.#m = 1; } assignGetter(o) { o.#g = 1; } readSetter(o) { return o.#s; } static stat(o) { return o.#sm(); } }
+  const a = new A();
+  eq([a.read(a), a.call(a), a.getter(a), a.setter(a, 9), A.stat(A)], [1, "m", "g", 9, 5]);
+  throws(() => a.read({}), TypeError); throws(() => a.write({}, 1), TypeError); throws(() => a.call({}), TypeError);
+  throws(() => a.assignMethod(a), TypeError); throws(() => a.assignGetter(a), TypeError); throws(() => a.readSetter(a), TypeError);
+  throws(() => A.stat(class extends A { }), TypeError);
+  eq([Object.getOwnPropertyNames(a).length, Object.getOwnPropertySymbols(a).length, Reflect.ownKeys(a).length, JSON.stringify(a)], [0, 0, 0, "{}"]);
+  const frozen = Object.freeze(new A()); a.write(frozen, 4); eq(a.read(frozen), 4);
+  class Base { constructor(o) { return o; } } class Stamp extends Base { #id = 1; static has(o) { return #id in o; } }
+  const target = {}; new Stamp(target); eq(Stamp.has(target), true); throws(() => new Stamp(target), TypeError);
+  const proxied = new Proxy(a, {}); throws(() => a.read(proxied), TypeError);
+});
 done();

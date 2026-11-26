@@ -733,6 +733,13 @@ private:
             case N::Update: return update(n, dst, false);
             case N::Binary: {
                 need();
+                if (n->op == P_In && n->a->type == N::Ident && (n->a->flags & NF_PRIVATE)) {
+                    int mark = f->nextReg;
+                    int k = expr(n->a);
+                    emit(OP_HasPrivate, dst, k, expr(n->b));
+                    f->nextReg = mark;
+                    return dst;
+                }
                 int mark = f->nextReg;
                 int l = operand(n->a, n->b);
                 int r = expr(n->b);
@@ -800,7 +807,7 @@ private:
                     int o = operand(n->a, n->b);
                     if (n->flags & NF_OPTIONAL) bail(o);
                     if (n->b->type == N::Str && !(n->flags & NF_PRIVATE)) getProp(dst, o, n->b->str);
-                    else emit(OP_GetElem, dst, o, expr(n->b));
+                    else emit((n->flags & NF_PRIVATE) ? OP_GetPrivate : OP_GetElem, dst, o, expr(n->b));
                 }
                 f->nextReg = mark;
                 return dst;
@@ -936,7 +943,7 @@ private:
             int m2 = f->nextReg;
             if (c->type == N::Member) getProp(base, base + 1, c->str);
             else if (c->b->type == N::Str && !(c->flags & NF_PRIVATE)) getProp(base, base + 1, c->b->str);
-            else emit(OP_GetElem, base, base + 1, expr(c->b));
+            else emit((c->flags & NF_PRIVATE) ? OP_GetPrivate : OP_GetElem, base, base + 1, expr(c->b));
             f->nextReg = m2;
         } else if (c->type == N::Ident && dynOf(c)) {  // a function found in a `with` object is called on that object
             emit(OP_LoadUndef, base + 1);
@@ -1125,10 +1132,10 @@ private:
             int o = expr(t->a);
             int k = newReg();
             emit(OP_ToPropKey, k, expr(t->b));
-            emit(OP_GetElem, oldv, o, k);
+            emit((t->flags & NF_PRIVATE) ? OP_GetPrivate : OP_GetElem, oldv, o, k);
             emit(OP_ToNumeric, oldv, oldv);
             emit(op, newv, oldv);
-            emit(OP_SetElem, o, k, newv);
+            emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, k, newv);
         }
         emit(OP_Move, dst, prefix ? newv : oldv);
         f->nextReg = mark;
@@ -1176,7 +1183,7 @@ private:
                     k = kk;
                 }
                 expr(n->b, dst);
-                emit(OP_SetElem, o, k, dst);
+                emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, k, dst);
             } else {
                 expr(n->b, dst);
                 bindTarget(t, dst, false);
@@ -1201,7 +1208,7 @@ private:
             o = expr(t->a);
             k = newReg();
             emit(OP_ToPropKey, k, expr(t->b));
-            emit(OP_GetElem, cur, o, k);
+            emit((t->flags & NF_PRIVATE) ? OP_GetPrivate : OP_GetElem, cur, o, k);
         }
         size_t skip = 0;
         if (logical) {
@@ -1213,7 +1220,7 @@ private:
         }
         if (t->type == N::Ident) storeIdent(t, cur, false);
         else if (t->type == N::Member) setProp(o, t->str, cur);
-        else emit(OP_SetElem, o, k, cur);
+        else emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, k, cur);
         if (logical) patch(skip);
         emit(OP_Move, dst, cur);
         f->nextReg = mark;
@@ -1346,6 +1353,11 @@ private:
                 if (m->b) closure(m->b->fn, fr);
                 else emit(OP_LoadUndef, fr);
                 emit(OP_AddField, rc, kr, fr);
+            } else if (m->flags & NF_PRIVATE) {
+                int fr = newReg();
+                closure(m->b->fn, fr);
+                emit(OP_PrivMethod, rc, kr, fr);
+                emitX(OP_Nop, 0, (uint32_t)((m->op == PK_GET ? 1 : m->op == PK_SET ? 2 : 0) | ((m->flags & NF_STATIC) ? 4 : 0)));
             } else {
                 int fr = newReg();
                 closure(m->b->fn, fr);
@@ -1386,7 +1398,7 @@ private:
             }
             case N::Index: {
                 int o = expr(t->a);
-                emit(OP_SetElem, o, expr(t->b), src);
+                emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, expr(t->b), src);
                 break;
             }
             case N::AssignPat: {
