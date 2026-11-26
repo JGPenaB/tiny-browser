@@ -1357,6 +1357,13 @@ void Vm::setupGlobals() {
     symToPrimitive = sym("Symbol.toPrimitive");
     symToStringTag = sym("Symbol.toStringTag");
     symSpecies = sym("Symbol.species");
+    symMatch = sym("Symbol.match");
+    symMatchAll = sym("Symbol.matchAll");
+    symReplace = sym("Symbol.replace");
+    symSearch = sym("Symbol.search");
+    symSplit = sym("Symbol.split");
+    symDispose = sym("Symbol.dispose");
+    symAsyncDispose = sym("Symbol.asyncDispose");
 
     {
         JSArray* ap = alloc<JSArray>();
@@ -1467,6 +1474,13 @@ void Vm::setupGlobals() {
     def(symbolC, "toPrimitive", V(symToPrimitive), 0);
     def(symbolC, "toStringTag", V(symToStringTag), 0);
     def(symbolC, "species", V(symSpecies), 0);
+    def(symbolC, "match", V(symMatch), 0);
+    def(symbolC, "matchAll", V(symMatchAll), 0);
+    def(symbolC, "replace", V(symReplace), 0);
+    def(symbolC, "search", V(symSearch), 0);
+    def(symbolC, "split", V(symSplit), 0);
+    def(symbolC, "dispose", V(symDispose), 0);
+    def(symbolC, "asyncDispose", V(symAsyncDispose), 0);
     defFn(symbolProto, "toString", symbolToString, 0);
     defFn(symbolProto, "valueOf", symbolValueOf, 0);
     defGetter(symbolProto, "description", symbolDescription);

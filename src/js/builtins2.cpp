@@ -31,6 +31,40 @@ static JSString* thisStr(CallInfo& ci, const char* method) {
     return ci.vm.toString(t);
 }
 
+// The first steps shared by match, matchAll, replace, replaceAll, search and split: `this` must not be undefined
+// or null, and an object argument may take over the whole operation through one of the well-known symbols.
+static void requireCoercible(CallInfo& ci, const char* method) {
+    if (ci.thisv.isNullish()) ci.vm.throwError(Err::TypeError, "String.prototype.%s called on null or undefined", method);
+}
+static bool patternMethod(CallInfo& ci, Value pattern, Symbol* sym, Value second, int argc, Value& out) {
+    Vm& vm = ci.vm;
+    if (!pattern.isObject()) return false;
+    Value m = vm.get(pattern, PropKey::of(sym));
+    if (m.isNullish()) return false;
+    if (!vm.isCallable(m)) vm.throwError(Err::TypeError, "%s is not a function", utf16to8(vm.inspect(m, 0)).c_str());
+    Value args[2] = {ci.thisv, second};
+    out = vm.call(m, pattern, args, argc);
+    return true;
+}
+// RegExpCreate(pattern, flags), then the method the symbol names on the new object
+static Value viaNewRegExp(Vm& vm, Value pattern, const char* flags, Symbol* sym, JSString* s) {
+    Value args[2] = {pattern.isUndef() ? pattern : V(vm.toString(pattern)), vm.strv(flags)};
+    Value rx = vm.construct(vm.regexpCtor, args, 2, vm.regexpCtor);
+    if (regexpIsPristine(vm, rx)) {
+        if (sym == vm.symMatch) return regexpMatch(vm, rx, s);
+        if (sym == vm.symSearch) return regexpSearch(vm, rx, s);
+    }
+    Value arg = V(s);
+    return vm.call(vm.get(rx, PropKey::of(sym)), rx, &arg, 1);
+}
+// replaceAll and matchAll refuse a regular expression that is not global
+static void requireGlobal(Vm& vm, Value pattern, const char* method) {
+    if (!isRegExpLike(vm, pattern)) return;
+    Value flags = vm.get(pattern, "flags");
+    if (flags.isNullish()) vm.throwError(Err::TypeError, "The flags of the regular expression are %s", flags.isNull() ? "null" : "undefined");
+    if (vm.toStr16(flags).find(u'g') == std::u16string::npos) vm.throwError(Err::TypeError, "%s must be called with a global RegExp", method);
+}
+
 JSFN(stringCtor) {
     Vm& vm = ci.vm;
     Value v = ci.arg(0);
@@ -90,7 +124,7 @@ JSFN(strLastIndexOf) {
 JSFN(strIncludes) {
     Vm& vm = ci.vm;
     JSString* s = thisStr(ci, "includes");
-    if (isRegExp(ci.arg(0))) vm.throwError(Err::TypeError, "First argument to String.prototype.includes must not be a regular expression");
+    if (isRegExpLike(vm, ci.arg(0))) vm.throwError(Err::TypeError, "First argument to String.prototype.includes must not be a regular expression");
     JSString* pat = vm.toString(ci.arg(0));
     double from = clamp0(vm.toInteger(ci.arg(1)), (double)s->s.size());
     return Value::boolean(s->s.find(pat->s, (size_t)from) != std::u16string::npos);
@@ -98,6 +132,7 @@ JSFN(strIncludes) {
 JSFN(strStartsWith) {
     Vm& vm = ci.vm;
     JSString* s = thisStr(ci, "startsWith");
+    if (isRegExpLike(vm, ci.arg(0))) vm.throwError(Err::TypeError, "First argument to String.prototype.startsWith must not be a regular expression");
     JSString* pat = vm.toString(ci.arg(0));
     size_t pos = (size_t)clamp0(vm.toInteger(ci.arg(1)), (double)s->s.size());
     return Value::boolean(pos + pat->s.size() <= s->s.size() && s->s.compare(pos, pat->s.size(), pat->s) == 0);
@@ -105,6 +140,7 @@ JSFN(strStartsWith) {
 JSFN(strEndsWith) {
     Vm& vm = ci.vm;
     JSString* s = thisStr(ci, "endsWith");
+    if (isRegExpLike(vm, ci.arg(0))) vm.throwError(Err::TypeError, "First argument to String.prototype.endsWith must not be a regular expression");
     JSString* pat = vm.toString(ci.arg(0));
     size_t end = ci.arg(1).isUndef() ? s->s.size() : (size_t)clamp0(vm.toInteger(ci.arg(1)), (double)s->s.size());
     if (pat->s.size() > end) return Value::boolean(false);
@@ -211,10 +247,15 @@ JSFN(strConcat) {
 }
 JSFN(strSplit) {
     Vm& vm = ci.vm;
+    requireCoercible(ci, "split");
+    Value sep = ci.arg(0), viaSymbol;
+    if (isRegExp(sep) && regexpIsPristine(vm, sep)) {
+        JSString* subject = thisStr(ci, "split");
+        return regexpSplit(vm, sep, subject, ci.arg(1).isUndef() ? 0xFFFFFFFFu : vm.toUint32(ci.arg(1)));
+    }
+    if (patternMethod(ci, sep, vm.symSplit, ci.arg(1), 2, viaSymbol)) return viaSymbol;
     JSString* s = thisStr(ci, "split");
-    Value sep = ci.arg(0);
     uint32_t limit = ci.arg(1).isUndef() ? 0xFFFFFFFFu : vm.toUint32(ci.arg(1));
-    if (isRegExp(sep)) return regexpSplit(vm, sep, s, limit);
     JSArray* out = vm.newArray();
     if (limit == 0) return V(out);
     if (sep.isUndef()) {
@@ -298,9 +339,14 @@ std::u16string expandReplacement(const std::u16string& tpl, const std::u16string
 
 static Value replaceImpl(CallInfo& ci, bool all) {
     Vm& vm = ci.vm;
+    requireCoercible(ci, all ? "replaceAll" : "replace");
+    Value pat = ci.arg(0), rep = ci.arg(1), viaSymbol;
+    if (isRegExp(pat) && regexpIsPristine(vm, pat)) return regexpReplace(vm, pat, thisStr(ci, "replace"), rep, all);
+    if (pat.isObject()) {
+        if (all) requireGlobal(vm, pat, "replaceAll");
+        if (patternMethod(ci, pat, vm.symReplace, rep, 2, viaSymbol)) return viaSymbol;
+    }
     JSString* str = thisStr(ci, all ? "replaceAll" : "replace");
-    Value pat = ci.arg(0), rep = ci.arg(1);
-    if (isRegExp(pat)) return regexpReplace(vm, pat, str, rep, all);
     std::u16string pattern = vm.toStr16(pat);
     bool fn = vm.isCallable(rep);
     std::u16string repl = fn ? std::u16string() : vm.toStr16(rep);
@@ -338,22 +384,31 @@ static Value replaceImpl(CallInfo& ci, bool all) {
 JSFN(strReplace) { return replaceImpl(ci, false); }
 JSFN(strReplaceAll) { return replaceImpl(ci, true); }
 
-static Value toRegExp(Vm& vm, Value v, const char* flags) {
-    if (isRegExp(v)) return v;
-    Value args[2] = {v.isUndef() ? V(vm.a.empty) : V(vm.toString(v)), vm.strv(flags)};
-    return vm.construct(vm.regexpCtor, args, 2, vm.regexpCtor);
-}
 JSFN(strMatch) {
-    JSString* s = thisStr(ci, "match");
-    return regexpMatch(ci.vm, toRegExp(ci.vm, ci.arg(0), ""), s);
+    Vm& vm = ci.vm;
+    requireCoercible(ci, "match");
+    Value rx = ci.arg(0), viaSymbol;
+    if (isRegExp(rx) && regexpIsPristine(vm, rx)) return regexpMatch(vm, rx, thisStr(ci, "match"));
+    if (patternMethod(ci, rx, vm.symMatch, Value::undef(), 1, viaSymbol)) return viaSymbol;
+    return viaNewRegExp(vm, rx, "", vm.symMatch, thisStr(ci, "match"));
 }
 JSFN(strMatchAll) {
-    JSString* s = thisStr(ci, "matchAll");
-    return regexpMatchAll(ci.vm, toRegExp(ci.vm, ci.arg(0), "g"), s);
+    Vm& vm = ci.vm;
+    requireCoercible(ci, "matchAll");
+    Value rx = ci.arg(0), viaSymbol;
+    if (rx.isObject()) {
+        requireGlobal(vm, rx, "String.prototype.matchAll");
+        if (patternMethod(ci, rx, vm.symMatchAll, Value::undef(), 1, viaSymbol)) return viaSymbol;
+    }
+    return viaNewRegExp(vm, rx, "g", vm.symMatchAll, thisStr(ci, "matchAll"));
 }
 JSFN(strSearch) {
-    JSString* s = thisStr(ci, "search");
-    return regexpSearch(ci.vm, toRegExp(ci.vm, ci.arg(0), ""), s);
+    Vm& vm = ci.vm;
+    requireCoercible(ci, "search");
+    Value rx = ci.arg(0), viaSymbol;
+    if (isRegExp(rx) && regexpIsPristine(vm, rx)) return regexpSearch(vm, rx, thisStr(ci, "search"));
+    if (patternMethod(ci, rx, vm.symSearch, Value::undef(), 1, viaSymbol)) return viaSymbol;
+    return viaNewRegExp(vm, rx, "", vm.symSearch, thisStr(ci, "search"));
 }
 JSFN(strLocaleCompare) {
     JSString* s = thisStr(ci, "localeCompare");
@@ -362,7 +417,40 @@ JSFN(strLocaleCompare) {
     if (r == 0) return Value::i32(s->s < o->s ? -1 : s->s > o->s ? 1 : 0);
     return Value::i32(r - 2);
 }
-JSFN(strNormalize) { return V(thisStr(ci, "normalize")); }
+JSFN(strNormalize) {  // 22.1.3.15, with the operating system's normalization tables
+    Vm& vm = ci.vm;
+    JSString* s = thisStr(ci, "normalize");
+    NORM_FORM form = NormalizationC;
+    if (!ci.arg(0).isUndef()) {
+        const std::u16string& f = vm.toStr16(ci.arg(0));
+        if (f == u"NFC") form = NormalizationC;
+        else if (f == u"NFD") form = NormalizationD;
+        else if (f == u"NFKC") form = NormalizationKC;
+        else if (f == u"NFKD") form = NormalizationKD;
+        else vm.throwError(Err::RangeError, "The normalization form should be one of NFC, NFD, NFKC, NFKD");
+    }
+    if (s->s.empty()) return V(s);
+    bool ascii = true;
+    for (char16_t c : s->s)
+        if (c >= 128) {
+            ascii = false;
+            break;
+        }
+    if (ascii) return V(s);
+    std::u16string out;
+    int guess = NormalizeString(form, (LPCWSTR)s->s.data(), (int)s->s.size(), nullptr, 0);
+    for (int tries = 0; tries < 4 && guess > 0; ++tries) {
+        out.resize((size_t)guess);
+        int n = NormalizeString(form, (LPCWSTR)s->s.data(), (int)s->s.size(), (LPWSTR)out.data(), guess);
+        if (n > 0) {
+            out.resize((size_t)n);
+            return vm.strv(std::move(out));
+        }
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) break;
+        guess = -n;
+    }
+    return V(s);  // text the system cannot normalise (a lone surrogate) is returned as it is
+}
 JSFN(strIterator) { return V(ci.vm.newIter(Cls::StringIter, V(thisStr(ci, "[Symbol.iterator]")), 0)); }
 JSFN(strFromCharCode) {
     std::u16string out;
@@ -414,7 +502,7 @@ void setupString(Vm& vm) {
         {"substring", strSubstring, 2}, {"substr", strSubstr, 2}, {"toLowerCase", strToLowerCase, 0},
         {"toUpperCase", strToUpperCase, 0}, {"toLocaleLowerCase", strToLowerCase, 0}, {"toLocaleUpperCase", strToUpperCase, 0},
         {"trim", strTrim, 0}, {"trimStart", strTrimStart, 0}, {"trimEnd", strTrimEnd, 0}, {"trimLeft", strTrimStart, 0},
-        {"trimRight", strTrimEnd, 0}, {"padStart", strPadStart, 2}, {"padEnd", strPadEnd, 2}, {"repeat", strRepeat, 1},
+        {"trimRight", strTrimEnd, 0}, {"padStart", strPadStart, 1}, {"padEnd", strPadEnd, 1}, {"repeat", strRepeat, 1},
         {"concat", strConcat, 1}, {"split", strSplit, 2}, {"replace", strReplace, 2}, {"replaceAll", strReplaceAll, 2},
         {"match", strMatch, 1}, {"matchAll", strMatchAll, 1}, {"search", strSearch, 1}, {"localeCompare", strLocaleCompare, 1},
         {"normalize", strNormalize, 0},

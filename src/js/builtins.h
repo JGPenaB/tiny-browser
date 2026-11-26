@@ -35,11 +35,14 @@ constexpr const char* kBuiltinFile = "<builtins>";
 void setupArrayMethods(Vm& vm, JSObject* proto, JSNative* ctor);
 void setupAsyncIteration(Vm& vm);
 
-// Regular expression hooks used by the String.prototype methods (regexp.cpp).
-bool isRegExp(Value v);
+// Regular expression hooks (regexp.cpp). The four direct routes may only be taken when regexpIsPristine holds.
+bool isRegExp(Value v);                 // has the internal slots of a RegExp
+bool isRegExpLike(Vm& vm, Value v);     // IsRegExp (7.2.6)
+bool regexpIsPristine(Vm& vm, Value v); // v is a RegExp that no script has customised, and neither is RegExp.prototype
+void regexpSnapshot(Vm& vm);
+Value regexpBuiltinExec(Vm& vm, Value rx, JSString* s);
 Value regexpReplace(Vm& vm, Value rx, JSString* s, Value replacement, bool all);
 Value regexpMatch(Vm& vm, Value rx, JSString* s);
-Value regexpMatchAll(Vm& vm, Value rx, JSString* s);
 Value regexpSearch(Vm& vm, Value rx, JSString* s);
 Value regexpSplit(Vm& vm, Value rx, JSString* s, uint32_t limit);
 

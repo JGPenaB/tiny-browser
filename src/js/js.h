@@ -708,7 +708,19 @@ public:
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
     Symbol *symUnscopables = nullptr, *symIsConcatSpreadable = nullptr;
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
-           *symToStringTag = nullptr, *symSpecies = nullptr;
+           *symToStringTag = nullptr, *symSpecies = nullptr, *symMatch = nullptr, *symMatchAll = nullptr, *symReplace = nullptr,
+           *symSearch = nullptr, *symSplit = nullptr, *symDispose = nullptr, *symAsyncDispose = nullptr;
+    struct PropWatch {  // one property of RegExp.prototype as the engine made it (regexp.cpp)
+        PropKey key;
+        uint64_t value;
+        uint8_t flags;
+    };
+    std::vector<PropWatch> regexpWatch;
+    // The legacy static properties of RegExp ($1, lastMatch, ...): the subject and offsets of the last match, or
+    // not valid after a match by a RegExp subclass.
+    Value regexpLastInput;
+    std::vector<int> regexpLastCaps;
+    bool regexpLegacyValid = true;
     Value regexpCtor, promiseCtor;
     std::unordered_map<std::u16string, Symbol*> symbolRegistry;
 

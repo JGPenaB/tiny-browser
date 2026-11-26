@@ -717,6 +717,259 @@ install(RegExp, {
   }
 });
 install(Error, { isError(arg) { return natives.isError(arg); } });
+)JS"
+R"JS(
+// ---- String.prototype: the HTML methods of Annex B (B.2.2)
+function createHTML(string, tag, attribute, value) {
+  if (string === undefined || string === null) throw new $TypeError('String.prototype method called on null or undefined');
+  var S = natives.toString(string), open = '<' + tag;
+  if (attribute !== '') {
+    var V = natives.toString(value), escaped = '';
+    for (var i = 0; i < V.length; i++) escaped += charCodeAt(V, i) === 34 ? '&quot;' : strSlice(V, i, i + 1);
+    open += ' ' + attribute + '="' + escaped + '"';
+  }
+  return open + '>' + S + '</' + tag + '>';
+}
+install($String.prototype, {
+  anchor(name) { return createHTML(this, 'a', 'name', name); },
+  big() { return createHTML(this, 'big', '', ''); },
+  blink() { return createHTML(this, 'blink', '', ''); },
+  bold() { return createHTML(this, 'b', '', ''); },
+  fixed() { return createHTML(this, 'tt', '', ''); },
+  fontcolor(color) { return createHTML(this, 'font', 'color', color); },
+  fontsize(size) { return createHTML(this, 'font', 'size', size); },
+  italics() { return createHTML(this, 'i', '', ''); },
+  link(url) { return createHTML(this, 'a', 'href', url); },
+  small() { return createHTML(this, 'small', '', ''); },
+  strike() { return createHTML(this, 'strike', '', ''); },
+  sub() { return createHTML(this, 'sub', '', ''); },
+  sup() { return createHTML(this, 'sup', '', ''); }
+});
+
+// ---- RegExp.prototype: the methods behind String's match, matchAll, replace, search and split (22.2.6)
+var $RegExp = RegExp, RegExpProto = $RegExp.prototype, builtinExec = natives.regexpBuiltinExec, toStr = natives.toString,
+    toInt = natives.toInteger, toLength = natives.toLength, sameValue = $Object.is, strIndexOf = uncurry($String.prototype.indexOf);
+var symMatch = $Symbol.match, symMatchAll = $Symbol.matchAll, symReplace = $Symbol.replace, symSearch = $Symbol.search, symSplit = $Symbol.split;
+function regExpExec(R, S) {  // RegExpExec (22.2.7.1)
+  var exec = R.exec;
+  if (typeof exec === 'function') {
+    var result = apply(exec, R, [S]);
+    if (result !== null && !isObject(result)) throw new $TypeError('The exec method returned something that is neither an object nor null');
+    return result;
+  }
+  return builtinExec(R, S);
+}
+function advanceStringIndex(S, index, unicode) {
+  if (!unicode || index + 1 >= S.length) return index + 1;
+  var lead = charCodeAt(S, index);
+  if (lead < 0xD800 || lead > 0xDBFF) return index + 1;
+  var trail = charCodeAt(S, index + 1);
+  return trail >= 0xDC00 && trail <= 0xDFFF ? index + 2 : index + 1;
+}
+function hasFlag(flags, letter) { return strIndexOf(flags, letter) !== -1; }
+function thisRegExpObject(R, name) {
+  if (!isObject(R)) throw new $TypeError('RegExp.prototype[' + name + '] called on a non-object');
+  return R;
+}
+function getSubstitution(matched, str, position, captures, namedCaptures, template) {  // 22.1.3.19.1
+  var stringLength = str.length, n = template.length, result = '', i = 0;
+  while (i < n) {
+    var c = charCodeAt(template, i), d = i + 1 < n ? charCodeAt(template, i + 1) : -1;
+    if (c !== 36 || d === -1) {
+      result += strSlice(template, i, i + 1);
+      i++;
+    } else if (d === 36) {
+      result += '$';
+      i += 2;
+    } else if (d === 96) {
+      result += strSlice(str, 0, position);
+      i += 2;
+    } else if (d === 38) {
+      result += matched;
+      i += 2;
+    } else if (d === 39) {
+      var tail = position + matched.length;
+      result += strSlice(str, tail < stringLength ? tail : stringLength);
+      i += 2;
+    } else if (d >= 48 && d <= 57) {
+      var e = i + 2 < n ? charCodeAt(template, i + 2) : -1;
+      var digitCount = e >= 48 && e <= 57 ? 2 : 1;
+      var index = digitCount === 2 ? (d - 48) * 10 + (e - 48) : d - 48;
+      if (index > captures.length && digitCount === 2) {
+        digitCount = 1;
+        index = d - 48;
+      }
+      if (index >= 1 && index <= captures.length) {
+        var capture = captures[index - 1];
+        if (capture !== undefined) result += capture;
+      } else {
+        result += strSlice(template, i, i + 1 + digitCount);
+      }
+      i += 1 + digitCount;
+    } else if (d === 60) {
+      var gt = strIndexOf(template, '>', i);
+      if (gt === -1 || namedCaptures === undefined) {
+        result += '$<';
+        i += 2;
+      } else {
+        var named = namedCaptures[strSlice(template, i + 2, gt)];
+        if (named !== undefined) result += toStr(named);
+        i = gt + 1;
+      }
+    } else {
+      result += '$';
+      i++;
+    }
+  }
+  return result;
+}
+var regExpIterState = new $WeakMap();
+var RegExpStringIteratorProto = create(IteratorProto);
+install(RegExpStringIteratorProto, {
+  next() {
+    var s = isObject(this) ? wmGet(regExpIterState, this) : undefined;
+    if (s === undefined) throw new $TypeError('next method called on an object that is not a RegExp String Iterator');
+    if (s.done) return { value: undefined, done: true };
+    var match = regExpExec(s.regexp, s.string);
+    if (match === null) {
+      s.done = true;
+      return { value: undefined, done: true };
+    }
+    if (!s.global) {
+      s.done = true;
+      return { value: match, done: false };
+    }
+    if (toStr(match[0]) === '') s.regexp.lastIndex = advanceStringIndex(s.string, toLength(s.regexp.lastIndex), s.unicode);
+    return { value: match, done: false };
+  }
+});
+defineProperty(RegExpStringIteratorProto, symToStringTag, { value: 'RegExp String Iterator', writable: false, enumerable: false, configurable: true });
+)JS"
+R"JS(
+install(RegExpProto, {
+  [symMatch](string) {
+    var rx = thisRegExpObject(this, 'Symbol.match'), S = toStr(string), flags = toStr(rx.flags);
+    if (!hasFlag(flags, 'g')) return regExpExec(rx, S);
+    var fullUnicode = hasFlag(flags, 'u') || hasFlag(flags, 'v');
+    rx.lastIndex = 0;
+    var A = [], n = 0;
+    for (;;) {
+      var result = regExpExec(rx, S);
+      if (result === null) return n === 0 ? null : A;
+      var matchStr = toStr(result[0]);
+      data(A, n++, matchStr);
+      if (matchStr === '') rx.lastIndex = advanceStringIndex(S, toLength(rx.lastIndex), fullUnicode);
+    }
+  },
+  [symMatchAll](string) {
+    var R = thisRegExpObject(this, 'Symbol.matchAll'), S = toStr(string);
+    var C = natives.speciesConstructor(R, $RegExp), flags = toStr(R.flags);
+    var matcher = new C(R, flags);
+    matcher.lastIndex = toLength(R.lastIndex);
+    var iterator = create(RegExpStringIteratorProto);
+    wmSet(regExpIterState, iterator, { regexp: matcher, string: S, global: hasFlag(flags, 'g'), unicode: hasFlag(flags, 'u') || hasFlag(flags, 'v'), done: false });
+    return iterator;
+  },
+  [symReplace](string, replaceValue) {
+    var rx = thisRegExpObject(this, 'Symbol.replace'), S = toStr(string), lengthS = S.length;
+    var functional = typeof replaceValue === 'function';
+    if (!functional) replaceValue = toStr(replaceValue);
+    var flags = toStr(rx.flags), global = hasFlag(flags, 'g');
+    if (global) rx.lastIndex = 0;
+    var results = [], count = 0, result;
+    for (;;) {
+      result = regExpExec(rx, S);
+      if (result === null) break;
+      data(results, count++, result);
+      if (!global) break;
+      if (toStr(result[0]) === '') {
+        var thisIndex = toLength(rx.lastIndex);
+        rx.lastIndex = advanceStringIndex(S, thisIndex, hasFlag(flags, 'u') || hasFlag(flags, 'v'));
+      }
+    }
+    var accumulated = '', nextSourcePosition = 0;
+    for (var i = 0; i < count; i++) {
+      result = results[i];
+      var nCaptures = toLength(result.length) - 1;
+      if (nCaptures < 0) nCaptures = 0;
+      var matched = toStr(result[0]), position = toInt(result.index);
+      position = position < 0 ? 0 : position > lengthS ? lengthS : position;
+      var captures = [];
+      for (var n = 1; n <= nCaptures; n++) {
+        var capture = result[n];
+        if (capture !== undefined) capture = toStr(capture);
+        data(captures, n - 1, capture);
+      }
+      var namedCaptures = result.groups, replacement;
+      if (functional) {
+        var args = [matched], argc = 1;
+        for (n = 0; n < nCaptures; n++) data(args, argc++, captures[n]);
+        data(args, argc++, position);
+        data(args, argc++, S);
+        if (namedCaptures !== undefined) data(args, argc++, namedCaptures);
+        replacement = toStr(apply(replaceValue, undefined, args));
+      } else {
+        if (namedCaptures !== undefined) {
+          if (namedCaptures === null) throw new $TypeError('Cannot convert null to object');
+          namedCaptures = $Object(namedCaptures);
+        }
+        replacement = getSubstitution(matched, S, position, captures, namedCaptures, replaceValue);
+      }
+      if (position >= nextSourcePosition) {
+        accumulated += strSlice(S, nextSourcePosition, position) + replacement;
+        nextSourcePosition = position + matched.length;
+      }
+    }
+    return nextSourcePosition >= lengthS ? accumulated : accumulated + strSlice(S, nextSourcePosition);
+  },
+  [symSearch](string) {
+    var rx = thisRegExpObject(this, 'Symbol.search'), S = toStr(string);
+    var previous = rx.lastIndex;
+    if (!sameValue(previous, 0)) rx.lastIndex = 0;
+    var result = regExpExec(rx, S), current = rx.lastIndex;
+    if (!sameValue(current, previous)) rx.lastIndex = previous;
+    return result === null ? -1 : result.index;
+  },
+  [symSplit](string, limit) {
+    var rx = thisRegExpObject(this, 'Symbol.split'), S = toStr(string);
+    var C = natives.speciesConstructor(rx, $RegExp), flags = toStr(rx.flags);
+    var unicodeMatching = hasFlag(flags, 'u') || hasFlag(flags, 'v');
+    var splitter = new C(rx, hasFlag(flags, 'y') ? flags : flags + 'y');
+    var A = [], lengthA = 0, lim = limit === undefined ? 4294967295 : limit >>> 0;
+    if (lim === 0) return A;
+    var size = S.length;
+    if (size === 0) {
+      if (regExpExec(splitter, S) === null) data(A, 0, S);
+      return A;
+    }
+    var p = 0, q = 0;
+    while (q < size) {
+      splitter.lastIndex = q;
+      var z = regExpExec(splitter, S);
+      if (z === null) {
+        q = advanceStringIndex(S, q, unicodeMatching);
+        continue;
+      }
+      var e = toLength(splitter.lastIndex);
+      if (e > size) e = size;
+      if (e === p) {
+        q = advanceStringIndex(S, q, unicodeMatching);
+        continue;
+      }
+      data(A, lengthA++, strSlice(S, p, q));
+      if (lengthA === lim) return A;
+      p = e;
+      var numberOfCaptures = toLength(z.length) - 1;
+      for (var i = 1; i <= numberOfCaptures; i++) {
+        data(A, lengthA++, z[i]);
+        if (lengthA === lim) return A;
+      }
+      q = p;
+    }
+    data(A, lengthA, strSlice(S, p, size));
+    return A;
+  }
+});
 }))JS";
 
 }  // namespace tb::js

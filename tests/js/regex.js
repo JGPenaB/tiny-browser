@@ -61,4 +61,28 @@ test("regex performance and limits", function () {
   const t1 = Date.now() - t0; console.log("timings ms: regex=" + t1); ok(t1 < 4000, "regex too slow: " + t1);
   eq(/(x+x+)+y/.test("x".repeat(40)), false, "catastrophic backtracking is cut off");
 });
+test("the RegExp protocol behind String methods", function () {
+  const calls = []; const fake = { [Symbol.replace](s, r) { calls.push("replace", s, r); return "R"; }, [Symbol.match](s) { calls.push("match"); return "M"; }, [Symbol.search](s) { return 7; }, [Symbol.split](s, l) { return [s, l]; } };
+  eq(["abc".replace(fake, "x"), "abc".match(fake), "abc".search(fake), "abc".split(fake, 2), calls], ["R", "M", 7, ["abc", 2], ["replace", "abc", "x", "match"]]);
+  class Loud extends RegExp { exec(s) { const m = super.exec(s); if (m) m[0] = m[0].toUpperCase(); return m; } }
+  eq(["a-b-c".replace(new Loud("[a-c]", "g"), "<$&>"), "abc".match(new Loud("b"))[0], new Loud("b").test("abc"), "a1b2".split(new Loud("[0-9]")), [..."a1b2".matchAll(new Loud("[0-9]", "g"))].map(m => m[0])], ["<A>-<B>-<C>", "B", true, ["a", "b", ""], ["1", "2"]]);
+  const re = /b/g; re.exec = function () { return null; }; eq(["abc".replace(re, "x"), re.test("abc")], ["abc", false]);
+  eq([RegExp.prototype[Symbol.replace].call(/(?<n>b)/, "abc", "[$<n>$1$`$'$$]"), RegExp.prototype[Symbol.match].call(/./g, "ab"), RegExp.prototype[Symbol.search].call(/c/, "abc"), RegExp.prototype[Symbol.split].call(/,/, "a,b", 1)], ["a[bbac$]c", ["a", "b"], 2, ["a"]]);
+  const it = /a/g[Symbol.matchAll]("aXa"); eq([Object.prototype.toString.call(it), it.next().value.index, it.next().value.index, it.next().done], ["[object RegExp String Iterator]", 0, 2, true]);
+  throws(() => "a".matchAll(/a/), TypeError); throws(() => "a".replaceAll(/a/, "b"), TypeError); throws(() => "a".startsWith(/a/), TypeError); throws(() => RegExp.prototype[Symbol.match].call(1, "a"), TypeError);
+  const notRe = /a/; notRe[Symbol.match] = false; eq("/a/".startsWith(notRe), true);
+});
+test("flags, lastIndex and friends", function () {
+  eq([/a/dgimsuy.flags, /a/v.unicodeSets, /a/.unicodeSets, RegExp.prototype.flags, RegExp.prototype.global, RegExp.prototype.source, Object.getOwnPropertyDescriptor(RegExp.prototype, "flags").get.call({ global: 1, sticky: 1, unicode: 0 }), RegExp[Symbol.species] === RegExp], ["dgimsuy", true, false, "", undefined, "(?:)", "gy", true]);
+  throws(() => new RegExp("a", "uv"), SyntaxError); throws(() => new RegExp("a", "gg"), SyntaxError); throws(() => Object.getOwnPropertyDescriptor(RegExp.prototype, "global").get.call({}), TypeError);
+  const frozen = Object.freeze(/a/g); throws(() => frozen.exec("a"), TypeError); eq(Object.freeze(/a/).exec("a")[0], "a");
+  const li = /a/g; li.lastIndex = { valueOf() { return 1; } }; eq([li.exec("aaa").index, li.lastIndex], [1, 2]); li.lastIndex = 5; eq([li.test("aaa"), li.lastIndex], [false, 0]);
+  const d = /(?<x>b)(c)?/d.exec("abd"); eq([d.indices[0], d.indices[1], d.indices[2], d.indices.groups.x, Object.keys(d)], [[1, 2], [1, 2], undefined, [1, 2], ["0", "1", "2", "index", "input", "groups", "indices"]]);
+  eq([RegExp(/a/g) instanceof RegExp, (() => { const r = /a/g; return RegExp(r) === r; })(), new RegExp(/a/g, "i").flags, new RegExp({ [Symbol.match]: true, source: "x", flags: "g", constructor: RegExp }).source, String(new RegExp("/"))], [true, true, "i", "x", "/\\//"]);
+  const c = /a/g; c.lastIndex = 3; eq([c.compile("b", "i") === c, c.source, c.flags, c.lastIndex, c.test("B")], [true, "b", "i", 0, true]);
+  /([0-9])([a-z])/.exec("x1yz"); eq([RegExp.$1, RegExp.$2, RegExp.$3, RegExp.lastMatch, RegExp["$&"], RegExp.leftContext, RegExp.rightContext, RegExp.lastParen, RegExp.input], ["1", "y", "", "1y", "1y", "x", "z", "y", "x1yz"]);
+  "ab".replace(/b/, "c"); eq([RegExp.lastMatch, RegExp["$`"]], ["b", "a"]); throws(() => Object.getOwnPropertyDescriptor(RegExp, "$1").get.call({}), TypeError);
+  eq(["x".anchor('a"b'), "x".bold(), "x".link("u"), "x".fontsize(3), "x".sup(), "Å".normalize() === "Å", "Å".normalize("NFD").length, "x".padEnd.length], ['<a name="a&quot;b">x</a>', "<b>x</b>", '<a href="u">x</a>', '<font size="3">x</font>', "<sup>x</sup>", true, 2, 1]);
+  throws(() => "x".normalize("bad"), RangeError);
+});
 done();

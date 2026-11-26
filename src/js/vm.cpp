@@ -437,6 +437,7 @@ void Vm::markRoots(Gc& g) {
     Symbol** syms = &symIterator;
     for (int i = 0; i < 6; ++i) g.mark(syms[i]);
     g.mark(regexpCtor);
+    g.mark(regexpLastInput);
     g.mark(promiseCtor);
     g.mark(freshError);
     for (auto& kv : atomTable) g.mark(kv.second);

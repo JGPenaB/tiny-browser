@@ -21,6 +21,9 @@ JSFN(toLength) {
     if (!(d > 0)) return Value::i32(0);
     return Value::num(d > 9007199254740991.0 ? 9007199254740991.0 : d);
 }
+JSFN(toStringNative) { return V(ci.vm.toString(ci.arg(0))); }
+JSFN(toIntegerNative) { return Value::num(ci.vm.toInteger(ci.arg(0)) + 0.0); }
+JSFN(regexpExecNative) { return regexpBuiltinExec(ci.vm, ci.arg(0), ci.vm.toString(ci.arg(1))); }
 JSFN(isPromise) { return Value::boolean(ci.arg(0).isObject() && ci.arg(0).asObject()->cls == Cls::Promise); }
 JSFN(newPromiseCapability) {
     Vm& vm = ci.vm;
@@ -57,6 +60,9 @@ void setupJsBuiltins(Vm& vm) {
     vm.defFn(natives, "asyncFromSync", asyncFromSync, 1);
     vm.defFn(natives, "toLength", toLength, 1);
     vm.defFn(natives, "arrayCreate", arrayCreate, 1);
+    vm.defFn(natives, "toString", toStringNative, 1);
+    vm.defFn(natives, "toInteger", toIntegerNative, 1);
+    vm.defFn(natives, "regexpBuiltinExec", regexpExecNative, 2);
     vm.defFn(natives, "isPromise", isPromise, 1);
     vm.defFn(natives, "newPromiseCapability", newPromiseCapability, 1);
     vm.defFn(natives, "promiseResolve", promiseResolve, 2);
@@ -66,6 +72,7 @@ void setupJsBuiltins(Vm& vm) {
     JSFunction* outer = vm.makeClosure(p, nullptr, nullptr);
     Value make = vm.callFunction(outer, V(vm.global), nullptr, 0, Value::undef(), false);
     vm.call(make, Value::undef(), &keep, 1);
+    regexpSnapshot(vm);
 }
 
 }  // namespace tb::js
