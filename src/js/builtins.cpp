@@ -314,7 +314,7 @@ JSFN(fnToString) {
     Value t = ci.thisv;
     if (t.isObject() && t.asObject()->cls == Cls::Function) {
         FuncProto* p = ((JSFunction*)t.asObject())->code;
-        if (p->source && p->srcEnd > p->srcStart && p->srcEnd <= p->source->size())
+        if (p->file != kBuiltinFile && p->source && p->srcEnd > p->srcStart && p->srcEnd <= p->source->size())
             return vm.strv(p->source->substr(p->srcStart, p->srcEnd - p->srcStart));
     }
     if (!vm.isCallable(t)) vm.throwError(Err::TypeError, "Function.prototype.toString requires that 'this' be a Function");

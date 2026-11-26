@@ -11,7 +11,7 @@ import concurrent.futures, os, re, shutil, subprocess, sys, tempfile
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 suite = os.path.join(root, "third_party", "test262")
-exe = os.path.join(root, "build", "Release", "tinybrowser.exe")
+exe = os.environ.get("TB_EXE") or os.path.join(root, "build", "Release", "tinybrowser.exe")  # TB_EXE: test a copy while rebuilding
 
 HOST = r"""
 var $262 = {

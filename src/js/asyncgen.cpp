@@ -308,13 +308,19 @@ Value Vm::getAsyncIterator(Value src, Value& next) {
     if (!isCallable(syncMethod)) throwError(Err::TypeError, "%s is not async iterable", utf16to8(inspect(src, 0)).c_str());
     Value syncIt = call(syncMethod, src, nullptr, 0);
     if (!syncIt.isObject()) throwError(Err::TypeError, "Result of the Symbol.iterator method is not an object");
+    Value wrapper = asyncFromSyncIterator(syncIt);
+    next = get(wrapper, a.next);
+    return wrapper;
+}
+
+// CreateAsyncFromSyncIterator (27.1.6.1)
+Value Vm::asyncFromSyncIterator(Value syncIt) {
     JSHost* h = alloc<JSHost>();
     h->hostKind = kAsyncFromSyncKind;
     h->proto = asyncFromSyncProto;
     h->slotA = syncIt;
     Value wrapper = Value::cell(h);
     h->slotB = get(syncIt, a.next);
-    next = get(wrapper, a.next);
     return wrapper;
 }
 

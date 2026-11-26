@@ -624,6 +624,7 @@ public:
     bool plainArrayIteration();
     Value startAsyncGenerator(JSFunction* f, Value thisv, const Value* args, int argc);
     Value getAsyncIterator(Value src, Value& next);
+    Value asyncFromSyncIterator(Value syncIterator);
     Value delegateCall(Value* regs);
     void delegateResult(Value* regs, Value& value, bool& done);
     Value startAsync(JSFunction* f, Value thisv, const Value* args, int argc);

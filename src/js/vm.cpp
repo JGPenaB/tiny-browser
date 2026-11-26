@@ -341,6 +341,7 @@ Vm::Vm() {
     setupTypedArrays(*this);
     setupAsyncIteration(*this);
     setupModules(*this);
+    setupJsBuiltins(*this);
 }
 Vm::~Vm() {}
 
