@@ -501,7 +501,8 @@ public:
     Value getObj(JSObject* o, PropKey k, Value receiver);
     Value get(Value target, JSString* name) { return get(target, PropKey::of(name)); }
     Value get(Value target, const char* name) { return get(target, PropKey::of(atom(name))); }
-    void set(Value target, PropKey k, Value v);
+    bool set(Value target, PropKey k, Value v);  // false when the assignment did not happen ([[Set]] returned false)
+    [[noreturn]] void failedSet(Value target, PropKey k);  // the TypeError strict code gets for that
     bool setObj(JSObject* o, PropKey k, Value v, Value receiver);
     void set(Value target, const char* name, Value v) { set(target, PropKey::of(atom(name)), v); }
     bool getOwn(JSObject* o, PropKey k, Prop& out);  // virtual properties included (array elements, length...)

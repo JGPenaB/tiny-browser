@@ -148,16 +148,13 @@ bool nsGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
     out = v;
     return true;
 }
-bool nsSet(Vm& vm, JSObject*, PropKey k, Value) {
-    // [[Set]] on a namespace always fails, which is a TypeError in strict code (and all module code is strict)
-    vm.throwError(Err::TypeError, "Cannot assign to read only property '%s' of object '[object Module]'", utf16to8(k.isString() ? k.str()->s : u"").c_str());
-}
 void nsKeys(Vm& vm, JSObject* o, std::vector<PropKey>& out) {
     JSModule* m = (JSModule*)o;
     ensureNames(vm, m);
     for (JSString* n : m->names) out.push_back(PropKey::of(n));
 }
-const HostHooks kNsHooks{nsGet, nsSet, nullptr, nsKeys, PF_W | PF_E, nsHas};
+// No set hook: [[Set]] on a namespace always fails, because the object is not extensible and has no own data.
+const HostHooks kNsHooks{nsGet, nullptr, nullptr, nsKeys, PF_W | PF_E, nsHas};
 
 JSModule* moduleArg(CallInfo& ci, int i) {
     if (!isModule(ci.arg(i))) ci.vm.throwError(Err::TypeError, "Not a module");

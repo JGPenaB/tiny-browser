@@ -1053,6 +1053,18 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
     }
     for (JSObject* cur = o; cur; cur = cur->proto) {
         Prop* p = cur->find(k);
+        if (!p && (cur->cls == Cls::Function || cur->cls == Cls::Native || cur->cls == Cls::String)) {
+            // properties that are not stored: a function's name and length and a string's characters are
+            // read-only; a function's prototype is created on first use and is then an ordinary property
+            Prop vp;
+            if (virtualProp(*this, cur, k, vp)) {
+                p = cur->find(k);
+                if (!p) {
+                    if (!(vp.flags & PF_W)) return false;
+                    break;
+                }
+            }
+        }
         if (!p) continue;
         if (p->flags & PF_ACC) {
             Accessor* acc = (Accessor*)p->val.asCell();
@@ -1072,22 +1084,37 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
     return true;
 }
 
-void Vm::set(Value target, PropKey k, Value v) {
-    if (target.isObject()) {
-        setObj(target.asObject(), k, v, target);
-        return;
-    }
+bool Vm::set(Value target, PropKey k, Value v) {
+    if (target.isObject()) return setObj(target.asObject(), k, v, target);
     if (target.isNullish() || target.isEmpty())
         throwError(Err::TypeError, "Cannot set properties of %s (setting '%s')", target.isNull() ? "null" : "undefined", keyName(*this, k).c_str());
-    // primitives: only setters on the prototype chain can observe the write
+    // primitives: only a setter on the prototype chain can take the value (ECMA-262 10.1.9.2, receiver not an object)
     for (JSObject* cur = protoOf(target); cur; cur = cur->proto)
         if (Prop* p = cur->find(k)) {
             if (p->flags & PF_ACC) {
                 Accessor* acc = (Accessor*)p->val.asCell();
-                if (!acc->set.isUndef()) call(acc->set, target, &v, 1);
+                if (!acc->set.isUndef()) {
+                    call(acc->set, target, &v, 1);
+                    return true;
+                }
             }
-            return;
+            return false;
         }
+    return false;
+}
+
+void Vm::failedSet(Value target, PropKey k) {
+    std::string name = keyName(*this, k);
+    if (!target.isObject()) throwError(Err::TypeError, "Cannot create property '%s' on %s", name.c_str(), utf16to8(inspect(target, 0)).c_str());
+    JSObject* o = target.asObject();
+    for (JSObject* cur = o; cur; cur = cur->proto)
+        if (Prop* p = cur->find(k)) {
+            if (p->flags & PF_ACC) throwError(Err::TypeError, "Cannot set property '%s', which has only a getter", name.c_str());
+            throwError(Err::TypeError, "Cannot assign to read-only property '%s'", name.c_str());
+        }
+    Prop vp;
+    if (getOwn(o, k, vp)) throwError(Err::TypeError, "Cannot assign to read-only property '%s'", name.c_str());
+    throwError(Err::TypeError, "Cannot add property '%s': the object is not extensible", name.c_str());
 }
 
 bool Vm::defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags) {
@@ -1159,7 +1186,12 @@ bool Vm::del(JSObject* o, PropKey k) {
         return true;
     }
     Prop* p = o->find(k);
-    if (!p) return true;
+    if (!p) {
+        // a property that exists without being stored (an array's length, a string's characters) cannot go
+        Prop vp;
+        if (o->cls != Cls::Host && virtualProp(*this, o, k, vp) && !(vp.flags & PF_C)) return false;
+        return true;
+    }
     if (!(p->flags & PF_C) || (o->oflags & OF_FROZEN)) return false;
     o->remove(k);
     return true;
@@ -2024,8 +2056,13 @@ Value Vm::runFrames(size_t base) {
                             if (!(p->flags & PF_W)) throwError(Err::TypeError, "Assignment to constant variable.");
                             if (p->val.isEmpty()) throwError(Err::ReferenceError, "Cannot access '%s' before initialization", NAMEK(i.bx));
                             p->val = R(i.a);
-                        } else
+                        } else if (!fr->code->isStrict) {
                             setObj(global, k, R(i.a), Value::cell(global));
+                        } else {  // strict code: no implicit globals, and a failed assignment is an error
+                            fr->pc = pc;
+                            if (!has(global, k)) throwError(Err::ReferenceError, "%s is not defined", NAMEK(i.bx));
+                            if (!setObj(global, k, R(i.a), Value::cell(global))) failedSet(Value::cell(global), k);
+                        }
                         break;
                     }
                     case OP_DeclGlobalVar: {
@@ -2122,8 +2159,11 @@ Value Vm::runFrames(size_t base) {
                     case OP_SetProp: {
                         Value o = R(i.a);
                         PropKey k = KEYK(i.b);
-                        if (o.isObject()) setObj(o.asObject(), k, R(i.c), o);
-                        else set(o, k, R(i.c));
+                        bool ok = o.isObject() ? setObj(o.asObject(), k, R(i.c), o) : set(o, k, R(i.c));
+                        if (!ok && fr->code->isStrict) {
+                            fr->pc = pc;
+                            failedSet(o, k);
+                        }
                         break;
                     }
                     case OP_GetElem: {
@@ -2177,7 +2217,11 @@ Value Vm::runFrames(size_t base) {
                             }
                         }
                         if (o.isNullish()) throwError(Err::TypeError, "Cannot set properties of %s", o.isNull() ? "null" : "undefined");
-                        set(o, toKey(kv), R(i.c));
+                        PropKey k = toKey(kv);
+                        if (!set(o, k, R(i.c)) && fr->code->isStrict) {
+                            fr->pc = pc;
+                            failedSet(o, k);
+                        }
                         break;
                     }
                     case OP_DelProp:
@@ -2185,7 +2229,12 @@ Value Vm::runFrames(size_t base) {
                         Value o = R(i.b);
                         if (o.isNullish()) throwError(Err::TypeError, "Cannot convert undefined or null to object");
                         PropKey k = i.op == OP_DelProp ? KEYK(i.c) : toKey(R(i.c));
-                        R(i.a) = Value::boolean(o.isObject() ? del(o.asObject(), k) : true);
+                        bool ok = o.isObject() ? del(o.asObject(), k) : true;
+                        if (!ok && fr->code->isStrict) {
+                            fr->pc = pc;
+                            throwError(Err::TypeError, "Cannot delete property '%s' of %s", keyName(*this, k).c_str(), utf16to8(inspect(o, 0)).c_str());
+                        }
+                        R(i.a) = Value::boolean(ok);
                         break;
                     }
                     case OP_GetSuper: {
@@ -2195,7 +2244,14 @@ Value Vm::runFrames(size_t base) {
                         R(i.a) = sp ? getObj(sp, toKey(R(i.b)), thisv) : Value::undef();
                         break;
                     }
-                    case OP_SetSuper: set(R(i.c), toKey(R(i.a)), R(i.b)); break;
+                    case OP_SetSuper: {
+                        PropKey k = toKey(R(i.a));
+                        if (!set(R(i.c), k, R(i.b)) && fr->code->isStrict) {
+                            fr->pc = pc;
+                            failedSet(R(i.c), k);
+                        }
+                        break;
+                    }
                     case OP_DefField: defineOwn(R(i.a).asObject(), KEYK(i.b), R(i.c), PF_ALL); break;
                     case OP_DefElem: defineOwn(R(i.a).asObject(), toKey(R(i.b)), R(i.c), PF_ALL); break;
                     case OP_DefMethod:

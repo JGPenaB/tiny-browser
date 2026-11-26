@@ -610,18 +610,30 @@ private:
                         emit(OP_LoadUndef, dst);
                         break;
                     case P_Delete: {
+                        // `delete a?.b.c`: when the chain stops at a null or undefined link the result is true
                         Node* t = n->a->type == N::OptChain ? n->a->a : n->a;
+                        bool chain = t != n->a && (t->type == N::Member || t->type == N::Index);
+                        if (chain) f->chains.emplace_back();
                         if (t->type == N::Member) {
                             int o = expr(t->a);
+                            if (t->flags & NF_OPTIONAL) bail(o);
                             uint32_t k = kstr(t->str);
                             if (k > 65535) fail("Too many constants");
                             emit(OP_DelProp, dst, o, (int)k);
                         } else if (t->type == N::Index) {
                             int o = expr(t->a);
+                            if (t->flags & NF_OPTIONAL) bail(o);
                             emit(OP_DelElem, dst, o, expr(t->b));
                         } else {
                             expr(n->a);
                             emit(OP_LoadTrue, dst);
+                        }
+                        if (chain) {
+                            size_t e = jump(OP_Jmp);
+                            for (size_t j : f->chains.back()) patch(j);
+                            f->chains.pop_back();
+                            emit(OP_LoadTrue, dst);
+                            patch(e);
                         }
                         break;
                     }
