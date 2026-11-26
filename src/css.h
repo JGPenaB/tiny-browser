@@ -114,6 +114,8 @@ std::vector<Decl> parse_decls(std::string_view body);
 bool parse_color(std::string_view v, Color& out);
 const char* display_name(Display d);
 std::string color_str(const Color& c);
+bool selector_parse(std::string_view text, Selector& out);
+bool selector_matches(const Selector& s, const Node* e);
 
 class StyleEngine {
 public:

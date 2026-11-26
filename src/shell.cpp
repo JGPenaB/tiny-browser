@@ -19,6 +19,7 @@
 #include "text.h"
 #include "url.h"
 #include "js/js.h"
+#include "script.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -91,6 +92,10 @@ static const Sheet& ua_sheet() {
     static Sheet s = parse_sheet(kUACss);
     return s;
 }
+static const Sheet& scripting_sheet() {  // applied to pages whose scripts run
+    static Sheet s = parse_sheet("noscript{display:none!important}");
+    return s;
+}
 
 constexpr UINT WM_APP_LOADED = WM_APP + 1;
 constexpr float kTabH = 38, kToolH = 44, kBmH = 30, kDevW = 500, kSbW = 10, kLine = 18, kInfoH = 42, kRowH = 22;
@@ -133,6 +138,9 @@ struct Page {
     double tFetch = 0, tParse = 0, tSub = 0, tStyle = 0, tLayout = 0;
     std::vector<DevLine> devLines;
     std::unordered_map<const Node*, FormState> fs;  // live values of form controls
+    bool domDirty = false;                            // scripts changed the tree since the devtools view was built
+    std::unique_ptr<ScriptHost::Client> sclient;      // declared before `script` so it outlives it
+    std::unique_ptr<ScriptHost> script;               // null for pages without scripts
 };
 
 struct Tab {
@@ -149,6 +157,9 @@ struct Tab {
     float refreshDelay = 0;
     uint64_t refreshGen = 0;
     int refreshCount = 0;
+    double scriptDue = -1;  // when the page's script timers next need service (-1: nothing scheduled)
+    bool navPending = false, navReplace = false;
+    std::string navRequest;  // navigation asked for by script; done once the script has returned
 };
 
 struct PendingSave {
@@ -384,7 +395,7 @@ public:
     // `req` carries POST data; `fromPage` marks navigations started by page content (links, forms, refresh).
     void navigate(Tab& t, const std::string& input, bool push = true, const FetchOpts* req = nullptr, bool fromPage = false) {
         std::string url = input;
-        if (istarts(url, "javascript:")) return;  // no JS engine yet
+        if (istarts(url, "javascript:")) return;  // javascript: links are not run
         if (istarts(url, "about:bookmarks?remove=")) {
             bm.removeAt((size_t)atoi(url.c_str() + 23));
             url = "about:bookmarks";
@@ -499,6 +510,11 @@ public:
         t.page = std::move(p);
         t.loading = false;
         t.scroll = 0;
+        t.scriptDue = -1;
+        t.navPending = false;
+        if (hwnd) KillTimer(hwnd, kScriptTimerBase + t.id);
+        startScripts(t, r->scripts);
+        if (!t.page) return;
         bool internal = t.hi >= 0 && t.hi < (int)t.hist.size() && istarts(t.hist[t.hi], "about:");
         if (t.hi >= 0 && t.hi < (int)t.hist.size() && !internal) t.hist[t.hi] = t.page->url;
         std::string title = t.page->doc->title;
@@ -513,6 +529,158 @@ public:
         invalidate();
     }
 
+    // ------------------------------------------------------------------ page scripts
+    static constexpr UINT_PTR kScriptTimerBase = 0x40000000;
+
+    struct PageClient : ScriptHost::Client {
+        App& app;
+        Tab& tab;
+        PageClient(App& a, Tab& t) : app(a), tab(t) {}
+        Page* page() { return tab.page.get(); }
+        void domChanged() override {
+            if (Page* p = page()) {
+                p->layoutW = -1;
+                p->domDirty = true;
+            }
+            app.invalidate();
+        }
+        void consoleMessage(int level, const std::wstring& text) override { app.conAdd(level, text); }
+        void navigate(const std::string& url, bool replace) override {
+            tab.navRequest = url;
+            tab.navReplace = replace;
+            tab.navPending = true;
+        }
+        void wake(double delayMs) override { app.scheduleScript(tab, delayMs); }
+        void ensureLayout() override { app.ensureLayout(tab); }
+        void viewport(float& w, float& h, float& sy) override {
+            w = app.viewportW();
+            h = app.contentRect().h();
+            sy = tab.scroll;
+        }
+        void scrollTo(float y) override {
+            app.ensureLayout(tab);
+            tab.scroll = y;
+            app.clampScroll(tab);
+            app.invalidate();
+        }
+        std::wstring formValue(Node* n) override {
+            Page* p = page();
+            if (!p) return L"";
+            FormState& s = app.stateOf(*p, n);
+            if (n->name != "select") return s.value;
+            auto opts = select_options(n);
+            if (s.sel < 0 || s.sel >= (int)opts.size()) return L"";
+            Node* o = opts[s.sel];
+            return widen(o->attr("value") ? *o->attr("value") : std::string(trim(text_content(o))));
+        }
+        void setFormValue(Node* n, const std::wstring& v) override {
+            Page* p = page();
+            if (!p) return;
+            FormState& s = app.stateOf(*p, n);
+            if (n->name == "select") {
+                auto opts = select_options(n);
+                std::string want = narrow(v);
+                for (int i = 0; i < (int)opts.size(); ++i)
+                    if ((opts[i]->attr("value") ? *opts[i]->attr("value") : std::string(trim(text_content(opts[i])))) == want) s.sel = i;
+                return;
+            }
+            s.value = v;
+            if (&tab == app.cur() && app.focus == n) app.fCaret = app.fAnchor = v.size();
+        }
+        bool formChecked(Node* n) override {
+            Page* p = page();
+            return p && app.stateOf(*p, n).checked;
+        }
+        void setFormChecked(Node* n, bool on) override {
+            if (Page* p = page()) app.stateOf(*p, n).checked = on;
+        }
+        void focusNode(Node* n) override {
+            if (&tab != app.cur()) return;
+            if (n && (n->name == "input" || n->name == "textarea" || n->name == "select" || n->name == "button")) app.focusWidget(n, false);
+            else app.focus = nullptr;
+            app.invalidate();
+        }
+        Node* focusedNode() override { return &tab == app.cur() ? app.focus : nullptr; }
+        void titleChanged() override {
+            Page* p = page();
+            if (!p) return;
+            tab.title = widen(p->doc->title.empty() ? p->url : p->doc->title);
+            app.updateTitle();
+            app.invalidate();
+        }
+        void urlChanged(const std::string& url) override {
+            Page* p = page();
+            if (!p) return;
+            p->url = url;
+            tab.addr = widen(url);
+            if (tab.hi >= 0 && tab.hi < (int)tab.hist.size()) tab.hist[tab.hi] = url;
+            app.invalidate();
+        }
+    };
+
+    void startScripts(Tab& t, const std::vector<ScriptSource>& scripts) {
+        if (scripts.empty() || !t.page) return;
+        Page& p = *t.page;
+        p.sclient = std::make_unique<PageClient>(*this, t);
+        p.script = std::make_unique<ScriptHost>(*p.doc, p.url, *p.sclient);
+        if (const char* inject = getenv("TB_INJECT_JS")) {  // debugging aid: a script to run before the page's own
+            std::vector<ScriptSource> all{{nullptr, inject, "injected"}};
+            all.insert(all.end(), scripts.begin(), scripts.end());
+            p.script->runScripts(all);
+        } else
+            p.script->runScripts(scripts);
+        afterScript(t);
+    }
+    // Called whenever control comes back from page script: carries out a navigation the script asked for.
+    void afterScript(Tab& t) {
+        if (t.navPending) {
+            t.navPending = false;
+            std::string url = t.navRequest;
+            navigate(t, url, !t.navReplace, nullptr, true);
+        }
+        invalidate();
+    }
+    void scheduleScript(Tab& t, double delayMs) {
+        double due = now_ms() + std::max(0.0, delayMs);
+        t.scriptDue = t.scriptDue < 0 ? due : std::min(t.scriptDue, due);
+        if (hwnd) SetTimer(hwnd, kScriptTimerBase + t.id, (UINT)std::max(1.0, t.scriptDue - now_ms()), nullptr);
+    }
+    void runScriptTimers(Tab& t) {
+        t.scriptDue = -1;
+        if (!t.page || !t.page->script) return;
+        t.page->script->pump();
+        afterScript(t);
+    }
+    // Headless mode has no message loop: serve timers here for a bounded time.
+    void pumpScripts(Tab& t, double budgetMs) {
+        double end = now_ms() + budgetMs;
+        while (t.page && t.page->script && t.scriptDue >= 0) {
+            double wait = t.scriptDue - now_ms();
+            if (now_ms() + std::max(0.0, wait) > end) break;
+            if (wait > 0) Sleep((DWORD)wait + 1);
+            runScriptTimers(t);
+        }
+    }
+    // Sends a DOM event to the page's scripts. Returns false when a listener cancelled the default action.
+    bool fireEvent(Tab& t, Node* target, const char* type, bool bubbles = true, bool cancelable = true) {
+        if (!t.page || !t.page->script) return true;
+        bool go = t.page->script->dispatch(target, type, bubbles, cancelable);
+        afterScript(t);
+        return go;
+    }
+    // The innermost element whose box contains a document point.
+    Node* nodeAt(Page& p, float dx, float dy) {
+        Node* best = p.doc->body;
+        std::vector<Node*> st{p.doc->root.get()};
+        while (!st.empty()) {
+            Node* n = st.back();
+            st.pop_back();
+            if (n->type == Node::T::Element && n->hasBox && dx >= n->bx && dx < n->bx + n->bw && dy >= n->by && dy < n->by + n->bh) best = n;
+            for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+        }
+        return best;
+    }
+
     float viewportW() const { return std::max(200.f, contentRect().w() - kSbW); }
 
     void restyle(Page& p, float vw) {
@@ -521,6 +689,7 @@ public:
         se.add(&ua_sheet(), true);
         if (p.doc->quirks) se.add(&quirks_sheet(), true);
         for (auto& s : p.sheets) se.add(&s, false);
+        if (p.script) se.add(&scripting_sheet(), true);
         se.compute(*p.doc, vw, contentRect().h());
         p.hasMedia = se.hasMedia();
         p.rules = se.ruleCount();
@@ -544,6 +713,11 @@ public:
         p.lo = layout_document(in);
         p.tLayout = now_ms() - t0;
         p.layoutW = vw;
+        if (p.domDirty) {
+            p.domDirty = false;
+            buildDevLines(p);
+            if (&t == cur()) devHover = devSel = nullptr;
+        }
         if (&t == cur()) popup = -1;
         clampScroll(t);
     }
@@ -611,6 +785,14 @@ public:
 
     void onTimer(UINT_PTR id) {
         if (hwnd) KillTimer(hwnd, id);
+        if (id >= kScriptTimerBase) {
+            for (auto& t : tabs)
+                if (kScriptTimerBase + t->id == id) {
+                    runScriptTimers(*t);
+                    return;
+                }
+            return;
+        }
         for (auto& t : tabs)
             if (1000 + t->id == (int)id && t->gen == t->refreshGen && !t->refreshUrl.empty()) {
                 std::string u = t->refreshUrl;
@@ -864,6 +1046,8 @@ public:
         Page& p = *t->page;
         Node* form = form_of(from);
         if (!form) return;
+        if (!fireEvent(*t, form, "submit")) return;  // a script handled the form itself
+        if (t->page.get() != &p) return;
         if (!submitter) submitter = defaultSubmit(form);
         std::string body, passVal, userVal, lastText;
         bool sawPass = false;
@@ -1036,6 +1220,10 @@ public:
             case WidgetKind::Check:
                 focus = n;
                 stateOf(*p, n).checked = !stateOf(*p, n).checked;
+                if (Tab* t = cur()) {
+                    fireEvent(*t, n, "input", true, false);
+                    fireEvent(*t, n, "change", true, false);
+                }
                 break;
             case WidgetKind::Radio: {
                 focus = n;
@@ -1047,6 +1235,10 @@ public:
                             *o.node->attr("name") == *name)
                             stateOf(*p, o.node).checked = false;
                 stateOf(*p, n).checked = true;
+                if (Tab* t = cur()) {
+                    fireEvent(*t, n, "input", true, false);
+                    fireEvent(*t, n, "change", true, false);
+                }
                 break;
             }
             case WidgetKind::Select:
@@ -1461,6 +1653,13 @@ public:
         conInput.clear();
         conCaret = 0;
         conAdd(4, src);
+        if (Tab* t = cur(); t && t->page && t->page->script) {
+            std::wstring out;
+            bool ok = t->page->script->eval(src, out);
+            conAdd(ok ? 5 : 3, out);
+            afterScript(*t);
+            return;
+        }
         if (!conVm) {
             conVm = std::make_unique<js::Vm>();
             conVm->onConsole = [this](int level, const std::u16string& s) { conAdd(level, std::wstring(s.begin(), s.end())); };
@@ -1942,7 +2141,12 @@ public:
             popup = -1;
             if (pr.hit(dx, dy)) {
                 int i = popupScroll + (int)((dy - pr.t - 1) / kRowH);
-                if (i >= 0 && i < (int)opts.size()) stateOf(p, w.node).sel = i;
+                if (i >= 0 && i < (int)opts.size()) {
+                    Node* chosen = w.node;
+                    stateOf(p, chosen).sel = i;
+                    fireEvent(*t, chosen, "input", true, false);
+                    fireEvent(*t, chosen, "change", true, false);
+                }
                 invalidate();
                 return;
             }
@@ -1952,6 +2156,28 @@ public:
             }
         }
         int wi = middle ? -1 : widgetAt(dx, dy);
+        if (p.script && !middle) {
+            Node* widgetNode = wi >= 0 ? p.lo.widgets[wi].node : nullptr;
+            Node* linkNode = linkAt(x, y);
+            Node* target = widgetNode ? widgetNode : nodeAt(p, dx, dy);
+            if (linkNode && !widgetNode) {
+                bool inside = false;
+                for (Node* n = target; n; n = n->parent) inside |= n == linkNode;
+                if (!inside) target = linkNode;
+            }
+            bool go = fireEvent(*t, target, "click");
+            if (t->page.get() != &p || t->loading) return;  // the script navigated away
+            if (!go) {
+                invalidate();
+                return;
+            }
+            ensureLayout(*t);
+            wi = widgetAt(dx, dy);
+            if ((wi >= 0 ? p.lo.widgets[wi].node : nullptr) != widgetNode || linkAt(x, y) != linkNode) {
+                invalidate();  // the page under the pointer changed: no default action
+                return;
+            }
+        }
         if (wi >= 0) {
             activateWidget(wi, dx, dy);
             return;
@@ -2132,7 +2358,11 @@ public:
             return;
         }
         if (!addrFocus) {
+            Node* typedInto = focus;
+            Tab* typedTab = cur();
             onFormChar(ch);
+            if (typedInto && typedTab && typedTab == cur() && focus == typedInto && ch != 13 && ch != 27 && ch != 9 && ch != 3)
+                fireEvent(*typedTab, typedInto, "input", true, false);
             return;
         }
         switch (ch) {
@@ -2486,7 +2716,8 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
         }
     };
     followRefresh();
-    t.scroll = scroll;
+    if (Tab* c = app.cur()) app.pumpScripts(*c, 1500);
+    app.cur()->scroll = scroll;
     app.ensureLayout(t);
     app.clampScroll(t);
     // Scripted input.
@@ -2513,8 +2744,11 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
             else if (arg == L"dismiss") app.answerSave(false);
         } else if (op == L"scroll") {
             app.scrollBy((float)_wtof(arg.c_str()));
+        } else if (op == L"wait") {
+            Sleep((DWORD)_wtoi(arg.c_str()));
         }
         followRefresh();
+        if (Tab* c = app.cur()) app.pumpScripts(*c, 800);
     }
     Tab& ft = *app.cur();
     app.ensureLayout(ft);
@@ -2567,6 +2801,9 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
                 fprintf(fp, "widget %s name=%s at %.0f,%.0f %0.fx%.0f\n", wd.node->name.c_str(), nm ? nm->c_str() : "", wd.x, wd.y, wd.w, wd.h);
             }
             for (auto& e : ft.page->net) fprintf(fp, "net %d %zu %s %s\n", e.status, e.bytes, e.url.c_str(), e.error.c_str());
+            fprintf(fp, "scripts=%d stopped=%d\n", ft.page->script ? 1 : 0, ft.page->script && ft.page->script->stopped() ? 1 : 0);
+            static const char* kinds[] = {"log", "info", "warn", "error", "input", "result"};
+            for (auto& line : app.conLines) fprintf(fp, "console %s %s\n", kinds[line.kind < 0 || line.kind > 5 ? 0 : line.kind], narrow(line.text).c_str());
             fclose(fp);
         }
     }

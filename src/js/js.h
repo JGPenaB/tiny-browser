@@ -557,6 +557,7 @@ public:
     bool terminated = false;
     uint16_t pollTicks = 0;
     void pollInterrupt();
+    bool traceThrows = false;  // debugging aid: report every exception to the console when it is thrown
     JSObject* freshError = nullptr;
     std::unordered_map<std::u16string_view, JSString*> atomTable;
     void setupGlobals();

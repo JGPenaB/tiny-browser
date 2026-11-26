@@ -465,6 +465,7 @@ void Vm::throwValue(Value v) {
 }
 void Vm::throwError(Err type, const std::u16string& msg) {
     JSObject* e = newError(type, msg);
+    if (traceThrows && onConsole && !terminated) onConsole(2, u"[throw] " + utf8to16(kErrNames[(int)type]) + u": " + msg + captureStack());
     freshError = e;
     throwValue(Value::cell(e));
 }
@@ -1713,6 +1714,10 @@ void Vm::runJob(const Job& j) {
 void Vm::runMicrotasks() {
     int guard = 0;
     while (!jobQueue.empty() && guard++ < 1000000) {
+        if (terminated) {  // a stopped script must not keep itself alive through promise callbacks
+            jobQueue.clear();
+            break;
+        }
         Job j = jobQueue.front();
         jobQueue.pop_front();
         runJob(j);
@@ -1871,6 +1876,20 @@ std::u16string Vm::inspect(Value v, int depth, bool quoteStrings) {
 }
 
 // ---------------------------------------------------------------------------- the interpreter
+// For "x is not a function" errors: names the thing that was called by finding the instruction that loaded it.
+static std::string calleeText(const FuncProto* p, const Ins* callIns, uint16_t reg) {
+    const Ins* first = p->code.data();
+    for (const Ins* q = callIns - 1; q >= first && callIns - q < 64; --q) {
+        if (q->a != reg) continue;
+        if (q->op == OP_GetProp && q->c < p->consts.size() && p->consts[q->c].isString()) return "." + utf16to8(p->consts[q->c].asString()->s);
+        if ((q->op == OP_GetGlobal || q->op == OP_GetGlobalTypeof) && q->bx < p->consts.size() && p->consts[q->bx].isString())
+            return utf16to8(p->consts[q->bx].asString()->s);
+        if (q->op == OP_GetElem) return "[...]";
+        if (q->op == OP_Move || q->op == OP_GetCtx || q->op == OP_Closure || q->op == OP_Call || q->op == OP_LoadK) break;
+    }
+    return "";
+}
+
 static const Handler* findHandler(FuncProto* p, uint32_t at) {
     for (auto& h : p->handlers)
         if (at >= h.start && at < h.end) return &h;
@@ -2335,6 +2354,16 @@ Value Vm::runFrames(size_t base) {
                                 break;
                             }
                         }
+                        if (!isCallable(callee)) {
+                            std::string what = calleeText(fr->code, pc - 1, i.b);
+                            std::string shown = utf16to8(inspect(callee, 0));
+                            if (what.empty()) throwError(Err::TypeError, "%s is not a function", shown.c_str());
+                            if (what[0] == '.' || what[0] == '[') {
+                                std::string owner = b2[1].isObject() ? "object" : utf16to8(inspect(b2[1], 0));
+                                throwError(Err::TypeError, "%s%s is not a function (it is %s)", b2[1].isObject() ? "(...)" : owner.c_str(), what.c_str(), shown.c_str());
+                            }
+                            throwError(Err::TypeError, "%s is not a function (it is %s)", what.c_str(), shown.c_str());
+                        }
                         Value r = call(callee, b2[1], b2 + 2, i.c);
                         regs[i.a] = r;
                         break;
@@ -2397,6 +2426,14 @@ Value Vm::runFrames(size_t base) {
                     case OP_Throw:
                         fr->pc = pc;
                         freshError = nullptr;
+                        if (traceThrows && onConsole) {
+                            Value thrown = R(i.a);
+                            traceThrows = false;
+                            std::u16string text = u"[throw] " + describeError(thrown);
+                            if (!(thrown.isObject() && thrown.asObject()->cls == Cls::Error)) text += captureStack();
+                            traceThrows = true;
+                            onConsole(2, text);
+                        }
                         throwValue(R(i.a));
                     case OP_Catch:
                         R(i.a) = pending;

@@ -1,0 +1,2098 @@
+// DOM bindings: exposes a page's document to the JavaScript engine and runs its scripts, events and timers.
+#include <windows.h>
+
+#include <algorithm>
+#include <unordered_map>
+
+#include "css.h"
+#include "html.h"
+#include "js/builtins.h"
+#include "script.h"
+#include "url.h"
+
+namespace tb {
+
+using namespace js;
+
+namespace {
+enum : uint8_t { HK_Node = 1, HK_ClassList, HK_Style, HK_Dataset, HK_Event, HK_Storage, HK_Computed };
+
+struct Listener {
+    std::string type;
+    Value fn;
+    bool capture = false, once = false;
+};
+struct Timer {
+    int id = 0;
+    double due = 0, interval = -1;
+    Value fn;
+    std::vector<Value> args;
+    bool frame = false;  // requestAnimationFrame: the callback receives a timestamp
+};
+using Store = std::vector<std::pair<std::u16string, std::u16string>>;
+}  // namespace
+
+struct ScriptHost::Impl {
+    Document& doc;
+    std::string url;
+    Client& client;
+    Vm vm;
+    std::unordered_map<Node*, JSHost*> wrappers;               // one JavaScript object per node, kept for the page's life
+    std::unordered_map<Node*, std::unique_ptr<Node>> orphans;  // nodes that are not in the tree (new or removed)
+    std::unordered_map<const void*, std::vector<Listener>> listeners;  // keyed by node; the window uses `this`
+    std::vector<Timer> timers;
+    std::unordered_map<std::string, std::vector<Selector>> selectorCache;
+    Store localStore, sessionStore;
+    JSObject *nodeProto = nullptr, *elementProto = nullptr, *documentProto = nullptr, *textProto = nullptr, *eventProto = nullptr,
+             *classListProto = nullptr, *styleProto = nullptr, *computedProto = nullptr, *nodeListProto = nullptr, *storageProto = nullptr;
+    Value currentScript = Value::null(), historyState = Value::null();
+    std::string readyState = "loading";
+    double startMs = now_ms();
+    int nextTimer = 1, depth = 0;
+    bool dead = false;
+
+    Impl(Document& d, const std::string& u, Client& c) : doc(d), url(u), client(c) {}
+
+    Value wrap(Node* n) {
+        if (!n) return Value::null();
+        auto it = wrappers.find(n);
+        if (it != wrappers.end()) return V(it->second);
+        JSHost* h = vm.alloc<JSHost>();
+        h->hostKind = HK_Node;
+        h->ptr = n;
+        h->proto = n->type == Node::T::Document ? documentProto : n->type == Node::T::Element ? elementProto : textProto;
+        wrappers[n] = h;
+        return V(h);
+    }
+    Value list(const std::vector<Node*>& nodes) {
+        JSArray* a = vm.newArray();
+        a->proto = nodeListProto;
+        for (Node* n : nodes) a->elems.push_back(wrap(n));
+        return V(a);
+    }
+    Node* docNode() { return doc.root.get(); }
+    void changed() { client.domChanged(); }
+    void reportError() {
+        Value e = vm.pending;
+        vm.pending = Value::undef();
+        if (vm.terminated) return;
+        std::u16string text = vm.describeError(e);
+        if (text.rfind(u"Uncaught", 0) != 0) text = u"Uncaught " + text;
+        client.consoleMessage(3, std::wstring(text.begin(), text.end()));
+    }
+
+    // ---- tree surgery
+    static void reindex(Node* p) {
+        uint32_t count = 0, idx = 0;
+        for (auto& k : p->kids)
+            if (k->type == Node::T::Element) ++count;
+        for (auto& k : p->kids)
+            if (k->type == Node::T::Element) {
+                k->elemIndex = idx++;
+                k->elemCount = count;
+            }
+    }
+    Node* adopt(std::unique_ptr<Node> n) {
+        Node* raw = n.get();
+        raw->parent = nullptr;
+        orphans[raw] = std::move(n);
+        return raw;
+    }
+    Node* newElement(const std::string& tag) {
+        auto n = std::make_unique<Node>();
+        n->type = Node::T::Element;
+        n->name = lower(tag);
+        return adopt(std::move(n));
+    }
+    Node* newText(const std::string& text, Node::T type = Node::T::Text) {
+        auto n = std::make_unique<Node>();
+        n->type = type;
+        n->text = text;
+        return adopt(std::move(n));
+    }
+    std::unique_ptr<Node> take(Node* n) {
+        if (Node* p = n->parent) {
+            for (size_t i = 0; i < p->kids.size(); ++i)
+                if (p->kids[i].get() == n) {
+                    std::unique_ptr<Node> u = std::move(p->kids[i]);
+                    p->kids.erase(p->kids.begin() + i);
+                    n->parent = nullptr;
+                    reindex(p);
+                    return u;
+                }
+        }
+        auto it = orphans.find(n);
+        if (it == orphans.end()) return nullptr;
+        std::unique_ptr<Node> u = std::move(it->second);
+        orphans.erase(it);
+        return u;
+    }
+    static bool isFragment(const Node* n) { return n->type == Node::T::Element && n->name == "#document-fragment"; }
+    void insert(Node* parent, Node* child, Node* before) {
+        for (Node* a = parent; a; a = a->parent)
+            if (a == child) vm.throwError(Err::Error, "HierarchyRequestError: the new child contains the parent");
+        if (isFragment(child)) {
+            std::vector<Node*> kids;
+            for (auto& k : child->kids) kids.push_back(k.get());
+            for (Node* k : kids) insert(parent, k, before);
+            return;
+        }
+        if (child == before) before = nullptr;
+        std::unique_ptr<Node> u = take(child);
+        if (!u) return;
+        u->parent = parent;
+        size_t pos = parent->kids.size();
+        if (before)
+            for (size_t i = 0; i < parent->kids.size(); ++i)
+                if (parent->kids[i].get() == before) {
+                    pos = i;
+                    break;
+                }
+        parent->kids.insert(parent->kids.begin() + pos, std::move(u));
+        reindex(parent);
+        changed();
+    }
+    void remove(Node* n) {
+        if (!n->parent) return;
+        std::unique_ptr<Node> u = take(n);
+        if (u) orphans[n] = std::move(u);
+        changed();
+    }
+    void clearChildren(Node* el) {
+        for (auto& k : el->kids) {
+            Node* raw = k.get();
+            raw->parent = nullptr;
+            orphans[raw] = std::move(k);
+        }
+        el->kids.clear();
+    }
+    void setInner(Node* el, const std::string& html) {
+        std::string pre = "<!doctype html><body>";
+        std::vector<const char*> path;
+        if (el->name == "tr") pre += "<table><tbody><tr>", path = {"table", "tbody", "tr"};
+        else if (el->name == "tbody" || el->name == "thead" || el->name == "tfoot") pre += "<table><tbody>", path = {"table", "tbody"};
+        else if (el->name == "table") pre += "<table>", path = {"table"};
+        else if (el->name == "select") pre += "<select>", path = {"select"};
+        else if (el->name == "ul" || el->name == "ol") pre += "<ul>", path = {"ul"};
+        std::unique_ptr<Document> d = parse_html(pre + html, doc.url);
+        Node* ctx = d->body;
+        for (const char* name : path) {
+            Node* next = nullptr;
+            if (ctx)
+                for (auto& k : ctx->kids)
+                    if (k->is(name)) {
+                        next = k.get();
+                        break;
+                    }
+            ctx = next;
+        }
+        clearChildren(el);
+        if (ctx) {
+            for (auto& k : ctx->kids) {
+                k->parent = el;
+                el->kids.push_back(std::move(k));
+            }
+            ctx->kids.clear();
+        }
+        reindex(el);
+        changed();
+    }
+    void setText(Node* n, const std::string& text) {
+        if (n->type == Node::T::Text || n->type == Node::T::Comment) {
+            n->text = text;
+        } else if (n->type == Node::T::Element) {
+            clearChildren(n);
+            if (!text.empty()) {
+                auto t = std::make_unique<Node>();
+                t->type = Node::T::Text;
+                t->text = text;
+                n->append(std::move(t));
+            }
+        }
+        changed();
+    }
+    Node* clone(const Node* src, bool deep) {
+        auto n = std::make_unique<Node>();
+        n->type = src->type == Node::T::Document ? Node::T::Element : src->type;
+        n->name = src->name;
+        n->text = src->text;
+        n->id = src->id;
+        n->attrs = src->attrs;
+        n->classes = src->classes;
+        Node* raw = adopt(std::move(n));
+        if (deep)
+            for (auto& k : src->kids) {
+                Node* c = clone(k.get(), true);
+                std::unique_ptr<Node> u = take(c);
+                u->parent = raw;
+                raw->kids.push_back(std::move(u));
+            }
+        reindex(raw);
+        return raw;
+    }
+
+    // ---- selectors
+    const std::vector<Selector>& selectors(const std::string& text) {
+        auto it = selectorCache.find(text);
+        if (it != selectorCache.end()) return it->second;
+        if (selectorCache.size() > 600) selectorCache.clear();
+        std::vector<Selector> out;
+        bool bad = false;
+        size_t start = 0;
+        int nest = 0;
+        char quote = 0;
+        for (size_t i = 0; i <= text.size(); ++i) {
+            char c = i < text.size() ? text[i] : ',';
+            if (quote && i < text.size()) {
+                if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '"' || c == '\'') quote = c;
+            else if (c == '(' || c == '[') ++nest;
+            else if (c == ')' || c == ']') --nest;
+            else if (c == ',' && (nest <= 0 || i == text.size())) {
+                std::string_view part = trim(std::string_view(text).substr(start, i - start));
+                Selector s;
+                if (!part.empty() && selector_parse(part, s)) out.push_back(std::move(s));
+                else bad = true;
+                start = i + 1;
+            }
+        }
+        if (bad) vm.throwError(Err::SyntaxError, "'%s' is not a valid selector", text.c_str());
+        return selectorCache.emplace(text, std::move(out)).first->second;
+    }
+    static bool matches(const std::vector<Selector>& sels, const Node* e) {
+        for (auto& s : sels)
+            if (selector_matches(s, e)) return true;
+        return false;
+    }
+
+    // ---- events
+    Value makeEvent(const std::string& type, bool bubbles, bool cancelable) {
+        JSHost* e = vm.alloc<JSHost>();
+        e->hostKind = HK_Event;
+        e->proto = eventProto;
+        vm.def(e, "type", vm.strv(utf8to16(type)), PF_ALL);
+        vm.def(e, "bubbles", Value::boolean(bubbles), PF_ALL);
+        vm.def(e, "cancelable", Value::boolean(cancelable), PF_ALL);
+        vm.def(e, "timeStamp", Value::num(now_ms() - startMs), PF_ALL);
+        vm.def(e, "isTrusted", Value::boolean(true), PF_ALL);
+        vm.def(e, "eventPhase", Value::i32(0), PF_ALL);
+        vm.def(e, "target", Value::null(), PF_ALL);
+        vm.def(e, "currentTarget", Value::null(), PF_ALL);
+        return V(e);
+    }
+    void callListener(Value fn, Value thisv, Value ev) {
+        try {
+            if (vm.isCallable(fn)) {
+                vm.call(fn, thisv, &ev, 1);
+            } else if (fn.isObject()) {
+                Value h = vm.get(fn, "handleEvent");
+                if (vm.isCallable(h)) vm.call(h, fn, &ev, 1);
+            }
+        } catch (JSThrow&) {
+            reportError();
+        }
+    }
+    // The handler set as el.onclick = fn, or written as an onclick="..." attribute.
+    Value handlerFor(const void* key, Value cur, const std::string& type) {
+        std::string name = "on" + type;
+        PropKey k = PropKey::of(vm.atom(name));
+        JSObject* o = cur.asObject();
+        if (Prop* p = o->find(k)) return (p->flags & PF_ACC) ? Value::undef() : p->val;
+        const Node* n = key == this ? doc.body : (const Node*)key;
+        if (key == this && type != "load" && type != "unload" && type != "resize" && type != "scroll" && type != "beforeunload") return Value::undef();
+        if (!n || n->type != Node::T::Element) return Value::undef();
+        const std::string* code = n->attr(name);
+        if (!code) return Value::undef();
+        Value f = Value::null();
+        try {
+            f = vm.compileFunction(u"event", utf8to16(*code), name);
+        } catch (JSThrow&) {
+            reportError();
+        }
+        o->add(k, f, PF_W | PF_C);
+        return f;
+    }
+    bool fire(Node* target, Value ev) {
+        JSHost* e = (JSHost*)ev.asObject();
+        std::string type = utf16to8(vm.toStr16(vm.get(ev, "type")));
+        bool bubbles = vm.toBool(vm.get(ev, "bubbles"));
+        Value window = V(vm.global), targetV = target ? wrap(target) : window;
+        vm.set(ev, "target", targetV);
+        vm.set(ev, "srcElement", targetV);
+        std::vector<Node*> path;
+        for (Node* n = target; n; n = n->parent) path.push_back(n);
+        e->flagA = e->flagB = false;
+        auto run = [&](const void* key, Value cur, int phase) {
+            if (e->flagA) return;
+            vm.set(ev, "currentTarget", cur);
+            vm.set(ev, "eventPhase", Value::i32(phase));
+            if (phase != 1) {
+                Value h = handlerFor(key, cur, type);
+                if (vm.isCallable(h)) {
+                    try {
+                        Value r = vm.call(h, cur, &ev, 1);
+                        if (r.isBool() && !r.isTrue()) e->flagC = true;
+                    } catch (JSThrow&) {
+                        reportError();
+                    }
+                }
+            }
+            auto it = listeners.find(key);
+            if (it == listeners.end()) return;
+            std::vector<Value> fns;
+            RootScope keep(vm, fns);
+            std::vector<Listener> snapshot = it->second;
+            for (auto& l : snapshot) fns.push_back(l.fn);
+            for (auto& l : snapshot) {
+                if (l.type != type || (phase == 1 && !l.capture) || (phase == 3 && l.capture)) continue;
+                if (l.once) removeListener(key, l.type, l.fn, l.capture);
+                callListener(l.fn, cur, ev);
+                if (e->flagB) break;
+            }
+        };
+        if (target) run(this, window, 1);
+        for (size_t i = path.size(); i-- > 1;) run(path[i], wrap(path[i]), 1);
+        run(target ? (const void*)target : (const void*)this, targetV, 2);
+        if (bubbles && target) {
+            for (size_t i = 1; i < path.size(); ++i) run(path[i], wrap(path[i]), 3);
+            run(this, window, 3);
+        }
+        vm.set(ev, "currentTarget", Value::null());
+        vm.set(ev, "eventPhase", Value::i32(0));
+        return !e->flagC;
+    }
+    void removeListener(const void* key, const std::string& type, Value fn, bool capture) {
+        auto it = listeners.find(key);
+        if (it == listeners.end()) return;
+        auto& v = it->second;
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i].type == type && v[i].fn == fn && v[i].capture == capture) {
+                v.erase(v.begin() + i);
+                return;
+            }
+    }
+
+    void setup();
+};
+
+namespace {
+
+using Impl = ScriptHost::Impl;
+
+// Every entry from the browser into page script goes through one of these: it arms the time limit, and when
+// the outermost one ends it runs promise callbacks and gives the garbage collector a chance.
+struct Entry {
+    Impl& im;
+    explicit Entry(Impl& i) : im(i) {
+        if (im.depth++ == 0) im.vm.deadlineTick = GetTickCount64() + 8000;
+    }
+    ~Entry() {
+        if (--im.depth) return;
+        im.vm.runMicrotasks();
+        im.vm.deadlineTick = 0;
+        if (im.vm.terminated && !im.dead) {
+            im.dead = true;
+            im.timers.clear();
+            im.client.consoleMessage(3, L"Scripts on this page were stopped: one of them ran for more than 8 seconds.");
+        }
+        if (im.vm.gc.shouldCollect()) im.vm.gc.collect();
+    }
+};
+
+Impl& I(Vm& vm) { return *(Impl*)vm.hostData; }
+std::string str8(Vm& vm, Value v) { return utf16to8(vm.toStr16(v)); }
+Value val8(Vm& vm, std::string_view s) { return vm.strv(utf8to16(s)); }
+
+Node* toNode(Value v) {
+    if (v.isObject() && v.asObject()->cls == Cls::Host) {
+        JSHost* h = (JSHost*)v.asObject();
+        if (h->hostKind == HK_Node) return (Node*)h->ptr;
+    }
+    return nullptr;
+}
+Node* thisNode(CallInfo& ci) {
+    Node* n = toNode(ci.thisv);
+    if (!n) ci.vm.throwError(Err::TypeError, "Illegal invocation");
+    return n;
+}
+Node* thisElem(CallInfo& ci) {
+    Node* n = thisNode(ci);
+    if (n->type != Node::T::Element) ci.vm.throwError(Err::TypeError, "Illegal invocation: not an element");
+    return n;
+}
+Node* argNode(CallInfo& ci, int i, const char* what) {
+    Node* n = toNode(ci.arg(i));
+    if (!n) ci.vm.throwError(Err::TypeError, "%s: parameter %d is not a Node", what, i + 1);
+    return n;
+}
+// Methods like append() take nodes or strings; strings become text nodes.
+Node* nodeOrText(CallInfo& ci, Value v) {
+    if (Node* n = toNode(v)) return n;
+    return I(ci.vm).newText(str8(ci.vm, v));
+}
+JSHost* thisHost(CallInfo& ci, uint8_t kind) {
+    if (ci.thisv.isObject() && ci.thisv.asObject()->cls == Cls::Host && ((JSHost*)ci.thisv.asObject())->hostKind == kind) return (JSHost*)ci.thisv.asObject();
+    ci.vm.throwError(Err::TypeError, "Illegal invocation");
+}
+
+void setAttr(Node* n, const std::string& name, const std::string& value) {
+    bool found = false;
+    for (auto& a : n->attrs)
+        if (a.first == name) {
+            a.second = value;
+            found = true;
+            break;
+        }
+    if (!found) n->attrs.push_back({name, value});
+    if (name == "id") {
+        n->id = value;
+    } else if (name == "class") {
+        n->classes.clear();
+        size_t i = 0;
+        while (i < value.size()) {
+            while (i < value.size() && isws(value[i])) ++i;
+            size_t st = i;
+            while (i < value.size() && !isws(value[i])) ++i;
+            if (i > st) n->classes.push_back(value.substr(st, i - st));
+        }
+    }
+}
+void removeAttr(Node* n, const std::string& name) {
+    for (size_t i = 0; i < n->attrs.size(); ++i)
+        if (n->attrs[i].first == name) {
+            n->attrs.erase(n->attrs.begin() + i);
+            break;
+        }
+    if (name == "id") n->id.clear();
+    if (name == "class") n->classes.clear();
+}
+
+template <class F>
+void eachElement(Node* root, F&& fn) {  // document order, excluding root; fn returns false to stop
+    std::vector<Node*> st;
+    for (auto it = root->kids.rbegin(); it != root->kids.rend(); ++it) st.push_back(it->get());
+    while (!st.empty()) {
+        Node* n = st.back();
+        st.pop_back();
+        if (n->type != Node::T::Element) continue;
+        if (!fn(n)) return;
+        for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+    }
+}
+bool isConnected(const Node* n) {
+    while (n->parent) n = n->parent;
+    return n->type == Node::T::Document;
+}
+int indexInParent(const Node* n) {
+    if (!n->parent) return -1;
+    auto& k = n->parent->kids;
+    for (size_t i = 0; i < k.size(); ++i)
+        if (k[i].get() == n) return (int)i;
+    return -1;
+}
+Node* sibling(const Node* n, int dir, bool elementsOnly) {
+    int i = indexInParent(n);
+    if (i < 0) return nullptr;
+    auto& k = n->parent->kids;
+    for (i += dir; i >= 0 && i < (int)k.size(); i += dir)
+        if (!elementsOnly || k[i]->type == Node::T::Element) return k[i].get();
+    return nullptr;
+}
+Node* edgeChild(const Node* n, bool last, bool elementsOnly) {
+    auto& k = n->kids;
+    for (size_t j = 0; j < k.size(); ++j) {
+        Node* c = k[last ? k.size() - 1 - j : j].get();
+        if (!elementsOnly || c->type == Node::T::Element) return c;
+    }
+    return nullptr;
+}
+
+bool isVoid(const std::string& n) {
+    static const char* v[] = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"};
+    for (const char* s : v)
+        if (n == s) return true;
+    return false;
+}
+void escapeInto(const std::string& s, std::string& out, bool attr) {
+    for (char c : s) {
+        if (c == '&') out += "&amp;";
+        else if (c == '<') out += "&lt;";
+        else if (c == '>') out += "&gt;";
+        else if (c == '"' && attr) out += "&quot;";
+        else out += c;
+    }
+}
+void serialize(const Node* n, std::string& out) {
+    switch (n->type) {
+        case Node::T::Text:
+            if (n->parent && (n->parent->name == "script" || n->parent->name == "style")) out += n->text;
+            else escapeInto(n->text, out, false);
+            break;
+        case Node::T::Comment: out += "<!--" + n->text + "-->"; break;
+        case Node::T::Document:
+            for (auto& k : n->kids) serialize(k.get(), out);
+            break;
+        case Node::T::Element: {
+            bool frag = Impl::isFragment(n);
+            if (!frag) {
+                out += "<" + n->name;
+                for (auto& a : n->attrs) {
+                    out += " " + a.first + "=\"";
+                    escapeInto(a.second, out, true);
+                    out += "\"";
+                }
+                out += ">";
+                if (isVoid(n->name)) return;
+            }
+            for (auto& k : n->kids) serialize(k.get(), out);
+            if (!frag) out += "</" + n->name + ">";
+        }
+    }
+}
+std::string upper(std::string s) {
+    for (char& c : s)
+        if (c >= 'a' && c <= 'z') c -= 32;
+    return s;
+}
+
+// ---------------------------------------------------------------------------- Node
+JSFN(nodeType) {
+    Node* n = thisNode(ci);
+    int t = n->type == Node::T::Document ? 9 : n->type == Node::T::Text ? 3 : n->type == Node::T::Comment ? 8 : Impl::isFragment(n) ? 11 : 1;
+    return Value::i32(t);
+}
+JSFN(nodeName) {
+    Node* n = thisNode(ci);
+    switch (n->type) {
+        case Node::T::Document: return ci.vm.strv("#document");
+        case Node::T::Text: return ci.vm.strv("#text");
+        case Node::T::Comment: return ci.vm.strv("#comment");
+        default: return val8(ci.vm, Impl::isFragment(n) ? n->name : upper(n->name));
+    }
+}
+JSFN(nodeValueGet) {
+    Node* n = thisNode(ci);
+    return n->type == Node::T::Text || n->type == Node::T::Comment ? val8(ci.vm, n->text) : Value::null();
+}
+JSFN(nodeValueSet) {
+    Node* n = thisNode(ci);
+    if (n->type == Node::T::Text || n->type == Node::T::Comment) I(ci.vm).setText(n, ci.arg(0).isNull() ? "" : str8(ci.vm, ci.arg(0)));
+    return Value::undef();
+}
+JSFN(textContentGet) {
+    Node* n = thisNode(ci);
+    if (n->type == Node::T::Document) return Value::null();
+    return val8(ci.vm, n->type == Node::T::Comment ? n->text : text_content(n));
+}
+JSFN(textContentSet) {
+    Node* n = thisNode(ci);
+    I(ci.vm).setText(n, ci.arg(0).isNullish() ? "" : str8(ci.vm, ci.arg(0)));
+    return Value::undef();
+}
+JSFN(parentNode) { return I(ci.vm).wrap(thisNode(ci)->parent); }
+JSFN(parentElement) {
+    Node* p = thisNode(ci)->parent;
+    return I(ci.vm).wrap(p && p->type == Node::T::Element ? p : nullptr);
+}
+JSFN(childNodes) {
+    Node* n = thisNode(ci);
+    std::vector<Node*> out;
+    for (auto& k : n->kids) out.push_back(k.get());
+    return I(ci.vm).list(out);
+}
+JSFN(children) {
+    Node* n = thisNode(ci);
+    std::vector<Node*> out;
+    for (auto& k : n->kids)
+        if (k->type == Node::T::Element) out.push_back(k.get());
+    return I(ci.vm).list(out);
+}
+JSFN(childElementCount) {
+    int c = 0;
+    for (auto& k : thisNode(ci)->kids)
+        if (k->type == Node::T::Element) ++c;
+    return Value::i32(c);
+}
+// One native serves firstChild, lastElementChild, nextSibling...: data holds which one.
+JSFN(relative) {
+    Node* n = thisNode(ci);
+    int w = ci.callee->data.asInt();
+    Node* r = nullptr;
+    switch (w) {
+        case 0: r = edgeChild(n, false, false); break;
+        case 1: r = edgeChild(n, true, false); break;
+        case 2: r = edgeChild(n, false, true); break;
+        case 3: r = edgeChild(n, true, true); break;
+        case 4: r = sibling(n, 1, false); break;
+        case 5: r = sibling(n, -1, false); break;
+        case 6: r = sibling(n, 1, true); break;
+        default: r = sibling(n, -1, true);
+    }
+    return I(ci.vm).wrap(r);
+}
+JSFN(ownerDocument) {
+    Node* n = thisNode(ci);
+    return n->type == Node::T::Document ? Value::null() : I(ci.vm).wrap(I(ci.vm).docNode());
+}
+JSFN(nodeIsConnected) { return Value::boolean(isConnected(thisNode(ci))); }
+JSFN(appendChild) {
+    Node* p = thisNode(ci);
+    Node* c = argNode(ci, 0, "appendChild");
+    I(ci.vm).insert(p, c, nullptr);
+    return ci.arg(0);
+}
+JSFN(insertBefore) {
+    Node* p = thisNode(ci);
+    Node* c = argNode(ci, 0, "insertBefore");
+    Node* ref = toNode(ci.arg(1));
+    if (ref && ref->parent != p) ci.vm.throwError(Err::Error, "NotFoundError: the reference node is not a child of this node");
+    I(ci.vm).insert(p, c, ref);
+    return ci.arg(0);
+}
+JSFN(removeChild) {
+    Node* p = thisNode(ci);
+    Node* c = argNode(ci, 0, "removeChild");
+    if (c->parent != p) ci.vm.throwError(Err::Error, "NotFoundError: the node to be removed is not a child of this node");
+    I(ci.vm).remove(c);
+    return ci.arg(0);
+}
+JSFN(replaceChild) {
+    Node* p = thisNode(ci);
+    Node* fresh = argNode(ci, 0, "replaceChild");
+    Node* old = argNode(ci, 1, "replaceChild");
+    if (old->parent != p) ci.vm.throwError(Err::Error, "NotFoundError: the node to be replaced is not a child of this node");
+    if (fresh != old) {
+        I(ci.vm).insert(p, fresh, old);
+        I(ci.vm).remove(old);
+    }
+    return ci.arg(1);
+}
+JSFN(cloneNode) {
+    Impl& im = I(ci.vm);
+    return im.wrap(im.clone(thisNode(ci), ci.vm.toBool(ci.arg(0))));
+}
+JSFN(nodeContains) {
+    Node* n = thisNode(ci);
+    for (Node* o = toNode(ci.arg(0)); o; o = o->parent)
+        if (o == n) return Value::boolean(true);
+    return Value::boolean(false);
+}
+JSFN(hasChildNodes) { return Value::boolean(!thisNode(ci)->kids.empty()); }
+JSFN(nodeRemove) {
+    I(ci.vm).remove(thisNode(ci));
+    return Value::undef();
+}
+JSFN(getRootNode) {
+    Node* n = thisNode(ci);
+    while (n->parent) n = n->parent;
+    return I(ci.vm).wrap(n);
+}
+JSFN(compareDocumentPosition) {
+    Node* a = thisNode(ci);
+    Node* b = toNode(ci.arg(0));
+    if (!b || a == b) return Value::i32(0);
+    for (Node* p = b->parent; p; p = p->parent)
+        if (p == a) return Value::i32(20);  // contained by, following
+    for (Node* p = a->parent; p; p = p->parent)
+        if (p == b) return Value::i32(10);  // contains, preceding
+    return Value::i32(isConnected(a) && isConnected(b) ? 4 : 1);
+}
+// append / prepend / before / after / replaceWith / replaceChildren: data holds which one.
+JSFN(insertMany) {
+    Impl& im = I(ci.vm);
+    Node* n = thisNode(ci);
+    int w = ci.callee->data.asInt();
+    Node* parent = w <= 1 || w == 5 ? n : n->parent;
+    if (!parent) return Value::undef();
+    Node* before = w == 0 || w == 5 ? nullptr : w == 1 ? edgeChild(n, false, false) : w == 2 ? n : w == 3 ? sibling(n, 1, false) : n;
+    if (w == 5) im.clearChildren(n);
+    for (int i = 0; i < ci.argc; ++i) im.insert(parent, nodeOrText(ci, ci.args[i]), before);
+    if (w == 4) im.remove(n);
+    im.changed();
+    return Value::undef();
+}
+
+// ---------------------------------------------------------------------------- queries
+JSFN(querySelector) {
+    Impl& im = I(ci.vm);
+    Node* root = thisNode(ci);
+    const auto& sels = im.selectors(str8(ci.vm, ci.arg(0)));
+    Node* found = nullptr;
+    eachElement(root, [&](Node* e) {
+        if (!Impl::matches(sels, e)) return true;
+        found = e;
+        return false;
+    });
+    return im.wrap(found);
+}
+JSFN(querySelectorAll) {
+    Impl& im = I(ci.vm);
+    Node* root = thisNode(ci);
+    const auto& sels = im.selectors(str8(ci.vm, ci.arg(0)));
+    std::vector<Node*> out;
+    eachElement(root, [&](Node* e) {
+        if (Impl::matches(sels, e)) out.push_back(e);
+        return true;
+    });
+    return im.list(out);
+}
+JSFN(elementMatches) {
+    Impl& im = I(ci.vm);
+    Node* e = thisElem(ci);
+    return Value::boolean(Impl::matches(im.selectors(str8(ci.vm, ci.arg(0))), e));
+}
+JSFN(elementClosest) {
+    Impl& im = I(ci.vm);
+    const auto& sels = im.selectors(str8(ci.vm, ci.arg(0)));
+    for (Node* e = thisElem(ci); e && e->type == Node::T::Element; e = e->parent)
+        if (Impl::matches(sels, e)) return im.wrap(e);
+    return Value::null();
+}
+JSFN(getElementById) {
+    Impl& im = I(ci.vm);
+    std::string id = str8(ci.vm, ci.arg(0));
+    Node* found = nullptr;
+    eachElement(thisNode(ci), [&](Node* e) {
+        if (e->id != id) return true;
+        found = e;
+        return false;
+    });
+    return im.wrap(found);
+}
+JSFN(getElementsByTagName) {
+    std::string tag = lower(str8(ci.vm, ci.arg(0)));
+    std::vector<Node*> out;
+    eachElement(thisNode(ci), [&](Node* e) {
+        if (tag == "*" || e->name == tag) out.push_back(e);
+        return true;
+    });
+    return I(ci.vm).list(out);
+}
+JSFN(getElementsByClassName) {
+    std::string names = str8(ci.vm, ci.arg(0));
+    std::vector<std::string> want;
+    size_t i = 0;
+    while (i < names.size()) {
+        while (i < names.size() && isws(names[i])) ++i;
+        size_t st = i;
+        while (i < names.size() && !isws(names[i])) ++i;
+        if (i > st) want.push_back(names.substr(st, i - st));
+    }
+    std::vector<Node*> out;
+    eachElement(thisNode(ci), [&](Node* e) {
+        for (auto& w : want)
+            if (std::find(e->classes.begin(), e->classes.end(), w) == e->classes.end()) return true;
+        if (!want.empty()) out.push_back(e);
+        return true;
+    });
+    return I(ci.vm).list(out);
+}
+JSFN(getElementsByName) {
+    std::string name = str8(ci.vm, ci.arg(0));
+    std::vector<Node*> out;
+    eachElement(thisNode(ci), [&](Node* e) {
+        const std::string* a = e->attr("name");
+        if (a && *a == name) out.push_back(e);
+        return true;
+    });
+    return I(ci.vm).list(out);
+}
+JSFN(nodeListItem) {
+    if (!ci.thisv.isObject() || ci.thisv.asObject()->cls != Cls::Array) return Value::null();
+    JSArray* a = (JSArray*)ci.thisv.asObject();
+    double i = ci.vm.toInteger(ci.arg(0));
+    return i >= 0 && i < (double)a->elems.size() ? a->elems[(size_t)i] : Value::null();
+}
+
+// ---------------------------------------------------------------------------- Element
+JSFN(tagName) { return val8(ci.vm, upper(thisElem(ci)->name)); }
+JSFN(localName) { return val8(ci.vm, thisElem(ci)->name); }
+JSFN(getAttribute) {
+    const std::string* v = thisElem(ci)->attr(lower(str8(ci.vm, ci.arg(0))));
+    return v ? val8(ci.vm, *v) : Value::null();
+}
+JSFN(setAttribute) {
+    Node* n = thisElem(ci);
+    setAttr(n, lower(str8(ci.vm, ci.arg(0))), str8(ci.vm, ci.arg(1)));
+    I(ci.vm).changed();
+    return Value::undef();
+}
+JSFN(removeAttribute) {
+    removeAttr(thisElem(ci), lower(str8(ci.vm, ci.arg(0))));
+    I(ci.vm).changed();
+    return Value::undef();
+}
+JSFN(hasAttribute) { return Value::boolean(thisElem(ci)->attr(lower(str8(ci.vm, ci.arg(0)))) != nullptr); }
+JSFN(toggleAttribute) {
+    Node* n = thisElem(ci);
+    std::string name = lower(str8(ci.vm, ci.arg(0)));
+    bool on = ci.argc > 1 ? ci.vm.toBool(ci.args[1]) : !n->attr(name);
+    if (on) setAttr(n, name, n->attr(name) ? *n->attr(name) : "");
+    else removeAttr(n, name);
+    I(ci.vm).changed();
+    return Value::boolean(on);
+}
+JSFN(getAttributeNames) {
+    JSArray* a = ci.vm.newArray();
+    for (auto& at : thisElem(ci)->attrs) a->elems.push_back(val8(ci.vm, at.first));
+    return V(a);
+}
+JSFN(attributesGet) {
+    Vm& vm = ci.vm;
+    JSArray* a = vm.newArray();
+    for (auto& at : thisElem(ci)->attrs) {
+        JSObject* o = vm.newObject();
+        vm.def(o, "name", val8(vm, at.first), PF_ALL);
+        vm.def(o, "value", val8(vm, at.second), PF_ALL);
+        a->elems.push_back(V(o));
+    }
+    return V(a);
+}
+// Properties that mirror an attribute. data: attribute name, data2: 0 text, 1 boolean, 2 URL, 3 number.
+JSFN(reflectGet) {
+    Vm& vm = ci.vm;
+    Node* n = thisElem(ci);
+    std::string attr = utf16to8(ci.callee->data.asString()->s);
+    const std::string* v = n->attr(attr);
+    switch (ci.callee->data2.asInt()) {
+        case 1: return Value::boolean(v != nullptr);
+        case 2: return v ? val8(vm, resolve_url(I(vm).doc.baseUrl, *v)) : V(vm.a.empty);
+        case 3: return Value::num(v ? atof(v->c_str()) : (attr == "tabindex" ? -1.0 : 0.0));
+        default: return v ? val8(vm, *v) : V(vm.a.empty);
+    }
+}
+JSFN(reflectSet) {
+    Vm& vm = ci.vm;
+    Node* n = thisElem(ci);
+    std::string attr = utf16to8(ci.callee->data.asString()->s);
+    if (ci.callee->data2.asInt() == 1) {
+        if (vm.toBool(ci.arg(0))) setAttr(n, attr, "");
+        else removeAttr(n, attr);
+    } else
+        setAttr(n, attr, str8(vm, ci.arg(0)));
+    I(vm).changed();
+    return Value::undef();
+}
+JSFN(innerHTMLGet) {
+    std::string out;
+    for (auto& k : thisNode(ci)->kids) serialize(k.get(), out);
+    return val8(ci.vm, out);
+}
+JSFN(innerHTMLSet) {
+    I(ci.vm).setInner(thisElem(ci), ci.arg(0).isNull() ? "" : str8(ci.vm, ci.arg(0)));
+    return Value::undef();
+}
+JSFN(outerHTMLGet) {
+    std::string out;
+    serialize(thisElem(ci), out);
+    return val8(ci.vm, out);
+}
+JSFN(outerHTMLSet) {
+    Impl& im = I(ci.vm);
+    Node* n = thisElem(ci);
+    if (!n->parent) return Value::undef();
+    Node* tmp = im.newElement("div");
+    im.setInner(tmp, str8(ci.vm, ci.arg(0)));
+    std::vector<Node*> kids;
+    for (auto& k : tmp->kids) kids.push_back(k.get());
+    for (Node* k : kids) im.insert(n->parent, k, n);
+    im.remove(n);
+    return Value::undef();
+}
+JSFN(insertAdjacent) {  // data: 0 HTML, 1 element, 2 text
+    Impl& im = I(ci.vm);
+    Node* n = thisElem(ci);
+    std::string where = lower(str8(ci.vm, ci.arg(0)));
+    int kind = ci.callee->data.asInt();
+    std::vector<Node*> items;
+    if (kind == 0) {
+        Node* tmp = im.newElement(n->name == "tr" || n->name == "tbody" || n->name == "table" ? n->name : std::string("div"));
+        im.setInner(tmp, str8(ci.vm, ci.arg(1)));
+        for (auto& k : tmp->kids) items.push_back(k.get());
+    } else if (kind == 1) {
+        items.push_back(argNode(ci, 1, "insertAdjacentElement"));
+    } else
+        items.push_back(im.newText(str8(ci.vm, ci.arg(1))));
+    Node* parent = where == "afterbegin" || where == "beforeend" ? n : n->parent;
+    if (!parent) return Value::null();
+    Node* before = where == "beforebegin" ? n : where == "afterbegin" ? edgeChild(n, false, false) : where == "afterend" ? sibling(n, 1, false) : nullptr;
+    for (Node* it : items) im.insert(parent, it, before);
+    return kind == 1 ? ci.arg(1) : Value::undef();
+}
+
+struct Box {
+    float x = 0, y = 0, w = 0, h = 0;
+};
+Box boxOf(Impl& im, Node* n) {
+    im.client.ensureLayout();
+    Box b;
+    if (n->hasBox) b = {n->bx, n->by, n->bw, n->bh};
+    return b;
+}
+JSFN(getBoundingClientRect) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    Box b = boxOf(im, thisElem(ci));
+    float vw, vh, sy;
+    im.client.viewport(vw, vh, sy);
+    JSObject* r = vm.newObject();
+    double y = b.y - sy;
+    const char* names[] = {"x", "y", "width", "height", "left", "top", "right", "bottom"};
+    double vals[] = {b.x, y, b.w, b.h, b.x, y, b.x + b.w, y + b.h};
+    for (int i = 0; i < 8; ++i) vm.def(r, names[i], Value::num(vals[i]), PF_ALL);
+    return V(r);
+}
+JSFN(getClientRects) {
+    JSArray* a = ci.vm.newArray();
+    a->elems.push_back(getBoundingClientRect(ci));
+    return V(a);
+}
+JSFN(metric) {  // data: 0 width, 1 height, 2 left, 3 top, 4 scrollTop/scrollLeft and other zeros
+    Impl& im = I(ci.vm);
+    Node* n = thisElem(ci);
+    int w = ci.callee->data.asInt();
+    if (w == 4) return Value::i32(0);
+    Box b = boxOf(im, n);
+    if ((n->name == "html" || n->name == "body") && w <= 1) {
+        float vw, vh, sy;
+        im.client.viewport(vw, vh, sy);
+        if (w == 0) return Value::num(std::round(vw));
+        if (ci.callee->data2.asInt() == 1) return Value::num(std::round(vh));  // clientHeight of the root is the viewport
+    }
+    return Value::num(std::round(w == 0 ? b.w : w == 1 ? b.h : w == 2 ? b.x : b.y));
+}
+JSFN(offsetParent) {
+    Node* n = thisElem(ci);
+    return I(ci.vm).wrap(n->name == "body" || n->name == "html" ? nullptr : I(ci.vm).doc.body);
+}
+JSFN(scrollIntoView) {
+    Impl& im = I(ci.vm);
+    Box b = boxOf(im, thisElem(ci));
+    im.client.scrollTo(b.y);
+    return Value::undef();
+}
+JSFN(elementFocus) {
+    I(ci.vm).client.focusNode(thisElem(ci));
+    return Value::undef();
+}
+JSFN(elementBlur) {
+    Impl& im = I(ci.vm);
+    if (im.client.focusedNode() == thisElem(ci)) im.client.focusNode(nullptr);
+    return Value::undef();
+}
+JSFN(elementClick) {
+    Impl& im = I(ci.vm);
+    Node* n = thisElem(ci);
+    Value ev = im.makeEvent("click", true, true);
+    im.fire(n, ev);
+    return Value::undef();
+}
+bool isControl(const Node* n) { return n->name == "input" || n->name == "textarea" || n->name == "select"; }
+JSFN(valueGet) {
+    Vm& vm = ci.vm;
+    Node* n = thisElem(ci);
+    if (isControl(n) && isConnected(n)) {
+        std::wstring v = I(vm).client.formValue(n);
+        return vm.strv(std::u16string(v.begin(), v.end()));
+    }
+    const std::string* a = n->attr("value");
+    if (!a && n->name == "textarea") return val8(vm, text_content(n));
+    if (!a && n->name == "option") return val8(vm, std::string(trim(text_content(n))));
+    return a ? val8(vm, *a) : V(vm.a.empty);
+}
+JSFN(valueSet) {
+    Vm& vm = ci.vm;
+    Node* n = thisElem(ci);
+    const std::u16string& s = vm.toStr16(ci.arg(0));
+    if (isControl(n) && isConnected(n)) I(vm).client.setFormValue(n, std::wstring(s.begin(), s.end()));
+    else setAttr(n, "value", utf16to8(s));
+    I(vm).changed();
+    return Value::undef();
+}
+JSFN(checkedGet) {
+    Node* n = thisElem(ci);
+    if (n->name == "input" && isConnected(n)) return Value::boolean(I(ci.vm).client.formChecked(n));
+    return Value::boolean(n->attr("checked") != nullptr);
+}
+JSFN(checkedSet) {
+    Node* n = thisElem(ci);
+    bool on = ci.vm.toBool(ci.arg(0));
+    if (n->name == "input" && isConnected(n)) I(ci.vm).client.setFormChecked(n, on);
+    else if (on) setAttr(n, "checked", "");
+    else removeAttr(n, "checked");
+    I(ci.vm).changed();
+    return Value::undef();
+}
+JSFN(formGet) {
+    for (Node* p = thisElem(ci)->parent; p; p = p->parent)
+        if (p->is("form")) return I(ci.vm).wrap(p);
+    return Value::null();
+}
+
+// ---- classList
+std::string joinClasses(const Node* n) {
+    std::string s;
+    for (auto& c : n->classes) s += (s.empty() ? "" : " ") + c;
+    return s;
+}
+JSFN(classListGet) {
+    Vm& vm = ci.vm;
+    Node* n = thisElem(ci);
+    JSHost* h = vm.alloc<JSHost>();
+    h->hostKind = HK_ClassList;
+    h->ptr = n;
+    h->proto = I(vm).classListProto;
+    return V(h);
+}
+JSFN(classListOp) {  // data: 0 add, 1 remove, 2 toggle, 3 contains, 4 replace
+    Vm& vm = ci.vm;
+    Node* n = (Node*)thisHost(ci, HK_ClassList)->ptr;
+    int op = ci.callee->data.asInt();
+    auto has = [&](const std::string& c) { return std::find(n->classes.begin(), n->classes.end(), c) != n->classes.end(); };
+    auto drop = [&](const std::string& c) { n->classes.erase(std::remove(n->classes.begin(), n->classes.end(), c), n->classes.end()); };
+    Value result = Value::undef();
+    if (op == 3) return Value::boolean(has(str8(vm, ci.arg(0))));
+    if (op == 2) {
+        std::string c = str8(vm, ci.arg(0));
+        bool on = ci.argc > 1 ? vm.toBool(ci.args[1]) : !has(c);
+        if (on && !has(c)) n->classes.push_back(c);
+        if (!on) drop(c);
+        result = Value::boolean(on);
+    } else if (op == 4) {
+        std::string from = str8(vm, ci.arg(0)), to = str8(vm, ci.arg(1));
+        bool had = has(from);
+        if (had) {
+            drop(from);
+            if (!has(to)) n->classes.push_back(to);
+        }
+        result = Value::boolean(had);
+    } else {
+        for (int i = 0; i < ci.argc; ++i) {
+            std::string c = str8(vm, ci.args[i]);
+            if (c.empty()) continue;
+            if (op == 0 && !has(c)) n->classes.push_back(c);
+            if (op == 1) drop(c);
+        }
+    }
+    setAttr(n, "class", joinClasses(n));
+    I(vm).changed();
+    return result;
+}
+JSFN(classListLength) { return Value::num((double)((Node*)thisHost(ci, HK_ClassList)->ptr)->classes.size()); }
+JSFN(classListValue) { return val8(ci.vm, joinClasses((Node*)thisHost(ci, HK_ClassList)->ptr)); }
+JSFN(classListItem) {
+    Node* n = (Node*)thisHost(ci, HK_ClassList)->ptr;
+    double i = ci.vm.toInteger(ci.arg(0));
+    return i >= 0 && i < (double)n->classes.size() ? val8(ci.vm, n->classes[(size_t)i]) : Value::null();
+}
+
+// ---- style and dataset: objects whose properties live in an attribute
+std::string kebab(const std::u16string& name) {
+    std::string out;
+    for (char16_t c : name) {
+        if (c >= 'A' && c <= 'Z') {
+            out += '-';
+            out += (char)(c + 32);
+        } else
+            out += (char)c;
+    }
+    return out;
+}
+std::string cssName(const std::u16string& prop) {
+    if (prop == u"cssFloat") return "float";
+    if (prop.find(u'-') != std::u16string::npos) return utf16to8(prop);
+    std::string k = kebab(prop);
+    if (k.rfind("webkit-", 0) == 0 || k.rfind("moz-", 0) == 0 || k.rfind("ms-", 0) == 0) k = "-" + k;
+    return k;
+}
+std::string styleValue(const Node* n, const std::string& name) {
+    std::string val;
+    if (const std::string* st = n->attr("style"))
+        for (auto& d : parse_decls(*st))
+            if (d.prop == name) val = d.val;
+    return val;
+}
+void setStyleProp(Impl& im, Node* n, const std::string& name, const std::string& value, bool important = false) {
+    std::vector<Decl> decls;
+    if (const std::string* st = n->attr("style")) decls = parse_decls(*st);
+    decls.erase(std::remove_if(decls.begin(), decls.end(), [&](const Decl& d) { return d.prop == name; }), decls.end());
+    if (!value.empty()) decls.push_back({name, value, important});
+    std::string out;
+    for (auto& d : decls) out += d.prop + ": " + d.val + (d.important ? " !important" : "") + "; ";
+    if (!out.empty()) out.pop_back();
+    setAttr(n, "style", out);
+    im.changed();
+}
+bool ownsKey(JSObject* o, PropKey k) { return !k.isString() || (o->proto && o->proto->find(k)); }
+bool styleHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
+    if (ownsKey(o, k)) return false;
+    out = val8(vm, styleValue((Node*)((JSHost*)o)->ptr, cssName(k.str()->s)));
+    return true;
+}
+bool styleHookSet(Vm& vm, JSObject* o, PropKey k, Value v) {
+    if (ownsKey(o, k)) return false;
+    setStyleProp(I(vm), (Node*)((JSHost*)o)->ptr, cssName(k.str()->s), v.isNullish() ? "" : str8(vm, v));
+    return true;
+}
+const HostHooks kStyleHooks{styleHookGet, styleHookSet, nullptr, nullptr};
+JSFN(styleGet) {
+    Vm& vm = ci.vm;
+    Node* n = thisElem(ci);
+    JSHost* h = vm.alloc<JSHost>();
+    h->hostKind = HK_Style;
+    h->ptr = n;
+    h->proto = I(vm).styleProto;
+    h->hooks = &kStyleHooks;
+    return V(h);
+}
+JSFN(styleSet) {  // el.style = "color: red"
+    setAttr(thisElem(ci), "style", str8(ci.vm, ci.arg(0)));
+    I(ci.vm).changed();
+    return Value::undef();
+}
+JSFN(styleSetProperty) {
+    Node* n = (Node*)thisHost(ci, HK_Style)->ptr;
+    setStyleProp(I(ci.vm), n, cssName(ci.vm.toStr16(ci.arg(0))), ci.arg(1).isNullish() ? "" : str8(ci.vm, ci.arg(1)), str8(ci.vm, ci.arg(2)) == "important");
+    return Value::undef();
+}
+JSFN(styleGetPropertyValue) { return val8(ci.vm, styleValue((Node*)thisHost(ci, HK_Style)->ptr, cssName(ci.vm.toStr16(ci.arg(0))))); }
+JSFN(styleRemoveProperty) {
+    Node* n = (Node*)thisHost(ci, HK_Style)->ptr;
+    std::string name = cssName(ci.vm.toStr16(ci.arg(0)));
+    std::string old = styleValue(n, name);
+    setStyleProp(I(ci.vm), n, name, "");
+    return val8(ci.vm, old);
+}
+JSFN(styleCssTextGet) {
+    const std::string* st = ((Node*)thisHost(ci, HK_Style)->ptr)->attr("style");
+    return st ? val8(ci.vm, *st) : V(ci.vm.a.empty);
+}
+JSFN(styleCssTextSet) {
+    setAttr((Node*)thisHost(ci, HK_Style)->ptr, "style", str8(ci.vm, ci.arg(0)));
+    I(ci.vm).changed();
+    return Value::undef();
+}
+
+std::string dataAttr(PropKey k) { return "data-" + kebab(k.str()->s); }
+bool dataHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
+    if (!k.isString()) return false;
+    const std::string* v = ((Node*)((JSHost*)o)->ptr)->attr(dataAttr(k));
+    if (!v) return false;
+    out = val8(vm, *v);
+    return true;
+}
+bool dataHookSet(Vm& vm, JSObject* o, PropKey k, Value v) {
+    if (!k.isString()) return false;
+    setAttr((Node*)((JSHost*)o)->ptr, dataAttr(k), str8(vm, v));
+    I(vm).changed();
+    return true;
+}
+bool dataHookDel(Vm& vm, JSObject* o, PropKey k) {
+    if (!k.isString()) return false;
+    removeAttr((Node*)((JSHost*)o)->ptr, dataAttr(k));
+    I(vm).changed();
+    return true;
+}
+void dataHookKeys(Vm& vm, JSObject* o, std::vector<PropKey>& out) {
+    for (auto& a : ((Node*)((JSHost*)o)->ptr)->attrs) {
+        if (a.first.rfind("data-", 0) != 0) continue;
+        std::u16string name;
+        bool up = false;
+        for (size_t i = 5; i < a.first.size(); ++i) {
+            char c = a.first[i];
+            if (c == '-') up = true;
+            else name += (char16_t)(up && c >= 'a' && c <= 'z' ? c - 32 : c), up = false;
+        }
+        out.push_back(PropKey::of(vm.atom(std::u16string_view(name))));
+    }
+}
+const HostHooks kDataHooks{dataHookGet, dataHookSet, dataHookDel, dataHookKeys};
+JSFN(datasetGet) {
+    JSHost* h = ci.vm.alloc<JSHost>();
+    h->hostKind = HK_Dataset;
+    h->ptr = thisElem(ci);
+    h->proto = ci.vm.objectProto;
+    h->hooks = &kDataHooks;
+    return V(h);
+}
+
+// ---- getComputedStyle
+bool computedHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
+    if (ownsKey(o, k)) return false;
+    Node* n = (Node*)((JSHost*)o)->ptr;
+    std::string name = cssName(k.str()->s), val;
+    const Style* s = n->style.get();
+    char buf[64];
+    if (s) {
+        if (name == "display") val = display_name(s->display);
+        else if (name == "visibility") val = s->hidden ? "hidden" : "visible";
+        else if (name == "color") val = color_str(s->color);
+        else if (name == "background-color") val = color_str(s->bg);
+        else if (name == "opacity") val = s->opacity0 ? "0" : "1";
+        else if (name == "position") val = s->position == 1 ? "relative" : s->position == 2 ? "absolute" : s->position == 3 ? "fixed" : s->position == 4 ? "sticky" : "static";
+        else if (name == "font-size") snprintf(buf, sizeof buf, "%gpx", s->fontSize), val = buf;
+        else if (name == "font-weight") val = std::to_string(s->weight);
+        else if (name == "width" || name == "height") {
+            if (n->hasBox) snprintf(buf, sizeof buf, "%gpx", name == "width" ? n->bw : n->bh), val = buf;
+            else val = "auto";
+        } else
+            val = styleValue(n, name);
+    }
+    out = val8(vm, val);
+    return true;
+}
+const HostHooks kComputedHooks{computedHookGet, nullptr, nullptr, nullptr};
+JSFN(getComputedStyle) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    Node* n = toNode(ci.arg(0));
+    if (!n || n->type != Node::T::Element) vm.throwError(Err::TypeError, "getComputedStyle: parameter 1 is not an Element");
+    im.client.ensureLayout();
+    JSHost* h = vm.alloc<JSHost>();
+    h->hostKind = HK_Computed;
+    h->ptr = n;
+    h->proto = im.computedProto;
+    h->hooks = &kComputedHooks;
+    return V(h);
+}
+JSFN(computedGetPropertyValue) {
+    Value out;
+    JSHost* h = thisHost(ci, HK_Computed);
+    PropKey k = PropKey::of(ci.vm.atom(std::u16string_view(ci.vm.toStr16(ci.arg(0)))));
+    return computedHookGet(ci.vm, h, k, out) ? out : V(ci.vm.a.empty);
+}
+
+// ---------------------------------------------------------------------------- events
+const void* targetKey(CallInfo& ci, Node*& node) {
+    node = toNode(ci.thisv);
+    if (node) return node;
+    if (ci.thisv.isNullish() || (ci.thisv.isObject() && ci.thisv.asObject() == ci.vm.global)) return &I(ci.vm);
+    ci.vm.throwError(Err::TypeError, "Illegal invocation");
+}
+JSFN(addEventListener) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    Node* node = nullptr;
+    const void* key = targetKey(ci, node);
+    Value fn = ci.arg(1), opts = ci.arg(2);
+    if (!fn.isObject()) return Value::undef();
+    Listener l;
+    l.type = str8(vm, ci.arg(0));
+    l.fn = fn;
+    if (opts.isObject()) {
+        l.capture = vm.toBool(vm.get(opts, "capture"));
+        l.once = vm.toBool(vm.get(opts, "once"));
+    } else
+        l.capture = vm.toBool(opts);
+    auto& list = im.listeners[key];
+    for (auto& e : list)
+        if (e.type == l.type && e.fn == l.fn && e.capture == l.capture) return Value::undef();
+    list.push_back(l);
+    return Value::undef();
+}
+JSFN(removeEventListener) {
+    Vm& vm = ci.vm;
+    Node* node = nullptr;
+    const void* key = targetKey(ci, node);
+    Value opts = ci.arg(2);
+    bool capture = opts.isObject() ? vm.toBool(vm.get(opts, "capture")) : vm.toBool(opts);
+    I(vm).removeListener(key, str8(vm, ci.arg(0)), ci.arg(1), capture);
+    return Value::undef();
+}
+JSFN(dispatchEventFn) {
+    Vm& vm = ci.vm;
+    Node* node = nullptr;
+    targetKey(ci, node);
+    Value ev = ci.arg(0);
+    if (!ev.isObject() || ev.asObject()->cls != Cls::Host || ((JSHost*)ev.asObject())->hostKind != HK_Event)
+        vm.throwError(Err::TypeError, "dispatchEvent: parameter 1 is not an Event");
+    return Value::boolean(I(vm).fire(node, ev));
+}
+JSFN(eventCtor) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    if (!ci.isConstruct()) vm.throwError(Err::TypeError, "Event constructor requires 'new'");
+    Value init = ci.arg(1);
+    bool bubbles = init.isObject() && vm.toBool(vm.get(init, "bubbles")), cancelable = init.isObject() && vm.toBool(vm.get(init, "cancelable"));
+    Value ev = im.makeEvent(str8(vm, ci.arg(0)), bubbles, cancelable);
+    JSObject* e = ev.asObject();
+    e->proto = vm.protoFromNewTarget(ci.newTarget, im.eventProto);
+    vm.def(e, "isTrusted", Value::boolean(false), PF_ALL);
+    vm.def(e, "detail", Value::null(), PF_ALL);
+    if (init.isObject()) vm.copyDataProps(e, init, nullptr);
+    return ev;
+}
+JSFN(eventPreventDefault) {
+    JSHost* e = thisHost(ci, HK_Event);
+    if (ci.vm.toBool(ci.vm.get(ci.thisv, "cancelable"))) e->flagC = true;
+    return Value::undef();
+}
+JSFN(eventStopPropagation) {
+    thisHost(ci, HK_Event)->flagA = true;
+    return Value::undef();
+}
+JSFN(eventStopImmediate) {
+    JSHost* e = thisHost(ci, HK_Event);
+    e->flagA = e->flagB = true;
+    return Value::undef();
+}
+JSFN(eventDefaultPrevented) { return Value::boolean(thisHost(ci, HK_Event)->flagC); }
+JSFN(eventInit) {
+    Vm& vm = ci.vm;
+    thisHost(ci, HK_Event);
+    vm.set(ci.thisv, "type", V(vm.toString(ci.arg(0))));
+    vm.set(ci.thisv, "bubbles", Value::boolean(vm.toBool(ci.arg(1))));
+    vm.set(ci.thisv, "cancelable", Value::boolean(vm.toBool(ci.arg(2))));
+    if (ci.argc > 3) vm.set(ci.thisv, "detail", ci.args[3]);
+    return Value::undef();
+}
+JSFN(eventComposedPath) {
+    JSArray* a = ci.vm.newArray();
+    for (Node* n = toNode(ci.vm.get(ci.thisv, "target")); n; n = n->parent) a->elems.push_back(I(ci.vm).wrap(n));
+    a->elems.push_back(V(ci.vm.global));
+    return V(a);
+}
+JSFN(createEvent) {
+    Value ev = I(ci.vm).makeEvent("", false, false);
+    ci.vm.def(ev.asObject(), "detail", Value::null(), PF_ALL);
+    return ev;
+}
+
+// ---------------------------------------------------------------------------- timers and window
+Value addTimer(CallInfo& ci, int kind) {  // 0 timeout, 1 interval, 2 animation frame
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    Value fn = ci.arg(0);
+    if (fn.isString()) fn = vm.compileFunction(u"", fn.asString()->s, "timer");
+    if (!vm.isCallable(fn) || im.dead) return Value::i32(0);
+    double ms = kind == 2 ? 16 : ci.argc > 1 ? vm.toNumber(ci.args[1]) : 0;
+    if (!(ms > 0)) ms = 0;
+    if (kind == 1 && ms < 4) ms = 4;
+    Timer t;
+    t.id = im.nextTimer++;
+    t.due = now_ms() + ms;
+    t.interval = kind == 1 ? ms : -1;
+    t.fn = fn;
+    t.frame = kind == 2;
+    for (int i = 2; i < ci.argc && kind != 2; ++i) t.args.push_back(ci.args[i]);
+    im.timers.push_back(std::move(t));
+    im.client.wake(ms);
+    return Value::i32(im.timers.back().id);
+}
+JSFN(setTimeoutFn) { return addTimer(ci, 0); }
+JSFN(setIntervalFn) { return addTimer(ci, 1); }
+JSFN(requestAnimationFrameFn) { return addTimer(ci, 2); }
+JSFN(clearTimerFn) {
+    Impl& im = I(ci.vm);
+    int id = ci.vm.toInt32(ci.arg(0));
+    im.timers.erase(std::remove_if(im.timers.begin(), im.timers.end(), [id](const Timer& t) { return t.id == id; }), im.timers.end());
+    return Value::undef();
+}
+JSFN(alertFn) {
+    I(ci.vm).client.consoleMessage(1, L"alert: " + std::wstring(ci.vm.toStr16(ci.arg(0)).begin(), ci.vm.toStr16(ci.arg(0)).end()));
+    return Value::undef();
+}
+JSFN(confirmFn) { return Value::boolean(true); }
+JSFN(promptFn) { return Value::null(); }
+JSFN(noopFn) { return Value::undef(); }
+JSFN(performanceNow) { return Value::dbl(now_ms() - I(ci.vm).startMs); }
+JSFN(viewportGet) {  // data: 0 innerWidth, 1 innerHeight, 2 scrollY, 3 scrollX
+    float w, h, sy;
+    I(ci.vm).client.viewport(w, h, sy);
+    int which = ci.callee->data.asInt();
+    return Value::num(std::round(which == 0 ? w : which == 1 ? h : which == 2 ? sy : 0));
+}
+JSFN(scrollToFn) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    Value a0 = ci.arg(0);
+    double y = a0.isObject() ? vm.toNumber(vm.get(a0, "top")) : vm.toNumber(ci.arg(1));
+    if (ci.callee->data.asInt() == 1) {  // scrollBy
+        float w, h, sy;
+        im.client.viewport(w, h, sy);
+        y += sy;
+    }
+    if (y == y) im.client.scrollTo((float)y);
+    return Value::undef();
+}
+JSFN(matchMediaFn) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    std::string q = lower(str8(vm, ci.arg(0)));
+    float w, h, sy;
+    im.client.viewport(w, h, sy);
+    bool ok = !contains(q, "print") && !contains(q, "prefers-color-scheme: dark") && !contains(q, "prefers-reduced-motion: reduce") && !contains(q, "hover: none") && !contains(q, "pointer: coarse");
+    auto bound = [&](const char* key, bool isMin) {
+        size_t p = q.find(key);
+        if (p == std::string::npos) return;
+        double v = atof(q.c_str() + p + strlen(key));
+        if (contains(std::string_view(q).substr(p, 40), "em")) v *= 16;
+        if (isMin ? w < v : w > v) ok = false;
+    };
+    bound("min-width:", true);
+    bound("max-width:", false);
+    JSObject* o = vm.newObject();
+    vm.def(o, "matches", Value::boolean(ok), PF_ALL);
+    vm.def(o, "media", ci.arg(0), PF_ALL);
+    for (const char* n : {"addListener", "removeListener", "addEventListener", "removeEventListener"}) vm.defFn(o, n, noopFn, 1);
+    return V(o);
+}
+static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+JSFN(btoaFn) {
+    Vm& vm = ci.vm;
+    const std::u16string& s = vm.toStr16(ci.arg(0));
+    std::string out;
+    for (size_t i = 0; i < s.size(); i += 3) {
+        uint32_t b[3] = {0, 0, 0};
+        size_t n = std::min<size_t>(3, s.size() - i);
+        for (size_t k = 0; k < n; ++k) {
+            if (s[i + k] > 255) vm.throwError(Err::Error, "InvalidCharacterError: btoa: the string contains characters outside of the Latin1 range");
+            b[k] = s[i + k];
+        }
+        uint32_t v = (b[0] << 16) | (b[1] << 8) | b[2];
+        out += kB64[v >> 18];
+        out += kB64[(v >> 12) & 63];
+        out += n > 1 ? kB64[(v >> 6) & 63] : '=';
+        out += n > 2 ? kB64[v & 63] : '=';
+    }
+    return vm.strv(out);
+}
+JSFN(atobFn) {
+    Vm& vm = ci.vm;
+    std::string in = str8(vm, ci.arg(0));
+    std::u16string out;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : in) {
+        if (isws(c) || c == '=') continue;
+        const char* p = strchr(kB64, c);
+        if (!p || !c) vm.throwError(Err::Error, "InvalidCharacterError: atob: the string is not correctly encoded");
+        acc = (acc << 6) | (uint32_t)(p - kB64);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += (char16_t)((acc >> bits) & 255);
+        }
+    }
+    return vm.strv(std::move(out));
+}
+
+// ---- location
+JSFN(locationGet) {  // data: which part
+    Vm& vm = ci.vm;
+    Url u = Url::parse(I(vm).url);
+    std::string v;
+    switch (ci.callee->data.asInt()) {
+        case 0: v = I(vm).url; break;
+        case 1: v = u.scheme + ":"; break;
+        case 2: v = u.hostport(); break;
+        case 3: v = u.host; break;
+        case 4: v = u.port; break;
+        case 5: v = u.path.empty() ? "/" : u.path; break;
+        case 6: v = u.hasQuery && !u.query.empty() ? "?" + u.query : ""; break;
+        case 7: v = u.hasFragment && !u.fragment.empty() ? "#" + u.fragment : ""; break;
+        default: v = u.hierarchical && !u.host.empty() ? u.origin() : "null";
+    }
+    return val8(vm, v);
+}
+JSFN(locationSet) {  // href, hash, search, pathname assignments and assign()/replace(): data2 = 1 for replace
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    std::string v = str8(vm, ci.arg(0));
+    int which = ci.callee->data.asInt();
+    if (which == 7 && !v.empty() && v[0] != '#') v = "#" + v;
+    if (which == 6 && !v.empty() && v[0] != '?') v = "?" + v;
+    im.client.navigate(resolve_url(im.url, v), ci.callee->data2.asInt() == 1);
+    return Value::undef();
+}
+JSFN(locationReload) {
+    I(ci.vm).client.navigate(I(ci.vm).url, true);
+    return Value::undef();
+}
+JSFN(locationToString) { return val8(ci.vm, I(ci.vm).url); }
+JSFN(historyPushState) {  // pushState / replaceState: the address changes without a load
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    im.historyState = ci.arg(0);
+    if (!ci.arg(2).isNullish()) {
+        std::string next = resolve_url(im.url, str8(vm, ci.arg(2)));
+        Url a = Url::parse(im.url), b = Url::parse(next);
+        if (a.origin() != b.origin()) vm.throwError(Err::Error, "SecurityError: history state URLs must stay on the same origin");
+        im.url = next;
+        im.client.urlChanged(next);
+    }
+    return Value::undef();
+}
+JSFN(historyStateGet) { return I(ci.vm).historyState; }
+
+// ---- storage
+Store& storeOf(JSObject* o) { return *(Store*)((JSHost*)o)->ptr; }
+bool storageHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
+    if (ownsKey(o, k)) return false;
+    for (auto& e : storeOf(o))
+        if (e.first == k.str()->s) {
+            out = vm.strv(e.second);
+            return true;
+        }
+    return false;
+}
+void storePut(Store& s, const std::u16string& key, const std::u16string& val) {
+    for (auto& e : s)
+        if (e.first == key) {
+            e.second = val;
+            return;
+        }
+    s.push_back({key, val});
+}
+bool storageHookSet(Vm& vm, JSObject* o, PropKey k, Value v) {
+    if (ownsKey(o, k)) return false;
+    storePut(storeOf(o), k.str()->s, vm.toStr16(v));
+    return true;
+}
+bool storeErase(Store& s, const std::u16string& key) {
+    for (size_t i = 0; i < s.size(); ++i)
+        if (s[i].first == key) {
+            s.erase(s.begin() + i);
+            return true;
+        }
+    return false;
+}
+bool storageHookDel(Vm&, JSObject* o, PropKey k) { return k.isString() && storeErase(storeOf(o), k.str()->s); }
+void storageHookKeys(Vm& vm, JSObject* o, std::vector<PropKey>& out) {
+    for (auto& e : storeOf(o)) out.push_back(PropKey::of(vm.atom(std::u16string_view(e.first))));
+}
+const HostHooks kStorageHooks{storageHookGet, storageHookSet, storageHookDel, storageHookKeys};
+JSFN(storageOp) {  // data: 0 getItem, 1 setItem, 2 removeItem, 3 clear, 4 key, 5 length
+    Vm& vm = ci.vm;
+    Store& s = storeOf(thisHost(ci, HK_Storage));
+    switch (ci.callee->data.asInt()) {
+        case 0: {
+            std::u16string key = vm.toStr16(ci.arg(0));
+            for (auto& e : s)
+                if (e.first == key) return vm.strv(e.second);
+            return Value::null();
+        }
+        case 1: {
+            std::u16string key = vm.toStr16(ci.arg(0));
+            storePut(s, key, vm.toStr16(ci.arg(1)));
+            return Value::undef();
+        }
+        case 2: storeErase(s, vm.toStr16(ci.arg(0))); return Value::undef();
+        case 3: s.clear(); return Value::undef();
+        case 4: {
+            double i = vm.toInteger(ci.arg(0));
+            return i >= 0 && i < (double)s.size() ? vm.strv(s[(size_t)i].first) : Value::null();
+        }
+        default: return Value::num((double)s.size());
+    }
+}
+
+// ---------------------------------------------------------------------------- document
+JSFN(docElementGet) {  // data: 0 documentElement, 1 head, 2 body
+    Impl& im = I(ci.vm);
+    thisNode(ci);
+    int w = ci.callee->data.asInt();
+    return im.wrap(w == 0 ? im.doc.html : w == 1 ? im.doc.head : im.doc.body);
+}
+JSFN(docTitleGet) { return val8(ci.vm, I(ci.vm).doc.title); }
+JSFN(docTitleSet) {
+    Impl& im = I(ci.vm);
+    im.doc.title = str8(ci.vm, ci.arg(0));
+    im.client.titleChanged();
+    return Value::undef();
+}
+JSFN(docUrlGet) { return val8(ci.vm, I(ci.vm).url); }
+JSFN(docReadyState) { return val8(ci.vm, I(ci.vm).readyState); }
+JSFN(docCurrentScript) { return I(ci.vm).currentScript; }
+JSFN(docActiveElement) {
+    Impl& im = I(ci.vm);
+    Node* f = im.client.focusedNode();
+    return im.wrap(f ? f : im.doc.body);
+}
+JSFN(docDomain) { return val8(ci.vm, Url::parse(I(ci.vm).url).host); }
+JSFN(createElement) {
+    Impl& im = I(ci.vm);
+    return im.wrap(im.newElement(str8(ci.vm, ci.arg(ci.callee->data.asInt()))));  // createElementNS passes the name second
+}
+JSFN(createTextNode) {
+    Impl& im = I(ci.vm);
+    return im.wrap(im.newText(str8(ci.vm, ci.arg(0)), ci.callee->data.asInt() == 1 ? Node::T::Comment : Node::T::Text));
+}
+JSFN(createDocumentFragment) {
+    Impl& im = I(ci.vm);
+    Node* f = im.newElement("#document-fragment");
+    return im.wrap(f);
+}
+JSFN(docCollection) {  // data: 0 forms, 1 images, 2 links, 3 scripts
+    static const char* tags[] = {"form", "img", "a", "script"};
+    const char* tag = tags[ci.callee->data.asInt()];
+    std::vector<Node*> out;
+    eachElement(thisNode(ci), [&](Node* e) {
+        if (e->name == tag && (e->name != "a" || e->attr("href"))) out.push_back(e);
+        return true;
+    });
+    return I(ci.vm).list(out);
+}
+JSFN(docWrite) {  // late document.write: the text is parsed and appended to the body
+    Impl& im = I(ci.vm);
+    std::string html;
+    for (int i = 0; i < ci.argc; ++i) html += str8(ci.vm, ci.args[i]);
+    if (!im.doc.body) return Value::undef();
+    Node* tmp = im.newElement("div");
+    im.setInner(tmp, html);
+    std::vector<Node*> kids;
+    for (auto& k : tmp->kids) kids.push_back(k.get());
+    for (Node* k : kids) im.insert(im.doc.body, k, nullptr);
+    return Value::undef();
+}
+JSFN(trueFn) { return Value::boolean(true); }
+JSFN(emptyStringFn) { return V(ci.vm.a.empty); }
+JSFN(illegalCtor) { ci.vm.throwError(Err::TypeError, "Illegal constructor"); }
+JSFN(observerCtor) {  // MutationObserver and friends exist so that feature checks pass; they never fire yet
+    Vm& vm = ci.vm;
+    JSObject* o = vm.newObject(vm.protoFromNewTarget(ci.newTarget, ci.callee->data2.asObject()));
+    return V(o);
+}
+JSFN(emptyArrayFn) { return V(ci.vm.newArray()); }
+
+}  // namespace
+
+// ---------------------------------------------------------------------------- setup
+void ScriptHost::Impl::setup() {
+    vm.hostData = this;
+    vm.traceThrows = getenv("TB_TRACE_THROWS") != nullptr;
+    vm.onConsole = [this](int level, const std::u16string& s) { client.consoleMessage(level, std::wstring(s.begin(), s.end())); };
+    vm.rootTracers.push_back([this](Gc& g) {
+        for (auto& w : wrappers) g.mark(w.second);
+        for (auto& l : listeners)
+            for (auto& e : l.second) g.mark(e.fn);
+        for (auto& t : timers) {
+            g.mark(t.fn);
+            for (Value v : t.args) g.mark(v);
+        }
+        g.mark(currentScript);
+        g.mark(historyState);
+        for (JSObject* p : {nodeProto, elementProto, documentProto, textProto, eventProto, classListProto, styleProto, computedProto, nodeListProto, storageProto}) g.mark(p);
+    });
+    JSObject* G = vm.global;
+    auto getter = [&](JSObject* o, const char* name, NativeFn get, NativeFn set = nullptr, int data = 0, int data2 = 0) {
+        JSNative* g = vm.newNative(get, name, 0);
+        g->data = Value::i32(data);
+        g->data2 = Value::i32(data2);
+        Value s = Value::undef();
+        if (set) {
+            JSNative* sn = vm.newNative(set, name, 1);
+            sn->data = Value::i32(data);
+            sn->data2 = Value::i32(data2);
+            s = V(sn);
+        }
+        vm.defineAccessor(o, PropKey::of(vm.atom(name)), V(g), s, PF_C | PF_E);
+    };
+    auto method = [&](JSObject* o, const char* name, NativeFn fn, int len, int data = 0) {
+        JSNative* n = vm.defFn(o, name, fn, len);
+        n->data = Value::i32(data);
+        return n;
+    };
+
+    // ---- EventTarget + Node
+    nodeProto = vm.newObject();
+    for (JSObject* o : {nodeProto, G}) {
+        method(o, "addEventListener", addEventListener, 2);
+        method(o, "removeEventListener", removeEventListener, 2);
+        method(o, "dispatchEvent", dispatchEventFn, 1);
+    }
+    getter(nodeProto, "nodeType", nodeType);
+    getter(nodeProto, "nodeName", nodeName);
+    getter(nodeProto, "nodeValue", nodeValueGet, nodeValueSet);
+    getter(nodeProto, "data", nodeValueGet, nodeValueSet);
+    getter(nodeProto, "textContent", textContentGet, textContentSet);
+    getter(nodeProto, "parentNode", parentNode);
+    getter(nodeProto, "parentElement", parentElement);
+    getter(nodeProto, "childNodes", childNodes);
+    getter(nodeProto, "children", children);
+    getter(nodeProto, "childElementCount", childElementCount);
+    const char* rel[] = {"firstChild", "lastChild", "firstElementChild", "lastElementChild", "nextSibling", "previousSibling", "nextElementSibling", "previousElementSibling"};
+    for (int i = 0; i < 8; ++i) getter(nodeProto, rel[i], relative, nullptr, i);
+    getter(nodeProto, "ownerDocument", ownerDocument);
+    getter(nodeProto, "isConnected", nodeIsConnected);
+    getter(nodeProto, "baseURI", docUrlGet);
+    method(nodeProto, "appendChild", appendChild, 1);
+    method(nodeProto, "insertBefore", insertBefore, 2);
+    method(nodeProto, "removeChild", removeChild, 1);
+    method(nodeProto, "replaceChild", replaceChild, 2);
+    method(nodeProto, "cloneNode", cloneNode, 1);
+    method(nodeProto, "contains", nodeContains, 1);
+    method(nodeProto, "hasChildNodes", hasChildNodes, 0);
+    method(nodeProto, "remove", nodeRemove, 0);
+    method(nodeProto, "getRootNode", getRootNode, 0);
+    method(nodeProto, "compareDocumentPosition", compareDocumentPosition, 1);
+    const char* many[] = {"append", "prepend", "before", "after", "replaceWith", "replaceChildren"};
+    for (int i = 0; i < 6; ++i) method(nodeProto, many[i], insertMany, 0, i);
+    method(nodeProto, "querySelector", querySelector, 1);
+    method(nodeProto, "querySelectorAll", querySelectorAll, 1);
+    method(nodeProto, "getElementById", getElementById, 1);
+    method(nodeProto, "getElementsByTagName", getElementsByTagName, 1);
+    method(nodeProto, "getElementsByClassName", getElementsByClassName, 1);
+    const char* consts[] = {"ELEMENT_NODE", "TEXT_NODE", "COMMENT_NODE", "DOCUMENT_NODE", "DOCUMENT_FRAGMENT_NODE"};
+    int constVals[] = {1, 3, 8, 9, 11};
+    for (int i = 0; i < 5; ++i) vm.def(nodeProto, consts[i], Value::i32(constVals[i]), 0);
+
+    nodeListProto = vm.newObject(vm.arrayProto);
+    method(nodeListProto, "item", nodeListItem, 1);
+
+    // ---- Element
+    elementProto = vm.newObject(nodeProto);
+    getter(elementProto, "tagName", tagName);
+    getter(elementProto, "localName", localName);
+    method(elementProto, "getAttribute", getAttribute, 1);
+    method(elementProto, "setAttribute", setAttribute, 2);
+    method(elementProto, "removeAttribute", removeAttribute, 1);
+    method(elementProto, "hasAttribute", hasAttribute, 1);
+    method(elementProto, "toggleAttribute", toggleAttribute, 1);
+    method(elementProto, "getAttributeNames", getAttributeNames, 0);
+    getter(elementProto, "attributes", attributesGet);
+    getter(elementProto, "innerHTML", innerHTMLGet, innerHTMLSet);
+    getter(elementProto, "outerHTML", outerHTMLGet, outerHTMLSet);
+    getter(elementProto, "innerText", textContentGet, textContentSet);
+    method(elementProto, "insertAdjacentHTML", insertAdjacent, 2, 0);
+    method(elementProto, "insertAdjacentElement", insertAdjacent, 2, 1);
+    method(elementProto, "insertAdjacentText", insertAdjacent, 2, 2);
+    method(elementProto, "matches", elementMatches, 1);
+    method(elementProto, "webkitMatchesSelector", elementMatches, 1);
+    method(elementProto, "closest", elementClosest, 1);
+    method(elementProto, "getBoundingClientRect", getBoundingClientRect, 0);
+    method(elementProto, "getClientRects", getClientRects, 0);
+    struct {
+        const char* name;
+        int which, root;
+    } metrics[] = {{"offsetWidth", 0, 0}, {"offsetHeight", 1, 0}, {"offsetLeft", 2, 0}, {"offsetTop", 3, 0}, {"clientWidth", 0, 0},
+                   {"clientHeight", 1, 1}, {"scrollWidth", 0, 0}, {"scrollHeight", 1, 0}, {"clientLeft", 4, 0}, {"clientTop", 4, 0},
+                   {"scrollLeft", 4, 0}, {"scrollTop", 4, 0}};
+    for (auto& m : metrics) getter(elementProto, m.name, metric, m.which == 4 ? noopFn : nullptr, m.which, m.root);
+    getter(elementProto, "offsetParent", offsetParent);
+    method(elementProto, "scrollIntoView", scrollIntoView, 0);
+    method(elementProto, "focus", elementFocus, 0);
+    method(elementProto, "blur", elementBlur, 0);
+    method(elementProto, "click", elementClick, 0);
+    getter(elementProto, "classList", classListGet);
+    getter(elementProto, "style", styleGet, styleSet);
+    getter(elementProto, "dataset", datasetGet);
+    getter(elementProto, "value", valueGet, valueSet);
+    getter(elementProto, "checked", checkedGet, checkedSet);
+    getter(elementProto, "form", formGet);
+    struct {
+        const char* prop;
+        const char* attr;
+        int kind;
+    } reflected[] = {
+        {"id", "id", 0}, {"className", "class", 0}, {"title", "title", 0}, {"lang", "lang", 0}, {"dir", "dir", 0}, {"name", "name", 0},
+        {"type", "type", 0}, {"placeholder", "placeholder", 0}, {"alt", "alt", 0}, {"rel", "rel", 0}, {"target", "target", 0},
+        {"method", "method", 0}, {"htmlFor", "for", 0}, {"content", "content", 0}, {"media", "media", 0}, {"charset", "charset", 0},
+        {"role", "role", 0}, {"accept", "accept", 0}, {"autocomplete", "autocomplete", 0}, {"enctype", "enctype", 0},
+        {"crossOrigin", "crossorigin", 0}, {"loading", "loading", 0}, {"srcset", "srcset", 0}, {"sizes", "sizes", 0},
+        {"integrity", "integrity", 0}, {"referrerPolicy", "referrerpolicy", 0}, {"nonce", "nonce", 0}, {"slot", "slot", 0},
+        {"href", "href", 2}, {"src", "src", 2}, {"action", "action", 2}, {"poster", "poster", 2},
+        {"disabled", "disabled", 1}, {"hidden", "hidden", 1}, {"required", "required", 1}, {"readOnly", "readonly", 1},
+        {"multiple", "multiple", 1}, {"autofocus", "autofocus", 1}, {"async", "async", 1}, {"defer", "defer", 1},
+        {"noValidate", "novalidate", 1}, {"open", "open", 1}, {"controls", "controls", 1}, {"autoplay", "autoplay", 1},
+        {"loop", "loop", 1}, {"muted", "muted", 1}, {"selected", "selected", 1}, {"draggable", "draggable", 1},
+        {"tabIndex", "tabindex", 3}, {"width", "width", 3}, {"height", "height", 3}, {"maxLength", "maxlength", 3},
+        {"size", "size", 3}, {"rows", "rows", 3}, {"cols", "cols", 3}, {"colSpan", "colspan", 3}, {"rowSpan", "rowspan", 3},
+    };
+    for (auto& r : reflected) {
+        JSNative* g = vm.newNative(reflectGet, r.prop, 0);
+        JSNative* s = vm.newNative(reflectSet, r.prop, 1);
+        g->data = s->data = V(vm.atom(r.attr));
+        g->data2 = s->data2 = Value::i32(r.kind);
+        vm.defineAccessor(elementProto, PropKey::of(vm.atom(r.prop)), V(g), V(s), PF_C | PF_E);
+    }
+
+    classListProto = vm.newObject();
+    const char* clOps[] = {"add", "remove", "toggle", "contains", "replace"};
+    for (int i = 0; i < 5; ++i) method(classListProto, clOps[i], classListOp, 1, i);
+    method(classListProto, "item", classListItem, 1);
+    method(classListProto, "toString", classListValue, 0);
+    getter(classListProto, "length", classListLength);
+    getter(classListProto, "value", classListValue);
+
+    styleProto = vm.newObject();
+    method(styleProto, "setProperty", styleSetProperty, 2);
+    method(styleProto, "getPropertyValue", styleGetPropertyValue, 1);
+    method(styleProto, "removeProperty", styleRemoveProperty, 1);
+    getter(styleProto, "cssText", styleCssTextGet, styleCssTextSet);
+    computedProto = vm.newObject();
+    method(computedProto, "getPropertyValue", computedGetPropertyValue, 1);
+
+    // ---- Document and text nodes
+    documentProto = vm.newObject(nodeProto);
+    textProto = vm.newObject(nodeProto);
+    getter(documentProto, "documentElement", docElementGet, nullptr, 0);
+    getter(documentProto, "head", docElementGet, nullptr, 1);
+    getter(documentProto, "body", docElementGet, nullptr, 2);
+    getter(documentProto, "title", docTitleGet, docTitleSet);
+    getter(documentProto, "URL", docUrlGet);
+    getter(documentProto, "documentURI", docUrlGet);
+    getter(documentProto, "readyState", docReadyState);
+    getter(documentProto, "currentScript", docCurrentScript);
+    getter(documentProto, "activeElement", docActiveElement);
+    getter(documentProto, "domain", docDomain);
+    getter(documentProto, "referrer", emptyStringFn);
+    getter(documentProto, "cookie", emptyStringFn, noopFn);
+    const char* colls[] = {"forms", "images", "links", "scripts"};
+    for (int i = 0; i < 4; ++i) getter(documentProto, colls[i], docCollection, nullptr, i);
+    method(documentProto, "createElement", createElement, 1, 0);
+    method(documentProto, "createElementNS", createElement, 2, 1);
+    method(documentProto, "createTextNode", createTextNode, 1, 0);
+    method(documentProto, "createComment", createTextNode, 1, 1);
+    method(documentProto, "createDocumentFragment", createDocumentFragment, 0);
+    method(documentProto, "createEvent", createEvent, 1);
+    method(documentProto, "getElementsByName", getElementsByName, 1);
+    method(documentProto, "write", docWrite, 1);
+    method(documentProto, "writeln", docWrite, 1);
+    method(documentProto, "hasFocus", trueFn, 0);
+    vm.def(documentProto, "characterSet", vm.strv("UTF-8"), PF_ALL);
+    vm.def(documentProto, "compatMode", vm.strv(doc.quirks ? "BackCompat" : "CSS1Compat"), PF_ALL);
+    vm.def(documentProto, "visibilityState", vm.strv("visible"), PF_ALL);
+    vm.def(documentProto, "hidden", Value::boolean(false), PF_ALL);
+    vm.def(documentProto, "defaultView", V(G), PF_ALL);
+
+    // ---- Event
+    eventProto = vm.newObject();
+    JSNative* eventC = makeCtor(vm, "Event", eventCtor, 1, eventProto);
+    method(eventProto, "preventDefault", eventPreventDefault, 0);
+    method(eventProto, "stopPropagation", eventStopPropagation, 0);
+    method(eventProto, "stopImmediatePropagation", eventStopImmediate, 0);
+    method(eventProto, "initEvent", eventInit, 3);
+    method(eventProto, "initCustomEvent", eventInit, 4);
+    method(eventProto, "composedPath", eventComposedPath, 0);
+    getter(eventProto, "defaultPrevented", eventDefaultPrevented);
+    for (const char* n : {"CustomEvent", "MouseEvent", "KeyboardEvent", "UIEvent", "FocusEvent", "InputEvent", "PointerEvent", "ErrorEvent", "MessageEvent"}) {
+        JSNative* c = vm.newNative(eventCtor, n, 1);
+        c->oflags |= OF_CTOR;
+        c->add(PropKey::of(vm.a.prototype), V(eventProto), 0);
+        c->proto = eventC;
+        vm.def(G, n, V(c));
+    }
+
+    // ---- constructors that exist for instanceof and feature tests
+    struct {
+        const char* name;
+        JSObject* proto;
+    } ctors[] = {{"EventTarget", nodeProto}, {"Node", nodeProto}, {"Element", elementProto}, {"HTMLElement", elementProto},
+                 {"Document", documentProto}, {"HTMLDocument", documentProto}, {"Text", textProto}, {"Comment", textProto},
+                 {"CharacterData", textProto}, {"DocumentFragment", elementProto}, {"SVGElement", vm.newObject(elementProto)}};
+    for (auto& c : ctors) makeCtor(vm, c.name, illegalCtor, 0, c.proto);
+    for (const char* n : {"HTMLDivElement", "HTMLSpanElement", "HTMLInputElement", "HTMLAnchorElement", "HTMLImageElement", "HTMLFormElement",
+                          "HTMLScriptElement", "HTMLButtonElement", "HTMLSelectElement", "HTMLTextAreaElement", "HTMLIFrameElement",
+                          "HTMLCanvasElement", "HTMLVideoElement", "HTMLStyleElement", "HTMLLinkElement", "HTMLBodyElement", "HTMLTemplateElement"}) {
+        JSNative* c = vm.newNative(illegalCtor, n, 0);
+        c->oflags |= OF_CTOR;
+        c->add(PropKey::of(vm.a.prototype), V(elementProto), 0);
+        vm.def(G, n, V(c));
+    }
+    vm.def(elementProto, "constructor", vm.get(V(G), "HTMLElement"));
+    for (const char* n : {"MutationObserver", "IntersectionObserver", "ResizeObserver", "PerformanceObserver"}) {
+        JSObject* p = vm.newObject();
+        for (const char* m : {"observe", "unobserve", "disconnect"}) vm.defFn(p, m, noopFn, 1);
+        vm.defFn(p, "takeRecords", emptyArrayFn, 0);
+        makeCtor(vm, n, observerCtor, 1, p)->data2 = V(p);
+    }
+
+    // ---- window
+    for (const char* n : {"window", "self", "top", "parent", "frames"}) vm.def(G, n, V(G), PF_W | PF_C | PF_E);
+    vm.def(G, "document", wrap(docNode()), PF_C | PF_E);
+    method(G, "setTimeout", setTimeoutFn, 2);
+    method(G, "setInterval", setIntervalFn, 2);
+    method(G, "requestAnimationFrame", requestAnimationFrameFn, 1);
+    method(G, "requestIdleCallback", setTimeoutFn, 1);
+    for (const char* n : {"clearTimeout", "clearInterval", "cancelAnimationFrame", "cancelIdleCallback"}) method(G, n, clearTimerFn, 1);
+    method(G, "alert", alertFn, 1);
+    method(G, "confirm", confirmFn, 1);
+    method(G, "prompt", promptFn, 1);
+    method(G, "getComputedStyle", getComputedStyle, 1);
+    method(G, "matchMedia", matchMediaFn, 1);
+    method(G, "scrollTo", scrollToFn, 2, 0);
+    method(G, "scroll", scrollToFn, 2, 0);
+    method(G, "scrollBy", scrollToFn, 2, 1);
+    method(G, "btoa", btoaFn, 1);
+    method(G, "atob", atobFn, 1);
+    for (const char* n : {"focus", "blur", "close", "stop", "print", "postMessage"}) method(G, n, noopFn, 0);
+    getter(G, "innerWidth", viewportGet, nullptr, 0);
+    getter(G, "innerHeight", viewportGet, nullptr, 1);
+    getter(G, "outerWidth", viewportGet, nullptr, 0);
+    getter(G, "outerHeight", viewportGet, nullptr, 1);
+    getter(G, "scrollY", viewportGet, nullptr, 2);
+    getter(G, "pageYOffset", viewportGet, nullptr, 2);
+    getter(G, "scrollX", viewportGet, nullptr, 3);
+    getter(G, "pageXOffset", viewportGet, nullptr, 3);
+    vm.def(G, "devicePixelRatio", Value::i32(1), PF_ALL);
+    vm.def(G, "name", V(vm.a.empty), PF_ALL);
+    vm.def(G, "isSecureContext", Value::boolean(url.rfind("https:", 0) == 0), PF_ALL);
+
+    JSObject* perf = vm.newObject();
+    vm.def(G, "performance", V(perf), PF_ALL);
+    method(perf, "now", performanceNow, 0);
+    vm.def(perf, "timeOrigin", Value::num(startMs), PF_ALL);
+    for (const char* n : {"mark", "measure", "clearMarks", "clearMeasures"}) method(perf, n, noopFn, 1);
+    for (const char* n : {"getEntries", "getEntriesByName", "getEntriesByType"}) method(perf, n, emptyArrayFn, 1);
+
+    float vw = 1280, vh = 720, sy = 0;
+    client.viewport(vw, vh, sy);
+    JSObject* screen = vm.newObject();
+    vm.def(G, "screen", V(screen), PF_ALL);
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    vm.def(screen, "width", Value::i32(sw), PF_ALL);
+    vm.def(screen, "height", Value::i32(sh), PF_ALL);
+    vm.def(screen, "availWidth", Value::i32(sw), PF_ALL);
+    vm.def(screen, "availHeight", Value::i32(sh), PF_ALL);
+    vm.def(screen, "colorDepth", Value::i32(24), PF_ALL);
+    vm.def(screen, "pixelDepth", Value::i32(24), PF_ALL);
+
+    JSObject* nav = vm.newObject();
+    vm.def(G, "navigator", V(nav), PF_ALL);
+    vm.def(nav, "userAgent", vm.strv("Mozilla/5.0 (Windows NT 10.0; Win64; x64) TinyBrowser/0.3"), PF_ALL);
+    vm.def(nav, "appName", vm.strv("Netscape"), PF_ALL);
+    vm.def(nav, "appVersion", vm.strv("5.0 (Windows)"), PF_ALL);
+    vm.def(nav, "platform", vm.strv("Win32"), PF_ALL);
+    vm.def(nav, "vendor", V(vm.a.empty), PF_ALL);
+    vm.def(nav, "product", vm.strv("Gecko"), PF_ALL);
+    vm.def(nav, "language", vm.strv("en-US"), PF_ALL);
+    JSArray* langs = vm.newArray();
+    langs->elems = {vm.strv("en-US"), vm.strv("en")};
+    vm.def(nav, "languages", V(langs), PF_ALL);
+    vm.def(nav, "cookieEnabled", Value::boolean(true), PF_ALL);
+    vm.def(nav, "onLine", Value::boolean(true), PF_ALL);
+    vm.def(nav, "hardwareConcurrency", Value::i32(4), PF_ALL);
+    vm.def(nav, "maxTouchPoints", Value::i32(0), PF_ALL);
+    vm.def(nav, "doNotTrack", vm.strv("1"), PF_ALL);
+    method(nav, "sendBeacon", trueFn, 2);
+    method(nav, "javaEnabled", confirmFn, 0)->fn = [](CallInfo&) { return Value::boolean(false); };
+
+    // location: one object for window.location and document.location; assigning to either navigates
+    JSObject* loc = vm.newObject();
+    const char* parts[] = {"href", "protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin"};
+    for (int i = 0; i < 9; ++i) getter(loc, parts[i], locationGet, i == 0 || i >= 5 && i <= 7 ? locationSet : nullptr, i);
+    method(loc, "assign", locationSet, 1, 0);
+    method(loc, "replace", locationSet, 1, 0)->data2 = Value::i32(1);
+    method(loc, "reload", locationReload, 0);
+    method(loc, "toString", locationToString, 0);
+    for (JSObject* o : {G, documentProto}) {
+        JSNative* g = vm.newNative([](CallInfo& ci) { return ci.callee->data; }, "location", 0);
+        g->data = V(loc);
+        JSNative* s = vm.newNative(locationSet, "location", 1);
+        s->data = Value::i32(0);
+        s->data2 = Value::i32(0);
+        vm.defineAccessor(o, PropKey::of(vm.atom("location")), V(g), V(s), PF_C | PF_E);
+    }
+
+    JSObject* hist = vm.newObject();
+    vm.def(G, "history", V(hist), PF_ALL);
+    vm.def(hist, "length", Value::i32(1), PF_ALL);
+    method(hist, "pushState", historyPushState, 3);
+    method(hist, "replaceState", historyPushState, 3);
+    for (const char* n : {"back", "forward", "go"}) method(hist, n, noopFn, 0);
+    getter(hist, "state", historyStateGet);
+
+    storageProto = vm.newObject();
+    const char* stOps[] = {"getItem", "setItem", "removeItem", "clear", "key"};
+    for (int i = 0; i < 5; ++i) method(storageProto, stOps[i], storageOp, 1, i);
+    getter(storageProto, "length", storageOp, nullptr, 5);
+    struct {
+        const char* name;
+        Store* store;
+    } stores[] = {{"localStorage", &localStore}, {"sessionStorage", &sessionStore}};
+    for (auto& s : stores) {
+        JSHost* h = vm.alloc<JSHost>();
+        h->hostKind = HK_Storage;
+        h->ptr = s.store;
+        h->proto = storageProto;
+        h->hooks = &kStorageHooks;
+        vm.def(G, s.name, V(h), PF_ALL);
+    }
+}
+
+// ---------------------------------------------------------------------------- public interface
+ScriptHost::ScriptHost(Document& doc, const std::string& url, Client& client) : impl_(std::make_unique<Impl>(doc, url, client)) { impl_->setup(); }
+ScriptHost::~ScriptHost() = default;
+
+bool ScriptHost::stopped() const { return impl_->dead; }
+
+void ScriptHost::runScripts(const std::vector<ScriptSource>& scripts) {
+    Impl& im = *impl_;
+    for (auto& s : scripts) {
+        if (im.dead) break;
+        Entry entry(im);
+        im.currentScript = im.wrap(s.node);
+        try {
+            im.vm.eval(utf8to16(s.code), s.url);
+        } catch (JSThrow&) {
+            im.reportError();
+        }
+        im.currentScript = Value::null();
+    }
+    im.readyState = "interactive";
+    dispatch(im.docNode(), "readystatechange", false, false);
+    dispatch(im.docNode(), "DOMContentLoaded", true, false);
+    im.readyState = "complete";
+    dispatch(im.docNode(), "readystatechange", false, false);
+    dispatch(nullptr, "load", false, false);
+}
+
+bool ScriptHost::dispatch(Node* target, const std::string& type, bool bubbles, bool cancelable) {
+    Impl& im = *impl_;
+    if (im.dead) return true;
+    Entry entry(im);
+    try {
+        return im.fire(target, im.makeEvent(type, bubbles, cancelable));
+    } catch (JSThrow&) {
+        im.reportError();
+        return true;
+    }
+}
+
+void ScriptHost::pump() {
+    Impl& im = *impl_;
+    if (im.dead || im.depth) return;
+    for (int budget = 200; budget > 0 && !im.dead; --budget) {
+        double now = now_ms();
+        int best = -1;
+        for (int i = 0; i < (int)im.timers.size(); ++i)
+            if (im.timers[i].due <= now && (best < 0 || im.timers[i].due < im.timers[best].due)) best = i;
+        if (best < 0) break;
+        Timer t = im.timers[best];
+        if (t.interval < 0) im.timers.erase(im.timers.begin() + best);
+        else im.timers[best].due = now + t.interval;
+        t.args.push_back(t.fn);
+        RootScope keep(im.vm, t.args);
+        Entry entry(im);
+        try {
+            if (t.frame) {
+                Value stamp = Value::dbl(now - im.startMs);
+                im.vm.call(t.fn, Value::undef(), &stamp, 1);
+            } else
+                im.vm.call(t.fn, Value::undef(), t.args.data(), (int)t.args.size() - 1);
+        } catch (JSThrow&) {
+            im.reportError();
+        }
+    }
+    if (!im.timers.empty() && !im.dead) {
+        double next = im.timers[0].due;
+        for (auto& t : im.timers) next = std::min(next, t.due);
+        im.client.wake(std::max(0.0, next - now_ms()));
+    }
+}
+
+bool ScriptHost::eval(const std::wstring& source, std::wstring& out) {
+    Impl& im = *impl_;
+    Entry entry(im);
+    im.vm.terminated = false;
+    std::u16string result, error;
+    bool ok = im.vm.run(std::u16string(source.begin(), source.end()), "console", &result, &error);
+    const std::u16string& shown = ok ? result : error;
+    out.assign(shown.begin(), shown.end());
+    return ok;
+}
+
+}  // namespace tb

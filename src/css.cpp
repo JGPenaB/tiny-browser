@@ -1807,4 +1807,8 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
     e->style = std::move(s);
 }
 
+// Selector access for the scripting layer (querySelector, matches, closest).
+bool selector_parse(std::string_view text, Selector& out) { return parse_selector(text, out) && !out.parts.empty(); }
+bool selector_matches(const Selector& s, const Node* e) { return !s.parts.empty() && match_at(s, (int)s.parts.size() - 1, e); }
+
 }  // namespace tb

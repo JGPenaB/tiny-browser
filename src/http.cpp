@@ -764,6 +764,8 @@ static void parallel_for(size_t n, size_t threads, F&& fn) {
     for (auto& t : ts) t.join();
 }
 
+bool (*script_policy)(const std::string& pageUrl) = nullptr;
+
 std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string* preset, const FetchOpts* nav) {
     auto R = std::make_unique<LoadResult>();
     R->url = url;
@@ -810,6 +812,13 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
         std::string text;  // inline css or URL
     };
     std::vector<Job> cssJobs;
+    struct ScriptJob {
+        Node* node;
+        bool isInline;
+        std::string text;  // code or URL
+    };
+    std::vector<ScriptJob> scriptJobs;
+    bool wantScripts = !script_policy || script_policy(R->url);
     std::vector<std::pair<const Node*, std::string>> imgRefs;
     const std::string& base = R->doc->baseUrl;
     std::vector<Node*> stack{R->doc->root.get()};
@@ -843,6 +852,20 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
                         s = std::string(v.substr(0, e));
                     }
                 if (!s.empty()) imgRefs.push_back({n, resolve_url(base, s)});
+            } else if (n->name == "script" && wantScripts && scriptJobs.size() < 150) {
+                const std::string* type = n->attr("type");
+                std::string ty = type ? lower(std::string(trim(*type))) : "";
+                bool classic = ty.empty() || ty == "text/javascript" || ty == "application/javascript" || ty == "application/x-javascript" ||
+                               ty == "text/ecmascript" || ty == "application/ecmascript" || ty == "text/jscript" || ty == "javascript";
+                if (classic) {
+                    const std::string* src = n->attr("src");
+                    if (src && !src->empty()) {
+                        scriptJobs.push_back({n, false, resolve_url(base, *src)});
+                    } else if (!src) {
+                        std::string code = text_content(n);
+                        if (!trim(code).empty()) scriptJobs.push_back({n, true, std::move(code)});
+                    }
+                }
             }
         }
         for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) stack.push_back(it->get());
@@ -863,13 +886,30 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
         Url du = Url::parse(R->url);
         sub.firstPartySite = du.valid && !du.host.empty() ? site_of(du.host) : std::string("local");
     }
-    size_t nCss = cssJobs.size(), nImg = imgUrls.size();
+    size_t nCss = cssJobs.size(), nImg = imgUrls.size(), nScript = scriptJobs.size();
+    std::vector<std::string> scriptCode(nScript);
+    std::vector<NetEntry> scriptNet(nScript);
+    std::vector<char> scriptOk(nScript, 0);
     std::vector<Sheet> sheets(nCss);
     std::vector<NetEntry> cssNet(nCss);
     std::vector<ImageRes> images(nImg);
     std::vector<NetEntry> imgNet(nImg);
-    parallel_for(nCss + nImg, 8, [&](size_t i) {
-        if (i < nCss) {
+    parallel_for(nCss + nImg + nScript, 8, [&](size_t i) {
+        if (i >= nCss + nImg) {
+            size_t k = i - nCss - nImg;
+            ScriptJob& j = scriptJobs[k];
+            if (j.isInline) {
+                scriptCode[k] = std::move(j.text);
+                scriptOk[k] = 1;
+                return;
+            }
+            FetchResult f = fetch(j.text, sub);
+            scriptNet[k] = {j.text, f.contentType.empty() ? "text/javascript" : f.contentType, f.error, f.status, f.body.size(), f.ms};
+            if (f.error.empty() && f.status < 400 && f.body.size() < 12u * 1024 * 1024) {
+                scriptCode[k] = bytes_to_utf8(f.body, f.contentType);
+                scriptOk[k] = 1;
+            }
+        } else if (i < nCss) {
             Job& j = cssJobs[i];
             if (j.isInline) {
                 sheets[i] = parse_sheet(j.text);
@@ -893,6 +933,10 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
         R->sheets.push_back(std::move(sheets[i]));
     }
     for (auto& e : imgNet) R->net.push_back(e);
+    for (size_t k = 0; k < nScript; ++k) {
+        if (!scriptJobs[k].isInline) R->net.push_back(scriptNet[k]);
+        if (scriptOk[k]) R->scripts.push_back({scriptJobs[k].node, std::move(scriptCode[k]), scriptJobs[k].isInline ? R->url : scriptJobs[k].text});
+    }
     R->images = std::move(images);
     for (auto& [node, u] : imgRefs) {
         auto it = imgIndex.find(u);

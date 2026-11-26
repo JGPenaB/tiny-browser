@@ -5,6 +5,8 @@
 #include "dom.h"
 #include "layout.h"
 
+#include "script.h"
+
 namespace tb {
 
 struct FetchResult {
@@ -60,8 +62,12 @@ struct LoadResult {
     std::vector<ImageRes> images;
     std::unordered_map<const Node*, int> imgNode;
     std::vector<NetEntry> net;
+    std::vector<ScriptSource> scripts;  // classic scripts in document order, external ones already fetched
     double tFetch = 0, tParse = 0, tSub = 0;
 };
+
+// Decides whether a page may run scripts (per-site setting). Null: scripts are allowed everywhere.
+extern bool (*script_policy)(const std::string& pageUrl);
 
 std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string* presetHtml, const FetchOpts* nav = nullptr);
 

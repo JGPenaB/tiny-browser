@@ -18,6 +18,7 @@ add_executable(tinybrowser WIN32
   src/storage.cpp
   src/gpu.cpp
   src/shell.cpp
+  src/script.cpp
   src/selftest.cpp
   src/js/parser.cpp
   src/js/compiler.cpp
