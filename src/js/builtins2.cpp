@@ -801,154 +801,52 @@ JSFN(promiseCtorFn) {
     }
     return V(p);
 }
-JSFN(promiseThenFn) { return V(ci.vm.promiseThen(thisPromise(ci, "then"), ci.arg(0), ci.arg(1), true)); }
+JSFN(promiseThenFn) {  // 27.2.5.4
+    Vm& vm = ci.vm;
+    JSPromise* p = thisPromise(ci, "then");
+    Value ctor = vm.speciesConstructor(p, vm.promiseCtor);
+    if (ctor == vm.promiseCtor) return V(vm.promiseThen(p, ci.arg(0), ci.arg(1), true));
+    Vm::PromiseCapability cap = vm.newPromiseCapability(ctor);
+    vm.promiseThenWith(p, ci.arg(0), ci.arg(1), cap.resolve, cap.reject);
+    return cap.promise;
+}
 JSFN(promiseCatchFn) {
     Value args[2] = {Value::undef(), ci.arg(0)};
     return ci.vm.invoke(ci.thisv, "then", args, 2);
 }
-JSFN(finallyValue) { return ci.callee->data; }
-JSFN(finallyThrow) { ci.vm.throwValue(ci.callee->data); }
-static Value finallyStep(CallInfo& ci, bool rejected) {
-    Vm& vm = ci.vm;
-    Value r = vm.call(ci.callee->data, Value::undef(), nullptr, 0);
-    JSPromise* p = vm.promiseResolve(r);
-    JSNative* k = vm.newNative(rejected ? finallyThrow : finallyValue, "", 0);
-    k->data = ci.arg(0);
-    return V(vm.promiseThen(p, V(k), Value::undef(), true));
+JSFN(promiseResolveFn) {
+    if (!ci.thisv.isObject()) ci.vm.throwError(Err::TypeError, "Promise.resolve called on a non-object");
+    return ci.vm.promiseResolveWith(ci.thisv, ci.arg(0));
 }
-JSFN(finallyOnFulfilled) { return finallyStep(ci, false); }
-JSFN(finallyOnRejected) { return finallyStep(ci, true); }
-JSFN(promiseFinallyFn) {
-    Vm& vm = ci.vm;
-    Value f = ci.arg(0);
-    Value args[2] = {f, f};
-    if (vm.isCallable(f)) {
-        JSNative* onF = vm.newNative(finallyOnFulfilled, "", 1);
-        onF->data = f;
-        JSNative* onR = vm.newNative(finallyOnRejected, "", 1);
-        onR->data = f;
-        args[0] = V(onF);
-        args[1] = V(onR);
-    }
-    return vm.invoke(ci.thisv, "then", args, 2);
-}
-JSFN(promiseResolveFn) { return V(ci.vm.promiseResolve(ci.arg(0))); }
 JSFN(promiseRejectFn) {
-    JSPromise* p = ci.vm.newPromise();
-    ci.vm.rejectPromise(p, ci.arg(0));
-    return V(p);
+    Vm::PromiseCapability cap = ci.vm.newPromiseCapability(ci.thisv);
+    Value r = ci.arg(0);
+    ci.vm.call(cap.reject, Value::undef(), &r, 1);
+    return cap.promise;
 }
 JSFN(promiseWithResolvers) {
     Vm& vm = ci.vm;
-    JSPromise* p = vm.newPromise();
-    Value fns[2];
-    makeResolvingFunctions(vm, p, fns);
+    Vm::PromiseCapability cap = vm.newPromiseCapability(ci.thisv);
     JSObject* o = vm.newObject();
-    vm.def(o, "promise", V(p), PF_ALL);
-    vm.def(o, "resolve", fns[0], PF_ALL);
-    vm.def(o, "reject", fns[1], PF_ALL);
+    vm.def(o, "promise", cap.promise, PF_ALL);
+    vm.def(o, "resolve", cap.resolve, PF_ALL);
+    vm.def(o, "reject", cap.reject, PF_ALL);
     return V(o);
 }
+JSFN(promiseSpecies) { return ci.thisv; }
 
-// Shared state of Promise.all / allSettled / any: [0] result values, [1] promises still pending, [2] the result promise.
-static void comboDone(Vm& vm, JSObject* st, bool aggregateError) {
-    Prop* left = st->find(PropKey::index(1));
-    int n = left->val.asInt() - 1;
-    left->val = Value::i32(n);
-    if (n) return;
-    JSPromise* result = (JSPromise*)st->find(PropKey::index(2))->val.asCell();
-    Value values = st->find(PropKey::index(0))->val;
-    if (!aggregateError) {
-        vm.resolvePromise(result, values);
-        return;
-    }
-    Value ctor = vm.get(V(vm.global), "AggregateError");
-    Value args[2] = {values, vm.strv("All promises were rejected")};
-    vm.rejectPromise(result, vm.construct(ctor, args, 2, ctor));
-}
-static Value comboElement(CallInfo& ci, int kind) {  // 0 all, 1 settled-fulfilled, 2 settled-rejected, 3 any-rejected
-    Vm& vm = ci.vm;
-    JSObject* st = ci.callee->data.asObject();
-    uint32_t idx = (uint32_t)ci.callee->data2.asInt();
-    JSArray* values = (JSArray*)st->find(PropKey::index(0))->val.asCell();
-    Value v = ci.arg(0);
-    if (kind == 1 || kind == 2) {
-        JSObject* o = vm.newObject();
-        vm.def(o, "status", vm.strv(kind == 1 ? "fulfilled" : "rejected"), PF_ALL);
-        vm.def(o, kind == 1 ? "value" : "reason", v, PF_ALL);
-        v = V(o);
-    }
-    if (idx < values->elems.size()) values->elems[idx] = v;
-    comboDone(vm, st, kind == 3);
-    return Value::undef();
-}
-JSFN(comboAllF) { return comboElement(ci, 0); }
-JSFN(comboSettledF) { return comboElement(ci, 1); }
-JSFN(comboSettledR) { return comboElement(ci, 2); }
-JSFN(comboAnyR) { return comboElement(ci, 3); }
-
-static Value promiseCombine(CallInfo& ci, int mode) {  // 0 all, 1 allSettled, 2 race, 3 any
-    Vm& vm = ci.vm;
-    JSPromise* result = vm.newPromise();
-    Value fns[2];
-    makeResolvingFunctions(vm, result, fns);
-    JSArray* values = vm.newArray();
-    JSObject* st = vm.newObject(nullptr);
-    st->add(PropKey::index(0), V(values), PF_W);
-    st->add(PropKey::index(1), Value::i32(1), PF_W);
-    st->add(PropKey::index(2), V(result), PF_W);
-    uint32_t idx = 0;
-    try {
-        vm.iterate(ci.arg(0), [&](Value item) {
-            JSPromise* p = vm.promiseResolve(item);
-            if (mode == 2) {
-                vm.promiseThen(p, fns[0], fns[1], false);
-                return true;
-            }
-            values->elems.push_back(Value::undef());
-            Prop* left = st->find(PropKey::index(1));
-            left->val = Value::i32(left->val.asInt() + 1);
-            auto mk = [&](NativeFn f) {
-                JSNative* n = vm.newNative(f, "", 1);
-                n->data = V(st);
-                n->data2 = Value::i32((int32_t)idx);
-                return V(n);
-            };
-            Value onF = mode == 0 ? mk(comboAllF) : mode == 1 ? mk(comboSettledF) : fns[0];
-            Value onR = mode == 0 ? fns[1] : mode == 1 ? mk(comboSettledR) : mk(comboAnyR);
-            vm.promiseThen(p, onF, onR, false);
-            ++idx;
-            return true;
-        });
-    } catch (JSThrow&) {
-        Value e = vm.pending;
-        vm.pending = Value::undef();
-        vm.call(fns[1], Value::undef(), &e, 1);
-        return V(result);
-    }
-    if (mode != 2) comboDone(vm, st, mode == 3);
-    return V(result);
-}
-JSFN(promiseAll) { return promiseCombine(ci, 0); }
-JSFN(promiseAllSettled) { return promiseCombine(ci, 1); }
-JSFN(promiseRace) { return promiseCombine(ci, 2); }
-JSFN(promiseAny) { return promiseCombine(ci, 3); }
-
+// all, allSettled, any, race and finally are written in JavaScript (builtins_js.h).
 void setupPromise(Vm& vm) {
     vm.promiseProto = vm.newObject();
     JSNative* c = makeCtor(vm, "Promise", promiseCtorFn, 1, vm.promiseProto);
     vm.promiseCtor = V(c);
     vm.defFn(vm.promiseProto, "then", promiseThenFn, 2);
     vm.defFn(vm.promiseProto, "catch", promiseCatchFn, 1);
-    vm.defFn(vm.promiseProto, "finally", promiseFinallyFn, 1);
     vm.defineOwn(vm.promiseProto, PropKey::of(vm.symToStringTag), vm.strv("Promise"), PF_C);
     vm.defFn(c, "resolve", promiseResolveFn, 1);
     vm.defFn(c, "reject", promiseRejectFn, 1);
-    vm.defFn(c, "all", promiseAll, 1);
-    vm.defFn(c, "allSettled", promiseAllSettled, 1);
-    vm.defFn(c, "race", promiseRace, 1);
-    vm.defFn(c, "any", promiseAny, 1);
     vm.defFn(c, "withResolvers", promiseWithResolvers, 0);
+    vm.defineAccessor(c, PropKey::of(vm.symSpecies), V(vm.newNative(promiseSpecies, "get [Symbol.species]", 0)), Value::undef(), PF_C);
 }
 
 // ---------------------------------------------------------------------------- Date

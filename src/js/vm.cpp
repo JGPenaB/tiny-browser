@@ -1404,8 +1404,17 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
         if (out.size() > mark && out.size() - firstIndex > 1)  // index keys come first, in ascending order
             std::sort(out.begin() + firstIndex, out.end(), [](PropKey x, PropKey y) { return x.asIndex() < y.asIndex(); });
         if (!onlyEnumerable && (o->cls == Cls::Array || o->cls == Cls::String)) out.push_back(PropKey::of(a.length));
-        for (auto& p : o->props)
-            if (p.key.isString() && (!onlyEnumerable || (p.flags & PF_E))) out.push_back(p.key);
+        bool fn = !onlyEnumerable && (o->cls == Cls::Function || o->cls == Cls::Native);
+        if (fn)  // a function's length, name and prototype come first, in the order they are created
+            for (JSString* n : {a.length, a.name, a.prototype}) {
+                Prop tmp{};
+                if (getOwn(o, PropKey::of(n), tmp)) out.push_back(PropKey::of(n));
+            }
+        for (auto& p : o->props) {
+            if (!p.key.isString() || (onlyEnumerable && !(p.flags & PF_E))) continue;
+            if (fn && (p.key.cell() == a.length || p.key.cell() == a.name || p.key.cell() == a.prototype)) continue;
+            out.push_back(p.key);
+        }
     }
     if (symbols)
         for (auto& p : o->props)
@@ -1974,13 +1983,66 @@ JSPromise* Vm::promiseThen(JSPromise* p, Value onFul, Value onRej, bool wantResu
     else enqueueJob({(uint8_t)(p->state == 1 ? 0 : 1), p->state == 1 ? onFul : onRej, rv, p->value});
     return res;
 }
-
-JSPromise* Vm::promiseResolve(Value v) {
-    if (v.isObject() && v.asObject()->cls == Cls::Promise) return (JSPromise*)v.asObject();
-    JSPromise* p = newPromise();
-    resolvePromise(p, v);
-    return p;
+// PerformPromiseThen (27.2.5.4.1) with a capability whose promise came from some other constructor: the reaction
+// job reports through the capability's resolve and reject functions, kept as a two-element array.
+void Vm::promiseThenWith(JSPromise* p, Value onFul, Value onRej, Value resolve, Value reject) {
+    JSArray* pair = newArray(2);
+    pair->elems[0] = resolve;
+    pair->elems[1] = reject;
+    Value rv = Value::cell(pair);
+    p->handled = true;
+    if (p->state == 0) p->reactions.push_back({onFul, onRej, rv});
+    else enqueueJob({(uint8_t)(p->state == 1 ? 0 : 1), p->state == 1 ? onFul : onRej, rv, p->value});
 }
+
+// SpeciesConstructor (7.3.22)
+Value Vm::speciesConstructor(JSObject* o, Value fallback) {
+    Value c = getObj(o, PropKey::of(a.constructor), Value::cell(o));
+    if (c.isUndef()) return fallback;
+    if (!c.isObject()) throwError(Err::TypeError, "The constructor property is not an object");
+    Value s = get(c, PropKey::of(symSpecies));
+    if (s.isNullish()) return fallback;
+    if (!isConstructor(s)) throwError(Err::TypeError, "The Symbol.species property is not a constructor");
+    return s;
+}
+
+static Value capabilityExecutor(CallInfo& ci) {  // GetCapabilitiesExecutor functions (27.2.1.5.1)
+    JSArray* slots = (JSArray*)ci.callee->data.asObject();
+    if (!slots->elems[0].isUndef() || !slots->elems[1].isUndef()) ci.vm.throwError(Err::TypeError, "The promise executor was already called");
+    slots->elems[0] = ci.arg(0);
+    slots->elems[1] = ci.arg(1);
+    return Value::undef();
+}
+Vm::PromiseCapability Vm::newPromiseCapability(Value ctor) {
+    if (!isConstructor(ctor)) throwError(Err::TypeError, "%s is not a promise constructor", utf16to8(inspect(ctor, 0)).c_str());
+    if (ctor == promiseCtor) {  // the built-in constructor: nothing a script could observe is skipped
+        JSPromise* p = newPromise();
+        Value fns[2];
+        makeResolvingFunctions(*this, p, fns);
+        return {Value::cell(p), fns[0], fns[1]};
+    }
+    JSArray* slots = newArray(2);
+    slots->elems[0] = slots->elems[1] = Value::undef();
+    JSNative* executor = newNative(capabilityExecutor, "", 2);
+    executor->data = Value::cell(slots);
+    Value arg = Value::cell(executor);
+    Value promise = construct(ctor, &arg, 1, ctor);
+    if (!isCallable(slots->elems[0]) || !isCallable(slots->elems[1])) throwError(Err::TypeError, "The promise constructor did not supply resolving functions");
+    return {promise, slots->elems[0], slots->elems[1]};
+}
+
+Value Vm::promiseResolveWith(Value ctor, Value x) {
+    if (x.isObject() && x.asObject()->cls == Cls::Promise && sameValue(get(x, a.constructor), ctor)) return x;
+    if (ctor == promiseCtor) {
+        JSPromise* p = newPromise();
+        resolvePromise(p, x);
+        return Value::cell(p);
+    }
+    PromiseCapability cap = newPromiseCapability(ctor);
+    call(cap.resolve, Value::undef(), &x, 1);
+    return cap.promise;
+}
+JSPromise* Vm::promiseResolve(Value v) { return (JSPromise*)promiseResolveWith(promiseCtor, v).asObject(); }
 
 static Value settleFrom(CallInfo& ci, bool resolve) {
     JSObject* flag = ci.callee->data2.asObject();
@@ -2008,24 +2070,36 @@ void makeResolvingFunctions(Vm& vm, JSPromise* p, Value out[2]) {
 }
 
 void Vm::runJob(const Job& j) {
-    if (j.kind == 0 || j.kind == 1) {
-        JSPromise* res = j.b.isObject() ? (JSPromise*)j.b.asObject() : nullptr;
-        if (!isCallable(j.a)) {
-            if (res) {
-                if (j.kind == 0) resolvePromise(res, j.c);
-                else rejectPromise(res, j.c);
+    if (j.kind == 0 || j.kind == 1) {  // NewPromiseReactionJob (27.2.2.1)
+        JSObject* target = j.b.isObject() ? j.b.asObject() : nullptr;
+        JSPromise* res = target && target->cls == Cls::Promise ? (JSPromise*)target : nullptr;
+        JSArray* cap = target && target->cls == Cls::Array ? (JSArray*)target : nullptr;
+        bool ok = j.kind == 0, threw = false;
+        Value x = j.c;
+        if (isCallable(j.a)) {
+            try {
+                x = call(j.a, Value::undef(), &j.c, 1);
+                ok = true;
+            } catch (JSThrow&) {
+                x = pending;
+                pending = Value::undef();
+                ok = false;
+                threw = true;
             }
-            return;
         }
-        try {
-            Value x = call(j.a, Value::undef(), &j.c, 1);
-            if (res) resolvePromise(res, x);
-        } catch (JSThrow&) {
-            Value e = pending;
-            pending = Value::undef();
-            if (res) rejectPromise(res, e);
-            else if (onConsole) onConsole(3, describeError(e));
-        }
+        if (res) {
+            if (ok) resolvePromise(res, x);
+            else rejectPromise(res, x);
+        } else if (cap) {
+            try {
+                call(cap->elems[ok ? 0 : 1], Value::undef(), &x, 1);
+            } catch (JSThrow&) {
+                Value e = pending;
+                pending = Value::undef();
+                if (onConsole) onConsole(3, u"Uncaught " + describeError(e));
+            }
+        } else if (threw && onConsole)
+            onConsole(3, describeError(x));
     } else if (j.kind == 2) {
         Value fns[2];
         makeResolvingFunctions(*this, (JSPromise*)j.a.asCell(), fns);

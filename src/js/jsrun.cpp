@@ -90,7 +90,8 @@ static bool runOne(const std::string& bytes, const std::string& name, HANDLE out
     r.roots.push_back(V(vm.newObject(nullptr)));
     RootScope keep(vm, r.roots);
     vm.onConsole = [&r](int level, const std::u16string& text) {
-        if (level == 3 && text.rfind(u"Uncaught", 0) == 0) r.failed = true;
+        // a rejection nobody handled is reported, but it does not make the script fail
+        if (level == 3 && text.rfind(u"Uncaught", 0) == 0 && text.rfind(u"Uncaught (in promise)", 0) != 0) r.failed = true;
         r.write(text);
     };
     vm.defFn(vm.global, "setTimeout", setTimeoutFn, 2);

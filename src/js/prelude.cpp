@@ -21,6 +21,18 @@ JSFN(toLength) {
     if (!(d > 0)) return Value::i32(0);
     return Value::num(d > 9007199254740991.0 ? 9007199254740991.0 : d);
 }
+JSFN(isPromise) { return Value::boolean(ci.arg(0).isObject() && ci.arg(0).asObject()->cls == Cls::Promise); }
+JSFN(newPromiseCapability) {
+    Vm& vm = ci.vm;
+    Vm::PromiseCapability cap = vm.newPromiseCapability(ci.arg(0));
+    JSObject* o = vm.newObject(nullptr);
+    vm.def(o, "promise", cap.promise, PF_ALL);
+    vm.def(o, "resolve", cap.resolve, PF_ALL);
+    vm.def(o, "reject", cap.reject, PF_ALL);
+    return V(o);
+}
+JSFN(promiseResolve) { return ci.vm.promiseResolveWith(ci.arg(0), ci.arg(1)); }
+JSFN(speciesConstructor) { return ci.vm.speciesConstructor(ci.arg(0).asObject(), ci.arg(1)); }
 JSFN(arrayCreate) {
     Vm& vm = ci.vm;
     double n = vm.toNumber(ci.arg(0));
@@ -45,6 +57,10 @@ void setupJsBuiltins(Vm& vm) {
     vm.defFn(natives, "asyncFromSync", asyncFromSync, 1);
     vm.defFn(natives, "toLength", toLength, 1);
     vm.defFn(natives, "arrayCreate", arrayCreate, 1);
+    vm.defFn(natives, "isPromise", isPromise, 1);
+    vm.defFn(natives, "newPromiseCapability", newPromiseCapability, 1);
+    vm.defFn(natives, "promiseResolve", promiseResolve, 2);
+    vm.defFn(natives, "speciesConstructor", speciesConstructor, 2);
     auto src = std::make_shared<const std::u16string>(utf8to16(kBuiltinsJs));
     FuncProto* p = compileScript(vm, src, kBuiltinFile, false, nullptr);
     JSFunction* outer = vm.makeClosure(p, nullptr, nullptr);

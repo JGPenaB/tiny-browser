@@ -437,22 +437,174 @@ install($Set.prototype, {
   }
 });
 
-// ---- Promise.try (27.2.4.8)
+)JS"
+R"JS(
+// ---- Promise: the combinators and finally (27.2.4, 27.2.5.3)
+var newCapability = natives.newPromiseCapability, promiseResolve = natives.promiseResolve, $AggregateError = AggregateError;
+var DONE = {};
+// IteratorStepValue: rec.done records that the iterator finished or failed, after which it must not be closed
+function stepValue(rec) {
+  try {
+    var result = apply(rec.next, rec.iterator, []);
+    if (!isObject(result)) throw new $TypeError('Iterator result ' + $String(result) + ' is not an object');
+    if (result.done) {
+      rec.done = true;
+      return DONE;
+    }
+    return result.value;
+  } catch (e) {
+    rec.done = true;
+    throw e;
+  }
+}
+function listToArray(list) {  // CreateArrayFromList
+  var out = [];
+  for (var i = 0; i < list.length; i++) data(out, i, list[i]);
+  return out;
+}
+function invokeThen(promise, onFulfilled, onRejected) { return apply(promise.then, promise, [onFulfilled, onRejected]); }
+function combine(C, iterable, perform) {
+  var cap = newCapability(C), promiseResolveFn, rec;
+  try {
+    promiseResolveFn = C.resolve;  // GetPromiseResolve
+    if (typeof promiseResolveFn !== 'function') throw new $TypeError('The promise constructor has no resolve method');
+    rec = getIterator(iterable);
+    rec.done = false;
+  } catch (e) {
+    (0, cap.reject)(e);
+    return cap.promise;
+  }
+  try {
+    return perform(rec, C, cap, promiseResolveFn);
+  } catch (e) {
+    if (!rec.done) closeQuietly(rec.iterator);
+    (0, cap.reject)(e);
+    return cap.promise;
+  }
+}
+// The functions handed to then() for one element: each pair runs at most once between them.
+function elementFunction(state, index, called, wrap, finish) {
+  return (x) => {
+    if (called.value) return undefined;
+    called.value = true;
+    data(state.values, index, wrap(x));
+    if (--state.remaining === 0) return finish(state);
+    return undefined;
+  };
+}
+function same(x) { return x; }
+function fulfilledRecord(x) { return { status: 'fulfilled', value: x }; }
+function rejectedRecord(x) { return { status: 'rejected', reason: x }; }
+function aggregate(errors) {
+  var error = new $AggregateError([], 'All promises were rejected');
+  defineProperty(error, 'errors', { value: listToArray(errors), writable: true, enumerable: false, configurable: true });
+  return error;
+}
+function performCombinator(kind) {  // 0 all, 1 allSettled, 2 any
+  return function (rec, C, cap, promiseResolveFn) {
+    var state = { values: [], remaining: 1 }, index = 0;
+    var finish = kind === 2 ? (s) => (0, cap.reject)(aggregate(s.values)) : (s) => (0, cap.resolve)(listToArray(s.values));
+    for (;;) {
+      var next = stepValue(rec);
+      if (next === DONE) {
+        if (--state.remaining === 0) {
+          if (kind === 2) throw aggregate(state.values);
+          (0, cap.resolve)(listToArray(state.values));
+        }
+        return cap.promise;
+      }
+      data(state.values, index, undefined);
+      var nextPromise = apply(promiseResolveFn, C, [next]);
+      var called = { value: false };
+      var onFulfilled = kind === 2 ? cap.resolve : elementFunction(state, index, called, kind === 1 ? fulfilledRecord : same, finish);
+      var onRejected = kind === 0 ? cap.reject : elementFunction(state, index, kind === 1 ? called : { value: false }, kind === 1 ? rejectedRecord : same, finish);
+      state.remaining++;
+      invokeThen(nextPromise, onFulfilled, onRejected);
+      index++;
+    }
+  };
+}
+var performAll = performCombinator(0), performAllSettled = performCombinator(1), performAny = performCombinator(2);
+function performRace(rec, C, cap, promiseResolveFn) {
+  for (;;) {
+    var next = stepValue(rec);
+    if (next === DONE) return cap.promise;
+    invokeThen(apply(promiseResolveFn, C, [next]), cap.resolve, cap.reject);
+  }
+}
+// Promise.allKeyed and Promise.allSettledKeyed (the await dictionary proposal)
+function keyedResult(state) {
+  var obj = create(null);
+  for (var i = 0; i < state.keys.length; i++) data(obj, state.keys[i], state.values[i]);
+  return obj;
+}
+function combineKeyed(C, promises, settled) {
+  var cap = newCapability(C);
+  try {
+    var promiseResolveFn = C.resolve;
+    if (typeof promiseResolveFn !== 'function') throw new $TypeError('The promise constructor has no resolve method');
+    if (!isObject(promises)) throw new $TypeError('The argument must be an object');
+    var allKeys = ownKeys(promises), state = { keys: [], values: [], remaining: 1 }, index = 0;
+    var finish = (s) => (0, cap.resolve)(keyedResult(s));
+    for (var i = 0; i < allKeys.length; i++) {
+      var key = allKeys[i], desc = getOwnPropertyDescriptor(promises, key);
+      if (desc === undefined || !desc.enumerable) continue;
+      var value = promises[key];
+      data(state.keys, index, key);
+      data(state.values, index, undefined);
+      var nextPromise = apply(promiseResolveFn, C, [value]);
+      var called = { value: false };
+      var onFulfilled = elementFunction(state, index, called, settled ? fulfilledRecord : same, finish);
+      var onRejected = settled ? elementFunction(state, index, called, rejectedRecord, finish) : cap.reject;
+      state.remaining++;
+      invokeThen(nextPromise, onFulfilled, onRejected);
+      index++;
+    }
+    if (--state.remaining === 0) (0, cap.resolve)(keyedResult(state));
+  } catch (e) {
+    (0, cap.reject)(e);
+  }
+  return cap.promise;
+}
 install($Promise, {
+  all(iterable) { return combine(this, iterable, performAll); },
+  allSettled(iterable) { return combine(this, iterable, performAllSettled); },
+  any(iterable) { return combine(this, iterable, performAny); },
+  race(iterable) { return combine(this, iterable, performRace); },
+  allKeyed(promises) { return combineKeyed(this, promises, false); },
+  allSettledKeyed(promises) { return combineKeyed(this, promises, true); },
   try(callback, ...args) {
-    var C = this, resolve, reject;
+    var C = this;
     if (!isObject(C)) throw new $TypeError('Promise.try called on a non-object');
-    var promise = new C(function (res, rej) {
-      if (resolve !== undefined || reject !== undefined) throw new $TypeError('The promise executor was already called');
-      resolve = res;
-      reject = rej;
+    var value;
+    try {
+      value = apply(callback, undefined, args);
+    } catch (e) {
+      var cap = newCapability(C);
+      (0, cap.reject)(e);
+      return cap.promise;
+    }
+    return promiseResolve(C, value);
+  }
+});
+install($Promise.prototype, {
+  finally(onFinally) {
+    var promise = this;
+    if (!isObject(promise)) throw new $TypeError('Promise.prototype.finally called on a non-object');
+    var C = natives.speciesConstructor(promise, $Promise);
+    if (typeof onFinally !== 'function') return invokeThen(promise, onFinally, onFinally);
+    return invokeThen(promise, (value) => {
+      var p = promiseResolve(C, onFinally());
+      return apply(p.then, p, [() => value]);
+    }, (reason) => {
+      var p = promiseResolve(C, onFinally());
+      return apply(p.then, p, [() => { throw reason; }]);
     });
-    if (typeof resolve !== 'function' || typeof reject !== 'function') throw new $TypeError('The promise constructor did not supply resolving functions');
-    try { resolve(apply(callback, undefined, args)); } catch (e) { reject(e); }
-    return promise;
   }
 });
 
+)JS"
+R"JS(
 // ---- Array.fromAsync (2.1.1.1 of the proposal, now 23.1.2.2)
 install(Array, {
   fromAsync(asyncItems) {

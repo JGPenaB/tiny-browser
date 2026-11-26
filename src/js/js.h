@@ -664,6 +664,13 @@ public:
     void fulfillPromise(JSPromise* p, Value v);
     JSPromise* promiseThen(JSPromise* p, Value onFul, Value onRej, bool wantResult = true);
     JSPromise* promiseResolve(Value v);
+    struct PromiseCapability {
+        Value promise, resolve, reject;
+    };
+    PromiseCapability newPromiseCapability(Value ctor);          // 27.2.1.5
+    Value promiseResolveWith(Value ctor, Value x);                // PromiseResolve (27.2.4.7.1)
+    void promiseThenWith(JSPromise* p, Value onFul, Value onRej, Value resolve, Value reject);  // PerformPromiseThen
+    Value speciesConstructor(JSObject* o, Value fallback);       // 7.3.22
     void enqueueJob(const Job& j) { jobQueue.push_back(j); }
     std::deque<Job> jobQueue;
     std::vector<Value> rejections;              // rejected promises nobody has handled yet

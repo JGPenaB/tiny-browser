@@ -36,6 +36,18 @@ async function main() {
   let ticks = 0; const iv = setInterval(() => { if (++ticks === 3) clearInterval(iv); }, 1); await sleep(150); results.interval = ticks;
   const cancelled = setTimeout(() => { results.cancelled = "should not run"; }, 1); clearTimeout(cancelled);
   results.finallyPass = await Promise.resolve("keep").finally(() => "ignored");
+  // subclasses and species (ECMA-262 27.2): every derived promise comes from the receiver's constructor
+  class Mine extends Promise { }
+  const mine = Mine.resolve(1), made = [];
+  class Counting extends Promise { constructor(executor) { super(executor); made.push(1); } }
+  results.species = [mine.then(() => 1) instanceof Mine, mine.finally(() => 1) instanceof Mine, mine.catch(() => 1) instanceof Mine, Mine.all([]) instanceof Mine, Mine.race([]) instanceof Mine,
+    Mine.reject(1).catch(() => 0) instanceof Mine, Mine.withResolvers().promise instanceof Mine, Mine.resolve(mine) === mine, Promise.resolve(mine) === mine, Promise.try(() => mine) === mine,
+    (Counting.all([1, 2]), made.length), Promise[Symbol.species] === Promise];
+  results.keyed = [await Promise.allKeyed({ a: 1, b: Promise.resolve(2) }), (await Promise.allSettledKeyed({ ok: 1, bad: Promise.reject(3) })).bad, Object.getPrototypeOf(await Promise.allKeyed({}))];
+  results.combinators = [await Promise.all(new Set([1, Promise.resolve(2)])), (await Promise.any([Promise.reject(1), Promise.reject(2)]).catch(e => e)).errors, await Promise.race([new Promise(() => { }), 5]),
+    await Promise.all.call(Promise, "ab"), (await Promise.all(5).catch(e => e)) instanceof TypeError, await Promise.resolve(7).finally(() => { throw "from finally"; }).catch(e => e)];
+  let thrown; try { Promise.all.call(function (executor) { executor(() => { }, () => { }); executor(() => { }, () => { }); }, []); } catch (e) { thrown = e instanceof TypeError; }
+  results.capability = [thrown, (() => { try { Promise.resolve.call(1, 1); } catch (e) { return e instanceof TypeError; } })(), Reflect.ownKeys(function (a) { }), Reflect.ownKeys(Math.max), Reflect.ownKeys(class { static m() { } })];
   return "main done";
 }
 main().then(v => {
@@ -43,7 +55,9 @@ main().then(v => {
   test("async results", function () {
     eq(v, "main done");
     eq(results, { fin: true, chain: "e2", all: [1, 2, 3], race: "fast", settled: ["rejected", "fulfilled"], any: "any-ok", anyErr: 1, allRej: "rej", asyncThrow: "async throw",
-      thenable: "thenable", nested: "inner", loop: 10, cls: 42, arrow: 2, seq: ["a", "b"], tfFin: true, tryFinally: "tf", withResolvers: "wr", interval: 3, finallyPass: "keep" });
+      thenable: "thenable", nested: "inner", loop: 10, cls: 42, arrow: 2, seq: ["a", "b"], tfFin: true, tryFinally: "tf", withResolvers: "wr", interval: 3, finallyPass: "keep",
+      species: [true, true, true, true, true, true, true, true, false, false, 5, true], keyed: [{ a: 1, b: 2 }, { status: "rejected", reason: 3 }, null],
+      combinators: [[1, 2], [1, 2], 5, ["a", "b"], true, "from finally"], capability: [true, true, ["length", "name", "prototype"], ["length", "name"], ["length", "name", "prototype", "m"]] });
   });
   done();
 }, e => { console.log("FAIL main rejected: " + (e && e.stack || e)); });
