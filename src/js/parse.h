@@ -27,9 +27,9 @@ enum class N : uint8_t {
 
 enum : uint16_t {
     NF_COMPUTED = 1, NF_STATIC = 2, NF_SHORTHAND = 4, NF_OPTIONAL = 8, NF_PREFIX = 16, NF_DELEGATE = 32, NF_PRIVATE = 64,
-    NF_PAREN = 128, NF_EXPRBODY = 256
+    NF_PAREN = 128, NF_EXPRBODY = 256, NF_AWAIT = 512
 };
-enum : uint8_t { PK_INIT, PK_GET, PK_SET, PK_METHOD, PK_SPREAD, PK_FIELD };
+enum : uint8_t { PK_INIT, PK_GET, PK_SET, PK_METHOD, PK_SPREAD, PK_FIELD, PK_STATIC_BLOCK };
 enum : uint8_t { VK_VAR, VK_LET, VK_CONST, VK_PARAM, VK_FUNC, VK_CLASS, VK_CATCH, VK_FUNCNAME, VK_PSEUDO, VK_PRIVATE, VK_IMPORT };
 
 struct Scope;
@@ -57,6 +57,7 @@ struct Node {
     JSString* str2 = nullptr;
     double num = 0;
     Variable* var = nullptr;
+    Variable* var2 = nullptr;  // class declaration: the binding in the enclosing scope (var is the one inside the class)
     Scope* scope = nullptr;
     FunctionInfo* fn = nullptr;
     std::vector<JSString*> strs;  // template quasis: cooked, raw, cooked, raw...

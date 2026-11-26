@@ -201,6 +201,7 @@ struct Ins {
 struct Handler {
     uint32_t start, end, target;
     uint16_t ctxDepth;
+    uint16_t isFinally = 0;  // cleanup code that reruns the exception: also taken when a generator is told to return
 };
 
 struct FuncProto : Cell {
@@ -342,8 +343,19 @@ struct JSGenerator : JSObject {  // also backs async functions
     uint16_t resumeReg = 0;
     uint8_t state = 0;  // 0 suspended-start, 1 suspended-yield, 2 running, 3 done
     bool isAsync = false;
+    bool isAsyncGen = false;        // an async generator: requests queue up and are answered with promises
+    bool suspendedAtAwait = false;  // the body stopped at an await, not a yield
+    bool delegating = false;        // stopped inside yield*: the next resumption goes to the inner iterator
+    uint8_t agState = 0;            // [[AsyncGeneratorState]]: start, yield, executing, draining-queue, completed
     Value newTarget, promise;
+    Value retVal;  // the value of a return() that is unwinding the body
     JSArray* args = nullptr;
+    struct Request {
+        uint8_t type;  // 0 next, 1 throw, 2 return
+        Value value;
+        JSPromise* promise;
+    };
+    std::vector<Request> queue;  // [[AsyncGeneratorQueue]]
     JSGenerator() { cls = Cls::Generator; }
     void trace(Gc&) override;
 };
@@ -546,6 +558,8 @@ public:
     JSObject* errorProtos[7] = {};
     JSObject* typedProtos[9] = {};
     JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr;
+    JSObject *asyncIteratorProto = nullptr, *asyncGeneratorProto = nullptr, *asyncFromSyncProto = nullptr;
+    JSObject* genReturnSignal = nullptr;  // thrown inside a generator to make it return through its finally blocks
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
            *symToStringTag = nullptr, *symSpecies = nullptr;
@@ -558,6 +572,10 @@ public:
     Value callFunction(JSFunction* f, Value thisv, const Value* args, int argc, Value newTarget, bool construct);
     Value resumeGenerator(JSGenerator* g, Value sent, int mode, bool& done);  // mode 0 next, 1 throw, 2 return
     Value startGenerator(JSFunction* f, Value thisv, const Value* args, int argc);
+    Value startAsyncGenerator(JSFunction* f, Value thisv, const Value* args, int argc);
+    Value getAsyncIterator(Value src, Value& next);
+    Value delegateCall(Value* regs);
+    void delegateResult(Value* regs, Value& value, bool& done);
     Value startAsync(JSFunction* f, Value thisv, const Value* args, int argc);
     void asyncStep(JSGenerator* g, Value sent, int mode);
     void initFields(JSFunction* f, Value obj);

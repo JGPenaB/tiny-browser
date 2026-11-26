@@ -10,7 +10,7 @@ struct Loop {
     std::vector<JSString*> labels;
     std::vector<size_t> breaks, conts;
     int breakDepth = 0, contDepth = 0, iterReg = -1;
-    bool isLoop = false, isSwitch = false;
+    bool isLoop = false, isSwitch = false, asyncIter = false;
     size_t finMark = 0;
 };
 struct Fin {
@@ -755,18 +755,33 @@ private:
                 if (!f->info->isGenerator) fail("yield outside a generator");
                 need();
                 int mark = f->nextReg;
+                bool isAsync = f->info->isAsync;
                 if (n->flags & NF_DELEGATE) {
-                    // yield* inner: forward every value of the inner iterator
+                    // yield* inner (ECMA-262 15.5.5): next(), throw() and return() on this generator are passed
+                    // to the inner iterator until it is done. Registers: it, next, received, mode, result.
                     int it = newReg();
                     newReg();
-                    emit(OP_GetIter, it, expr(n->a));
-                    int v = newReg(), done = newReg(), sent = newReg();
+                    int recv = newReg(), mode = newReg(), r = newReg(), v = newReg(), done = newReg();
+                    emit(isAsync ? OP_GetAsyncIter : OP_GetIter, it, expr(n->a));
+                    emit(OP_LoadUndef, recv);
+                    emitX(OP_LoadInt, mode, 0);
                     size_t top = here();
-                    emit(OP_IterNextRet, v, it, done);
+                    emit(OP_DelegateCall, r, it);
+                    if (isAsync) emit(OP_Await, r, r);
+                    emit(OP_DelegateResult, v, it, done);
                     size_t out = jump(OP_JmpT, done);
-                    emit(OP_Yield, sent, v);
+                    if (isAsync) {
+                        getProp(v, r, vm.a.value);
+                        emit(OP_YieldDelegate, recv, v);
+                    } else
+                        emit(OP_YieldDelegate, recv, r);
                     patchTo(jump(OP_Jmp), top);
                     patch(out);
+                    size_t valuePath = jump(OP_JmpF, mode);
+                    // this generator was told to return and the inner iterator has finished: return its value
+                    if (!f->fins.empty() || hasOpenIter()) unwind(0, -1, 0);
+                    emit(OP_Return, v);
+                    patch(valuePath);
                     emit(OP_Move, dst, v);
                 } else {
                     int v;
@@ -774,6 +789,11 @@ private:
                     else {
                         v = newReg();
                         emit(OP_LoadUndef, v);
+                    }
+                    if (isAsync) {  // an async generator awaits what it yields
+                        int t = newReg();
+                        emit(OP_Await, t, v);
+                        v = t;
                     }
                     emit(OP_Yield, dst, v);
                 }
@@ -1098,17 +1118,36 @@ private:
         f->p->inner.push_back(ctor);
         emitX(OP_Closure, rc, (uint32_t)f->p->inner.size() - 1);
         emit(OP_MakeClass, rc, parent < 0 ? 0xFFFF : parent, rp);
+        // ECMA-262 ClassDefinitionEvaluation: methods are defined and every computed key is evaluated in source
+        // order; static fields and static blocks run afterwards, once the class's own name is bound.
+        struct Late {
+            Node* m;
+            int key;
+        };
+        std::vector<Late> late;
         for (Node* m : n->list) {
             if (m->op == 255) continue;
-            int m2 = f->nextReg;
             curLine = m->line;
+            if (m->op == PK_STATIC_BLOCK) {
+                late.push_back({m, -1});
+                continue;
+            }
+            if (m->op == PK_FIELD && (m->flags & NF_STATIC)) {
+                int keep = newReg();  // holds the key until the field is defined
+                int kr = keyReg(m, m->a);
+                if (kr != keep) emit(OP_Move, keep, kr);
+                f->nextReg = keep + 1;
+                late.push_back({m, keep});
+                continue;
+            }
+            int m2 = f->nextReg;
             int target = (m->flags & NF_STATIC) ? rc : rp;
             int kr = keyReg(m, m->a);
             if (m->op == PK_FIELD) {
                 int fr = newReg();
                 if (m->b) closure(m->b->fn, fr);
                 else emit(OP_LoadUndef, fr);
-                emit((m->flags & NF_STATIC) ? OP_DefStaticField : OP_AddField, rc, kr, fr);
+                emit(OP_AddField, rc, kr, fr);
             } else {
                 int fr = newReg();
                 closure(m->b->fn, fr);
@@ -1116,7 +1155,21 @@ private:
             }
             f->nextReg = m2;
         }
-        if (n->var && n->var->scope == n->scope) storeVar(n->var, n->var->name, rc, true);
+        if (n->var) storeVar(n->var, n->var->name, rc, true);
+        for (auto& l : late) {
+            int m2 = f->nextReg;
+            curLine = l.m->line;
+            int fr = newReg();
+            if (l.m->op == PK_STATIC_BLOCK) {
+                closure(l.m->b->fn, fr);
+                emit(OP_ClassInit, rc, fr);
+            } else {
+                if (l.m->b) closure(l.m->b->fn, fr);
+                else emit(OP_LoadUndef, fr);
+                emit(OP_DefStaticField, rc, l.key, fr);
+            }
+            f->nextReg = m2;
+        }
         emit(OP_Move, dst, rc);
         exitScope(sm);
         f->nextReg = mark;
@@ -1152,6 +1205,7 @@ private:
                 newReg();
                 emit(OP_GetIter, it, src);
                 int v = newReg(), done = newReg();
+                size_t start = here();
                 for (Node* e : t->list) {
                     if (e->type == N::Rest) {
                         int arr = newReg();
@@ -1168,6 +1222,17 @@ private:
                         if (e->type != N::Hole) bindTarget(e, v, init);
                     }
                 }
+                // ECMA-262 8.6.2: an iterator that was not used up is closed, also when binding throws
+                size_t end = here();
+                emit(OP_IterClose, it);
+                size_t over = jump(OP_Jmp);
+                size_t handler = here();
+                int e = newReg();
+                emit(OP_Catch, e);
+                emit(OP_IterCloseQuiet, it);
+                emit(OP_Throw, e);
+                patch(over);
+                f->p->handlers.push_back({(uint32_t)start, (uint32_t)end, (uint32_t)handler, (uint16_t)f->ctxDepth, 1});
                 break;
             }
             case N::ObjectPat: {
@@ -1232,10 +1297,39 @@ private:
         f->loops.pop_back();
     }
 
+    // Closes a for-of iterator that is being left early. `quiet` is the exception path: whatever return() does is
+    // ignored and the exception carries on. An async iterator's return() is awaited (ECMA-262 7.4.13).
+    void emitIterClose(int state, bool isAsync, bool quiet) {
+        if (!isAsync) {
+            emit(quiet ? OP_IterCloseQuiet : OP_IterClose, state);
+            return;
+        }
+        int mark = f->nextReg;
+        int r = newReg(), flag = newReg();
+        emit(quiet ? OP_IterReturnCallQuiet : OP_IterReturnCall, r, state, flag);
+        size_t skip = jump(OP_JmpF, flag);
+        if (quiet) {
+            size_t start = here();
+            emit(OP_Await, r, r);
+            size_t end = here();
+            size_t over = jump(OP_Jmp);
+            size_t handler = here();
+            int e = newReg();
+            emit(OP_Catch, e);  // a rejected return() is dropped: the exception already under way wins
+            patch(over);
+            f->p->handlers.push_back({(uint32_t)start, (uint32_t)end, (uint32_t)handler, (uint16_t)f->ctxDepth, 0});
+        } else {
+            emit(OP_Await, r, r);
+            emit(OP_CheckIterResult, r);
+        }
+        patch(skip);
+        f->nextReg = mark;
+    }
+
     // Emits the code needed before a jump that leaves try/finally blocks, loops and scopes.
     void unwind(size_t finMark, int targetDepth, size_t loopFrom) {
         for (size_t i = f->loops.size(); i-- > loopFrom;)
-            if (f->loops[i].iterReg >= 0) emit(OP_IterClose, f->loops[i].iterReg);
+            if (f->loops[i].iterReg >= 0) emitIterClose(f->loops[i].iterReg, f->loops[i].asyncIter, false);
         int depth = f->ctxDepth;
         for (size_t i = f->fins.size(); i-- > finMark;) {
             Fin fin = f->fins[i];
@@ -1313,24 +1407,42 @@ private:
 
     void forInOf(Node* n) {
         bool isOf = n->type == N::ForOf;
+        bool isAwait = isOf && (n->flags & NF_AWAIT);
         ScopeMark sm = enterScope(n->scope);
         int mark = f->nextReg;
         int src = expr(n->b);
         int state = newReg();
         newReg();
-        emit(isOf ? OP_GetIter : OP_ForInPrep, state, src);
+        emit(isAwait ? OP_GetAsyncIter : isOf ? OP_GetIter : OP_ForInPrep, state, src);
         int v = newReg(), done = newReg();
         Loop& L = pushLoop(true);
         if (isOf) L.iterReg = state;
+        L.asyncIter = isAwait;
         size_t top = here();
-        emit(isOf ? OP_IterNext : OP_ForInNext, v, state, done);
+        if (isAwait) {  // each step is awaited: next() gives a promise of the {value, done} result
+            emit(OP_IterCall, v, state);
+            emit(OP_Await, v, v);
+            emit(OP_IterResult, v, v, done);
+        } else
+            emit(isOf ? OP_IterNext : OP_ForInNext, v, state, done);
         size_t out = jump(OP_JmpT, done);
+        size_t bodyStart = here();
+        int depth = f->ctxDepth;
         if (n->scope->hasCtx) emit(OP_CloneCtx);
         if (n->a->type == N::VarDecl) bindTarget(n->a->list[0]->a, v, true);
         else bindTarget(n->a, v, false);
         stmt(n->d);
+        size_t bodyEnd = here();
         patchConts();
         patchTo(jump(OP_Jmp), top);
+        if (isOf) {  // an exception in the body closes the iterator and then carries on (ECMA-262 14.7.5.7)
+            size_t handler = here();
+            int e = newReg();
+            emit(OP_Catch, e);
+            emitIterClose(state, isAwait, true);
+            emit(OP_Throw, e);
+            f->p->handlers.push_back({(uint32_t)bodyStart, (uint32_t)bodyEnd, (uint32_t)handler, (uint16_t)depth, 1});
+        }
         // a `break` must not run IterClose twice, so breaks land after the normal exit
         patch(out);
         popLoop();
@@ -1355,7 +1467,7 @@ private:
             stmt(n->c);
             exitScope(sm);
             patch(after);
-            f->p->handlers.push_back({(uint32_t)start, (uint32_t)endTry, (uint32_t)handler, (uint16_t)depth});
+            f->p->handlers.push_back({(uint32_t)start, (uint32_t)endTry, (uint32_t)handler, (uint16_t)depth, 0});
         }
         if (hasFin) {
             size_t endAll = here();
@@ -1369,7 +1481,7 @@ private:
             emit(OP_Throw, e);
             f->nextReg--;
             patch(after);
-            f->p->handlers.push_back({(uint32_t)start, (uint32_t)endAll, (uint32_t)handler, (uint16_t)depth});
+            f->p->handlers.push_back({(uint32_t)start, (uint32_t)endAll, (uint32_t)handler, (uint16_t)depth, 1});
         }
     }
 
@@ -1384,7 +1496,7 @@ private:
             case N::Debugger: break;
             case N::Class: {
                 int r = emitClass(n, newReg());
-                storeVar(n->var, n->str, r, true);
+                storeVar(n->var2, n->str, r, true);
                 break;
             }
             case N::Block: {
@@ -1456,6 +1568,7 @@ private:
                 if (n->a) {
                     r = newReg();
                     expr(n->a, r);
+                    if (f->info->isAsync && f->info->isGenerator) emit(OP_Await, r, r);  // async generators await what they return
                 }
                 if (!f->fins.empty() || hasOpenIter()) unwind(0, -1, 0);
                 if (r >= 0) emit(OP_Return, r);

@@ -64,6 +64,17 @@ enum Op : uint16_t {
     OP_NewPrivate,  // a = fresh private name (description consts[bx])
     OP_Yield,       // a = yield b
     OP_Await,       // a = await b
+    OP_GetAsyncIter,  // a, a+1 = async iterator of b and its next method
+    OP_IterCall,      // a = b.next(), the raw result (b, b+1 as set by GetAsyncIter)
+    OP_IterResult,    // unpack the iterator result b: a = value, c = done
+    OP_IterReturnCall,       // a = b.return() if there is one, c = whether it was called; the iterator in b is cleared
+    OP_IterReturnCallQuiet,  // the same, with errors swallowed
+    OP_CheckIterResult,      // TypeError unless a is an object
+    OP_IterCloseQuiet,       // close the iterator in a, ignoring what return() does: an exception is passing
+    OP_DelegateCall,    // yield*: a = result of next/throw/return on the inner iterator at b (b+2 received, b+3 mode)
+    OP_DelegateResult,  // yield*: read the result at b+4: c = done, a = final value when done
+    OP_YieldDelegate,   // yield b from inside yield*; the resumption lands in a (value) and a+1 (mode)
+    OP_ClassInit,   // run the static block b with `this` set to the class a
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
     OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2
     OP_Debugger,

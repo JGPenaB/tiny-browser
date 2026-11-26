@@ -1377,9 +1377,11 @@ JSFN(builtinIterNext) {
 }
 static Value generatorResume(CallInfo& ci, int mode) {
     Vm& vm = ci.vm;
-    if (!ci.thisv.isObject() || ci.thisv.asObject()->cls != Cls::Generator) vm.throwError(Err::TypeError, "Generator method called on incompatible receiver");
+    JSGenerator* g = ci.thisv.isObject() && ci.thisv.asObject()->cls == Cls::Generator ? (JSGenerator*)ci.thisv.asObject() : nullptr;
+    if (!g || g->isAsync) vm.throwError(Err::TypeError, "Generator method called on incompatible receiver");
     bool done = false;
-    Value v = vm.resumeGenerator((JSGenerator*)ci.thisv.asObject(), ci.arg(0), mode, done);
+    Value v = vm.resumeGenerator(g, ci.arg(0), mode, done);
+    if (!done && g->delegating) return v;  // yield* hands on the inner iterator's own result object
     return vm.makeIterResult(v, done);
 }
 JSFN(generatorNext) { return generatorResume(ci, 0); }

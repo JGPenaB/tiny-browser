@@ -136,6 +136,8 @@ function strictSet(o, k, v) { "use strict"; o[k] = v; }
   eq([log.join(), (await load("w5.js").catch(e => e)) === w], ["w4", true]);
   mod("w7.js", `export let state = 'before'; if (false) await 0; state = 'after';`);
   eq((await load("w7.js")).state, "after");
+  mod("w8.js", `export const seen = []; for await (const x of [Promise.resolve(1), 2]) seen.push(x); export default class { static { seen.push('static block'); } }`);
+  eq((await load("w8.js")).seen, [1, 2, "static block"]);
 
   __current = "import() and import.meta";
   mod("dy.js", `export const ns = await import('./a.js'); export const same = ns === (await import('./a.js'));

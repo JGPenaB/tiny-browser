@@ -255,7 +255,12 @@ void JSGenerator::trace(Gc& g) {
     g.mark(ctx);
     g.mark(newTarget);
     g.mark(promise);
+    g.mark(retVal);
     g.mark(args);
+    for (auto& r : queue) {
+        g.mark(r.value);
+        g.mark(r.promise);
+    }
 }
 
 // ---------------------------------------------------------------------------- property storage
@@ -331,6 +336,7 @@ Vm::Vm() {
     setupGlobals();
     setupCollections();
     setupTypedArrays(*this);
+    setupAsyncIteration(*this);
     setupModules(*this);
 }
 Vm::~Vm() {}
@@ -439,6 +445,10 @@ void Vm::markRoots(Gc& g) {
     g.mark(arrayBufferProto);
     g.mark(dataViewProto);
     g.mark(importHook);
+    g.mark(asyncIteratorProto);
+    g.mark(asyncGeneratorProto);
+    g.mark(asyncFromSyncProto);
+    g.mark(genReturnSignal);
 }
 
 // ---------------------------------------------------------------------------- errors
@@ -854,8 +864,8 @@ Value Vm::fnProtoProp(JSFunction* f) {
     PropKey k = PropKey::of(a.prototype);
     if (Prop* p = f->find(k)) return p->val;
     FuncProto* c = f->code;
-    if (c->isArrow || c->isMethod || c->isAsync) return Value::undef();
-    JSObject* po = newObject(c->isGenerator ? generatorProto : objectProto);
+    if (c->isArrow || c->isMethod || (c->isAsync && !c->isGenerator)) return Value::undef();
+    JSObject* po = newObject(c->isGenerator ? (c->isAsync ? asyncGeneratorProto : generatorProto) : objectProto);
     if (!c->isGenerator) po->add(PropKey::of(a.constructor), Value::cell(f), PF_W | PF_C);
     f->add(k, Value::cell(po), PF_W);
     return Value::cell(po);
@@ -1281,7 +1291,7 @@ Value Vm::callFunction(JSFunction* f, Value thisv, const Value* args, int argc, 
     FuncProto* p = f->code;
     if (!construct) {
         if (p->isClassCtor) throwError(Err::TypeError, "Class constructor %s cannot be invoked without 'new'", p->name ? utf16to8(p->name->s).c_str() : "");
-        if (p->isGenerator) return startGenerator(f, thisv, args, argc);
+        if (p->isGenerator) return p->isAsync ? startAsyncGenerator(f, thisv, args, argc) : startGenerator(f, thisv, args, argc);
         if (p->isAsync) return startAsync(f, thisv, args, argc);
     }
     DepthGuard guard(*this);
@@ -1533,14 +1543,10 @@ Value Vm::resumeGenerator(JSGenerator* g, Value sent, int mode, bool& done) {
         if (mode == 1) throwValue(sent);
         return mode == 2 ? sent : Value::undef();
     }
-    if (mode != 0 && g->state == 0) {
-        g->state = 3;
-        if (mode == 1) throwValue(sent);
-        return sent;
-    }
-    if (mode == 2) {  // return(): finishes the generator (finally blocks inside it are not run yet)
+    if (mode != 0 && g->state == 0) {  // not started: there is nothing to unwind
         g->state = 3;
         g->regs.clear();
+        if (mode == 1) throwValue(sent);
         return sent;
     }
     DepthGuard guard(*this);
@@ -1553,9 +1559,17 @@ Value Vm::resumeGenerator(JSGenerator* g, Value sent, int mode, bool& done) {
     stackTop = base + p->nregs;
     g->state = 2;
     if (wasYield) {
-        if (mode == 0) base[g->resumeReg] = sent;
+        if (g->delegating) {  // inside yield*: the inner iterator is given the value, the throw or the return
+            g->delegating = false;
+            base[g->resumeReg] = sent;
+            base[g->resumeReg + 1] = Value::i32(mode);
+        } else if (mode == 0)
+            base[g->resumeReg] = sent;
         else {
-            pending = sent;
+            // throw() raises the value at the yield. return() raises a signal no catch clause sees, so that only
+            // the finally blocks on the way out run (ECMA-262 27.5.3.4 GeneratorResumeAbrupt).
+            if (mode == 2) g->retVal = sent;
+            pending = mode == 2 ? Value::cell(genReturnSignal) : sent;
             resumeThrow = true;
         }
     }
@@ -1566,6 +1580,12 @@ Value Vm::resumeGenerator(JSGenerator* g, Value sent, int mode, bool& done) {
     } catch (JSThrow&) {
         g->state = 3;
         g->regs.clear();
+        if (pending.isObject() && pending.asObject() == genReturnSignal) {  // return() has left the body
+            pending = Value::undef();
+            Value r = g->retVal;
+            g->retVal = Value::undef();
+            return r;
+        }
         throw;
     }
     if (yielded) {
@@ -1939,9 +1959,9 @@ static std::string calleeText(const FuncProto* p, const Ins* callIns, uint16_t r
     return "";
 }
 
-static const Handler* findHandler(FuncProto* p, uint32_t at) {
+static const Handler* findHandler(FuncProto* p, uint32_t at, bool finallyOnly) {
     for (auto& h : p->handlers)
-        if (at >= h.start && at < h.end) return &h;
+        if (at >= h.start && at < h.end && (h.isFinally || !finallyOnly)) return &h;
     return nullptr;
 }
 
@@ -2540,9 +2560,12 @@ Value Vm::runFrames(size_t base) {
                             }
                             break;
                         }
+                        R(i.b) = Value::undef();  // an iterator whose next() throws is finished: nobody closes it
                         Value r = call(R(i.b + 1), itv, nullptr, 0);
                         if (!r.isObject()) throwError(Err::TypeError, "Iterator result is not an object");
-                        if (toBool(get(r, a.done))) {
+                        bool finished = toBool(get(r, a.done));
+                        R(i.b) = itv;
+                        if (finished) {
                             R(i.a) = i.op == OP_IterNextRet ? get(r, a.value) : Value::undef();
                             R(i.c) = Value::boolean(true);
                             R(i.b) = Value::undef();
@@ -2552,14 +2575,87 @@ Value Vm::runFrames(size_t base) {
                         }
                         break;
                     }
-                    case OP_IterClose: {
+                    case OP_IterClose:
+                    case OP_IterCloseQuiet: {
                         Value itv = R(i.a);
-                        if (itv.isObject() && !R(i.a + 1).isEmpty()) {
-                            fr->pc = pc;
+                        R(i.a) = Value::undef();  // closing happens once, even if return() throws
+                        if (!itv.isObject() || R(i.a + 1).isEmpty()) break;
+                        fr->pc = pc;
+                        if (i.op == OP_IterClose) {
                             Value ret = get(itv, a.return_);
-                            if (isCallable(ret)) call(ret, itv, nullptr, 0);
+                            if (isCallable(ret) && !call(ret, itv, nullptr, 0).isObject()) throwError(Err::TypeError, "Iterator result is not an object");
+                        } else {
+                            Value keep = pending;  // an exception is on its way: whatever return() does is ignored
+                            try {
+                                Value ret = get(itv, a.return_);
+                                if (isCallable(ret)) call(ret, itv, nullptr, 0);
+                            } catch (JSThrow&) {
+                            }
+                            pending = keep;
                         }
-                        R(i.a) = Value::undef();
+                        break;
+                    }
+                    case OP_GetAsyncIter: {
+                        fr->pc = pc;
+                        Value next;
+                        Value it = getAsyncIterator(R(i.b), next);
+                        R(i.a) = it;
+                        R(i.a + 1) = next;
+                        break;
+                    }
+                    case OP_IterCall:
+                        fr->pc = pc;
+                        R(i.a) = call(R(i.b + 1), R(i.b), nullptr, 0);
+                        break;
+                    case OP_IterResult: {
+                        Value r = R(i.b);
+                        fr->pc = pc;
+                        if (!r.isObject()) throwError(Err::TypeError, "Iterator result %s is not an object", utf16to8(inspect(r, 0)).c_str());
+                        bool d = toBool(get(r, a.done));
+                        R(i.c) = Value::boolean(d);
+                        R(i.a) = d ? Value::undef() : get(r, a.value);
+                        break;
+                    }
+                    case OP_IterReturnCall:
+                    case OP_IterReturnCallQuiet: {
+                        Value itv = R(i.b);
+                        R(i.b) = Value::undef();
+                        R(i.c) = Value::boolean(false);
+                        if (!itv.isObject()) break;
+                        fr->pc = pc;
+                        if (i.op == OP_IterReturnCall) {
+                            Value ret = get(itv, a.return_);
+                            if (ret.isNullish()) break;
+                            R(i.a) = call(ret, itv, nullptr, 0);
+                            R(i.c) = Value::boolean(true);
+                        } else {
+                            Value keep = pending;
+                            try {
+                                Value ret = get(itv, a.return_);
+                                if (isCallable(ret)) {
+                                    R(i.a) = call(ret, itv, nullptr, 0);
+                                    R(i.c) = Value::boolean(true);
+                                }
+                            } catch (JSThrow&) {
+                            }
+                            pending = keep;
+                        }
+                        break;
+                    }
+                    case OP_CheckIterResult:
+                        if (!R(i.a).isObject()) throwError(Err::TypeError, "Iterator result %s is not an object", utf16to8(inspect(R(i.a), 0)).c_str());
+                        break;
+                    case OP_DelegateCall:
+                        fr->pc = pc;
+                        R(i.a) = delegateCall(&R(i.b));
+                        break;
+                    case OP_DelegateResult: {
+                        fr->pc = pc;
+                        Value v;
+                        bool d = false;
+                        delegateResult(&R(i.b), v, d);
+                        R(i.c) = Value::boolean(d);
+                        if (d) R(i.a) = v;
                         break;
                     }
                     case OP_ForInPrep: {
@@ -2668,19 +2764,31 @@ Value Vm::runFrames(size_t base) {
                         defineOwn(ctor, toKey(R(i.b)), v, PF_ALL);
                         break;
                     }
+                    case OP_ClassInit: {
+                        JSFunction* ctor = (JSFunction*)R(i.a).asCell();
+                        Value fv = R(i.b);
+                        fr->pc = pc;
+                        if (fv.isObject() && fv.asObject()->cls == Cls::Function) ((JSFunction*)fv.asObject())->home = ctor;
+                        call(fv, R(i.a), nullptr, 0);
+                        break;
+                    }
                     case OP_ModuleInit: moduleInit(*this, R(i.a), fr->ctx); break;
                     case OP_ImportCall: {
                         if (importHook.isUndef()) throwError(Err::TypeError, "import() is not available here");
                         Value args[3] = {R(i.b), R(i.b + 1), R(i.b + 2)};
+                        fr->pc = pc;
                         R(i.a) = call(importHook, Value::undef(), args, 3);
                         break;
                     }
                     case OP_NewPrivate: R(i.a) = Value::cell(newSymbol(K[i.bx].asString())); break;
                     case OP_Yield:
+                    case OP_YieldDelegate:
                     case OP_Await: {
                         JSGenerator* g = fr->gen;
                         if (!g) throwError(Err::SyntaxError, "await/yield is only valid in async functions and generators");
                         Value v = R(i.b);
+                        g->suspendedAtAwait = i.op == OP_Await;
+                        g->delegating = i.op == OP_YieldDelegate;
                         g->regs.assign(regs, regs + fr->code->nregs);
                         g->pc = pc;
                         g->ctx = fr->ctx;
@@ -2706,11 +2814,12 @@ Value Vm::runFrames(size_t base) {
                 }
             }
             freshError = nullptr;
+            bool returning = pending.isObject() && pending.asObject() == genReturnSignal;
             for (;;) {
                 fr = &frames.back();
                 uint32_t at = (uint32_t)(pc - fr->code->code.data());
                 if (at > 0) --at;
-                if (const Handler* h = terminated ? nullptr : findHandler(fr->code, at)) {
+                if (const Handler* h = terminated ? nullptr : findHandler(fr->code, at, returning)) {
                     while (fr->ctxDepth > h->ctxDepth) {
                         fr->ctx = fr->ctx->parent;
                         fr->ctxDepth--;

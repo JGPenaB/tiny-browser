@@ -27,6 +27,7 @@ void setupDate(Vm& vm);
 void setupRegExp(Vm& vm);
 void setupTypedArrays(Vm& vm);
 void setupModules(Vm& vm);
+void setupAsyncIteration(Vm& vm);
 
 // Regular expression hooks used by the String.prototype methods (regexp.cpp).
 bool isRegExp(Value v);

@@ -1159,7 +1159,12 @@ private:
     Node* forStmt() {
         Node* n = mk(N::For);
         advance();
-        if (isK(k.await_)) fail("for await is not supported yet");
+        bool isAwait = false;
+        if (isK(k.await_) && fn->isAsync) {  // for await (x of asyncIterable)
+            isAwait = true;
+            if (fn == ast.moduleFn) ast.hasTLA = true;
+            advance();
+        }
         expectP(P_LParen);
         Scope* sc = open(Scope::For);
         n->scope = sc;
@@ -1174,8 +1179,10 @@ private:
         } else {
             init = expression(false);
         }
+        if (isAwait && !(init && isK(k.of_))) fail("for await needs the form: for await (x of y)");
         if (init && (isK(k.of_) || isK(k.in_))) {
             n->type = isK(k.of_) ? N::ForOf : N::ForIn;
+            if (isAwait) n->flags |= NF_AWAIT;
             advance();
             if (isDecl) {
                 finishDecl(mark);
@@ -1498,11 +1505,11 @@ private:
         if (eatK(k.extends_)) n->a = lhs();
         Scope* cs = open(Scope::Class);
         n->scope = cs;
-        if (n->str && !isDecl) {  // a named class expression binds its name inside the class body
+        n->var2 = outer;
+        if (n->str) {  // the name is also bound inside the class body, and set before static fields and blocks run
             n->var = newVar(cs, n->str, VK_CONST);
             n->var->declEnd = 0;
-        } else
-            n->var = outer;
+        }
         expectP(P_LBrace);
         while (!isP(P_RBrace)) {
             if (eatP(P_Semi)) continue;
@@ -1527,7 +1534,25 @@ private:
         if (isK(k.static_) && nameFollows()) {
             isStatic = true;
             advance();
-            if (isP(P_LBrace)) fail("Class static blocks are not supported yet");
+            if (isP(P_LBrace)) {  // static { ... }: runs once while the class is defined, with `this` set to the class
+                m->op = PK_STATIC_BLOCK;
+                m->flags |= NF_STATIC;
+                FunctionInfo* f = beginFn(nullptr, t.pos);
+                f->isMethod = true;
+                f->isFieldInit = true;
+                f->strict = true;
+                advance();
+                while (!isP(P_RBrace)) {
+                    if (t.type == Tok::End) unexpected();
+                    f->body.push_back(statement());
+                }
+                advance();
+                endFn(f);
+                Node* fnNode = mk(N::Function);
+                fnNode->fn = f;
+                m->b = fnNode;
+                return m;
+            }
         }
         if (isK(k.async_) && nameFollows() && !peek().nl) {
             isAsync = true;
@@ -1967,7 +1992,16 @@ private:
                 return n;
             }
             case Tok::Templ: return templateLit();
-            case Tok::Private: fail("Unexpected private name");
+            case Tok::Private: {  // `#name in object`: does the object have this private member
+                Tok nx = peek();
+                if (!(nx.type == Tok::Ident && nx.str == k.in_ && !nx.esc)) fail("Unexpected private name");
+                Node* id = mk(N::Ident);
+                id->str = t.str;
+                id->flags = NF_PRIVATE;
+                reference(id);
+                advance();
+                return id;
+            }
             case Tok::Punct:
                 if (t.p == P_LParen) {
                     advance();
