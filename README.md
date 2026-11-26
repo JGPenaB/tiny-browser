@@ -61,13 +61,17 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 2. **Milestone 2 (mostly done):** flexbox, inline-block, positioning, overflow clipping, rounded corners, interactive forms with
    GET/POST, own cookie jar, password save + autofill, meta refresh. Still open: floats, grid, background images, inline SVG,
    `::before`/`::after`, `:hover`, find-in-page, zoom, downloads, text selection.
-3. **Milestone 3 - JavaScript engine (engine built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
-   strings; classes, generators, async/await, Promises, destructuring, the core standard library, own RegExp engine, devtools
-   Console. Still open: ES modules, Proxy, typed arrays, BigInt, Intl, async generators, a test262 run.
-4. **Milestone 4 - DOM + Web APIs (next; required by Google results, YouTube and Reddit):** DOM bindings and events, script
-   loading, timers + event loop, `fetch`/XHR, storage, incremental restyle/relayout. With it: per-site controls (JavaScript,
-   cookies, images), the security baseline (same-origin rules, script time and memory limits, certificate and mixed-content
-   warnings, per-site exceptions), content blocker (EasyList-format lists), tab sleeping.
+3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
+   strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
+   engine, ES modules (`import`, `export`, `import()`, top-level await, cycles), devtools Console. Missing behavior is filled
+   in from the ECMAScript specification (ECMA-262). Still open: `for await` and async generators, strict-mode errors on
+   failed assignments, direct `eval` with local scope, class static blocks, Proxy, BigInt, Intl, a test262 run.
+4. **Milestone 4 - DOM + Web APIs (in progress; required by Google results, YouTube and Reddit):** done so far: DOM
+   bindings and events, classic and module scripts (import maps, `defer`, `nomodule`), timers + event loop, `fetch`/XHR with
+   CORS, storage, cookies, MutationObserver. Still open: custom elements and shadow DOM (Reddit), styles and images added
+   by script, incremental restyle/relayout, per-site controls (JavaScript, cookies, images), the security baseline
+   (script time and memory limits, certificate and mixed-content warnings, per-site exceptions), content blocker
+   (EasyList-format lists), tab sleeping.
 5. **Milestone 5 - performance, security, graphics:** GPU layer compositor, off-thread layout, HTTP cache, process isolation,
    CSP and sandboxed frames, media playback, WebGL (own GLSL-to-HLSL translator), 3D page view (page layers as a movable
    parallax), save as PDF.

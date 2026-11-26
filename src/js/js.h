@@ -265,6 +265,9 @@ struct HostHooks {
     bool (*set)(Vm& vm, JSObject* o, PropKey k, Value v) = nullptr;
     bool (*del)(Vm& vm, JSObject* o, PropKey k) = nullptr;
     void (*keys)(Vm& vm, JSObject* o, std::vector<PropKey>& out) = nullptr;
+    uint8_t attrs = PF_ALL;  // attributes reported for the properties the hooks supply
+    // Optional: answers `in` without reading the value, and makes delete fail for non-configurable hook properties.
+    bool (*has)(Vm& vm, JSObject* o, PropKey k) = nullptr;
 };
 struct JSHost : JSObject {
     const HostHooks* hooks = nullptr;
@@ -543,6 +546,7 @@ public:
     JSObject* errorProtos[7] = {};
     JSObject* typedProtos[9] = {};
     JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr;
+    Value importHook;  // called for import(): (specifier, options, file of the calling code)
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
            *symToStringTag = nullptr, *symSpecies = nullptr;
     Value regexpCtor, promiseCtor;
@@ -591,8 +595,26 @@ struct RootScope {
 };
 
 // Parses and compiles source text into bytecode. Throws JSThrow (SyntaxError) on failure.
+// With `module` set the source is compiled as an ES module: the result evaluates to an async function taking
+// (own namespace, import.meta), and `module` receives what the loader needs to link it (ECMA-262 16.2.1.7).
+struct ModuleInfo {
+    struct Export {
+        std::u16string name;
+        int slot;                  // slot in the module's scope, or -1 for a re-export
+        int request;               // index of the module re-exported from, or -1
+        std::u16string importName; // name in that module
+        bool named;                // false: re-exports that module's whole namespace (export * as x)
+    };
+    std::vector<std::u16string> requests;  // module specifiers
+    std::vector<int> requestSlots;         // scope slot that receives each requested module's namespace
+    std::vector<Export> exports;
+    std::vector<int> stars;                               // export * from
+    std::vector<std::pair<int, std::u16string>> imports;  // named imports: request index, name
+    bool hasTopLevelAwait = false;
+};
 FuncProto* compileScript(Vm& vm, std::shared_ptr<const std::u16string> src, const std::string& file, bool functionBody,
-                         const std::u16string* params);
+                         const std::u16string* params, ModuleInfo* module = nullptr);
+void moduleInit(Vm& vm, Value ns, Context* ctx);
 
 std::u16string utf8to16(std::string_view s);
 std::string utf16to8(std::u16string_view s);

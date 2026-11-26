@@ -28,6 +28,7 @@ add_executable(tinybrowser WIN32
   src/js/regex.cpp
   src/js/regexp.cpp
   src/js/typedarray.cpp
+  src/js/module.cpp
   src/js/jsrun.cpp
 )
 

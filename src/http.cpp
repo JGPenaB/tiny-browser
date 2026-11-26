@@ -824,6 +824,8 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
         Node* node;
         bool isInline;
         std::string text;  // code or URL
+        ScriptSource::Kind kind = ScriptSource::Classic;
+        bool noFetch = false;  // a module with a src: the module loader fetches it, with its own checks
     };
     std::vector<ScriptJob> scriptJobs;
     bool wantScripts = !script_policy || script_policy(R->url);
@@ -865,7 +867,7 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
                 std::string ty = type ? lower(std::string(trim(*type))) : "";
                 bool classic = ty.empty() || ty == "text/javascript" || ty == "application/javascript" || ty == "application/x-javascript" ||
                                ty == "text/ecmascript" || ty == "application/ecmascript" || ty == "text/jscript" || ty == "javascript";
-                if (classic) {
+                if (classic && !n->attr("nomodule")) {  // nomodule marks a fallback for browsers without modules
                     const std::string* src = n->attr("src");
                     if (src && !src->empty()) {
                         scriptJobs.push_back({n, false, resolve_url(base, *src)});
@@ -873,6 +875,16 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
                         std::string code = text_content(n);
                         if (!trim(code).empty()) scriptJobs.push_back({n, true, std::move(code)});
                     }
+                } else if (ty == "module") {
+                    const std::string* src = n->attr("src");
+                    if (src && !src->empty()) {
+                        scriptJobs.push_back({n, false, resolve_url(base, *src), ScriptSource::Module, true});
+                    } else if (!src) {
+                        std::string code = text_content(n);
+                        if (!trim(code).empty()) scriptJobs.push_back({n, true, std::move(code), ScriptSource::Module});
+                    }
+                } else if (ty == "importmap" && !n->attr("src")) {
+                    scriptJobs.push_back({n, true, text_content(n), ScriptSource::ImportMap});
                 }
             }
         }
@@ -906,6 +918,10 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
         if (i >= nCss + nImg) {
             size_t k = i - nCss - nImg;
             ScriptJob& j = scriptJobs[k];
+            if (j.noFetch) {
+                scriptOk[k] = 1;
+                return;
+            }
             if (j.isInline) {
                 scriptCode[k] = std::move(j.text);
                 scriptOk[k] = 1;
@@ -942,8 +958,14 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
     }
     for (auto& e : imgNet) R->net.push_back(e);
     for (size_t k = 0; k < nScript; ++k) {
-        if (!scriptJobs[k].isInline) R->net.push_back(scriptNet[k]);
-        if (scriptOk[k]) R->scripts.push_back({scriptJobs[k].node, std::move(scriptCode[k]), scriptJobs[k].isInline ? R->url : scriptJobs[k].text});
+        ScriptJob& j = scriptJobs[k];
+        if (!j.isInline && !j.noFetch) R->net.push_back(scriptNet[k]);
+        if (!scriptOk[k]) continue;
+        ScriptSource src{j.node, std::move(scriptCode[k]), j.isInline ? R->url : j.text, j.kind};
+        src.external = !j.isInline;
+        src.async = j.node->attr("async") != nullptr;
+        src.deferred = j.kind == ScriptSource::Module || (j.kind == ScriptSource::Classic && src.external && !src.async && j.node->attr("defer"));
+        R->scripts.push_back(std::move(src));
     }
     R->images = std::move(images);
     for (auto& [node, u] : imgRefs) {

@@ -331,6 +331,7 @@ Vm::Vm() {
     setupGlobals();
     setupCollections();
     setupTypedArrays(*this);
+    setupModules(*this);
 }
 Vm::~Vm() {}
 
@@ -437,6 +438,7 @@ void Vm::markRoots(Gc& g) {
     for (JSObject* p : typedProtos) g.mark(p);
     g.mark(arrayBufferProto);
     g.mark(dataViewProto);
+    g.mark(importHook);
 }
 
 // ---------------------------------------------------------------------------- errors
@@ -934,7 +936,7 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
             if (!h->hooks || !h->hooks->get || k.isSymbol()) return false;
             Value v;
             if (!h->hooks->get(vm, o, k, v)) return false;
-            out = {k, v, PF_ALL};
+            out = {k, v, h->hooks->attrs};
             return true;
         }
         default: return false;
@@ -1122,6 +1124,10 @@ void Vm::defineAccessor(JSObject* o, PropKey k, Value getter, Value setter, uint
 }
 
 bool Vm::hasOwn(JSObject* o, PropKey k) {
+    if (o->cls == Cls::Host && !k.isSymbol()) {
+        JSHost* h = (JSHost*)o;
+        if (h->hooks && h->hooks->has) return o->find(k) || h->hooks->has(*this, o, k);
+    }
     Prop tmp;
     return getOwn(o, k, tmp);
 }
@@ -1134,6 +1140,7 @@ bool Vm::del(JSObject* o, PropKey k) {
     if (o->cls == Cls::Host && !k.isSymbol()) {
         JSHost* h = (JSHost*)o;
         if (h->hooks && h->hooks->del && h->hooks->del(*this, o, k)) return true;
+        if (h->hooks && h->hooks->has && !(h->hooks->attrs & PF_C) && h->hooks->has(*this, o, k)) return false;
     }
     if ((o->cls == Cls::Array || o->cls == Cls::Arguments) && k.isIndex()) {
         JSArray* arr = (JSArray*)o;
@@ -2659,6 +2666,13 @@ Value Vm::runFrames(size_t base) {
                             v = call(fv, R(i.a), nullptr, 0);
                         }
                         defineOwn(ctor, toKey(R(i.b)), v, PF_ALL);
+                        break;
+                    }
+                    case OP_ModuleInit: moduleInit(*this, R(i.a), fr->ctx); break;
+                    case OP_ImportCall: {
+                        if (importHook.isUndef()) throwError(Err::TypeError, "import() is not available here");
+                        Value args[3] = {R(i.b), R(i.b + 1), R(i.b + 2)};
+                        R(i.a) = call(importHook, Value::undef(), args, 3);
                         break;
                     }
                     case OP_NewPrivate: R(i.a) = Value::cell(newSymbol(K[i.bx].asString())); break;

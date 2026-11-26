@@ -10,9 +10,14 @@
 namespace tb {
 
 struct ScriptSource {
+    enum Kind { Classic, Module, ImportMap };
     Node* node = nullptr;  // the <script> element
-    std::string code;      // UTF-8 source text
+    std::string code;      // UTF-8 source text; empty for a module that is fetched from `url`
     std::string url;       // where it came from, for error messages
+    Kind kind = Classic;
+    bool external = false;  // has a src attribute
+    bool deferred = false;  // runs once the document is parsed, in document order: defer scripts and modules
+    bool async = false;     // runs as soon as it is ready
 };
 
 class ScriptHost {
@@ -44,6 +49,7 @@ public:
 
     // Runs the page's scripts in document order, then fires DOMContentLoaded and load.
     void runScripts(const std::vector<ScriptSource>& scripts);
+    void fireLoadEvents();
     // Fires a user-interface event at a node (null: the window). Returns false when a listener cancelled it.
     bool dispatch(Node* target, const std::string& type, bool bubbles = true, bool cancelable = true);
     // Runs timers that are due. The shell calls this when a wake() delay has passed.

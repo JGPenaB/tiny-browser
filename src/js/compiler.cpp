@@ -215,6 +215,7 @@ private:
             if (target->type == N::Ident && !target->var->captured) target->var->reg = 2 + i;
         }
         enterScope(sc, true);
+        if (info == ast.moduleFn) emit(OP_ModuleInit, 2);  // r2 is the namespace argument
         prologuePseudo(info);
         for (int i = 0; i < np; ++i) {
             Node* p = info->params[i];
@@ -238,6 +239,14 @@ private:
                 bindTarget(target, reg, true);
         }
         hoist(sc);
+        if (info == ast.moduleFn) {
+            // The module's scope now exists with its functions in place (ECMA-262 InitializeEnvironment). The
+            // body waits here until the loader evaluates the module.
+            int t = newReg();
+            emit(OP_LoadUndef, t);
+            emit(OP_Yield, t, t);
+            f->nextReg--;
+        }
         for (Node* s : info->body) stmt(s);
         emit(OP_RetUndef);
         FuncProto* p = end(fn);
@@ -258,7 +267,7 @@ private:
         if (isFunctionScope) m.regMark = 0;
         int slots = 0;
         for (Variable* v : sc->vars)
-            if (!v->isGlobal && v->captured) v->slot = slots++;
+            if (!v->isGlobal && v->captured && v->kind != VK_IMPORT) v->slot = slots++;
         sc->hasCtx = slots > 0;
         if (slots) {
             emitX(OP_PushCtx, 0, (uint32_t)slots);
@@ -320,6 +329,10 @@ private:
             if (lex && init) emitX(OP_InitGlobalLet, src, kstr(v->name));
             else if (v->kind == VK_FUNC && init) emitX(OP_DefGlobalFunc, src, kstr(v->name));
             else emitX(OP_SetGlobal, src, kstr(v->name));
+            return;
+        }
+        if (v->kind == VK_IMPORT) {  // imports are immutable bindings
+            emitX(OP_ThrowConst, 0, kstr(v->name));
             return;
         }
         if (!init && v->kind == VK_CONST) {
@@ -466,6 +479,13 @@ private:
                     need();
                     if (!v && n->str == vm.a.undefined) emit(OP_LoadUndef, dst);
                     else emitX(OP_GetGlobal, dst, kstr(n->str));
+                    return dst;
+                }
+                if (v->kind == VK_IMPORT) {  // read the export out of the module it comes from, every time
+                    need();
+                    Variable* from = v->importNs;
+                    emit(OP_GetCtx, dst, depthOf(from), from->slot);
+                    if (v->importName) getProp(dst, dst, v->importName);
                     return dst;
                 }
                 if (v->captured) {
@@ -713,6 +733,20 @@ private:
                 emit(OP_LoadUndef, base + 1);
                 if (args(n, base)) emit(OP_NewSpread, dst, base);
                 else emit(OP_New, dst, base, (int)n->list.size());
+                f->nextReg = mark;
+                return dst;
+            }
+            case N::ImportCall: {  // import(specifier, options)
+                need();
+                int mark = f->nextReg;
+                int a0 = newReg();
+                int a1 = newReg();
+                int a2 = newReg();
+                expr(n->a, a0);
+                if (n->b) expr(n->b, a1);
+                else emit(OP_LoadUndef, a1);
+                emitX(OP_LoadK, a2, konst(Value::cell(vm.str(utf8to16(file_)))));
+                emit(OP_ImportCall, dst, a0);
                 f->nextReg = mark;
                 return dst;
             }
@@ -1492,13 +1526,24 @@ private:
 }  // namespace
 
 FuncProto* compileScript(Vm& vm, std::shared_ptr<const std::u16string> src, const std::string& file, bool functionBody,
-                         const std::u16string* params) {
+                         const std::u16string* params, ModuleInfo* module) {
     Ast ast;
     ast.src = std::move(src);
+    (void)functionBody;
     try {
-        parseScript(vm, ast, functionBody, params);
+        parseScript(vm, ast, module != nullptr, params);
         Compiler c(vm, ast, file);
-        return c.program();
+        FuncProto* p = c.program();
+        if (module) {
+            for (JSString* r : ast.requests) module->requests.push_back(r->s);
+            for (Variable* v : ast.requestVars) module->requestSlots.push_back(v->slot);
+            for (auto& e : ast.exports)
+                module->exports.push_back({e.name->s, e.var ? e.var->slot : -1, e.request, e.importName ? e.importName->s : std::u16string(), e.importName != nullptr});
+            module->stars = ast.starRequests;
+            for (auto& im : ast.imports) module->imports.push_back({im.request, im.name->s});
+            module->hasTopLevelAwait = ast.hasTLA;
+        }
+        return p;
     } catch (const SyntaxErr& e) {
         std::string m = e.msg + " (" + file + ":" + std::to_string(e.line) + ")";
         vm.throwError(Err::SyntaxError, utf8to16(m));

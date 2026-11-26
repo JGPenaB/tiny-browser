@@ -584,6 +584,119 @@ var Intl = {
   Segmenter: class { segment(s) { return Array.from(String(s)).map(function (c, i) { return { segment: c, index: i }; }); } },
   getCanonicalLocales: function (l) { return l === undefined ? [] : [].concat(l); }, supportedValuesOf: function () { return []; }
 };
+)JS"
+R"JS(
+// ---- module scripts: how specifiers become URLs (import maps), how module text is fetched, and the order in
+// which a page's deferred scripts and modules run
+var modules = G.__modules, reportError = G.__reportError;
+delete G.__modules; delete G.__reportError;
+var importMap = { imports: [], scopes: [] }, inlineModules = 0;
+var JS_TYPE = /^(application|text)\/(x-)?(javascript|ecmascript)$|^text\/(javascript1\.[0-5]|jscript|livescript)$/;
+function urlLike(specifier, base) {
+  if (/^(\/|\.\/|\.\.\/)/.test(specifier)) { try { return new URL(specifier, base).href; } catch (e) { return null; } }
+  try { return new URL(specifier).href; } catch (e) { return null; }
+}
+function specifierMap(obj, base) {  // sorted so that the longest, most specific keys are tried first
+  var out = [];
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new TypeError('An import map must hold objects of specifier to address');
+  Object.keys(obj).forEach(function (key) {
+    if (key === '') return;
+    var address = typeof obj[key] === 'string' ? urlLike(obj[key], base) : null;
+    if (address !== null && key.endsWith('/') && !address.endsWith('/')) address = null;
+    out.push([urlLike(key, base) || key, address]);
+  });
+  return out;
+}
+function byKeyDescending(a, b) { return a[0] < b[0] ? 1 : a[0] > b[0] ? -1 : 0; }
+function addEntries(list, more) {  // earlier import maps win
+  more.forEach(function (e) { if (!list.some(function (x) { return x[0] === e[0]; })) list.push(e); });
+  list.sort(byKeyDescending);
+}
+function registerImportMap(text) {
+  try {
+    var parsed = JSON.parse(text), base = document.baseURI;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TypeError('An import map must be a JSON object');
+    if (parsed.imports !== undefined) addEntries(importMap.imports, specifierMap(parsed.imports, base));
+    if (parsed.scopes !== undefined) {
+      if (!parsed.scopes || typeof parsed.scopes !== 'object' || Array.isArray(parsed.scopes)) throw new TypeError("An import map's scopes must be an object");
+      Object.keys(parsed.scopes).forEach(function (prefix) {
+        var url; try { url = new URL(prefix, base).href; } catch (e) { return; }
+        var entry = importMap.scopes.find(function (s) { return s[0] === url; });
+        if (!entry) importMap.scopes.push(entry = [url, []]);
+        addEntries(entry[1], specifierMap(parsed.scopes[prefix], base));
+      });
+      importMap.scopes.sort(byKeyDescending);
+    }
+  } catch (e) { reportError(e); }
+}
+function importsMatch(specifier, asURL, map) {
+  for (var i = 0; i < map.length; i++) {
+    var key = map[i][0], address = map[i][1];
+    if (key === specifier) {
+      if (address === null) throw new TypeError('The import map blocks the module specifier "' + specifier + '"');
+      return address;
+    }
+    if (key.endsWith('/') && specifier.startsWith(key) && (asURL === null || /^(https?|file|ftp|wss?):/.test(asURL))) {
+      if (address === null) throw new TypeError('The import map blocks the module specifier "' + specifier + '"');
+      var url; try { url = new URL(specifier.slice(key.length), address).href; } catch (e) { url = ''; }
+      if (!url.startsWith(address)) throw new TypeError('The import map entry for "' + key + '" cannot resolve "' + specifier + '"');
+      return url;
+    }
+  }
+  return null;
+}
+modules.host.resolve = function (specifier, referrer) {
+  var base; try { base = new URL(referrer, document.baseURI).href; } catch (e) { base = document.baseURI; }
+  var asURL = urlLike(specifier, base), normalized = asURL !== null ? asURL : specifier;
+  for (var i = 0; i < importMap.scopes.length; i++) {
+    var prefix = importMap.scopes[i][0];
+    if (prefix === base || (prefix.endsWith('/') && base.startsWith(prefix))) {
+      var scoped = importsMatch(normalized, asURL, importMap.scopes[i][1]);
+      if (scoped !== null) return scoped;
+    }
+  }
+  var top = importsMatch(normalized, asURL, importMap.imports);
+  if (top !== null) return top;
+  if (asURL !== null) return asURL;
+  throw new TypeError('Failed to resolve module specifier "' + specifier + '". Relative references must start with either "/", "./", or "../".');
+};
+modules.host.fetch = function (url) {
+  return fetch(url, { credentials: 'same-origin' }).then(function (r) {
+    if (!r.ok) throw new TypeError('Failed to load module ' + url + ' (status ' + r.status + ')');
+    var type = (r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!JS_TYPE.test(type) && !(type === '' && /^file:/.test(url)))
+      throw new TypeError('Failed to load module ' + url + ': expected JavaScript but the server sent "' + type + '"');
+    return r.text().then(function (source) { return { source: source, url: r.url || url }; });
+  }, function () { throw new TypeError('Failed to load module ' + url); });
+};
+function loadModuleScript(src, code) {
+  var ready = src ? modules.load(src) : modules.load(document.URL.split('#')[0] + '#module-script-' + (++inlineModules), code, document.baseURI);
+  ready.catch(function () {});
+  return ready;
+}
+function signal(el, type) { if (el) { try { el.dispatchEvent(new Event(type)); } catch (e) { reportError(e); } } }
+function runModuleScript(el, ready, external) {
+  return ready.then(function (record) {
+    try { modules.run(record).catch(reportError); } catch (e) { reportError(e); }
+    if (external) signal(el, 'load');
+  }, function (e) { reportError(e); signal(el, 'error'); });
+}
+Object.defineProperty(G, '__pageScripts', { configurable: true, value: {
+  importMap: registerImportMap,
+  // items: [is module, element, src, inline code, run (classic scripts), async], in document order
+  deferred: function (items, done) {
+    var chain = Promise.resolve();
+    items.forEach(function (it) {
+      if (!it[0]) { chain = chain.then(it[4]); return; }
+      var ready = loadModuleScript(it[2], it[3]);
+      var exec = function () { return runModuleScript(it[1], ready, !!it[2]); };
+      if (it[5]) exec(); else chain = chain.then(exec);
+    });
+    chain.then(done, done);
+  },
+  dynamic: function (el, src, code) { runModuleScript(el, loadModuleScript(src, code), !!src); }
+} });
+G.reportError = function (e) { reportError(e); };
 
 var exported = { DOMException: DOMException, EventTarget: EventTarget, AbortController: AbortController, AbortSignal: AbortSignal, URL: URL, URLSearchParams: URLSearchParams,
   Blob: Blob, File: File, FormData: FormData, Headers: Headers, Request: Request, Response: Response, fetch: fetch, XMLHttpRequest: XMLHttpRequest,

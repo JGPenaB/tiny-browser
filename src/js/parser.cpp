@@ -458,7 +458,277 @@ public:
         close(g);
     }
 
+    // An ES module is compiled as `async function (namespace, meta) { ...module code... }`. Its top level is that
+    // function's scope: exported variables are read out of the scope by the namespace object, and an imported
+    // name is a variable that reads through the namespace of the module it comes from (a live binding).
+    void module() {
+        FunctionInfo& outer = ast.fns.emplace_back();
+        ast.top = &outer;
+        fn = &outer;
+        Scope* g = open(Scope::Global);
+        g->fn = &outer;
+        outer.scope = g;
+        outer.strict = true;
+        advance();
+        Node* fnode = mk(N::Function);
+        FunctionInfo* f = beginFn(nullptr, 0);
+        f->isAsync = true;
+        f->strict = true;
+        ast.moduleFn = f;
+        for (const char* name : {"%ns", "%meta"}) {
+            Node* id = mk(N::Ident);
+            id->str = vm.atom(name);
+            id->var = declare(id->str, VK_PARAM);
+            id->var->declEnd = 0;
+            f->params.push_back(id);
+        }
+        declaredNow.clear();
+        while (t.type != Tok::End) f->body.push_back(statement());
+        for (size_t i = 0; i < ast.exports.size(); ++i) {
+            auto& e = ast.exports[i];
+            for (size_t j = 0; j < i; ++j)
+                if (ast.exports[j].name == e.name) throw SyntaxErr{"Duplicate export of '" + utf16to8(e.name->s) + "'", e.line};
+            if (!e.local) continue;
+            Variable* v = f->scope->find(e.local);
+            if (!v) throw SyntaxErr{"Export '" + utf16to8(e.local->s) + "' is not defined in module", e.line};
+            if (v->kind == VK_IMPORT) {  // export { imported }: an indirect export of where it came from
+                e.local = nullptr;
+                e.request = requestOf(v->importNs);
+                e.importName = v->importName;
+            } else {
+                v->captured = true;  // other modules read it out of the scope
+                if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS) v->needsTdz = true;
+                e.var = v;
+            }
+        }
+        prevEnd = (uint32_t)s.size();
+        endFn(f);
+        fnode->fn = f;
+        Node* st = mk(N::ExprStmt);
+        st->a = fnode;
+        outer.body.push_back(st);
+        outer.srcEnd = (uint32_t)s.size();
+        close(g);
+    }
+
 private:
+    bool atModuleTop() const { return ast.moduleFn && fn == ast.moduleFn && scope == ast.moduleFn->scope; }
+    int requestOf(Variable* nsVar) {
+        for (size_t i = 0; i < ast.requestVars.size(); ++i)
+            if (ast.requestVars[i] == nsVar) return (int)i;
+        return -1;
+    }
+    // Registers a module specifier and returns its index; the first use also creates its namespace variable.
+    int request(JSString* spec) {
+        for (size_t i = 0; i < ast.requests.size(); ++i)
+            if (ast.requests[i]->s == spec->s) return (int)i;
+        int idx = (int)ast.requests.size();
+        ast.requests.push_back(spec);
+        Variable* v = newVar(ast.moduleFn->scope, vm.atom("%m" + std::to_string(idx)), VK_LET);
+        v->declEnd = 0;
+        v->captured = true;
+        declaredNow.pop_back();
+        ast.requestVars.push_back(v);
+        return idx;
+    }
+    bool isWord(const char* w) const { return t.type == Tok::Ident && !t.esc && t.str->s == std::u16string(w, w + strlen(w)); }
+    JSString* moduleName() {  // a name in an import/export list: any word, or a string
+        if (t.type != Tok::Ident && t.type != Tok::Str) unexpected();
+        JSString* n = vm.atomOf(t.str);
+        advance();
+        return n;
+    }
+    JSString* fromClause() {
+        if (!isWord("from")) unexpected();
+        advance();
+        if (t.type != Tok::Str) unexpected();
+        JSString* spec = t.str;
+        advance();
+        if (isWord("with") && !t.nl) {  // import attributes: none are supported, so naming one is an error
+            uint32_t line = t.line;
+            advance();
+            expectP(P_LBrace);
+            bool any = false;
+            while (!isP(P_RBrace)) {
+                moduleName();
+                expectP(P_Colon);
+                if (t.type != Tok::Str) unexpected();
+                advance();
+                any = true;
+                if (!eatP(P_Comma)) break;
+            }
+            expectP(P_RBrace);
+            if (any) throw SyntaxErr{"Import attributes are not supported", line};
+        }
+        return spec;
+    }
+    Node* importDecl() {
+        advance();  // import
+        if (t.type == Tok::Str) {  // import "module": only for its side effects
+            request(t.str);
+            advance();
+            semi();
+            return mk(N::Empty);
+        }
+        std::vector<Variable*> made;
+        auto bind = [&](JSString* local, JSString* imported) {
+            if (isRes(local)) fail("Unexpected reserved word '" + utf16to8(local->s) + "'");
+            Variable* v = declare(local, VK_CONST);
+            v->kind = VK_IMPORT;
+            v->declEnd = 0;
+            v->captured = true;  // never in a register: every use reads through the source module
+            v->importName = imported;
+            declaredNow.pop_back();
+            made.push_back(v);
+        };
+        bool more = true;
+        if (t.type == Tok::Ident && !isRes(t.str)) {  // import name from: the default export
+            JSString* local = t.str;
+            advance();
+            bind(local, k.default_);
+            more = eatP(P_Comma);
+        }
+        if (more && isP(P_Star)) {  // import * as name
+            advance();
+            if (!isWord("as")) unexpected();
+            advance();
+            if (t.type != Tok::Ident) unexpected();
+            JSString* local = t.str;
+            advance();
+            bind(local, nullptr);
+        } else if (more && isP(P_LBrace)) {  // import { a, b as c }
+            advance();
+            while (!isP(P_RBrace)) {
+                bool wasString = t.type == Tok::Str;
+                JSString* imported = moduleName();
+                JSString* local = imported;
+                if (isWord("as")) {
+                    advance();
+                    if (t.type != Tok::Ident) unexpected();
+                    local = t.str;
+                    advance();
+                } else if (wasString)
+                    unexpected();
+                bind(local, imported);
+                if (!eatP(P_Comma)) break;
+            }
+            expectP(P_RBrace);
+        } else if (more)
+            unexpected();
+        int idx = request(fromClause());
+        for (Variable* v : made) {
+            v->importNs = ast.requestVars[idx];
+            if (v->importName) ast.imports.push_back({idx, v->importName});
+        }
+        semi();
+        return mk(N::Empty);
+    }
+    void addExport(JSString* name, JSString* local, int request, JSString* importName, uint32_t line) {
+        ast.exports.push_back({name, local, nullptr, request, importName, line});
+    }
+    // export default <expression>: the value lives in a hidden variable that stays uninitialised until this runs
+    Node* hiddenDefault(Node* value, uint32_t line) {
+        JSString* name = vm.atom("%default");
+        if (ast.moduleFn->scope->find(name)) throw SyntaxErr{"Duplicate export of 'default'", line};
+        Variable* v = newVar(ast.moduleFn->scope, name, VK_LET);
+        v->declEnd = 0;
+        declaredNow.pop_back();
+        nameFn(value, k.default_);
+        Node* target = mk(N::Ident);
+        target->str = name;
+        target->var = v;
+        Node* asg = mk(N::Assign);
+        asg->op = P_Assign;
+        asg->a = target;
+        asg->b = value;
+        Node* st = mk(N::ExprStmt);
+        st->a = asg;
+        addExport(k.default_, name, -1, nullptr, line);
+        return st;
+    }
+    Node* exportDecl() {
+        uint32_t line = t.line;
+        advance();  // export
+        if (isK(k.default_)) {
+            advance();
+            bool isAsyncFn = isK(k.async_) && peek().type == Tok::Ident && peek().str == k.function_ && !peek().nl;
+            if (isK(k.function_) || isAsyncFn) {  // a declaration (hoisted like any other), named or not
+                if (isAsyncFn) advance();
+                Node* d = functionDecl(isAsyncFn, true);
+                addExport(k.default_, d->var->name, -1, nullptr, line);
+                return d;
+            }
+            if (isK(k.class_)) {
+                Tok nx = peek();
+                if (nx.type == Tok::Ident && nx.str != k.extends_ && !isRes(nx.str)) {
+                    Node* d = classNode(true);
+                    addExport(k.default_, d->str, -1, nullptr, line);
+                    return d;
+                }
+                return hiddenDefault(classNode(false), line);
+            }
+            Node* st = hiddenDefault(assign(true), line);
+            semi();
+            return st;
+        }
+        if (isP(P_Star)) {  // export * from, export * as name from
+            advance();
+            JSString* as = nullptr;
+            if (isWord("as")) {
+                advance();
+                as = moduleName();
+            }
+            int idx = request(fromClause());
+            if (as) addExport(as, nullptr, idx, nullptr, line);
+            else ast.starRequests.push_back(idx);
+            semi();
+            return mk(N::Empty);
+        }
+        if (isP(P_LBrace)) {  // export { a, b as c } [from]
+            advance();
+            struct Item {
+                JSString *local, *exported;
+                bool isString;
+            };
+            std::vector<Item> list;
+            while (!isP(P_RBrace)) {
+                bool isString = t.type == Tok::Str;
+                JSString* local = moduleName();
+                JSString* exported = local;
+                if (isWord("as")) {
+                    advance();
+                    exported = moduleName();
+                }
+                list.push_back({local, exported, isString});
+                if (!eatP(P_Comma)) break;
+            }
+            expectP(P_RBrace);
+            if (isWord("from")) {
+                int idx = request(fromClause());
+                for (auto& it : list) addExport(it.exported, nullptr, idx, it.local, line);
+            } else
+                for (auto& it : list) {
+                    if (it.isString || isRes(it.local)) throw SyntaxErr{"Unexpected export name '" + utf16to8(it.local->s) + "'", line};
+                    addExport(it.exported, it.local, -1, nullptr, line);
+                }
+            semi();
+            return mk(N::Empty);
+        }
+        // export var/let/const/function/class: an ordinary declaration whose names are exported
+        bool decl = isK(k.var_) || isK(k.let_) || isK(k.const_) || isK(k.function_) || isK(k.class_) ||
+                    (isK(k.async_) && peek().type == Tok::Ident && peek().str == k.function_ && !peek().nl);
+        if (!decl) unexpected();
+        Scope* ms = ast.moduleFn->scope;
+        size_t before = ms->vars.size();
+        Node* d = statement();
+        for (size_t i = before; i < ms->vars.size(); ++i) {
+            Variable* v = ms->vars[i];
+            if (v->kind == VK_VAR || v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_FUNC || v->kind == VK_CLASS)
+                addExport(v->name, v->name, -1, nullptr, line);
+        }
+        return d;
+    }
+
     struct KW {
         JSString *var_, *let_, *const_, *function_, *class_, *if_, *else_, *for_, *while_, *do_, *return_, *break_, *continue_,
             *throw_, *try_, *catch_, *finally_, *switch_, *case_, *default_, *new_, *delete_, *typeof_, *void_, *in_, *instanceof_,
@@ -728,9 +998,15 @@ private:
             }
             if (w == k.import_) {
                 Tok nx = peek();
-                if (!(nx.type == Tok::Punct && (nx.p == P_LParen || nx.p == P_Dot))) fail("import declarations are not supported yet");
+                if (!(nx.type == Tok::Punct && (nx.p == P_LParen || nx.p == P_Dot))) {
+                    if (!atModuleTop()) fail("Cannot use import statement outside a module");
+                    return importDecl();
+                }
             }
-            if (w == k.export_) fail("export declarations are not supported yet");
+            if (w == k.export_) {
+                if (!atModuleTop()) fail("Unexpected token 'export'");
+                return exportDecl();
+            }
             if (w == k.with_) fail("'with' statements are not supported");
             if (!isRes(w)) {
                 Tok nx = peek();
@@ -980,15 +1256,23 @@ private:
     }
 
     // ---------------------------------------------------------------- functions
-    Node* functionDecl(bool isAsync) {
+    // anonymousDefault: `export default function () {}` is a declaration too, bound to a hidden name
+    Node* functionDecl(bool isAsync, bool anonymousDefault = false) {
         uint32_t start = t.pos;
         uint32_t line = t.line;
         advance();  // function
         bool gen = eatP(P_Star);
-        if (t.type != Tok::Ident || isRes(t.str)) unexpected();
-        JSString* name = t.str;
-        Variable* v = declare(name, VK_FUNC);
-        advance();
+        JSString* name;
+        Variable* v;
+        if (anonymousDefault && isP(P_LParen)) {
+            name = k.default_;
+            v = declare(vm.atom("%default"), VK_FUNC);
+        } else {
+            if (t.type != Tok::Ident || isRes(t.str)) unexpected();
+            name = t.str;
+            v = declare(name, VK_FUNC);
+            advance();
+        }
         Node* n = functionRest(name, start, isAsync, gen, false);
         n->fn->isDecl = true;
         n->fn->line = line;
@@ -1480,6 +1764,7 @@ private:
                 return n;
             }
             if (t.str == k.await_ && fn->isAsync) {
+                if (fn == ast.moduleFn) ast.hasTLA = true;
                 Node* n = mk(N::Await);
                 advance();
                 n->a = unary();
@@ -1546,7 +1831,22 @@ private:
             advance();
             if (!isP(P_Dot) && !isP(P_LBrack) && !isP(P_LParen)) unexpected();
         } else if (isK(k.import_)) {
-            fail("import() is not supported yet");
+            advance();
+            if (eatP(P_Dot)) {  // import.meta
+                if (!isWord("meta")) unexpected();
+                advance();
+                if (!ast.moduleFn) fail("Cannot use 'import.meta' outside a module");
+                e = identRef(vm.atom("%meta"));
+            } else {
+                expectP(P_LParen);
+                e = mk(N::ImportCall);
+                e->a = assign(true);
+                if (eatP(P_Comma) && !isP(P_RParen)) {
+                    e->b = assign(true);  // options
+                    eatP(P_Comma);
+                }
+                expectP(P_RParen);
+            }
         } else {
             e = primary();
         }
@@ -1865,9 +2165,10 @@ private:
 
 }  // namespace
 
-void parseScript(Vm& vm, Ast& ast, bool, const std::u16string*) {
+void parseScript(Vm& vm, Ast& ast, bool asModule, const std::u16string*) {
     Parser p(vm, ast);
-    p.program();
+    if (asModule) p.module();
+    else p.program();
 }
 
 }  // namespace tb::js

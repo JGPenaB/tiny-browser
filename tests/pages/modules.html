@@ -1,0 +1,114 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Module scripts test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+</style>
+<script>
+  var order = [], pass = 0, fail = 0;
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    (document.getElementById('results') || document.documentElement).appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { var a = JSON.stringify(actual), e = JSON.stringify(expected); log(name, a === e, a === e ? '' : 'got ' + a + ', want ' + e); }
+  function rejects(name, promise, type) {
+    return promise.then(function () { log(name, false, 'did not reject'); }, function (e) { log(name, e instanceof type, e instanceof type ? '' : 'rejected with ' + e); return e; });
+  }
+  document.addEventListener('DOMContentLoaded', function () { order.push('DOMContentLoaded:' + document.readyState); });
+  window.addEventListener('load', function () { order.push('load:' + document.readyState); });
+</script>
+<script type="importmap">
+{
+  "imports": { "bare": "/pages/mod/bare-target.js", "pkg/": "/pages/mod/pkg/", "blocked": null },
+  "scopes": { "/pages/mod/scoped/": { "bare": "/pages/mod/scoped-target.js" } }
+}
+</script>
+<script nomodule>order.push('nomodule script ran');</script>
+<script type="module" src="mod/main.js" id="external" onload="window.externalLoaded = true"></script>
+<script defer src="mod/classic-defer.js" id="deferred"></script>
+<script type="module">
+  import { four, mathDefault, url, resolved, stateWhenRun } from './mod/main.js';
+  order.push('inline module');
+  window.fromMain = [four, mathDefault, url, resolved, stateWhenRun];
+  window.inlineFacts = [typeof this, import.meta.url === document.baseURI, document.currentScript];
+</script>
+<script type="module" async src="mod/async.js"></script>
+<script type="module">
+  import { done } from './mod/tla.js';
+  order.push('after tla');
+  window.tlaDone = done;
+</script>
+</head>
+<body>
+<h1>Module scripts test</h1>
+<p>Open through the test server: <code>http://localhost:8765/pages/modules.html</code></p>
+<div id="results"></div>
+<script>
+  order.push('classic inline:' + document.readyState);
+  window.classicImport = import('./mod/math.js');
+</script>
+<script type="module">
+  import { hits, hit, pi } from './mod/math.js';
+  import mapped from 'bare';
+  import inner from 'pkg/inner.js';
+  import scoped from './mod/scoped/user.js';
+  const other = 'http://127.0.0.1:8765';  // same server, different origin
+
+  order.push('test module');
+  await new Promise(resolve => window.addEventListener('load', resolve));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const here = location.origin + '/pages/';
+  // A module that awaits at its top level does not hold up the scripts after it, or the load events.
+  eq('order of scripts and events', order, ['classic inline:loading', 'math', 'dep', 'main', 'classic defer', 'inline module', 'tla start', 'test module',
+    'DOMContentLoaded:interactive', 'load:complete', 'tla end', 'after tla']);
+  eq('values from an external module', window.fromMain, [4, 'math default', here + 'mod/main.js', here + 'mod/x/y.js', 'interactive']);
+  eq('inline module: this, import.meta.url, currentScript', window.inlineFacts, ['undefined', true, null]);
+  eq('deferred classic script', window.deferCurrentScript, 'deferred');
+  eq('external module fires load, async module ran', [window.externalLoaded, window.asyncRan], [true, true]);
+  eq('nomodule', [document.querySelector('script[nomodule]').noModule, order.indexOf('nomodule script ran')], [true, -1]);
+  hit();
+  eq('live binding and top-level await', [hits, pi, window.tlaDone], [1, 3, true]);
+  eq('import map', [mapped, inner, scoped], ['mapped', 'pkg inner', 'scoped']);
+
+  const math = await import('./mod/math.js');
+  eq('import()', [math.pi, math.hits, math === await import(here + 'mod/math.js'), math === await window.classicImport, Object.keys(math)], [3, 1, true, true, ['default', 'double', 'hit', 'hits', 'pi']]);
+  eq('import() through the import map', [(await import('bare')).default, (await import('pkg/inner.js')).default], ['mapped', 'pkg inner']);
+  await rejects('import() of a missing file', import('./mod/nope.js'), TypeError);
+  await rejects('import() of a module with a missing import', import('./mod/missing-import.js'), TypeError);
+  eq('nothing ran from the failed graph', window.missingImportRan, undefined);
+  await rejects('import() of a syntax error', import('./mod/broken.js'), SyntaxError);
+  const thrown = await rejects('import() of a module that throws', import('./mod/throws.js'), RangeError);
+  eq('a failed module is not run again', [(await import('./mod/throws.js').catch(e => e)) === thrown, window.throwsRuns], [true, 1]);
+  await rejects('bare specifier without a mapping', import('unmapped'), TypeError);
+  await rejects('specifier blocked by the import map', import('blocked'), TypeError);
+  await rejects('module served as text/plain', import('./mod/math.js?type=text/plain'), TypeError);
+  await rejects('cross-origin module without CORS', import(other + '/pages/mod/dep.js'), TypeError);
+  const far = await import(other + '/pages/mod/dep.js?cors=1');
+  eq('cross-origin module with CORS', [Object.keys(far), order[order.length - 1]], [[], 'dep']);
+
+  function addScript(set) {
+    return new Promise(resolve => {
+      const s = document.createElement('script');
+      s.type = 'module';
+      s.onload = () => resolve('load');
+      s.onerror = () => resolve('error');
+      set(s);
+      document.head.appendChild(s);
+      if (!s.src) setTimeout(() => resolve('inline'), 50);
+    });
+  }
+  eq('module script added by script', [await addScript(s => { s.src = 'mod/dynamic.js'; }), window.dynamicRan, window.dynamicCurrentScript], ['load', 1, null]);
+  eq('the same module is not run twice', [await addScript(s => { s.src = 'mod/dynamic.js'; }), window.dynamicRan], ['load', 1]);
+  eq('inline module added by script', [await addScript(s => { s.textContent = "import { pi } from './mod/math.js'; window.dynamicInline = pi;"; }), window.dynamicInline], ['inline', 3]);
+  eq('missing module script fires error', await addScript(s => { s.src = 'mod/nope.js'; }), 'error');
+  console.log('modules: ' + pass + ' passed, ' + fail + ' failed');
+</script>
+</body>
+</html>

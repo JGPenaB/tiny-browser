@@ -129,11 +129,15 @@ FetchResult corsFetch(const std::string& url, FetchOpts o, bool crossOrigin, con
     }
     return r;
 }
-bool classicScript(const Node* n) {
+// What a <script> element holds, going by its type attribute; -1 for data blocks the browser does not run.
+int scriptKind(const Node* n) {
     const std::string* type = n->attr("type");
     std::string ty = type ? lower(std::string(trim(*type))) : "";
-    return ty.empty() || ty == "text/javascript" || ty == "application/javascript" || ty == "application/x-javascript" || ty == "text/ecmascript" ||
-           ty == "application/ecmascript" || ty == "text/jscript" || ty == "javascript";
+    if (ty == "module") return ScriptSource::Module;
+    if (ty == "importmap") return ScriptSource::ImportMap;
+    bool classic = ty.empty() || ty == "text/javascript" || ty == "application/javascript" || ty == "application/x-javascript" || ty == "text/ecmascript" ||
+                   ty == "application/ecmascript" || ty == "text/jscript" || ty == "javascript";
+    return classic ? ScriptSource::Classic : -1;
 }
 }  // namespace
 
@@ -166,6 +170,10 @@ struct ScriptHost::Impl {
     bool observersScheduled = false;
     Value deliverFn;
     JSObject* observerProto = nullptr;
+    Value pageScripts;                  // the prelude's object that runs module scripts
+    std::vector<ScriptSource> deferred;  // scripts that wait for the document to be parsed
+    bool loadPending = false;           // deferred scripts are still running; the load events come after them
+    bool loadDue = false;               // they are done: fire the load events on the next pump
 
     Impl(Document& d, const std::string& u, Client& c) : doc(d), url(u), client(c) {}
 
@@ -388,9 +396,36 @@ struct ScriptHost::Impl {
         Url page = Url::parse(url);
         return page.valid && !page.host.empty() ? site_of(page.host) : std::string("local");
     }
+    void callPage(const char* method, Value* args, int n) {
+        if (!pageScripts.isObject()) return;
+        try {
+            vm.call(vm.get(pageScripts, method), pageScripts, args, n);
+        } catch (JSThrow&) {
+            reportError();
+        }
+    }
+    void registerImportMap(const std::string& text) {
+        Value arg = vm.strv(utf8to16(text));
+        callPage("importMap", &arg, 1);
+    }
     void startScript(Node* sc) {
-        if (dead || !connected(sc) || !classicScript(sc)) return;
+        if (dead || !connected(sc)) return;
+        int kind = scriptKind(sc);
         const std::string* src = sc->attr("src");
+        if (kind == ScriptSource::Module) {  // a module script added by script: runs as soon as it is loaded
+            bool external = src && !src->empty();
+            std::string code = external ? std::string() : text_content(sc);
+            if ((!external && (src || trim(code).empty())) || !startedScripts.insert(sc).second) return;
+            Value args[3] = {wrap(sc), external ? vm.strv(utf8to16(resolve_url(doc.baseUrl, *src))) : Value::null(),
+                             external ? Value::null() : vm.strv(utf8to16(code))};
+            callPage("dynamic", args, 3);
+            return;
+        }
+        if (kind == ScriptSource::ImportMap) {
+            if (!src && startedScripts.insert(sc).second) registerImportMap(text_content(sc));
+            return;
+        }
+        if (kind != ScriptSource::Classic || sc->attr("nomodule")) return;
         if (src && !src->empty()) {
             if (!startedScripts.insert(sc).second) return;
             std::string u = resolve_url(doc.baseUrl, *src);
@@ -1302,6 +1337,27 @@ Node* formOf(Node* n) {
 bool isSubmitButton(const Node* n) {
     std::string type = n->attr("type") ? lower(*n->attr("type")) : "";
     return (n->name == "button" && (type.empty() || type == "submit")) || (n->name == "input" && (type == "submit" || type == "image"));
+}
+JSFN(reportErrorFn) {  // prints an error the way an uncaught exception is printed
+    Impl& im = I(ci.vm);
+    ci.vm.pending = ci.arg(0);
+    im.reportError();
+    return Value::undef();
+}
+JSFN(deferredRun) {  // runs one deferred classic script; the callee's data is its index
+    Impl& im = I(ci.vm);
+    size_t i = (size_t)ci.callee->data.asInt();
+    if (i < im.deferred.size() && !im.dead) im.runCode(im.deferred[i].node, im.deferred[i].code, im.deferred[i].url);
+    return Value::undef();
+}
+JSFN(deferredDone) {  // every deferred script has run
+    Impl& im = I(ci.vm);
+    if (im.loadPending) {
+        im.loadPending = false;
+        im.loadDue = true;
+        im.client.wake(0);
+    }
+    return Value::undef();
 }
 JSFN(elementClick) {
     Impl& im = I(ci.vm);
@@ -2249,6 +2305,7 @@ void ScriptHost::Impl::setup() {
         g.mark(currentScript);
         g.mark(historyState);
         g.mark(deliverFn);
+        g.mark(pageScripts);
         g.mark(fragmentProto);
         for (auto& tp : tagProtos) g.mark(tp.second);
         g.mark(observerProto);
@@ -2674,11 +2731,14 @@ void ScriptHost::Impl::setup() {
     vm.defFn(G, "__netSync", netSyncFn, 5);
     vm.defFn(G, "__netAbort", netAbortFn, 1);
     vm.defFn(G, "__url", urlParse, 2);
+    vm.defFn(G, "__reportError", reportErrorFn, 1);
     try {
         vm.eval(utf8to16(kScriptPrelude), "browser:prelude");
     } catch (JSThrow&) {
         reportError();
     }
+    pageScripts = vm.get(V(G), "__pageScripts");
+    vm.del(G, PropKey::of(vm.atom("__pageScripts")));
 }
 
 // ---------------------------------------------------------------------------- public interface
@@ -2690,6 +2750,7 @@ ScriptHost::~ScriptHost() {
 
 bool ScriptHost::busy() const {
     if (impl_->dead) return false;
+    if (impl_->loadPending || impl_->loadDue) return true;
     if (impl_->net->inflight.load() > 0) return true;
     std::lock_guard<std::mutex> lk(impl_->net->mu);
     return !impl_->net->done.empty();
@@ -2701,9 +2762,18 @@ void ScriptHost::runScripts(const std::vector<ScriptSource>& scripts) {
     Impl& im = *impl_;
     for (auto& s : scripts)
         if (s.node) im.startedScripts.insert(s.node);
+    // First the scripts that run while the document is being parsed, in document order.
     for (auto& s : scripts) {
         if (im.dead) break;
+        if (s.deferred) {
+            im.deferred.push_back(s);
+            continue;
+        }
         Entry entry(im);
+        if (s.kind == ScriptSource::ImportMap) {
+            im.registerImportMap(s.code);
+            continue;
+        }
         im.currentScript = im.wrap(s.node);
         try {
             im.vm.eval(utf8to16(s.code), s.url);
@@ -2712,8 +2782,42 @@ void ScriptHost::runScripts(const std::vector<ScriptSource>& scripts) {
         }
         im.currentScript = Value::null();
     }
-    im.readyState = "interactive";
+    im.readyState = "interactive";  // the document is parsed; deferred scripts see this state
     dispatch(im.docNode(), "readystatechange", false, false);
+    if (im.deferred.empty() || im.dead || !im.pageScripts.isObject()) {
+        fireLoadEvents();
+        return;
+    }
+    // Then defer scripts and modules. Modules load in the background, so the prelude runs this list and calls
+    // back when it is through; DOMContentLoaded and load are fired after that.
+    im.loadPending = true;
+    Entry entry(im);
+    Vm& vm = im.vm;
+    JSArray* items = vm.newArray();
+    for (size_t i = 0; i < im.deferred.size(); ++i) {
+        const ScriptSource& s = im.deferred[i];
+        bool module = s.kind == ScriptSource::Module;
+        JSArray* it = vm.newArray();
+        items->elems.push_back(V(it));
+        it->elems.push_back(Value::boolean(module));
+        it->elems.push_back(im.wrap(s.node));
+        it->elems.push_back(module && s.external ? val8(vm, s.url) : Value::null());
+        it->elems.push_back(module && !s.external ? val8(vm, s.code) : Value::null());
+        JSNative* run = nullptr;
+        if (!module) {
+            run = vm.newNative(deferredRun, "", 0);
+            run->data = Value::i32((int32_t)i);
+        }
+        it->elems.push_back(run ? V(run) : Value::null());
+        it->elems.push_back(Value::boolean(s.async));
+    }
+    Value args[2] = {V(items), V(vm.newNative(deferredDone, "", 0))};
+    im.callPage("deferred", args, 2);
+}
+
+void ScriptHost::fireLoadEvents() {
+    Impl& im = *impl_;
+    im.loadPending = im.loadDue = false;
     dispatch(im.docNode(), "DOMContentLoaded", true, false);
     im.readyState = "complete";
     dispatch(im.docNode(), "readystatechange", false, false);
@@ -2736,6 +2840,7 @@ void ScriptHost::pump() {
     Impl& im = *impl_;
     if (im.dead || im.depth) return;
     drainNet(im);
+    if (im.loadDue) fireLoadEvents();
     for (int budget = 200; budget > 0 && !im.dead; --budget) {
         double now = now_ms();
         int best = -1;

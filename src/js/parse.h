@@ -22,7 +22,7 @@ enum class N : uint8_t {
     Unary, Update, Binary, Logical, Assign, Cond, Call, New, Member, Index, OptChain, Spread, Seq, Yield, Await, Hole,
     ArrayPat, ObjectPat, AssignPat, Rest,
     VarDecl, Declarator, ExprStmt, Block, Empty, If, For, ForIn, ForOf, While, DoWhile, Return, Break, Continue, Throw,
-    Try, Switch, Case, Labeled, Debugger, Program
+    Try, Switch, Case, Labeled, Debugger, Program, ImportCall
 };
 
 enum : uint16_t {
@@ -30,7 +30,7 @@ enum : uint16_t {
     NF_PAREN = 128, NF_EXPRBODY = 256
 };
 enum : uint8_t { PK_INIT, PK_GET, PK_SET, PK_METHOD, PK_SPREAD, PK_FIELD };
-enum : uint8_t { VK_VAR, VK_LET, VK_CONST, VK_PARAM, VK_FUNC, VK_CLASS, VK_CATCH, VK_FUNCNAME, VK_PSEUDO, VK_PRIVATE };
+enum : uint8_t { VK_VAR, VK_LET, VK_CONST, VK_PARAM, VK_FUNC, VK_CLASS, VK_CATCH, VK_FUNCNAME, VK_PSEUDO, VK_PRIVATE, VK_IMPORT };
 
 struct Scope;
 struct FunctionInfo;
@@ -42,6 +42,8 @@ struct Variable {
     int reg = -1, slot = -1;
     Scope* scope = nullptr;
     uint32_t declEnd = 0;
+    Variable* importNs = nullptr;     // VK_IMPORT: the variable holding the source module's namespace
+    JSString* importName = nullptr;  // VK_IMPORT: the export it stands for (null: the namespace itself)
 };
 
 struct Node {
@@ -107,6 +109,27 @@ struct Ast {
     std::deque<FunctionInfo> fns;
     FunctionInfo* top = nullptr;
     std::shared_ptr<const std::u16string> src;
+    // ES module being compiled (moduleFn is null for scripts). ECMA-262 16.2.1.7: the fields below are the
+    // module record's [[RequestedModules]], import entries and local/indirect/star export entries.
+    struct Export {
+        JSString* name;        // exported name
+        JSString* local;       // module-scope variable, or null for a re-export
+        Variable* var;         // resolved local
+        int request;           // index into requests for a re-export, else -1
+        JSString* importName;  // name in the source module (null: its whole namespace)
+        uint32_t line;
+    };
+    struct Import {
+        int request;
+        JSString* name;
+    };
+    FunctionInfo* moduleFn = nullptr;
+    bool hasTLA = false;                 // the module body awaits at its top level
+    std::vector<JSString*> requests;     // module specifiers in source order, without repeats
+    std::vector<Variable*> requestVars;  // the variable that holds each requested module's namespace
+    std::vector<Export> exports;
+    std::vector<Import> imports;  // named imports, checked when the module is linked
+    std::vector<int> starRequests;
 };
 
 struct SyntaxErr {
@@ -114,7 +137,7 @@ struct SyntaxErr {
     uint32_t line;
 };
 
-// Parses a whole script (or, with `functionBody`, the body of a function whose parameter list is `params`).
-void parseScript(Vm& vm, Ast& ast, bool functionBody, const std::u16string* params);
+// Parses a whole script, or with `asModule` an ES module.
+void parseScript(Vm& vm, Ast& ast, bool asModule, const std::u16string* params);
 
 }  // namespace tb::js

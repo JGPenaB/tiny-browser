@@ -2,6 +2,7 @@
 import html
 import json
 import os
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -69,10 +70,21 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/refresh":
             self.send("<!doctype html><html><head><meta http-equiv=refresh content='0; url=/echo'><title>Refreshing</title></head><body>Redirecting</body></html>")
         elif u.path.startswith("/pages/"):  # the script test pages in tests/pages, served so they have an http origin
+            root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pages")
+            path = os.path.normpath(os.path.join(root, *u.path[len("/pages/"):].split("/")))
             try:
-                body = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pages", os.path.basename(u.path)), encoding="utf-8").read()
+                if not path.startswith(root + os.sep):
+                    raise OSError("outside the pages folder")
+                body = open(path, encoding="utf-8").read()
             except OSError:
                 self.send(page("Not found", ""), 404)
+                return
+            q = parse_qs(u.query)
+            if "delay" in q:
+                time.sleep(int(q["delay"][0]) / 1000)
+            if path.endswith((".js", ".mjs")):  # module files: ?type= overrides the content type, ?cors=1 allows other origins
+                headers = [("Access-Control-Allow-Origin", "*")] if "cors" in q else []
+                self.send_raw(body, q.get("type", ["text/javascript"])[0], headers)
                 return
             self.send(body, headers=[("Set-Cookie", "visible=1; Path=/"), ("Set-Cookie", "secret=hidden; Path=/; HttpOnly")])
         elif u.path.startswith("/api/"):

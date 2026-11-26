@@ -64,6 +64,8 @@ enum Op : uint16_t {
     OP_NewPrivate,  // a = fresh private name (description consts[bx])
     OP_Yield,       // a = yield b
     OP_Await,       // a = await b
+    OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
+    OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2
     OP_Debugger,
     OP__Count
 };
