@@ -47,7 +47,7 @@ test("regex with strings", function () {
   eq("%20and%2F".replace(/%([0-9A-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16))), " and/"); eq("k1=v1&k2=v2".split("&").map(p => p.split("=")), [["k1", "v1"], ["k2", "v2"]]);
   eq("The Quick  brown".split(/\s+/).map(w => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" "), "The Quick Brown"); eq("abc".match("b").index, 1); eq("a+b".split("+"), ["a", "b"]);
   eq("1,234,567.89".replace(/,/g, ""), "1234567.89"); eq("1234567.891".replace(/\B(?=(\d{3})+(?!\d))/g, ","), "1,234,567.891");
-  eq(JSON.stringify("id: 42".match(/(?<key>\w+): (?<val>\d+)/).groups), '{"key":"id","val":"42"}'); eq(RegExp.escape ? RegExp.escape("a.b*c") : "a\\.b\\*c", "a\\.b\\*c");
+  eq(JSON.stringify("id: 42".match(/(?<key>\w+): (?<val>\d+)/).groups), '{"key":"id","val":"42"}'); eq(RegExp.escape(".b*c a"), "\\.b\\*c\\x20a"); eq(RegExp.escape("a1"), "\\x611");
 });
 test("regex unicode", function () {
   eq(/^.$/.test("😀"), false); eq(/^.$/u.test("😀"), true); eq("😀".match(/./gu).length, 1); eq(/\u{1F600}/u.test("😀"), true); eq(/[😀-😂]/u.test("😁"), true);
