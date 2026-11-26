@@ -141,7 +141,7 @@ CookieJar& CookieJar::get() {
     return j;
 }
 
-void CookieJar::store(const Url& u, std::string_view h) {
+void CookieJar::store(const Url& u, std::string_view h, bool fromScript) {
     if (h.size() > 4096 || has_ctl(h)) return;
     Cookie c;
     int64_t now = (int64_t)time(nullptr);
@@ -208,8 +208,12 @@ void CookieJar::store(const Url& u, std::string_view h) {
     if (c.name.rfind("__Secure-", 0) == 0 && !c.secure) return;
     if (c.name.rfind("__Host-", 0) == 0 && (!c.secure || !c.hostOnly || c.path != "/")) return;
     if (c.sameSite == 0 && !c.secure) c.sameSite = 1;
+    if (fromScript && c.httpOnly) return;  // scripts can neither create nor replace HttpOnly cookies
 
     std::lock_guard<std::mutex> lk(g_cmu);
+    if (fromScript)
+        for (auto& o : g_cookies)
+            if (o.httpOnly && o.name == c.name && o.domain == c.domain && o.path == c.path) return;
     for (size_t k = 0; k < g_cookies.size();) {
         Cookie& o = g_cookies[k];
         if (o.name == c.name && o.domain == c.domain && o.path == c.path) {
@@ -226,7 +230,7 @@ void CookieJar::store(const Url& u, std::string_view h) {
     if (g_cookies.size() > 3000) g_cookies.erase(g_cookies.begin(), g_cookies.begin() + 300);
 }
 
-std::string CookieJar::header(const Url& u, bool crossSiteNav, bool crossSitePost) {
+std::string CookieJar::header(const Url& u, bool crossSiteNav, bool crossSitePost, bool forScript) {
     std::lock_guard<std::mutex> lk(g_cmu);
     int64_t now = (int64_t)time(nullptr);
     std::vector<const Cookie*> m;
@@ -234,6 +238,7 @@ std::string CookieJar::header(const Url& u, bool crossSiteNav, bool crossSitePos
         if (c.expires && c.expires <= now) continue;
         if (!domain_match(c, u.host) || !path_match(c, u.path)) continue;
         if (c.secure && u.scheme != "https") continue;
+        if (forScript && c.httpOnly) continue;
         if (crossSiteNav && c.sameSite == 2) continue;
         if (crossSitePost && c.sameSite != 0) continue;
         m.push_back(&c);
@@ -497,7 +502,7 @@ std::string referer_for(const std::string& ref, const Url& target) {
 
 struct Hop {
     int status = 0;
-    std::string body, contentType, location, error;
+    std::string body, contentType, location, error, rawHeaders;
 };
 
 Hop http_once(const Url& u, const std::string& method, const std::string& body, const FetchOpts& o) {
@@ -535,11 +540,12 @@ Hop http_once(const Url& u, const std::string& method, const std::string& body, 
     }
     std::string ref = referer_for(o.referrer, u);
     if (!ref.empty()) hdrs += "Referer: " + clean_header(ref) + "\r\n";
-    if (method != "GET") {
+    if (method != "GET" || o.sendOrigin) {
         Url ro = Url::parse(o.referrer);
         hdrs += "Origin: " + (ro.valid && ro.hierarchical ? clean_header(ro.origin()) : std::string("null")) + "\r\n";
         if (!o.contentType.empty()) hdrs += "Content-Type: " + clean_header(o.contentType) + "\r\n";
     }
+    for (auto& extra : o.headers) hdrs += clean_header(extra.first) + ": " + clean_header(extra.second) + "\r\n";
     std::wstring wh = widen(hdrs);
     BOOL ok = WinHttpSendRequest(rq, wh.c_str(), (DWORD)wh.size(), body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(),
                                  (DWORD)body.size(), (DWORD)body.size(), 0) &&
@@ -566,6 +572,7 @@ Hop http_once(const Url& u, const std::string& method, const std::string& body, 
                 idx = i2 > idx ? i2 : idx + 1;
             }
         }
+        if (o.wantHeaders) r.rawHeaders = narrow(query_header(rq, WINHTTP_QUERY_RAW_HEADERS_CRLF));
         bool redirect = (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) && !r.location.empty();
         if (!redirect) {
             std::vector<char> buf(1 << 16);
@@ -641,6 +648,7 @@ FetchResult fetch(const std::string& url, const FetchOpts& o) {
         r.status = h.status;
         r.body = std::move(h.body);
         r.contentType = std::move(h.contentType);
+        r.rawHeaders = std::move(h.rawHeaders);
         done = true;
     }
     if (first.valid && first.hasFragment && r.finalUrl.find('#') == std::string::npos) r.finalUrl += "#" + first.fragment;

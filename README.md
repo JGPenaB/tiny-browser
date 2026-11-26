@@ -73,4 +73,5 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    parallax), save as PDF.
 
 Small features slotted between the engine steps: resource monitor (CPU, RAM, GPU, VRAM, GPU temperature, plus a network
-monitor), private windows, reader mode, page screenshots, RSS reader, translate selection.
+monitor), private windows, reader mode, page screenshots, RSS reader, translate selection, a frameless window with the tabs
+in the title strip, and a headless mode driven by JSON commands for automated scripts and AI agents.

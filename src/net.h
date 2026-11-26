@@ -12,6 +12,7 @@ namespace tb {
 struct FetchResult {
     int status = 0;
     std::string body, finalUrl, contentType, error;
+    std::string rawHeaders;  // status line and response headers, when FetchOpts::wantHeaders is set
     double ms = 0;
 };
 
@@ -22,6 +23,9 @@ struct FetchOpts {
     std::string firstPartySite;  // set for subresources: registrable domain of the top-level page
     std::string initiatorSite;   // set for top-level navigations started from page content
     bool topLevel = false;
+    std::vector<std::pair<std::string, std::string>> headers;  // extra request headers (script requests)
+    bool wantHeaders = false;                                  // fill FetchResult::rawHeaders
+    bool sendOrigin = false;                                   // send Origin even for GET (cross-origin script requests)
 };
 
 // Synchronous fetch for http(s) (WinHTTP: TLS via SChannel, HTTP/2, gzip/deflate/brotli), file: and data: URLs.
@@ -41,8 +45,8 @@ public:
     void clear();
     size_t count();
     // Used by the HTTP layer:
-    void store(const struct Url& u, std::string_view setCookie);
-    std::string header(const struct Url& u, bool crossSiteNav, bool crossSitePost);
+    void store(const struct Url& u, std::string_view setCookie, bool fromScript = false);
+    std::string header(const struct Url& u, bool crossSiteNav, bool crossSitePost, bool forScript = false);
 };
 
 struct NetEntry {

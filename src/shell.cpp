@@ -98,6 +98,7 @@ static const Sheet& scripting_sheet() {  // applied to pages whose scripts run
 }
 
 constexpr UINT WM_APP_LOADED = WM_APP + 1;
+constexpr UINT WM_APP_SCRIPT = WM_APP + 2;  // a worker thread has results for a page script
 constexpr float kTabH = 38, kToolH = 44, kBmH = 30, kDevW = 500, kSbW = 10, kLine = 18, kInfoH = 42, kRowH = 22;
 
 static inline D2D1_COLOR_F hexc(uint32_t v, float a = 1) { return D2D1::ColorF(v, a); }
@@ -551,6 +552,13 @@ public:
             tab.navPending = true;
         }
         void wake(double delayMs) override { app.scheduleScript(tab, delayMs); }
+        std::function<void()> threadWake() override {
+            HWND target = app.hwnd;
+            int id = tab.id;
+            return [target, id] {
+                if (target) PostMessageW(target, WM_APP_SCRIPT, (WPARAM)id, 0);
+            };
+        }
         void ensureLayout() override { app.ensureLayout(tab); }
         void viewport(float& w, float& h, float& sy) override {
             w = app.viewportW();
@@ -654,8 +662,11 @@ public:
     // Headless mode has no message loop: serve timers here for a bounded time.
     void pumpScripts(Tab& t, double budgetMs) {
         double end = now_ms() + budgetMs;
-        while (t.page && t.page->script && t.scriptDue >= 0) {
-            double wait = t.scriptDue - now_ms();
+        while (t.page && t.page->script && now_ms() < end) {
+            bool busy = t.page->script->busy();
+            if (t.scriptDue < 0 && !busy) break;
+            double wait = t.scriptDue < 0 ? 5 : t.scriptDue - now_ms();
+            if (busy) wait = std::min(wait, 5.0);
             if (now_ms() + std::max(0.0, wait) > end) break;
             if (wait > 0) Sleep((DWORD)wait + 1);
             runScriptTimers(t);
@@ -2637,6 +2648,13 @@ public:
             case WM_CHAR: onChar((wchar_t)wp); return 0;
             case WM_TIMER: onTimer((UINT_PTR)wp); return 0;
             case WM_APP_LOADED: onLoaded((LoadResult*)lp); return 0;
+            case WM_APP_SCRIPT:
+                for (auto& t : tabs)
+                    if (t->id == (int)wp) {
+                        runScriptTimers(*t);
+                        break;
+                    }
+                return 0;
             case WM_DESTROY:
                 CookieJar::get().save();
                 PostQuitMessage(0);

@@ -330,6 +330,7 @@ Vm::Vm() {
     globalLex = alloc<JSObject>();
     setupGlobals();
     setupCollections();
+    setupTypedArrays(*this);
 }
 Vm::~Vm() {}
 
@@ -433,6 +434,9 @@ void Vm::markRoots(Gc& g) {
     for (auto* vec : rootVecs)
         for (Value v : *vec) g.mark(v);
     for (auto& tracer : rootTracers) tracer(g);
+    for (JSObject* p : typedProtos) g.mark(p);
+    g.mark(arrayBufferProto);
+    g.mark(dataViewProto);
 }
 
 // ---------------------------------------------------------------------------- errors
@@ -918,6 +922,13 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
             }
             return false;
         }
+        case Cls::TypedArray: {
+            if (!k.isIndex()) return false;
+            JSTypedArray* t = (JSTypedArray*)o;
+            if (k.asIndex() >= t->length) return false;
+            out = {k, typedGet(t, k.asIndex()), (uint8_t)(PF_W | PF_E)};
+            return true;
+        }
         case Cls::Host: {
             JSHost* h = (JSHost*)o;
             if (!h->hooks || !h->hooks->get || k.isSymbol()) return false;
@@ -940,6 +951,10 @@ bool Vm::getOwn(JSObject* o, PropKey k, Prop& out) {
 
 Value Vm::getObj(JSObject* o, PropKey k, Value receiver) {
     for (JSObject* cur = o; cur; cur = cur->proto) {
+        if (k.isIndex() && cur->cls == Cls::TypedArray) {
+            JSTypedArray* t = (JSTypedArray*)cur;
+            return k.asIndex() < t->length ? typedGet(t, k.asIndex()) : Value::undef();
+        }
         if (k.isIndex() && (cur->cls == Cls::Array || cur->cls == Cls::Arguments)) {
             JSArray* arr = (JSArray*)cur;
             uint32_t i = k.asIndex();
@@ -998,6 +1013,10 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
     if (o->cls == Cls::Host && !k.isSymbol()) {
         JSHost* h = (JSHost*)o;
         if (h->hooks && h->hooks->set && h->hooks->set(*this, o, k, v)) return true;
+    }
+    if (o->cls == Cls::TypedArray && k.isIndex()) {
+        typedSet(*this, (JSTypedArray*)o, k.asIndex(), v);
+        return true;
     }
     if (o->cls == Cls::Array || o->cls == Cls::Arguments) {
         JSArray* arr = (JSArray*)o;
@@ -1060,6 +1079,10 @@ void Vm::set(Value target, PropKey k, Value v) {
 }
 
 bool Vm::defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags) {
+    if (o->cls == Cls::TypedArray && k.isIndex()) {
+        typedSet(*this, (JSTypedArray*)o, k.asIndex(), v);
+        return true;
+    }
     if ((o->cls == Cls::Array || o->cls == Cls::Arguments) && k.isIndex()) {
         JSArray* arr = (JSArray*)o;
         uint32_t i = k.asIndex();
@@ -1131,6 +1154,8 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
         if (h->hooks && h->hooks->keys) h->hooks->keys(*this, o, out);
     }
     if (strings) {
+        if (o->cls == Cls::TypedArray)
+            for (uint32_t i = 0; i < ((JSTypedArray*)o)->length; ++i) out.push_back(PropKey::index(i));
         if (o->cls == Cls::Array || o->cls == Cls::Arguments) {
             JSArray* arr = (JSArray*)o;
             for (uint32_t i = 0; i < arr->elems.size(); ++i)
@@ -1154,6 +1179,7 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
 
 uint32_t Vm::lengthOf(Value v) {
     if (v.isObject() && (v.asObject()->cls == Cls::Array || v.asObject()->cls == Cls::Arguments)) return (uint32_t)((JSArray*)v.asObject())->elems.size();
+    if (v.isObject() && v.asObject()->cls == Cls::TypedArray) return ((JSTypedArray*)v.asObject())->length;
     if (v.isString()) return (uint32_t)((JSString*)v.asCell())->length();
     double d = toInteger(get(v, a.length));
     if (d <= 0) return 0;
@@ -1797,6 +1823,22 @@ static void inspectInto(Vm& vm, Value v, int depth, bool quote, std::u16string& 
         out += u" }";
         return;
     }
+    if (o->cls == Cls::ArrayBuffer) {
+        out += u"ArrayBuffer(" + ascii16(std::to_string(((JSArrayBuffer*)o)->bytes.size())) + u")";
+        return;
+    }
+    if (o->cls == Cls::TypedArray) {
+        JSTypedArray* t = (JSTypedArray*)o;
+        Value tag = vm.getObj(o, PropKey::of(vm.symToStringTag), v);
+        out += (tag.isString() ? tag.asString()->s : std::u16string(u"TypedArray")) + u"(" + ascii16(std::to_string(t->length)) + u") [";
+        for (uint32_t i = 0; i < t->length && i < 100; ++i) {
+            if (i) out += u", ";
+            out += vm.toString(typedGet(t, i))->s;
+        }
+        if (t->length > 100) out += u", ...";
+        out += u"]";
+        return;
+    }
     if (depth < 0) {
         out += (o->cls == Cls::Array) ? u"[Array]" : u"[Object]";
         return;
@@ -2063,6 +2105,11 @@ Value Vm::runFrames(size_t base) {
                             uint32_t idx = (uint32_t)kv.asInt();
                             if (o.isObject()) {
                                 JSObject* ob = o.asObject();
+                                if (ob->cls == Cls::TypedArray) {
+                                    JSTypedArray* ta = (JSTypedArray*)ob;
+                                    R(i.a) = idx < ta->length ? typedGet(ta, idx) : Value::undef();
+                                    break;
+                                }
                                 if (ob->cls == Cls::Array || ob->cls == Cls::Arguments) {
                                     auto& e = ((JSArray*)ob)->elems;
                                     if (idx < e.size() && !e[idx].isEmpty()) {
@@ -2085,6 +2132,10 @@ Value Vm::runFrames(size_t base) {
                         Value o = R(i.a), kv = R(i.b);
                         if (o.isObject() && kv.isInt() && kv.asInt() >= 0) {
                             JSObject* ob = o.asObject();
+                            if (ob->cls == Cls::TypedArray) {
+                                typedSet(*this, (JSTypedArray*)ob, (uint32_t)kv.asInt(), R(i.c));
+                                break;
+                            }
                             if (ob->cls == Cls::Array && !(ob->oflags & (OF_FROZEN | OF_NOEXT))) {
                                 auto& e = ((JSArray*)ob)->elems;
                                 uint32_t idx = (uint32_t)kv.asInt();

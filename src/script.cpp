@@ -2,12 +2,18 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "css.h"
 #include "html.h"
 #include "js/builtins.h"
+#include "net.h"
 #include "script.h"
+#include "script_prelude.h"
 #include "url.h"
 
 namespace tb {
@@ -15,7 +21,7 @@ namespace tb {
 using namespace js;
 
 namespace {
-enum : uint8_t { HK_Node = 1, HK_ClassList, HK_Style, HK_Dataset, HK_Event, HK_Storage, HK_Computed };
+enum : uint8_t { HK_Node = 1, HK_ClassList, HK_Style, HK_Dataset, HK_Event, HK_Storage, HK_Computed, HK_Observer };
 
 struct Listener {
     std::string type;
@@ -30,6 +36,105 @@ struct Timer {
     bool frame = false;  // requestAnimationFrame: the callback receives a timestamp
 };
 using Store = std::vector<std::pair<std::u16string, std::u16string>>;
+
+// Results of network requests come back from worker threads through this; it outlives the page if needed.
+struct NetShared {
+    std::mutex mu;
+    std::vector<std::pair<int, FetchResult>> done;
+    std::atomic<int> inflight{0};
+    std::function<void()> wake;
+    bool alive = true;
+};
+struct ObserveTarget {
+    Node* node;
+    bool childList, attributes, characterData, subtree;
+};
+struct Observer {  // a MutationObserver
+    Value object, callback;
+    std::vector<ObserveTarget> targets;
+    std::vector<Value> records;
+};
+
+std::string headerValue(const std::string& raw, const char* lowerName) {
+    size_t i = 0;
+    while (i < raw.size()) {
+        size_t e = raw.find("\r\n", i);
+        if (e == std::string::npos) e = raw.size();
+        std::string_view line(raw.data() + i, e - i);
+        size_t c = line.find(':');
+        if (c != std::string_view::npos && lower(trim(line.substr(0, c))) == lowerName) return std::string(trim(line.substr(c + 1)));
+        i = e + 2;
+    }
+    return "";
+}
+// A request made by script: adds the cross-origin (CORS) checks on top of a plain fetch. Runs on a worker thread.
+FetchResult corsFetch(const std::string& url, FetchOpts o, bool crossOrigin, const std::string& origin, bool credentials) {
+    o.wantHeaders = true;
+    auto refuse = [&](const char* why) {
+        FetchResult bad;
+        bad.error = why;
+        bad.finalUrl = url;
+        return bad;
+    };
+    if (crossOrigin) {
+        o.sendOrigin = true;
+        bool simpleMethod = o.method == "GET" || o.method == "HEAD" || o.method == "POST";
+        std::string custom;
+        for (auto& h : o.headers) {
+            std::string n = lower(h.first);
+            if (n != "accept" && n != "accept-language" && n != "content-language") custom += (custom.empty() ? "" : ",") + n;
+        }
+        std::string ct = lower(o.contentType);
+        if (!(ct.empty() || istarts(ct, "text/plain") || istarts(ct, "application/x-www-form-urlencoded") || istarts(ct, "multipart/form-data")))
+            custom += (custom.empty() ? "" : ",") + std::string("content-type");
+        if (!simpleMethod || !custom.empty()) {  // ask the server first (preflight)
+            FetchOpts pf;
+            pf.method = "OPTIONS";
+            pf.referrer = o.referrer;
+            pf.firstPartySite = o.firstPartySite;
+            pf.wantHeaders = true;
+            pf.headers.push_back({"Access-Control-Request-Method", o.method});
+            if (!custom.empty()) pf.headers.push_back({"Access-Control-Request-Headers", custom});
+            FetchResult p = fetch(url, pf);
+            std::string allow = headerValue(p.rawHeaders, "access-control-allow-origin");
+            if (!p.error.empty() || p.status < 200 || p.status >= 300 || !(allow == "*" || allow == origin))
+                return refuse("the server did not allow this cross-origin request (CORS preflight)");
+            auto listed = [](const std::string& list, const std::string& item) {
+                size_t i = 0;
+                while (i <= list.size()) {
+                    size_t e = list.find(',', i);
+                    if (e == std::string::npos) e = list.size();
+                    std::string_view one = trim(std::string_view(list).substr(i, e - i));
+                    if (one == "*" || one == item) return true;
+                    i = e + 1;
+                }
+                return false;
+            };
+            std::string methods = lower(headerValue(p.rawHeaders, "access-control-allow-methods"));
+            std::string allowedHeaders = lower(headerValue(p.rawHeaders, "access-control-allow-headers"));
+            if (!simpleMethod && !listed(methods, lower(o.method))) return refuse("the server does not allow this method from other sites (CORS preflight)");
+            size_t at = 0;
+            while (at < custom.size()) {
+                size_t e = custom.find(',', at);
+                if (e == std::string::npos) e = custom.size();
+                if (!listed(allowedHeaders, custom.substr(at, e - at))) return refuse("the server does not allow this request header from other sites (CORS preflight)");
+                at = e + 1;
+            }
+        }
+    }
+    FetchResult r = fetch(url, o);
+    if (crossOrigin && r.error.empty()) {
+        std::string allow = headerValue(r.rawHeaders, "access-control-allow-origin");
+        if (!(allow == origin || (allow == "*" && !credentials))) return refuse("blocked by the same-origin policy: the response has no matching Access-Control-Allow-Origin header");
+    }
+    return r;
+}
+bool classicScript(const Node* n) {
+    const std::string* type = n->attr("type");
+    std::string ty = type ? lower(std::string(trim(*type))) : "";
+    return ty.empty() || ty == "text/javascript" || ty == "application/javascript" || ty == "application/x-javascript" || ty == "text/ecmascript" ||
+           ty == "application/ecmascript" || ty == "text/jscript" || ty == "javascript";
+}
 }  // namespace
 
 struct ScriptHost::Impl {
@@ -50,6 +155,17 @@ struct ScriptHost::Impl {
     double startMs = now_ms();
     int nextTimer = 1, depth = 0;
     bool dead = false;
+    std::shared_ptr<NetShared> net = std::make_shared<NetShared>();
+    std::unordered_map<int, std::function<void(FetchResult&)>> netCallbacks;
+    std::unordered_map<int, Value> netJs;  // JavaScript callbacks of requests in flight
+    int nextNet = 1;
+    std::unordered_set<Node*> startedScripts;
+    std::unordered_map<std::string, JSObject*> tagProtos;  // HTMLInputElement.prototype for <input>, and so on
+    JSObject* fragmentProto = nullptr;
+    std::vector<std::unique_ptr<Observer>> observers;
+    bool observersScheduled = false;
+    Value deliverFn;
+    JSObject* observerProto = nullptr;
 
     Impl(Document& d, const std::string& u, Client& c) : doc(d), url(u), client(c) {}
 
@@ -60,7 +176,11 @@ struct ScriptHost::Impl {
         JSHost* h = vm.alloc<JSHost>();
         h->hostKind = HK_Node;
         h->ptr = n;
-        h->proto = n->type == Node::T::Document ? documentProto : n->type == Node::T::Element ? elementProto : textProto;
+        if (n->type == Node::T::Element) {
+            auto tp = tagProtos.find(n->name);
+            h->proto = tp != tagProtos.end() ? tp->second : isFragment(n) ? fragmentProto : elementProto;
+        } else
+            h->proto = n->type == Node::T::Document ? documentProto : textProto;
         wrappers[n] = h;
         return V(h);
     }
@@ -137,7 +257,10 @@ struct ScriptHost::Impl {
             for (Node* k : kids) insert(parent, k, before);
             return;
         }
-        if (child == before) before = nullptr;
+        if (child == before) {  // inserting a node before itself leaves it where it is
+            if (child->parent == parent) return;
+            before = nullptr;
+        }
         std::unique_ptr<Node> u = take(child);
         if (!u) return;
         u->parent = parent;
@@ -151,20 +274,186 @@ struct ScriptHost::Impl {
         parent->kids.insert(parent->kids.begin() + pos, std::move(u));
         reindex(parent);
         changed();
+        record("childList", parent, child, nullptr, nullptr);
+        if (connected(parent)) {
+            std::vector<Node*> scripts;
+            collectScripts(child, scripts);
+            for (Node* sc : scripts) startScript(sc);
+        }
     }
     void remove(Node* n) {
-        if (!n->parent) return;
+        Node* parent = n->parent;
+        if (!parent) return;
         std::unique_ptr<Node> u = take(n);
         if (u) orphans[n] = std::move(u);
         changed();
+        record("childList", parent, nullptr, n, nullptr);
     }
     void clearChildren(Node* el) {
+        std::vector<Node*> gone;
         for (auto& k : el->kids) {
             Node* raw = k.get();
             raw->parent = nullptr;
+            gone.push_back(raw);
             orphans[raw] = std::move(k);
         }
         el->kids.clear();
+        for (Node* g : gone) record("childList", el, nullptr, g, nullptr);
+    }
+    static bool connected(const Node* n) {
+        while (n->parent) n = n->parent;
+        return n->type == Node::T::Document;
+    }
+    static void collectScripts(Node* n, std::vector<Node*>& out) {
+        if (n->type != Node::T::Element) return;
+        if (n->name == "script") out.push_back(n);
+        else
+            for (auto& k : n->kids) collectScripts(k.get(), out);
+    }
+
+    // ---- MutationObserver
+    void record(const char* type, Node* target, Node* added, Node* removed, const std::string* attrName) {
+        if (observers.empty()) return;
+        for (auto& ob : observers) {
+            bool hit = false;
+            for (auto& t : ob->targets) {
+                bool wants = type[0] == 'c' && type[1] == 'h' ? t.childList : type[0] == 'a' ? t.attributes : t.characterData;
+                if (!wants) continue;
+                if (t.node == target) hit = true;
+                else if (t.subtree)
+                    for (Node* a = target->parent; a && !hit; a = a->parent) hit = a == t.node;
+                if (hit) break;
+            }
+            if (!hit) continue;
+            JSObject* r = vm.newObject();
+            vm.def(r, "type", vm.strv(type), PF_ALL);
+            vm.def(r, "target", wrap(target), PF_ALL);
+            std::vector<Node*> a, d;
+            if (added) a.push_back(added);
+            if (removed) d.push_back(removed);
+            vm.def(r, "addedNodes", list(a), PF_ALL);
+            vm.def(r, "removedNodes", list(d), PF_ALL);
+            vm.def(r, "attributeName", attrName ? vm.strv(utf8to16(*attrName)) : Value::null(), PF_ALL);
+            vm.def(r, "oldValue", Value::null(), PF_ALL);
+            vm.def(r, "previousSibling", Value::null(), PF_ALL);
+            vm.def(r, "nextSibling", Value::null(), PF_ALL);
+            ob->records.push_back(Value::cell(r));
+            if (!observersScheduled) {
+                observersScheduled = true;
+                vm.enqueueJob({3, deliverFn, Value::undef(), Value::undef()});
+            }
+        }
+    }
+    void attrChanged(Node* n, const std::string& name) {
+        changed();
+        record("attributes", n, nullptr, nullptr, &name);
+        if (name == "src" && n->name == "script" && connected(n)) startScript(n);
+    }
+
+    // ---- scripts added after the page loaded, and network requests made by script
+    void runCode(Node* script, const std::string& code, const std::string& file) {
+        Value prev = currentScript;
+        currentScript = wrap(script);
+        try {
+            vm.eval(utf8to16(code), file);
+        } catch (JSThrow&) {
+            reportError();
+        }
+        currentScript = prev;
+    }
+    void fireSimple(Node* target, const char* type) {
+        try {
+            fire(target, makeEvent(type, false, false));
+        } catch (JSThrow&) {
+            reportError();
+        }
+    }
+    int startFetch(const std::string& u, const FetchOpts& opts, bool crossOrigin, const std::string& origin, bool credentials, std::function<void(FetchResult&)> cb) {
+        int id = nextNet++;
+        netCallbacks[id] = std::move(cb);
+        net->inflight++;
+        std::shared_ptr<NetShared> sh = net;
+        std::thread([sh, id, u, opts, crossOrigin, origin, credentials] {
+            FetchResult r = corsFetch(u, opts, crossOrigin, origin, credentials);
+            {
+                std::lock_guard<std::mutex> lk(sh->mu);
+                if (sh->alive) sh->done.push_back({id, std::move(r)});
+            }
+            sh->inflight--;
+            if (sh->wake) sh->wake();
+        }).detach();
+        return id;
+    }
+    std::string firstParty() const {
+        Url page = Url::parse(url);
+        return page.valid && !page.host.empty() ? site_of(page.host) : std::string("local");
+    }
+    void startScript(Node* sc) {
+        if (dead || !connected(sc) || !classicScript(sc)) return;
+        const std::string* src = sc->attr("src");
+        if (src && !src->empty()) {
+            if (!startedScripts.insert(sc).second) return;
+            std::string u = resolve_url(doc.baseUrl, *src);
+            if (url.rfind("https:", 0) == 0 && u.rfind("http:", 0) == 0) {
+                client.consoleMessage(2, L"Blocked insecure script on a secure page: " + widen(u));
+                fireSimple(sc, "error");
+                return;
+            }
+            FetchOpts o;
+            o.referrer = url;
+            o.firstPartySite = firstParty();
+            startFetch(u, o, false, "", false, [this, sc, u](FetchResult& r) {
+                if (!r.error.empty() || r.status >= 400) {
+                    client.consoleMessage(2, L"Could not load script " + widen(u));
+                    fireSimple(sc, "error");
+                    return;
+                }
+                runCode(sc, bytes_to_utf8(r.body, r.contentType), u);
+                fireSimple(sc, "load");
+            });
+        } else if (!src) {
+            std::string code = text_content(sc);
+            if (trim(code).empty() || !startedScripts.insert(sc).second) return;
+            runCode(sc, code, url);
+        }
+    }
+    void finishNet(int id, bool binary, FetchResult& r) {
+        auto it = netJs.find(id);
+        if (it == netJs.end()) return;
+        Value cb = it->second;
+        netJs.erase(it);
+        Value args[6];
+        netResult(r, binary, args);
+        try {
+            vm.call(cb, Value::undef(), args, 6);
+        } catch (JSThrow&) {
+            reportError();
+        }
+    }
+    // error, status, statusText, final URL, response headers, body
+    void netResult(FetchResult& r, bool binary, Value out[6]) {
+        std::string statusText, headers = r.rawHeaders;
+        size_t eol = headers.find("\r\n");
+        if (eol != std::string::npos) {
+            std::string first = headers.substr(0, eol);
+            headers.erase(0, eol + 2);
+            size_t sp = first.find(' ');
+            sp = sp == std::string::npos ? sp : first.find(' ', sp + 1);
+            if (sp != std::string::npos) statusText = first.substr(sp + 1);
+        }
+        if (headers.empty() && !r.contentType.empty()) headers = "content-type: " + r.contentType + "\r\n";
+        out[0] = r.error.empty() ? Value::null() : vm.strv(utf8to16(r.error));
+        out[1] = Value::i32(r.status);
+        out[2] = vm.strv(utf8to16(statusText));
+        out[3] = vm.strv(utf8to16(r.finalUrl));
+        out[4] = vm.strv(utf8to16(headers));
+        if (binary) {
+            JSArrayBuffer* b = vm.alloc<JSArrayBuffer>();
+            b->proto = vm.arrayBufferProto;
+            b->bytes.assign(r.body.begin(), r.body.end());
+            out[5] = Value::cell(b);
+        } else
+            out[5] = vm.strv(utf8to16(bytes_to_utf8(r.body, r.contentType)));
     }
     void setInner(Node* el, const std::string& html) {
         std::string pre = "<!doctype html><body>";
@@ -190,12 +479,16 @@ struct ScriptHost::Impl {
         if (ctx) {
             for (auto& k : ctx->kids) {
                 k->parent = el;
+                std::vector<Node*> inert;  // scripts that arrive through innerHTML never run
+                collectScripts(k.get(), inert);
+                for (Node* sc : inert) startedScripts.insert(sc);
                 el->kids.push_back(std::move(k));
             }
             ctx->kids.clear();
         }
         reindex(el);
         changed();
+        for (auto& k : el->kids) record("childList", el, k.get(), nullptr, nullptr);
     }
     void setText(Node* n, const std::string& text) {
         if (n->type == Node::T::Text || n->type == Node::T::Comment) {
@@ -210,6 +503,7 @@ struct ScriptHost::Impl {
             }
         }
         changed();
+        record(n->type == Node::T::Element ? "childList" : "characterData", n, nullptr, nullptr, nullptr);
     }
     Node* clone(const Node* src, bool deep) {
         auto n = std::make_unique<Node>();
@@ -405,6 +699,10 @@ Impl& I(Vm& vm) { return *(Impl*)vm.hostData; }
 std::string str8(Vm& vm, Value v) { return utf16to8(vm.toStr16(v)); }
 Value val8(Vm& vm, std::string_view s) { return vm.strv(utf8to16(s)); }
 
+[[noreturn]] void illegal(CallInfo& ci, const char* want) {
+    std::string name = ci.callee && ci.callee->name ? utf16to8(ci.callee->name->s) : "method";
+    ci.vm.throwError(Err::TypeError, "Illegal invocation: %s was called on %s, which is not %s", name.c_str(), utf16to8(ci.vm.inspect(ci.thisv, 0)).c_str(), want);
+}
 Node* toNode(Value v) {
     if (v.isObject() && v.asObject()->cls == Cls::Host) {
         JSHost* h = (JSHost*)v.asObject();
@@ -414,12 +712,12 @@ Node* toNode(Value v) {
 }
 Node* thisNode(CallInfo& ci) {
     Node* n = toNode(ci.thisv);
-    if (!n) ci.vm.throwError(Err::TypeError, "Illegal invocation");
+    if (!n) illegal(ci, "a node");
     return n;
 }
 Node* thisElem(CallInfo& ci) {
     Node* n = thisNode(ci);
-    if (n->type != Node::T::Element) ci.vm.throwError(Err::TypeError, "Illegal invocation: not an element");
+    if (n->type != Node::T::Element) illegal(ci, "an element");
     return n;
 }
 Node* argNode(CallInfo& ci, int i, const char* what) {
@@ -434,7 +732,7 @@ Node* nodeOrText(CallInfo& ci, Value v) {
 }
 JSHost* thisHost(CallInfo& ci, uint8_t kind) {
     if (ci.thisv.isObject() && ci.thisv.asObject()->cls == Cls::Host && ((JSHost*)ci.thisv.asObject())->hostKind == kind) return (JSHost*)ci.thisv.asObject();
-    ci.vm.throwError(Err::TypeError, "Illegal invocation");
+    illegal(ci, "the right kind of object");
 }
 
 void setAttr(Node* n, const std::string& name, const std::string& value) {
@@ -799,6 +1097,17 @@ JSFN(getElementsByName) {
     });
     return I(ci.vm).list(out);
 }
+JSFN(nodeListNamedItem) {
+    if (!ci.thisv.isObject() || ci.thisv.asObject()->cls != Cls::Array) return Value::null();
+    std::string name = str8(ci.vm, ci.arg(0));
+    for (Value v : ((JSArray*)ci.thisv.asObject())->elems) {
+        Node* n = toNode(v);
+        if (!n || n->type != Node::T::Element) continue;
+        const std::string* a = n->attr("name");
+        if (n->id == name || (a && *a == name)) return v;
+    }
+    return Value::null();
+}
 JSFN(nodeListItem) {
     if (!ci.thisv.isObject() || ci.thisv.asObject()->cls != Cls::Array) return Value::null();
     JSArray* a = (JSArray*)ci.thisv.asObject();
@@ -815,13 +1124,16 @@ JSFN(getAttribute) {
 }
 JSFN(setAttribute) {
     Node* n = thisElem(ci);
-    setAttr(n, lower(str8(ci.vm, ci.arg(0))), str8(ci.vm, ci.arg(1)));
-    I(ci.vm).changed();
+    std::string name = lower(str8(ci.vm, ci.arg(0)));
+    setAttr(n, name, str8(ci.vm, ci.arg(1)));
+    I(ci.vm).attrChanged(n, name);
     return Value::undef();
 }
 JSFN(removeAttribute) {
-    removeAttr(thisElem(ci), lower(str8(ci.vm, ci.arg(0))));
-    I(ci.vm).changed();
+    Node* n = thisElem(ci);
+    std::string name = lower(str8(ci.vm, ci.arg(0)));
+    removeAttr(n, name);
+    I(ci.vm).attrChanged(n, name);
     return Value::undef();
 }
 JSFN(hasAttribute) { return Value::boolean(thisElem(ci)->attr(lower(str8(ci.vm, ci.arg(0)))) != nullptr); }
@@ -872,7 +1184,7 @@ JSFN(reflectSet) {
         else removeAttr(n, attr);
     } else
         setAttr(n, attr, str8(vm, ci.arg(0)));
-    I(vm).changed();
+    I(vm).attrChanged(n, attr);
     return Value::undef();
 }
 JSFN(innerHTMLGet) {
@@ -1037,6 +1349,18 @@ std::string joinClasses(const Node* n) {
     for (auto& c : n->classes) s += (s.empty() ? "" : " ") + c;
     return s;
 }
+bool classListHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
+    if (!k.isIndex()) return false;
+    Node* n = (Node*)((JSHost*)o)->ptr;
+    if (k.asIndex() >= n->classes.size()) return false;
+    out = vm.strv(utf8to16(n->classes[k.asIndex()]));
+    return true;
+}
+void classListHookKeys(Vm&, JSObject* o, std::vector<PropKey>& out) {
+    Node* n = (Node*)((JSHost*)o)->ptr;
+    for (uint32_t i = 0; i < n->classes.size(); ++i) out.push_back(PropKey::index(i));
+}
+const HostHooks kClassListHooks{classListHookGet, nullptr, nullptr, classListHookKeys};
 JSFN(classListGet) {
     Vm& vm = ci.vm;
     Node* n = thisElem(ci);
@@ -1044,6 +1368,7 @@ JSFN(classListGet) {
     h->hostKind = HK_ClassList;
     h->ptr = n;
     h->proto = I(vm).classListProto;
+    h->hooks = &kClassListHooks;
     return V(h);
 }
 JSFN(classListOp) {  // data: 0 add, 1 remove, 2 toggle, 3 contains, 4 replace
@@ -1077,7 +1402,7 @@ JSFN(classListOp) {  // data: 0 add, 1 remove, 2 toggle, 3 contains, 4 replace
         }
     }
     setAttr(n, "class", joinClasses(n));
-    I(vm).changed();
+    I(vm).attrChanged(n, "class");
     return result;
 }
 JSFN(classListLength) { return Value::num((double)((Node*)thisHost(ci, HK_ClassList)->ptr)->classes.size()); }
@@ -1123,7 +1448,7 @@ void setStyleProp(Impl& im, Node* n, const std::string& name, const std::string&
     for (auto& d : decls) out += d.prop + ": " + d.val + (d.important ? " !important" : "") + "; ";
     if (!out.empty()) out.pop_back();
     setAttr(n, "style", out);
-    im.changed();
+    im.attrChanged(n, "style");
 }
 bool ownsKey(JSObject* o, PropKey k) { return !k.isString() || (o->proto && o->proto->find(k)); }
 bool styleHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
@@ -1269,7 +1594,7 @@ const void* targetKey(CallInfo& ci, Node*& node) {
     node = toNode(ci.thisv);
     if (node) return node;
     if (ci.thisv.isNullish() || (ci.thisv.isObject() && ci.thisv.asObject() == ci.vm.global)) return &I(ci.vm);
-    ci.vm.throwError(Err::TypeError, "Illegal invocation");
+    illegal(ci, "the right kind of object");
 }
 JSFN(addEventListener) {
     Vm& vm = ci.vm;
@@ -1657,6 +1982,219 @@ JSFN(observerCtor) {  // MutationObserver and friends exist so that feature chec
 }
 JSFN(emptyArrayFn) { return V(ci.vm.newArray()); }
 
+// ---- MutationObserver
+JSFN(mutationObserverCtor) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    if (!ci.isConstruct() || !vm.isCallable(ci.arg(0))) vm.throwError(Err::TypeError, "MutationObserver: a callback function and 'new' are required");
+    JSHost* h = vm.alloc<JSHost>();
+    h->hostKind = HK_Observer;
+    h->proto = vm.protoFromNewTarget(ci.newTarget, im.observerProto);
+    auto ob = std::make_unique<Observer>();
+    ob->object = V(h);
+    ob->callback = ci.arg(0);
+    h->ptr = ob.get();
+    im.observers.push_back(std::move(ob));
+    return V(h);
+}
+JSFN(mutationObserve) {
+    Vm& vm = ci.vm;
+    Observer* ob = (Observer*)thisHost(ci, HK_Observer)->ptr;
+    Node* n = argNode(ci, 0, "MutationObserver.observe");
+    Value o = ci.arg(1);
+    ObserveTarget t{n, false, false, false, false};
+    if (o.isObject()) {
+        t.childList = vm.toBool(vm.get(o, "childList"));
+        t.attributes = vm.toBool(vm.get(o, "attributes")) || !vm.get(o, "attributeFilter").isUndef() || vm.toBool(vm.get(o, "attributeOldValue"));
+        t.characterData = vm.toBool(vm.get(o, "characterData")) || vm.toBool(vm.get(o, "characterDataOldValue"));
+        t.subtree = vm.toBool(vm.get(o, "subtree"));
+    }
+    for (auto& e : ob->targets)
+        if (e.node == n) {
+            e = t;
+            return Value::undef();
+        }
+    ob->targets.push_back(t);
+    return Value::undef();
+}
+JSFN(mutationDisconnect) {
+    Observer* ob = (Observer*)thisHost(ci, HK_Observer)->ptr;
+    ob->targets.clear();
+    ob->records.clear();
+    return Value::undef();
+}
+JSFN(mutationTakeRecords) {
+    Observer* ob = (Observer*)thisHost(ci, HK_Observer)->ptr;
+    JSArray* a = ci.vm.newArray();
+    a->elems.swap(ob->records);
+    return V(a);
+}
+JSFN(deliverMutations) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    im.observersScheduled = false;
+    for (size_t i = 0; i < im.observers.size(); ++i) {
+        Observer* ob = im.observers[i].get();
+        if (ob->records.empty()) continue;
+        JSArray* a = vm.newArray();
+        a->elems.swap(ob->records);
+        Value args[2] = {V(a), ob->object};
+        try {
+            vm.call(ob->callback, ob->object, args, 2);
+        } catch (JSThrow&) {
+            im.reportError();
+        }
+    }
+    return Value::undef();
+}
+
+// ---- cookies as script sees them (never HttpOnly ones)
+JSFN(docCookieGet) {
+    Url u = Url::parse(I(ci.vm).url);
+    if (!u.valid || (u.scheme != "http" && u.scheme != "https")) return V(ci.vm.a.empty);
+    return val8(ci.vm, CookieJar::get().header(u, false, false, true));
+}
+JSFN(docCookieSet) {
+    Url u = Url::parse(I(ci.vm).url);
+    if (u.valid && (u.scheme == "http" || u.scheme == "https")) CookieJar::get().store(u, str8(ci.vm, ci.arg(0)), true);
+    return Value::undef();
+}
+
+// ---- network primitives behind fetch() and XMLHttpRequest (see script_prelude.h)
+struct NetRequest {
+    std::string url, origin, error;
+    FetchOpts opts;
+    bool crossOrigin = false, credentials = false, binary = false;
+};
+// arguments: method, url, [[name, value]...], body, flags (1 = send credentials, 2 = binary response)
+void buildRequest(CallInfo& ci, NetRequest& rq) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    rq.opts.method = upper(str8(vm, ci.arg(0)));
+    rq.url = resolve_url(im.doc.baseUrl, str8(vm, ci.arg(1)));
+    Url page = Url::parse(im.url), target = Url::parse(rq.url);
+    rq.origin = page.valid && page.hierarchical ? page.origin() : "null";
+    int flags = vm.toInt32(ci.arg(4));
+    rq.credentials = (flags & 1) != 0;
+    rq.binary = (flags & 2) != 0;
+    bool web = target.scheme == "http" || target.scheme == "https";
+    if (!target.valid || !(web || target.scheme == "data" || (target.scheme == "file" && page.scheme == "file"))) rq.error = "this kind of address cannot be requested from a page";
+    else if (page.scheme == "https" && target.scheme == "http") rq.error = "blocked: an insecure request from a secure page (mixed content)";
+    rq.crossOrigin = web && rq.origin != target.origin();
+    rq.opts.referrer = im.url;
+    rq.opts.firstPartySite = im.firstParty();
+    Value hs = ci.arg(2);
+    if (hs.isObject()) {
+        uint32_t n = vm.lengthOf(hs);
+        for (uint32_t i = 0; i < n; ++i) {
+            Value pair = vm.get(hs, PropKey::index(i));
+            std::string name = str8(vm, vm.get(pair, PropKey::index(0))), value = str8(vm, vm.get(pair, PropKey::index(1)));
+            std::string ln = lower(name);
+            static const char* forbidden[] = {"cookie", "cookie2", "host", "origin", "referer", "user-agent", "content-length", "connection", "accept-encoding",
+                                              "accept-charset", "date", "expect", "te", "trailer", "transfer-encoding", "upgrade", "via", "keep-alive", "dnt"};
+            bool skip = ln.rfind("sec-", 0) == 0 || ln.rfind("proxy-", 0) == 0 || ln.empty();
+            for (const char* f : forbidden) skip |= ln == f;
+            if (skip) continue;
+            if (ln == "content-type") rq.opts.contentType = value;
+            else rq.opts.headers.push_back({name, value});
+        }
+    }
+    Value body = ci.arg(3);
+    if (body.isString()) {
+        rq.opts.body = utf16to8(body.asString()->s);
+    } else if (body.isObject()) {
+        JSObject* o = body.asObject();
+        if (o->cls == Cls::ArrayBuffer) {
+            auto& b = ((JSArrayBuffer*)o)->bytes;
+            rq.opts.body.assign(b.begin(), b.end());
+        } else if (o->cls == Cls::TypedArray || o->cls == Cls::DataView) {
+            JSTypedArray* t = (JSTypedArray*)o;
+            static const int sizes[] = {1, 1, 1, 2, 2, 4, 4, 4, 8};
+            size_t n = (size_t)t->length * (o->cls == Cls::DataView ? 1 : sizes[(int)t->type]);
+            const uint8_t* p = t->buffer->bytes.data() + t->offset;
+            rq.opts.body.assign(p, p + n);
+        }
+    }
+    if (rq.opts.method == "GET" || rq.opts.method == "HEAD") rq.opts.body.clear();
+}
+JSFN(netStart) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    NetRequest rq;
+    buildRequest(ci, rq);
+    if (!vm.isCallable(ci.arg(5))) return Value::i32(0);
+    bool binary = rq.binary;
+    Impl* self = &im;
+    if (!rq.error.empty()) {  // refused before it starts: report it like any other failure, later
+        int id = im.nextNet++;
+        im.netJs[id] = ci.arg(5);
+        im.netCallbacks[id] = [self, id, binary](FetchResult& r) { self->finishNet(id, binary, r); };
+        FetchResult bad;
+        bad.error = rq.error;
+        bad.finalUrl = rq.url;
+        {
+            std::lock_guard<std::mutex> lk(im.net->mu);
+            im.net->done.push_back({id, std::move(bad)});
+        }
+        im.client.wake(0);
+        return Value::i32(id);
+    }
+    int id = im.nextNet;
+    im.netJs[id] = ci.arg(5);
+    im.startFetch(rq.url, rq.opts, rq.crossOrigin, rq.origin, rq.credentials, [self, id, binary](FetchResult& r) { self->finishNet(id, binary, r); });
+    return Value::i32(id);
+}
+JSFN(netSyncFn) {
+    Vm& vm = ci.vm;
+    NetRequest rq;
+    buildRequest(ci, rq);
+    FetchResult r;
+    if (!rq.error.empty()) r.error = rq.error;
+    else r = corsFetch(rq.url, rq.opts, rq.crossOrigin, rq.origin, rq.credentials);
+    JSArray* out = vm.newArray(6);
+    Value vals[6];
+    I(vm).netResult(r, rq.binary, vals);
+    for (int i = 0; i < 6; ++i) out->elems[i] = vals[i];
+    return V(out);
+}
+JSFN(netAbortFn) {
+    Impl& im = I(ci.vm);
+    int id = ci.vm.toInt32(ci.arg(0));
+    im.netJs.erase(id);
+    im.netCallbacks.erase(id);
+    return Value::undef();
+}
+// [href, protocol, host, hostname, port, pathname, search, hash, origin] or null when the address is not valid
+JSFN(urlParse) {
+    Vm& vm = ci.vm;
+    std::string text = std::string(trim(str8(vm, ci.arg(0))));
+    if (!ci.arg(1).isUndef()) text = resolve_url(str8(vm, ci.arg(1)), text);
+    Url u = Url::parse(text);
+    if (!u.valid) return Value::null();
+    JSArray* a = vm.newArray();
+    std::string path = u.hierarchical && u.path.empty() ? "/" : u.path;
+    const std::string parts[] = {u.str(), u.scheme + ":", u.hostport(), u.host, u.port, path, u.hasQuery && !u.query.empty() ? "?" + u.query : "",
+                                 u.hasFragment && !u.fragment.empty() ? "#" + u.fragment : "", u.hierarchical && !u.host.empty() ? u.origin() : "null"};
+    for (auto& p : parts) a->elems.push_back(val8(vm, p));
+    return V(a);
+}
+void drainNet(Impl& im) {
+    std::vector<std::pair<int, FetchResult>> done;
+    {
+        std::lock_guard<std::mutex> lk(im.net->mu);
+        done.swap(im.net->done);
+    }
+    for (auto& d : done) {
+        if (im.dead) break;
+        auto it = im.netCallbacks.find(d.first);
+        if (it == im.netCallbacks.end()) continue;
+        std::function<void(FetchResult&)> cb = std::move(it->second);
+        im.netCallbacks.erase(it);
+        Entry entry(im);
+        cb(d.second);
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------- setup
@@ -1674,6 +2212,16 @@ void ScriptHost::Impl::setup() {
         }
         g.mark(currentScript);
         g.mark(historyState);
+        g.mark(deliverFn);
+        g.mark(fragmentProto);
+        for (auto& tp : tagProtos) g.mark(tp.second);
+        g.mark(observerProto);
+        for (auto& n : netJs) g.mark(n.second);
+        for (auto& ob : observers) {
+            g.mark(ob->object);
+            g.mark(ob->callback);
+            for (Value v : ob->records) g.mark(v);
+        }
         for (JSObject* p : {nodeProto, elementProto, documentProto, textProto, eventProto, classListProto, styleProto, computedProto, nodeListProto, storageProto}) g.mark(p);
     });
     JSObject* G = vm.global;
@@ -1706,7 +2254,6 @@ void ScriptHost::Impl::setup() {
     getter(nodeProto, "nodeType", nodeType);
     getter(nodeProto, "nodeName", nodeName);
     getter(nodeProto, "nodeValue", nodeValueGet, nodeValueSet);
-    getter(nodeProto, "data", nodeValueGet, nodeValueSet);
     getter(nodeProto, "textContent", textContentGet, textContentSet);
     getter(nodeProto, "parentNode", parentNode);
     getter(nodeProto, "parentElement", parentElement);
@@ -1741,6 +2288,7 @@ void ScriptHost::Impl::setup() {
 
     nodeListProto = vm.newObject(vm.arrayProto);
     method(nodeListProto, "item", nodeListItem, 1);
+    method(nodeListProto, "namedItem", nodeListNamedItem, 1);
 
     // ---- Element
     elementProto = vm.newObject(nodeProto);
@@ -1779,35 +2327,23 @@ void ScriptHost::Impl::setup() {
     getter(elementProto, "classList", classListGet);
     getter(elementProto, "style", styleGet, styleSet);
     getter(elementProto, "dataset", datasetGet);
-    getter(elementProto, "value", valueGet, valueSet);
-    getter(elementProto, "checked", checkedGet, checkedSet);
-    getter(elementProto, "form", formGet);
-    struct {
+    struct RP {
         const char* prop;
         const char* attr;
-        int kind;
-    } reflected[] = {
-        {"id", "id", 0}, {"className", "class", 0}, {"title", "title", 0}, {"lang", "lang", 0}, {"dir", "dir", 0}, {"name", "name", 0},
-        {"type", "type", 0}, {"placeholder", "placeholder", 0}, {"alt", "alt", 0}, {"rel", "rel", 0}, {"target", "target", 0},
-        {"method", "method", 0}, {"htmlFor", "for", 0}, {"content", "content", 0}, {"media", "media", 0}, {"charset", "charset", 0},
-        {"role", "role", 0}, {"accept", "accept", 0}, {"autocomplete", "autocomplete", 0}, {"enctype", "enctype", 0},
-        {"crossOrigin", "crossorigin", 0}, {"loading", "loading", 0}, {"srcset", "srcset", 0}, {"sizes", "sizes", 0},
-        {"integrity", "integrity", 0}, {"referrerPolicy", "referrerpolicy", 0}, {"nonce", "nonce", 0}, {"slot", "slot", 0},
-        {"href", "href", 2}, {"src", "src", 2}, {"action", "action", 2}, {"poster", "poster", 2},
-        {"disabled", "disabled", 1}, {"hidden", "hidden", 1}, {"required", "required", 1}, {"readOnly", "readonly", 1},
-        {"multiple", "multiple", 1}, {"autofocus", "autofocus", 1}, {"async", "async", 1}, {"defer", "defer", 1},
-        {"noValidate", "novalidate", 1}, {"open", "open", 1}, {"controls", "controls", 1}, {"autoplay", "autoplay", 1},
-        {"loop", "loop", 1}, {"muted", "muted", 1}, {"selected", "selected", 1}, {"draggable", "draggable", 1},
-        {"tabIndex", "tabindex", 3}, {"width", "width", 3}, {"height", "height", 3}, {"maxLength", "maxlength", 3},
-        {"size", "size", 3}, {"rows", "rows", 3}, {"cols", "cols", 3}, {"colSpan", "colspan", 3}, {"rowSpan", "rowspan", 3},
+        int kind;  // 0 text, 1 boolean, 2 URL, 3 number
     };
-    for (auto& r : reflected) {
-        JSNative* g = vm.newNative(reflectGet, r.prop, 0);
-        JSNative* s = vm.newNative(reflectSet, r.prop, 1);
-        g->data = s->data = V(vm.atom(r.attr));
-        g->data2 = s->data2 = Value::i32(r.kind);
-        vm.defineAccessor(elementProto, PropKey::of(vm.atom(r.prop)), V(g), V(s), PF_C | PF_E);
-    }
+    auto reflect = [&](JSObject* proto, std::initializer_list<RP> props) {
+        for (auto& r : props) {
+            JSNative* g = vm.newNative(reflectGet, r.prop, 0);
+            JSNative* s = vm.newNative(reflectSet, r.prop, 1);
+            g->data = s->data = V(vm.atom(r.attr));
+            g->data2 = s->data2 = Value::i32(r.kind);
+            vm.defineAccessor(proto, PropKey::of(vm.atom(r.prop)), V(g), V(s), PF_C | PF_E);
+        }
+    };
+    reflect(elementProto, {{"id", "id", 0}, {"className", "class", 0}, {"title", "title", 0}, {"lang", "lang", 0}, {"dir", "dir", 0},
+                           {"hidden", "hidden", 1}, {"tabIndex", "tabindex", 3}, {"draggable", "draggable", 1}, {"slot", "slot", 0},
+                           {"role", "role", 0}, {"nonce", "nonce", 0}, {"accessKey", "accesskey", 0}});
 
     classListProto = vm.newObject();
     const char* clOps[] = {"add", "remove", "toggle", "contains", "replace"};
@@ -1816,6 +2352,8 @@ void ScriptHost::Impl::setup() {
     method(classListProto, "toString", classListValue, 0);
     getter(classListProto, "length", classListLength);
     getter(classListProto, "value", classListValue);
+    for (const char* n : {"forEach", "keys", "values", "entries"}) vm.def(classListProto, n, vm.get(V(vm.arrayProto), n));
+    vm.defineOwn(classListProto, PropKey::of(vm.symIterator), vm.get(V(vm.arrayProto), "values"), PF_W | PF_C);
 
     styleProto = vm.newObject();
     method(styleProto, "setProperty", styleSetProperty, 2);
@@ -1839,7 +2377,7 @@ void ScriptHost::Impl::setup() {
     getter(documentProto, "activeElement", docActiveElement);
     getter(documentProto, "domain", docDomain);
     getter(documentProto, "referrer", emptyStringFn);
-    getter(documentProto, "cookie", emptyStringFn, noopFn);
+    getter(documentProto, "cookie", docCookieGet, docCookieSet);
     const char* colls[] = {"forms", "images", "links", "scripts"};
     for (int i = 0; i < 4; ++i) getter(documentProto, colls[i], docCollection, nullptr, i);
     method(documentProto, "createElement", createElement, 1, 0);
@@ -1868,7 +2406,7 @@ void ScriptHost::Impl::setup() {
     method(eventProto, "initCustomEvent", eventInit, 4);
     method(eventProto, "composedPath", eventComposedPath, 0);
     getter(eventProto, "defaultPrevented", eventDefaultPrevented);
-    for (const char* n : {"CustomEvent", "MouseEvent", "KeyboardEvent", "UIEvent", "FocusEvent", "InputEvent", "PointerEvent", "ErrorEvent", "MessageEvent"}) {
+    for (const char* n : {"CustomEvent", "MouseEvent", "KeyboardEvent", "UIEvent", "FocusEvent", "InputEvent", "PointerEvent", "ErrorEvent", "MessageEvent", "ProgressEvent", "HashChangeEvent", "PopStateEvent", "StorageEvent", "PageTransitionEvent", "WheelEvent", "DragEvent", "CompositionEvent", "TransitionEvent", "AnimationEvent", "BeforeUnloadEvent", "PromiseRejectionEvent", "ClipboardEvent", "TouchEvent", "SubmitEvent", "ToggleEvent"}) {
         JSNative* c = vm.newNative(eventCtor, n, 1);
         c->oflags |= OF_CTOR;
         c->add(PropKey::of(vm.a.prototype), V(eventProto), 0);
@@ -1876,24 +2414,104 @@ void ScriptHost::Impl::setup() {
         vm.def(G, n, V(c));
     }
 
-    // ---- constructors that exist for instanceof and feature tests
+    // ---- one constructor and prototype per kind of node, so properties such as `value` or `async` exist only
+    // on the elements that have them
+    fragmentProto = vm.newObject(nodeProto);
     struct {
         const char* name;
         JSObject* proto;
-    } ctors[] = {{"EventTarget", nodeProto}, {"Node", nodeProto}, {"Element", elementProto}, {"HTMLElement", elementProto},
-                 {"Document", documentProto}, {"HTMLDocument", documentProto}, {"Text", textProto}, {"Comment", textProto},
-                 {"CharacterData", textProto}, {"DocumentFragment", elementProto}, {"SVGElement", vm.newObject(elementProto)}};
-    for (auto& c : ctors) makeCtor(vm, c.name, illegalCtor, 0, c.proto);
-    for (const char* n : {"HTMLDivElement", "HTMLSpanElement", "HTMLInputElement", "HTMLAnchorElement", "HTMLImageElement", "HTMLFormElement",
-                          "HTMLScriptElement", "HTMLButtonElement", "HTMLSelectElement", "HTMLTextAreaElement", "HTMLIFrameElement",
-                          "HTMLCanvasElement", "HTMLVideoElement", "HTMLStyleElement", "HTMLLinkElement", "HTMLBodyElement", "HTMLTemplateElement"}) {
+    } ctors[] = {{"Node", nodeProto}, {"Element", elementProto}, {"HTMLElement", elementProto}, {"Document", documentProto},
+                 {"HTMLDocument", documentProto}, {"Text", textProto}, {"Comment", textProto}, {"CharacterData", textProto},
+                 {"DocumentFragment", fragmentProto}, {"NodeList", nodeListProto}, {"HTMLCollection", nodeListProto}};
+    for (auto& c : ctors) {
+        JSNative* made = makeCtor(vm, c.name, illegalCtor, 0, c.proto);
+        if (std::string(c.name) != "Node") continue;
+        for (int i = 0; i < 5; ++i) vm.def(made, consts[i], Value::i32(constVals[i]), 0);
+        const char* positions[] = {"DOCUMENT_POSITION_DISCONNECTED", "DOCUMENT_POSITION_PRECEDING", "DOCUMENT_POSITION_FOLLOWING", "DOCUMENT_POSITION_CONTAINS", "DOCUMENT_POSITION_CONTAINED_BY"};
+        int bits[] = {1, 2, 4, 8, 16};
+        for (int i = 0; i < 5; ++i) {
+            vm.def(made, positions[i], Value::i32(bits[i]), 0);
+            vm.def(nodeProto, positions[i], Value::i32(bits[i]), 0);
+        }
+    }
+    getter(textProto, "data", nodeValueGet, nodeValueSet);
+    auto iface = [&](const char* name, JSObject* parent, const std::vector<const char*>& tags, std::initializer_list<RP> props) {
+        JSObject* proto = vm.newObject(parent);
+        makeCtor(vm, name, illegalCtor, 0, proto);
+        for (const char* t : tags) tagProtos[t] = proto;
+        reflect(proto, props);
+        return proto;
+    };
+    auto control = [&](JSObject* proto, bool checkable) {
+        getter(proto, "value", valueGet, valueSet);
+        getter(proto, "form", formGet);
+        if (checkable) getter(proto, "checked", checkedGet, checkedSet);
+    };
+    iface("HTMLAnchorElement", elementProto, {"a"}, {{"href", "href", 2}, {"target", "target", 0}, {"rel", "rel", 0}, {"download", "download", 0}, {"hreflang", "hreflang", 0}, {"type", "type", 0}, {"referrerPolicy", "referrerpolicy", 0}, {"name", "name", 0}});
+    iface("HTMLAreaElement", elementProto, {"area"}, {{"href", "href", 2}, {"target", "target", 0}, {"alt", "alt", 0}});
+    iface("HTMLImageElement", elementProto, {"img"}, {{"src", "src", 2}, {"alt", "alt", 0}, {"width", "width", 3}, {"height", "height", 3}, {"srcset", "srcset", 0}, {"sizes", "sizes", 0}, {"loading", "loading", 0}, {"decoding", "decoding", 0}, {"crossOrigin", "crossorigin", 0}, {"referrerPolicy", "referrerpolicy", 0}, {"useMap", "usemap", 0}, {"name", "name", 0}});
+    iface("HTMLScriptElement", elementProto, {"script"}, {{"src", "src", 2}, {"type", "type", 0}, {"async", "async", 1}, {"defer", "defer", 1}, {"charset", "charset", 0}, {"crossOrigin", "crossorigin", 0}, {"integrity", "integrity", 0}, {"noModule", "nomodule", 1}, {"referrerPolicy", "referrerpolicy", 0}, {"htmlFor", "for", 0}, {"event", "event", 0}});
+    iface("HTMLLinkElement", elementProto, {"link"}, {{"href", "href", 2}, {"rel", "rel", 0}, {"media", "media", 0}, {"type", "type", 0}, {"as", "as", 0}, {"crossOrigin", "crossorigin", 0}, {"integrity", "integrity", 0}, {"sizes", "sizes", 0}, {"disabled", "disabled", 1}, {"hreflang", "hreflang", 0}, {"referrerPolicy", "referrerpolicy", 0}});
+    iface("HTMLMetaElement", elementProto, {"meta"}, {{"name", "name", 0}, {"content", "content", 0}, {"httpEquiv", "http-equiv", 0}, {"charset", "charset", 0}});
+    iface("HTMLStyleElement", elementProto, {"style"}, {{"media", "media", 0}, {"type", "type", 0}, {"disabled", "disabled", 1}});
+    iface("HTMLBaseElement", elementProto, {"base"}, {{"href", "href", 2}, {"target", "target", 0}});
+    control(iface("HTMLInputElement", elementProto, {"input"}, {{"type", "type", 0}, {"name", "name", 0}, {"placeholder", "placeholder", 0}, {"disabled", "disabled", 1}, {"required", "required", 1}, {"readOnly", "readonly", 1}, {"maxLength", "maxlength", 3}, {"minLength", "minlength", 3}, {"size", "size", 3}, {"multiple", "multiple", 1}, {"autofocus", "autofocus", 1}, {"min", "min", 0}, {"max", "max", 0}, {"step", "step", 0}, {"pattern", "pattern", 0}, {"accept", "accept", 0}, {"autocomplete", "autocomplete", 0}, {"alt", "alt", 0}, {"src", "src", 2}, {"defaultValue", "value", 0}, {"defaultChecked", "checked", 1}, {"inputMode", "inputmode", 0}}), true);
+    control(iface("HTMLTextAreaElement", elementProto, {"textarea"}, {{"name", "name", 0}, {"placeholder", "placeholder", 0}, {"disabled", "disabled", 1}, {"required", "required", 1}, {"readOnly", "readonly", 1}, {"rows", "rows", 3}, {"cols", "cols", 3}, {"maxLength", "maxlength", 3}, {"wrap", "wrap", 0}, {"autofocus", "autofocus", 1}, {"autocomplete", "autocomplete", 0}}), false);
+    control(iface("HTMLSelectElement", elementProto, {"select"}, {{"name", "name", 0}, {"disabled", "disabled", 1}, {"required", "required", 1}, {"multiple", "multiple", 1}, {"size", "size", 3}, {"autofocus", "autofocus", 1}, {"autocomplete", "autocomplete", 0}}), false);
+    control(iface("HTMLOptionElement", elementProto, {"option"}, {{"selected", "selected", 1}, {"defaultSelected", "selected", 1}, {"disabled", "disabled", 1}, {"label", "label", 0}}), false);
+    control(iface("HTMLButtonElement", elementProto, {"button"}, {{"type", "type", 0}, {"name", "name", 0}, {"disabled", "disabled", 1}, {"autofocus", "autofocus", 1}, {"formAction", "formaction", 2}, {"formMethod", "formmethod", 0}}), false);
+    iface("HTMLFormElement", elementProto, {"form"}, {{"action", "action", 2}, {"method", "method", 0}, {"enctype", "enctype", 0}, {"encoding", "enctype", 0}, {"target", "target", 0}, {"name", "name", 0}, {"noValidate", "novalidate", 1}, {"acceptCharset", "accept-charset", 0}, {"autocomplete", "autocomplete", 0}});
+    iface("HTMLLabelElement", elementProto, {"label"}, {{"htmlFor", "for", 0}});
+    iface("HTMLFieldSetElement", elementProto, {"fieldset"}, {{"name", "name", 0}, {"disabled", "disabled", 1}});
+    iface("HTMLIFrameElement", elementProto, {"iframe", "frame"}, {{"src", "src", 2}, {"name", "name", 0}, {"width", "width", 0}, {"height", "height", 0}, {"allow", "allow", 0}, {"sandbox", "sandbox", 0}, {"srcdoc", "srcdoc", 0}, {"loading", "loading", 0}, {"referrerPolicy", "referrerpolicy", 0}, {"allowFullscreen", "allowfullscreen", 1}, {"frameBorder", "frameborder", 0}, {"scrolling", "scrolling", 0}});
+    iface("HTMLCanvasElement", elementProto, {"canvas"}, {{"width", "width", 3}, {"height", "height", 3}});
+    JSObject* media = iface("HTMLMediaElement", elementProto, {}, {{"src", "src", 2}, {"controls", "controls", 1}, {"autoplay", "autoplay", 1}, {"loop", "loop", 1}, {"muted", "muted", 1}, {"defaultMuted", "muted", 1}, {"preload", "preload", 0}, {"crossOrigin", "crossorigin", 0}});
+    iface("HTMLVideoElement", media, {"video"}, {{"poster", "poster", 2}, {"width", "width", 3}, {"height", "height", 3}, {"playsInline", "playsinline", 1}});
+    iface("HTMLAudioElement", media, {"audio"}, {});
+    iface("HTMLSourceElement", elementProto, {"source"}, {{"src", "src", 2}, {"type", "type", 0}, {"srcset", "srcset", 0}, {"sizes", "sizes", 0}, {"media", "media", 0}});
+    iface("HTMLTrackElement", elementProto, {"track"}, {{"src", "src", 2}, {"kind", "kind", 0}, {"srclang", "srclang", 0}, {"label", "label", 0}, {"default", "default", 1}});
+    iface("HTMLEmbedElement", elementProto, {"embed"}, {{"src", "src", 2}, {"type", "type", 0}, {"width", "width", 0}, {"height", "height", 0}});
+    iface("HTMLObjectElement", elementProto, {"object"}, {{"data", "data", 2}, {"type", "type", 0}, {"name", "name", 0}, {"width", "width", 0}, {"height", "height", 0}});
+    iface("HTMLTableCellElement", elementProto, {"td", "th"}, {{"colSpan", "colspan", 3}, {"rowSpan", "rowspan", 3}, {"headers", "headers", 0}, {"scope", "scope", 0}});
+    iface("HTMLDetailsElement", elementProto, {"details"}, {{"open", "open", 1}});
+    iface("HTMLDialogElement", elementProto, {"dialog"}, {{"open", "open", 1}});
+    iface("HTMLOListElement", elementProto, {"ol"}, {{"start", "start", 3}, {"reversed", "reversed", 1}, {"type", "type", 0}});
+    iface("HTMLLIElement", elementProto, {"li"}, {{"value", "value", 3}});
+    iface("HTMLProgressElement", elementProto, {"progress", "meter"}, {{"value", "value", 3}, {"max", "max", 3}});
+    iface("HTMLSlotElement", elementProto, {"slot"}, {{"name", "name", 0}});
+    iface("HTMLTimeElement", elementProto, {"time"}, {{"dateTime", "datetime", 0}});
+    iface("HTMLQuoteElement", elementProto, {"blockquote", "q"}, {{"cite", "cite", 2}});
+    struct {
+        const char* name;
+        std::vector<const char*> tags;
+    } plain[] = {
+        {"HTMLDivElement", {"div"}}, {"HTMLSpanElement", {"span"}}, {"HTMLParagraphElement", {"p"}},
+        {"HTMLHeadingElement", {"h1", "h2", "h3", "h4", "h5", "h6"}}, {"HTMLUListElement", {"ul"}}, {"HTMLBodyElement", {"body"}},
+        {"HTMLHeadElement", {"head"}}, {"HTMLHtmlElement", {"html"}}, {"HTMLBRElement", {"br"}}, {"HTMLHRElement", {"hr"}},
+        {"HTMLPreElement", {"pre"}}, {"HTMLTitleElement", {"title"}}, {"HTMLTemplateElement", {"template"}},
+        {"HTMLTableElement", {"table"}}, {"HTMLTableRowElement", {"tr"}}, {"HTMLTableSectionElement", {"tbody", "thead", "tfoot"}},
+        {"HTMLPictureElement", {"picture"}}, {"HTMLDataListElement", {"datalist"}}, {"HTMLLegendElement", {"legend"}},
+        {"HTMLOptGroupElement", {"optgroup"}}, {"HTMLMenuElement", {"menu"}}, {"HTMLUnknownElement", {}},
+    };
+    for (auto& pl : plain) iface(pl.name, elementProto, pl.tags, {});
+    JSObject* svg = iface("SVGElement", elementProto, {"svg", "g", "path", "circle", "rect", "line", "polyline", "polygon", "ellipse", "text", "tspan", "use", "defs", "symbol", "clippath", "lineargradient", "radialgradient", "stop", "mask", "pattern", "image", "foreignobject"}, {});
+    for (const char* n : {"SVGSVGElement", "SVGGraphicsElement", "SVGPathElement"}) {
         JSNative* c = vm.newNative(illegalCtor, n, 0);
         c->oflags |= OF_CTOR;
-        c->add(PropKey::of(vm.a.prototype), V(elementProto), 0);
+        c->add(PropKey::of(vm.a.prototype), V(svg), 0);
         vm.def(G, n, V(c));
     }
+    makeCtor(vm, "DOMTokenList", illegalCtor, 0, classListProto);
+    makeCtor(vm, "CSSStyleDeclaration", illegalCtor, 0, styleProto);
     vm.def(elementProto, "constructor", vm.get(V(G), "HTMLElement"));
-    for (const char* n : {"MutationObserver", "IntersectionObserver", "ResizeObserver", "PerformanceObserver"}) {
+    observerProto = vm.newObject();
+    makeCtor(vm, "MutationObserver", mutationObserverCtor, 1, observerProto);
+    vm.def(G, "WebKitMutationObserver", vm.get(V(G), "MutationObserver"));
+    vm.defFn(observerProto, "observe", mutationObserve, 2);
+    vm.defFn(observerProto, "disconnect", mutationDisconnect, 0);
+    vm.defFn(observerProto, "takeRecords", mutationTakeRecords, 0);
+    deliverFn = V(vm.newNative(deliverMutations, "deliverMutations", 0));
+    for (const char* n : {"IntersectionObserver", "ResizeObserver", "PerformanceObserver"}) {
         JSObject* p = vm.newObject();
         for (const char* m : {"observe", "unobserve", "disconnect"}) vm.defFn(p, m, noopFn, 1);
         vm.defFn(p, "takeRecords", emptyArrayFn, 0);
@@ -1996,6 +2614,7 @@ void ScriptHost::Impl::setup() {
     getter(hist, "state", historyStateGet);
 
     storageProto = vm.newObject();
+    makeCtor(vm, "Storage", illegalCtor, 0, storageProto);
     const char* stOps[] = {"getItem", "setItem", "removeItem", "clear", "key"};
     for (int i = 0; i < 5; ++i) method(storageProto, stOps[i], storageOp, 1, i);
     getter(storageProto, "length", storageOp, nullptr, 5);
@@ -2011,16 +2630,39 @@ void ScriptHost::Impl::setup() {
         h->hooks = &kStorageHooks;
         vm.def(G, s.name, V(h), PF_ALL);
     }
+
+    net->wake = client.threadWake();
+    vm.defFn(G, "__net", netStart, 6);
+    vm.defFn(G, "__netSync", netSyncFn, 5);
+    vm.defFn(G, "__netAbort", netAbortFn, 1);
+    vm.defFn(G, "__url", urlParse, 2);
+    try {
+        vm.eval(utf8to16(kScriptPrelude), "browser:prelude");
+    } catch (JSThrow&) {
+        reportError();
+    }
 }
 
 // ---------------------------------------------------------------------------- public interface
 ScriptHost::ScriptHost(Document& doc, const std::string& url, Client& client) : impl_(std::make_unique<Impl>(doc, url, client)) { impl_->setup(); }
-ScriptHost::~ScriptHost() = default;
+ScriptHost::~ScriptHost() {
+    std::lock_guard<std::mutex> lk(impl_->net->mu);
+    impl_->net->alive = false;  // results still on their way are dropped
+}
+
+bool ScriptHost::busy() const {
+    if (impl_->dead) return false;
+    if (impl_->net->inflight.load() > 0) return true;
+    std::lock_guard<std::mutex> lk(impl_->net->mu);
+    return !impl_->net->done.empty();
+}
 
 bool ScriptHost::stopped() const { return impl_->dead; }
 
 void ScriptHost::runScripts(const std::vector<ScriptSource>& scripts) {
     Impl& im = *impl_;
+    for (auto& s : scripts)
+        if (s.node) im.startedScripts.insert(s.node);
     for (auto& s : scripts) {
         if (im.dead) break;
         Entry entry(im);
@@ -2055,6 +2697,7 @@ bool ScriptHost::dispatch(Node* target, const std::string& type, bool bubbles, b
 void ScriptHost::pump() {
     Impl& im = *impl_;
     if (im.dead || im.depth) return;
+    drainNet(im);
     for (int budget = 200; budget > 0 && !im.dead; --budget) {
         double now = now_ms();
         int best = -1;

@@ -88,7 +88,7 @@ struct Value {
 enum class CK : uint8_t { String, Symbol, Object, Context, Code, Accessor };
 enum class Cls : uint8_t {
     Object, Array, Arguments, Function, Native, Bound, Error, Boolean, Number, String, SymbolObj, Date, RegExp,
-    Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host
+    Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host, ArrayBuffer, TypedArray, DataView
 };
 
 struct Cell {
@@ -275,6 +275,23 @@ struct JSHost : JSObject {
     JSHost() { cls = Cls::Host; }
     void trace(Gc&) override;
 };
+
+// Binary data: an ArrayBuffer owns bytes; typed arrays and DataViews are windows onto a buffer.
+struct JSArrayBuffer : JSObject {
+    std::vector<uint8_t> bytes;
+    JSArrayBuffer() { cls = Cls::ArrayBuffer; }
+};
+enum class TA : uint8_t { I8, U8, U8C, I16, U16, I32, U32, F32, F64 };
+struct JSTypedArray : JSObject {  // also backs DataView (cls DataView, lengths in bytes)
+    JSArrayBuffer* buffer = nullptr;
+    uint32_t offset = 0, length = 0;  // byte offset into the buffer, length in elements
+    TA type = TA::U8;
+    JSTypedArray() { cls = Cls::TypedArray; }
+    void trace(Gc&) override;
+};
+Value typedGet(const JSTypedArray* t, uint32_t i);  // i must be below t->length
+void typedSet(Vm& vm, JSTypedArray* t, uint32_t i, Value v);
+JSTypedArray* newTypedArray(Vm& vm, TA type, uint32_t length);
 
 struct ValueHash {
     size_t operator()(Value v) const;
@@ -524,6 +541,8 @@ public:
              *generatorProto = nullptr, *dateProto = nullptr, *regexpProto = nullptr, *mapIterProto = nullptr, *setIterProto = nullptr,
              *stringIterProto = nullptr, *globalLex = nullptr;
     JSObject* errorProtos[7] = {};
+    JSObject* typedProtos[9] = {};
+    JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr;
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
            *symToStringTag = nullptr, *symSpecies = nullptr;
     Value regexpCtor, promiseCtor;

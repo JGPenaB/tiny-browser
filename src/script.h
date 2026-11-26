@@ -1,5 +1,6 @@
 // Connects the JavaScript engine to a page: the DOM as script sees it, events, timers and window objects.
 #pragma once
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,6 +24,7 @@ public:
         virtual void consoleMessage(int level, const std::wstring& text) = 0;
         virtual void navigate(const std::string& url, bool replace) = 0;
         virtual void wake(double delayMs) = 0;  // call pump() after this long
+        virtual std::function<void()> threadWake() = 0;  // callable from any thread: asks for a pump() soon
         virtual void ensureLayout() = 0;        // bring element boxes up to date before script reads them
         virtual void viewport(float& w, float& h, float& scrollY) = 0;
         virtual void scrollTo(float y) = 0;
@@ -48,6 +50,7 @@ public:
     // Devtools console: evaluates in the page's global scope. Returns false and the error text on failure.
     bool eval(const std::wstring& source, std::wstring& out);
     bool stopped() const;  // scripts were halted (time limit)
+    bool busy() const;     // network requests started by script are still in flight
 
     struct Impl;
 

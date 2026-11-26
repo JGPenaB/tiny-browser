@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Network and web API test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Network and web API test</h1>
+<p>Open through the test server: <code>http://localhost:8765/pages/net.html</code></p>
+<form id="f"><input name="q" value="hello world"><input type="checkbox" name="c" checked><input type="checkbox" name="d"><select name="s"><option value="1">one</option><option value="2" selected>two</option></select></form>
+<div id="watched"></div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    document.getElementById('results').appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { var a = JSON.stringify(actual), e = JSON.stringify(expected); log(name, a === e, a === e ? '' : 'got ' + a + ', want ' + e); }
+  var other = 'http://127.0.0.1:8765';  // same server, different origin
+
+  // ---- URL and friends (no network)
+  var u = new URL('/a/b?x=1&y=two%20words#frag', 'https://example.com:8443/base/');
+  eq('URL parts', [u.href, u.protocol, u.host, u.hostname, u.port, u.pathname, u.search, u.hash, u.origin], ['https://example.com:8443/a/b?x=1&y=two%20words#frag', 'https:', 'example.com:8443', 'example.com', '8443', '/a/b', '?x=1&y=two%20words', '#frag', 'https://example.com:8443']);
+  eq('searchParams', [u.searchParams.get('y'), u.searchParams.has('z'), [...u.searchParams.keys()]], ['two words', false, ['x', 'y']]);
+  u.searchParams.set('z', 'a&b'); u.hash = '';
+  eq('URL updates', u.href, 'https://example.com:8443/a/b?x=1&y=two+words&z=a%26b');
+  eq('relative URL', new URL('../up?q', 'http://h/a/b/c').href, 'http://h/a/up?q');
+  var threw = false; try { new URL('not a url'); } catch (e) { threw = e instanceof TypeError; } eq('invalid URL throws', threw, true);
+  var sp = new URLSearchParams('a=1&a=2&b=%C3%A9'); sp.append('c', 'x y');
+  eq('URLSearchParams', [sp.getAll('a'), sp.get('b'), sp.toString(), [...sp].length], [['1', '2'], '\u00e9', 'a=1&a=2&b=%C3%A9&c=x+y', 4]);
+  eq('FormData from form', [...new FormData(document.getElementById('f'))], [['q', 'hello world'], ['c', 'on'], ['s', '2']]);
+  var h = new Headers({ 'Content-Type': 'text/plain', 'X-A': '1' }); h.append('x-a', '2');
+  eq('Headers', [h.get('content-type'), h.get('X-A'), h.has('nope')], ['text/plain', '1, 2', false]);
+  var walker = document.createTreeWalker(document.getElementById('f'), NodeFilter.SHOW_ELEMENT), walked = 0; while (walker.nextNode()) walked++;
+  eq('TreeWalker', walked, 6);
+  eq('Image and feature objects', [new Image() instanceof HTMLElement, typeof XMLHttpRequest, typeof AbortController, navigator.plugins.length, typeof performance.timing.responseStart, typeof Intl.DateTimeFormat], [true, 'function', 'function', 0, 'number', 'function']);
+  eq('Blob', new Blob(['ab', new Uint8Array([99])]).size, 3);
+
+  // ---- cookies
+  eq('document.cookie hides HttpOnly', [document.cookie.indexOf('visible=1') >= 0, document.cookie.indexOf('secret') >= 0], [true, false]);
+  document.cookie = 'fromscript=yes; path=/';
+  document.cookie = 'sneaky=1; path=/; HttpOnly';
+  eq('document.cookie write', [document.cookie.indexOf('fromscript=yes') >= 0, document.cookie.indexOf('sneaky') >= 0], [true, false]);
+
+  // ---- MutationObserver
+  var seen = [];
+  new MutationObserver(function (records) { for (var r of records) seen.push(r.type + (r.attributeName ? ':' + r.attributeName : '') + (r.addedNodes.length ? '+' + r.addedNodes.length : '')); })
+    .observe(document.getElementById('watched'), { childList: true, attributes: true, subtree: true });
+  document.getElementById('watched').appendChild(document.createElement('b')).setAttribute('title', 'x');
+  eq('MutationObserver is asynchronous', seen.length, 0);
+
+  // ---- scripts added by script
+  var inline = document.createElement('script'); inline.textContent = 'window.inlineRan = (window.inlineRan || 0) + 1;'; document.head.appendChild(inline);
+  eq('inline script added by script runs at once', window.inlineRan, 1);
+  var viaHtml = document.createElement('div'); viaHtml.innerHTML = '<script>window.viaInnerHtml = 1;<\/script>'; document.body.appendChild(viaHtml);
+  eq('script from innerHTML does not run', window.viaInnerHtml, undefined);
+  var external = new Promise(function (resolve) { var s = document.createElement('script'); s.onload = function () { resolve(window.loadedByScript); }; s.onerror = function () { resolve('error'); }; s.src = '/api/script.js'; document.head.appendChild(s); });
+  var broken = new Promise(function (resolve) { var s = document.createElement('script'); s.onload = function () { resolve('loaded'); }; s.onerror = function () { resolve('error'); }; s.src = '/api/missing'; document.head.appendChild(s); });
+
+  async function main() {
+    await Promise.resolve();  // observers are told in a microtask, after the script that made the changes
+    eq('MutationObserver records', seen, ['childList+1', 'attributes:title']);
+    eq('external script added by script', await external, 1);
+    eq('missing script fires error', await broken, 'error');
+
+    var r = await fetch('/api/json?x=1');
+    var j = await r.json();
+    eq('fetch GET', [r.status, r.ok, r.headers.get('x-reply'), r.headers.get('content-type'), j.method, j.query, r.url], [200, true, 'yes', 'application/json', 'GET', 'x=1', 'http://localhost:8765/api/json?x=1']);
+    eq('cookies sent with same-origin fetch', [j.cookie.indexOf('fromscript=yes') >= 0, j.cookie.indexOf('secret=hidden') >= 0, j.cookie.indexOf('sneaky') >= 0], [true, true, false]);
+    r = await fetch('/api/json', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Test': 'custom' }, body: JSON.stringify({ a: [1, 2] }) });
+    j = await r.json();
+    eq('fetch POST', [j.method, j.body, j.contentType, j.custom, j.origin], ['POST', '{"a":[1,2]}', 'application/json', 'custom', 'http://localhost:8765']);
+    r = await fetch('/api/json', { method: 'POST', body: new URLSearchParams({ k: 'v w' }) });
+    j = await r.json();
+    eq('fetch form body', [j.body, j.contentType], ['k=v+w', 'application/x-www-form-urlencoded;charset=UTF-8']);
+    r = await fetch('/api/missing');
+    eq('fetch 404', [r.status, r.ok, await r.text()], [404, false, '{}']);
+    r = await fetch('/api/json');
+    eq('arrayBuffer', new TextDecoder().decode(await r.arrayBuffer()).indexOf('"method"') >= 0, true);
+
+    r = await fetch(other + '/api/cors');
+    j = await r.json();
+    eq('cross-origin fetch allowed by the server', [r.ok, j.origin, j.cookie], [true, 'http://localhost:8765', '']);
+    var blocked = await fetch(other + '/api/json').then(function () { return 'allowed'; }, function (e) { return e instanceof TypeError ? 'blocked' : String(e); });
+    eq('cross-origin fetch without permission is blocked', blocked, 'blocked');
+    r = await fetch(other + '/api/preflight', { method: 'PUT', headers: { 'X-Test': 'pf' }, body: 'data' });
+    j = await r.json();
+    eq('preflighted cross-origin PUT', [j.method, j.custom, j.body], ['PUT', 'pf', 'data']);
+    blocked = await fetch(other + '/api/cors', { method: 'PUT', body: 'x' }).then(function () { return 'allowed'; }, function () { return 'blocked'; });
+    eq('preflight refusal blocks the request', blocked, 'blocked');
+
+    var xhr = await new Promise(function (resolve) {
+      var x = new XMLHttpRequest(), states = [];
+      x.onreadystatechange = function () { states.push(x.readyState); };
+      x.onload = function () { resolve([x.status, JSON.parse(x.responseText).custom, x.getResponseHeader('X-Reply'), states.join('')]); };
+      x.onerror = function () { resolve('error'); };
+      x.open('GET', '/api/json'); x.setRequestHeader('X-Test', 'xhr'); x.send();
+    });
+    eq('XMLHttpRequest', xhr, [200, 'xhr', 'yes', '1234']);
+    var jx = await new Promise(function (resolve) { var x = new XMLHttpRequest(); x.responseType = 'json'; x.addEventListener('load', function () { resolve(x.response.method); }); x.open('POST', '/api/json'); x.send('b'); });
+    eq('XMLHttpRequest json response', jx, 'POST');
+    var sync = new XMLHttpRequest(); sync.open('GET', '/api/json?sync=1', false); sync.send();
+    eq('synchronous XMLHttpRequest', [sync.status, JSON.parse(sync.responseText).query], [200, 'sync=1']);
+    var xerr = await new Promise(function (resolve) { var x = new XMLHttpRequest(); x.onload = function () { resolve('loaded'); }; x.onerror = function () { resolve('error:' + x.status); }; x.open('GET', other + '/api/json'); x.send(); });
+    eq('cross-origin XMLHttpRequest is blocked', xerr, 'error:0');
+
+    var ac = new AbortController();
+    var aborted = fetch('/api/json', { signal: ac.signal }).then(function () { return 'finished'; }, function (e) { return e.name; });
+    ac.abort();
+    eq('AbortController', await aborted, 'AbortError');
+    var mixed = await fetch('file:///C:/Windows/win.ini').then(function () { return 'read'; }, function () { return 'refused'; });
+    eq('pages cannot read local files', mixed, 'refused');
+  }
+  main().catch(function (e) { log('main threw ' + (e && e.stack || e), false); }).then(function () {
+    document.title = 'Net test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

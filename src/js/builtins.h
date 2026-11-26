@@ -25,6 +25,7 @@ void setupJSON(Vm& vm);
 void setupPromise(Vm& vm);
 void setupDate(Vm& vm);
 void setupRegExp(Vm& vm);
+void setupTypedArrays(Vm& vm);
 
 // Regular expression hooks used by the String.prototype methods (regexp.cpp).
 bool isRegExp(Value v);

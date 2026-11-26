@@ -1,5 +1,7 @@
 """Tiny local test site for the browser's forms, cookies, redirects and layout. Run: python tests/server.py"""
 import html
+import json
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -66,13 +68,64 @@ class H(BaseHTTPRequestHandler):
             self.send(page("Cookies", f"<div class=card><h2>Cookies</h2><pre>{html.escape(cookies) or '(none)'}</pre><p>Referer: {html.escape(self.headers.get('Referer', '(none)'))}</p></div>"))
         elif u.path == "/refresh":
             self.send("<!doctype html><html><head><meta http-equiv=refresh content='0; url=/echo'><title>Refreshing</title></head><body>Redirecting</body></html>")
+        elif u.path.startswith("/pages/"):  # the script test pages in tests/pages, served so they have an http origin
+            try:
+                body = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pages", os.path.basename(u.path)), encoding="utf-8").read()
+            except OSError:
+                self.send(page("Not found", ""), 404)
+                return
+            self.send(body, headers=[("Set-Cookie", "visible=1; Path=/"), ("Set-Cookie", "secret=hidden; Path=/; HttpOnly")])
+        elif u.path.startswith("/api/"):
+            self.api("GET", u, "")
         else:
             self.send(page("Not found", "<div class=card><h2>404</h2></div>"), 404)
+
+    def send_raw(self, body, ctype, headers=(), status=200):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    # JSON endpoints for fetch/XMLHttpRequest tests. /api/cors allows any origin, /api/preflight allows custom
+    # methods and headers, everything else is same-origin only.
+    def api(self, method, u, raw):
+        origin = self.headers.get("Origin", "")
+        info = {"method": method, "path": u.path, "query": u.query, "body": raw, "origin": origin,
+                "cookie": self.headers.get("Cookie", ""), "contentType": self.headers.get("Content-Type", ""),
+                "custom": self.headers.get("X-Test", "")}
+        hdrs = [("X-Reply", "yes")]
+        if u.path == "/api/cors":
+            hdrs.append(("Access-Control-Allow-Origin", "*"))
+        if u.path == "/api/preflight":
+            hdrs += [("Access-Control-Allow-Origin", origin or "*"), ("Access-Control-Allow-Headers", "x-test, content-type"),
+                     ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")]
+        if u.path == "/api/script.js":
+            self.send_raw("window.loadedByScript = (window.loadedByScript || 0) + 1;", "text/javascript", hdrs)
+        elif u.path == "/api/missing":
+            self.send_raw("{}", "application/json", hdrs, 404)
+        elif method == "OPTIONS":
+            self.send_raw("", "text/plain", hdrs, 204)
+        else:
+            self.send_raw(json.dumps(info), "application/json", hdrs)
+
+    def do_OPTIONS(self):
+        self.api("OPTIONS", urlparse(self.path), "")
+
+    def do_PUT(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        self.api("PUT", urlparse(self.path), self.rfile.read(n).decode("utf-8", "replace"))
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n).decode("utf-8", "replace")
         f = parse_qs(raw)
+        if self.path.startswith("/api/"):
+            self.api("POST", urlparse(self.path), raw)
+            return
         if self.path == "/login":
             user = f.get("username", [""])[0]
             ok = f.get("csrf", [""])[0] == "tok123" and self.headers.get("Origin", "") == "http://localhost:8765"
