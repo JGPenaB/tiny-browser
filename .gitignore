@@ -38,3 +38,6 @@ __pycache__/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Third-party test suites, downloaded on demand
+third_party/

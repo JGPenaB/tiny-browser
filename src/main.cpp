@@ -14,6 +14,7 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
 int run_selftest(const std::wstring& outPath);
 namespace js {
 int runJsFile(const std::wstring& path, const std::wstring& outPath);
+int runJsBatch(const std::wstring& listPath, const std::wstring& outPath);
 }
 }  // namespace tb
 
@@ -33,6 +34,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     LocalFree(argv);
 
     if (args.size() >= 2 && args[0] == L"--js") return tb::js::runJsFile(args[1], args.size() > 2 ? args[2] : L"");
+    if (args.size() >= 3 && args[0] == L"--js-batch") return tb::js::runJsBatch(args[1], args[2]);
     if (!args.empty() && args[0] == L"--selftest") return tb::run_selftest(args.size() > 1 ? args[1] : L"selftest.txt");
     if (args.size() >= 3 && args[0] == L"--screenshot") {
         int w = 1280, h = 860, devTab = 0;

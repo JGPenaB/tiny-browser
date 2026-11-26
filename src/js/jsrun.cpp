@@ -58,20 +58,23 @@ JSFN(clearTimerFn) {
 }
 }  // namespace
 
-int runJsFile(const std::wstring& path, const std::wstring& outPath) {
+static bool readFile(const std::wstring& path, std::string& bytes) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return 2;
-    std::string bytes;
+    if (f == INVALID_HANDLE_VALUE) return false;
     char buf[65536];
     DWORD n = 0;
     while (ReadFile(f, buf, sizeof buf, &n, nullptr) && n) bytes.append(buf, n);
     CloseHandle(f);
     if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF) bytes.erase(0, 3);
+    return true;
+}
 
+// Runs one script in a fresh engine, with its timers, writing console output to `out`. limitMs > 0 stops a
+// script that runs too long. Returns true when it failed with an uncaught error.
+static bool runOne(const std::string& bytes, const std::string& name, HANDLE out, double limitMs) {
     Runner r;
     g_runner = &r;
-    r.out = outPath.empty() ? GetStdHandle(STD_OUTPUT_HANDLE)
-                            : CreateFileW(outPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+    r.out = out;
     Vm& vm = r.vm;
     r.roots.push_back(V(vm.newObject(nullptr)));
     RootScope keep(vm, r.roots);
@@ -84,17 +87,17 @@ int runJsFile(const std::wstring& path, const std::wstring& outPath) {
     vm.defFn(vm.global, "clearTimeout", clearTimerFn, 1);
     vm.defFn(vm.global, "clearInterval", clearTimerFn, 1);
     vm.def(vm.global, "print", vm.get(vm.get(V(vm.global), "console"), "log"));
+    double started = tick();
+    if (limitMs > 0) vm.deadlineTick = GetTickCount64() + (ULONGLONG)limitMs;
 
-    std::string name = utf16to8(std::u16string(path.begin(), path.end()));
-    size_t slash = name.find_last_of("/\\");
-    if (slash != std::string::npos) name.erase(0, slash + 1);
     std::u16string err;
     if (!vm.run(utf8to16(bytes), name, nullptr, &err)) {
         r.write(err.rfind(u"Uncaught", 0) == 0 ? err : u"Uncaught " + err);
         r.failed = true;
     }
 
-    while (!r.timers.empty()) {
+    while (!r.timers.empty() && !vm.terminated) {
+        if (limitMs > 0 && tick() - started > limitMs) break;
         size_t best = 0;
         for (size_t i = 1; i < r.timers.size(); ++i)
             if (r.timers[i].due < r.timers[best].due) best = i;
@@ -126,9 +129,60 @@ int runJsFile(const std::wstring& path, const std::wstring& outPath) {
         vm.runMicrotasks();
         if (vm.gc.shouldCollect()) vm.gc.collect();
     }
-    if (!outPath.empty() && r.out != INVALID_HANDLE_VALUE) CloseHandle(r.out);
+    if (vm.terminated) {
+        r.write(u"Uncaught TimeLimit: the script ran too long");
+        r.failed = true;
+    }
     g_runner = nullptr;
-    return r.failed ? 1 : 0;
+    return r.failed;
+}
+
+int runJsFile(const std::wstring& path, const std::wstring& outPath) {
+    std::string bytes;
+    if (!readFile(path, bytes)) return 2;
+    HANDLE out = outPath.empty() ? GetStdHandle(STD_OUTPUT_HANDLE)
+                                 : CreateFileW(outPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+    std::string name = utf16to8(std::u16string(path.begin(), path.end()));
+    size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) name.erase(0, slash + 1);
+    bool failed = runOne(bytes, name, out, 0);
+    if (!outPath.empty() && out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    return failed ? 1 : 0;
+}
+
+// tinybrowser.exe --js-batch <list.txt> <output.txt>: runs every script named in the list (one path per line),
+// each in a fresh engine with a time limit. The output has a "### <path>" line before each script's console
+// output and a "### end <0|1>" line after it, so a crash shows which script was running.
+int runJsBatch(const std::wstring& listPath, const std::wstring& outPath) {
+    std::string list;
+    if (!readFile(listPath, list)) return 2;
+    HANDLE out = CreateFileW(outPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (out == INVALID_HANDLE_VALUE) return 2;
+    auto put = [&](const std::string& line) {
+        DWORD n = 0;
+        WriteFile(out, line.data(), (DWORD)line.size(), &n, nullptr);
+    };
+    size_t pos = 0;
+    while (pos < list.size()) {
+        size_t nl = list.find('\n', pos);
+        if (nl == std::string::npos) nl = list.size();
+        std::string path = list.substr(pos, nl - pos);
+        pos = nl + 1;
+        while (!path.empty() && (path.back() == '\r' || path.back() == ' ')) path.pop_back();
+        if (path.empty()) continue;
+        put("### " + path + "\n");
+        std::string bytes;
+        std::u16string wide = utf8to16(path);
+        bool failed = true;
+        if (readFile(std::wstring(wide.begin(), wide.end()), bytes)) {
+            size_t slash = path.find_last_of("/\\");
+            failed = runOne(bytes, slash == std::string::npos ? path : path.substr(slash + 1), out, 10000);
+        } else
+            put("Uncaught could not read the file\n");
+        put(failed ? "### end 1\n" : "### end 0\n");
+    }
+    CloseHandle(out);
+    return 0;
 }
 
 }  // namespace tb::js
