@@ -1,0 +1,4 @@
+# Keep sources LF in the repo and in working copies; PowerShell scripts stay CRLF-friendly.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
