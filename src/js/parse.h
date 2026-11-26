@@ -27,7 +27,7 @@ enum class N : uint8_t {
 
 enum : uint16_t {
     NF_COMPUTED = 1, NF_STATIC = 2, NF_SHORTHAND = 4, NF_OPTIONAL = 8, NF_PREFIX = 16, NF_DELEGATE = 32, NF_PRIVATE = 64,
-    NF_PAREN = 128, NF_EXPRBODY = 256, NF_AWAIT = 512, NF_EVAL = 1024
+    NF_PAREN = 128, NF_EXPRBODY = 256, NF_AWAIT = 512, NF_EVAL = 1024, NF_TRAILING = 2048
 };
 enum : uint8_t { PK_INIT, PK_GET, PK_SET, PK_METHOD, PK_SPREAD, PK_FIELD, PK_STATIC_BLOCK };
 enum : uint8_t { VK_VAR, VK_LET, VK_CONST, VK_PARAM, VK_FUNC, VK_CLASS, VK_CATCH, VK_FUNCNAME, VK_PSEUDO, VK_PRIVATE, VK_IMPORT };
@@ -70,7 +70,9 @@ struct Scope {
     std::vector<Variable*> vars;
     std::unordered_map<JSString*, Variable*> map;
     std::vector<std::pair<Node*, bool>> refs;  // unresolved identifier references (node, crossed a function boundary)
-    bool hasEval = false;  // a direct eval call sits inside: every variable must stay reachable by name
+    bool hasEval = false;
+    bool catchBody = false;            // the block of a catch clause: its names must not repeat the parameter's
+    std::vector<JSString*> varNames;   // `var`s declared in nested blocks that are hoisted through this scope  // a direct eval call sits inside: every variable must stay reachable by name
     std::vector<Node*> funcDecls;              // function declarations hoisted to the top of this scope
     // filled in by the compiler
     bool hasCtx = false;
@@ -97,7 +99,8 @@ struct FunctionInfo {
     JSString* name = nullptr;
     bool isArrow = false, isAsync = false, isGenerator = false, isMethod = false, isGetter = false, isSetter = false,
          isClassCtor = false, isDerived = false, strict = false, isDecl = false, exprBody = false, usesSuper = false,
-         isFieldInit = false, isEvalBody = false;
+         isFieldInit = false, isEvalBody = false, isStaticBlock = false, simpleParams = true, dupParams = false,
+         hasUseStrict = false, strictNames = false;
     Variable *thisVar = nullptr, *argsVar = nullptr, *selfVar = nullptr, *newTargetVar = nullptr;
     uint32_t srcStart = 0, srcEnd = 0, line = 0;
     int length = 0;

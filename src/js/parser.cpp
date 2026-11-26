@@ -11,7 +11,7 @@ namespace {
 struct Tok {
     enum T : uint8_t { End, Ident, Num, Str, Templ, Regex, Punct, Private } type = End;
     uint8_t p = P_None;
-    bool nl = false, tail = false, esc = false;
+    bool nl = false, tail = false, esc = false, oct = false;
     uint32_t pos = 0, end = 0, line = 1;
     double num = 0;
     JSString* str = nullptr;
@@ -161,9 +161,11 @@ public:
             case 0x2028:
             case 0x2029: break;
             default:
+                if (c == '8' || c == '9') sawOctal = true;
                 if (c >= '0' && c <= '7') {
                     int v = c - '0';
                     if (!(c == '0' && !(pos < n && isDigit(s[pos])))) {
+                        sawOctal = true;
                         for (int i = 0; i < 2 && pos < n && s[pos] >= '0' && s[pos] <= '7' && v * 8 + (s[pos] - '0') < 256; ++i)
                             v = v * 8 + (s[pos++] - '0');
                     }
@@ -248,8 +250,10 @@ public:
         return t;
     }
 
+    bool sawOctal = false;  // the token being read used a legacy octal number or escape
     Tok next() {
         Tok t;
+        sawOctal = false;
         t.nl = skipSpace();
         t.pos = (uint32_t)pos;
         t.line = line;
@@ -267,6 +271,7 @@ public:
         } else if (isDigit(c) || (c == '.' && pos + 1 < n && isDigit(s[pos + 1]))) {
             t.type = Tok::Num;
             t.num = number();
+            t.oct = sawOctal;
         } else if (c == '"' || c == '\'') {
             ++pos;
             std::u16string v;
@@ -280,6 +285,7 @@ public:
             }
             t.type = Tok::Str;
             t.str = vm.atom(v);
+            t.oct = sawOctal;
         } else if (c == '`') {
             uint32_t p0 = t.pos;
             bool nl = t.nl;
@@ -310,19 +316,24 @@ private:
             pos += 2;
             double v = 0;
             bool any = false;
+            bool lastDigit = false;
             while (pos < n) {
                 if (s[pos] == '_') {
+                    int nextDigit = pos + 1 < n ? hexVal(s[pos + 1]) : -1;
+                    if (!lastDigit || nextDigit < 0 || nextDigit >= r) fail("Numeric separators are not allowed here");
+                    lastDigit = false;
                     ++pos;
                     continue;
                 }
                 int h = hexVal(s[pos]);
                 if (h < 0 || h >= r) break;
                 v = v * r + h;
-                any = true;
+                any = lastDigit = true;
                 ++pos;
             }
             if (!any) fail("Invalid number");
             if (pos < n && s[pos] == 'n') ++pos;
+            if (pos < n && (idStart(s[pos]) || isDigit(s[pos]))) fail("Invalid number");
             return v;
         };
         if (c == '0' && pos + 1 < n) {
@@ -330,6 +341,7 @@ private:
             if (x == 'x') return radix(16);
             if (x == 'o') return radix(8);
             if (x == 'b') return radix(2);
+            if (s[pos + 1] == '_') fail("Numeric separators are not allowed here");
             if (isDigit(s[pos + 1])) {  // legacy octal, unless a digit is 8 or 9
                 size_t e = pos;
                 bool oct = true;
@@ -337,17 +349,27 @@ private:
                     if (s[e] > '7') oct = false;
                     ++e;
                 }
+                sawOctal = true;
+                if (e < n && (s[e] == '_' || s[e] == 'n')) fail("Invalid number");
                 if (oct) {
                     double v = 0;
                     while (pos < e) v = v * 8 + (s[pos++] - '0');
+                    if (pos < n && (idStart(s[pos]) || s[pos] == '.')) fail("Invalid number");
                     return v;
                 }
             }
         }
         std::string buf;
         auto digits = [&] {
+            bool lastDigit = false;
             while (pos < n && (isDigit(s[pos]) || s[pos] == '_')) {
-                if (s[pos] != '_') buf += (char)s[pos];
+                if (s[pos] == '_') {
+                    if (!lastDigit || !(pos + 1 < n && isDigit(s[pos + 1]))) fail("Numeric separators are not allowed here");
+                    lastDigit = false;
+                } else {
+                    buf += (char)s[pos];
+                    lastDigit = true;
+                }
                 ++pos;
             }
         };
@@ -852,6 +874,78 @@ private:
     FunctionInfo* fn = nullptr;
     std::unordered_map<JSString*, bool> reserved;
     std::vector<Variable*> declaredNow;
+    JSString* strictWords[9] = {vm.atom("implements"), vm.atom("interface"), vm.atom("let"),       vm.atom("package"), vm.atom("private"),
+                                vm.atom("protected"),  vm.atom("public"),    vm.atom("static"),    vm.atom("yield")};
+    bool noLetDecl = false;           // a `let` here starts an expression, not a declaration
+    bool nextBlockIsCatchBody = false;
+    struct Labels {
+        std::vector<std::pair<JSString*, bool>> names;  // label, does it name a loop
+        int loops = 0, breakables = 0;
+    };
+    Labels lab;  // of the function being parsed
+    std::vector<Labels> labStack;
+    bool isStrictRes(JSString* a) const {
+        for (JSString* w : strictWords)
+            if (w == a) return true;
+        return false;
+    }
+    bool inStaticBlock() const {
+        const FunctionInfo* f = fn;
+        while (f->isArrow && f->parent) f = f->parent;
+        return f->isStaticBlock;
+    }
+    // An identifier used as a name: a reference, a binding or a label (ECMA-262 13.1.1).
+    void checkName(JSString* name, bool escaped) {
+        if (escaped && isRes(name)) fail("Keyword must not contain escaped characters");
+        if (name == k.yield_ && (fn->strict || fn->isGenerator)) fail("Unexpected identifier 'yield'");
+        if (name == k.await_ && (ast.moduleFn || fn->isAsync || inStaticBlock())) fail("Unexpected reserved word 'await'");
+        if (fn->strict && isStrictRes(name)) fail("Unexpected strict mode reserved word '" + utf16to8(name->s) + "'");
+    }
+    bool isEvalOrArguments(JSString* a) const { return a == evalAtom || a == k.arguments_; }
+    // Early errors that depend on the whole function: its parameters against its strictness (15.1.1, 15.2.1).
+    void checkFunction(FunctionInfo* f) {
+        if (f->hasUseStrict && !f->simpleParams) fail("Illegal 'use strict' directive in function with non-simple parameter list");
+        if (f->dupParams && (f->strict || !f->simpleParams || f->isArrow || f->isMethod)) fail("Duplicate parameter name not allowed in this context");
+        if (f->strict && f->strictNames) fail("Unexpected eval or arguments in strict mode");
+        if (f->strict && f->name && !f->isMethod && !f->isClassCtor && (isEvalOrArguments(f->name) || isStrictRes(f->name)))
+            fail("Unexpected eval or arguments in strict mode");
+    }
+    // The body of if, a loop or a label: one statement, where declarations are not allowed (14.6, 14.7, 14.13).
+    Node* subStatement(bool ifBody = false, bool labelled = false) {
+        bool noLet = false;
+        if (t.type == Tok::Ident && !t.esc) {
+            JSString* w = t.str;
+            const char* lexical = "Lexical declaration cannot appear in a single-statement context";
+            if (w == k.class_ || w == k.const_) fail(lexical);
+            if (w == k.let_) {
+                Tok nx = peek();
+                if (nx.type == Tok::Punct && nx.p == P_LBrack) fail(lexical);
+                if (!nx.nl && ((nx.type == Tok::Ident && nx.str != k.in_ && nx.str != k.instanceof_) || (nx.type == Tok::Punct && nx.p == P_LBrace))) fail(lexical);
+                noLet = true;
+            }
+            if (w == k.function_) {
+                if (fn->strict || !(ifBody || labelled)) fail("In this context a function can only be declared at the top level or inside a block");
+                Tok nx = peek();
+                if (nx.type == Tok::Punct && nx.p == P_Star) fail("Generators can only be declared at the top level or inside a block");
+            }
+            if (w == k.async_) {
+                Tok nx = peek();
+                if (nx.type == Tok::Ident && nx.str == k.function_ && !nx.nl) fail("Async functions can only be declared at the top level or inside a block");
+            }
+        }
+        noLetDecl = noLet;
+        Node* r = statement();
+        noLetDecl = false;
+        return r;
+    }
+    Node* loopBody() {
+        ++lab.loops;
+        ++lab.breakables;
+        Node* b = subStatement();
+        --lab.loops;
+        --lab.breakables;
+        return b;
+    }
     JSString* evalAtom = vm.atom("eval");
 
     [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, t.line}; }
@@ -943,6 +1037,13 @@ private:
                     return v;
                 }
             }
+            if (kind == VK_VAR)
+                for (Scope* sc = scope; sc != fs; sc = sc->parent) {
+                    Variable* v = sc->find(name);
+                    if (v && (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS || v->kind == VK_FUNC))
+                        fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+                    sc->varNames.push_back(name);
+                }
             if (Variable* v = fs->find(name)) {
                 if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)
                     fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
@@ -954,8 +1055,18 @@ private:
             return v;
         }
         if (Variable* v = scope->find(name)) {
-            if (v->kind == VK_PARAM && kind == VK_PARAM) return v;  // duplicate parameter names (sloppy mode)
+            if (v->kind == VK_PARAM && kind == VK_PARAM) {  // duplicate parameter names: sloppy functions with plain parameters only
+                fn->dupParams = true;
+                return v;
+            }
+            // a block may declare the same function twice in sloppy code (Annex B.3.2.4)
+            if (v->kind == VK_FUNC && kind == VK_FUNC && !fn->strict && scope->kind != Scope::Function && scope->kind != Scope::Global) return v;
             if (!(v->kind == VK_PSEUDO)) fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+        }
+        if (kind == VK_LET || kind == VK_CONST || kind == VK_CLASS || kind == VK_FUNC) {
+            for (JSString* n : scope->varNames)
+                if (n == name) fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+            if (scope->catchBody && scope->parent && scope->parent->find(name)) fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
         }
         Variable* v = newVar(scope, name, kind);
         if (kind == VK_PARAM || kind == VK_FUNC || kind == VK_CATCH || kind == VK_FUNCNAME) v->declEnd = 0;
@@ -1032,12 +1143,14 @@ private:
         while (t.type == Tok::Str) {
             Tok nx = peek();
             if (!(nx.type == Tok::End || nx.nl || (nx.type == Tok::Punct && (nx.p == P_Semi || nx.p == P_RBrace)))) break;
-            if (t.str == k.useStrict) f.strict = true;
+            if (t.str == k.useStrict && !t.esc && t.end - t.pos == 12) f.strict = f.hasUseStrict = true;
             f.body.push_back(statement());
         }
     }
 
     Node* statement() {
+        bool letIsName = noLetDecl;
+        noLetDecl = false;
         if (isP(P_LBrace)) return block(true);
         if (isP(P_Semi)) {
             Node* e = mk(N::Empty);
@@ -1051,7 +1164,7 @@ private:
                 semi();
                 return d;
             }
-            if (w == k.let_) {
+            if (w == k.let_ && !letIsName) {
                 Tok nx = peek();
                 if ((nx.type == Tok::Ident && nx.str != k.in_ && nx.str != k.instanceof_) ||
                     (nx.type == Tok::Punct && (nx.p == P_LBrack || nx.p == P_LBrace))) {
@@ -1077,13 +1190,13 @@ private:
                 expectP(P_LParen);
                 n->a = expression();
                 expectP(P_RParen);
-                n->d = statement();
+                n->d = loopBody();
                 return n;
             }
             if (w == k.do_) {
                 Node* n = mk(N::DoWhile);
                 advance();
-                n->d = statement();
+                n->d = loopBody();
                 if (!eatK(k.while_)) unexpected();
                 expectP(P_LParen);
                 n->a = expression();
@@ -1104,8 +1217,14 @@ private:
                 advance();
                 if (t.type == Tok::Ident && !t.nl && !isRes(t.str)) {
                     n->str = t.str;
+                    bool found = false, loop = false;
+                    for (auto& l : lab.names)
+                        if (l.first == t.str) found = true, loop = l.second;
+                    if (!found) fail("Undefined label '" + utf16to8(t.str->s) + "'");
+                    if (w == k.continue_ && !loop) fail("Illegal continue statement: '" + utf16to8(t.str->s) + "' does not denote an iteration statement");
                     advance();
-                }
+                } else if (w == k.continue_ ? lab.loops == 0 : lab.breakables == 0)
+                    fail(w == k.continue_ ? "Illegal continue statement: no surrounding iteration statement" : "Illegal break statement");
                 semi();
                 return n;
             }
@@ -1140,11 +1259,24 @@ private:
             if (!isRes(w)) {
                 Tok nx = peek();
                 if (nx.type == Tok::Punct && nx.p == P_Colon) {
+                    checkName(w, false);
+                    for (auto& l : lab.names)
+                        if (l.first == w) fail("Label '" + utf16to8(w->s) + "' has already been declared");
                     Node* n = mk(N::Labeled);
                     n->str = w;
                     advance();
                     advance();
-                    n->a = statement();
+                    // the label names a loop when the statement it leads to, past any further labels, is one
+                    Tok look = t;
+                    for (int off = 0; off < 16 && look.type == Tok::Ident && !look.esc && !isRes(look.str); off += 2) {
+                        Tok colon = peek(off + 1);
+                        if (!(colon.type == Tok::Punct && colon.p == P_Colon)) break;
+                        look = peek(off + 2);
+                    }
+                    bool loop = look.type == Tok::Ident && !look.esc && (look.str == k.for_ || look.str == k.while_ || look.str == k.do_);
+                    lab.names.push_back({w, loop});
+                    n->a = subStatement(false, true);
+                    lab.names.pop_back();
                     return n;
                 }
             }
@@ -1159,6 +1291,8 @@ private:
         Node* b = mk(N::Block);
         expectP(P_LBrace);
         Scope* sc = newScope ? open(Scope::Block) : nullptr;
+        if (sc) sc->catchBody = nextBlockIsCatchBody;
+        nextBlockIsCatchBody = false;
         while (!isP(P_RBrace)) {
             if (t.type == Tok::End) unexpected();
             b->list.push_back(statement());
@@ -1191,6 +1325,7 @@ private:
 
     Node* bindingIdent(uint8_t kind) {
         if (t.type != Tok::Ident || isRes(t.str)) unexpected();
+        checkBinding(t.str, t.esc, kind);
         Node* n = mk(N::Ident);
         n->str = t.str;
         n->var = declare(t.str, kind);
@@ -1198,6 +1333,15 @@ private:
         return n;
     }
 
+    void checkBinding(JSString* name, bool escaped, uint8_t kind) {
+        checkName(name, escaped);
+        if (isEvalOrArguments(name)) {
+            if (fn->strict) fail("Unexpected eval or arguments in strict mode");
+            if (kind == VK_PARAM) fn->strictNames = true;
+        } else if (kind == VK_PARAM && isStrictRes(name))
+            fn->strictNames = true;
+        if ((kind == VK_LET || kind == VK_CONST) && name == k.let_) fail("let is disallowed as a lexically bound name");
+    }
     Node* bindingTarget(uint8_t kind) {
         if (isP(P_LBrack)) {
             Node* p = mk(N::ArrayPat);
@@ -1213,6 +1357,7 @@ private:
                     advance();
                     r->a = bindingTarget(kind);
                     p->list.push_back(r);
+                    if (!isP(P_RBrack)) fail("Rest element must be last element");
                 } else {
                     p->list.push_back(bindingElement(kind));
                 }
@@ -1228,17 +1373,20 @@ private:
                 if (isP(P_Ellipsis)) {
                     Node* r = mk(N::Rest);
                     advance();
-                    r->a = bindingTarget(kind);
+                    r->a = bindingIdent(kind);
                     p->list.push_back(r);
+                    if (!isP(P_RBrace)) fail("Rest element must be last element");
                 } else {
                     Node* pr = mk(N::Property);
                     bool isIdent = t.type == Tok::Ident;
+                    bool nameEscaped = t.esc;
                     JSString* name = t.str;
                     pr->a = propertyName(pr);
                     if (eatP(P_Colon)) {
                         pr->b = bindingElement(kind);
                     } else {
                         if (!isIdent || isRes(name)) unexpected();
+                        checkBinding(name, nameEscaped, kind);
                         Node* id = mk(N::Ident);
                         id->str = name;
                         id->var = declare(name, kind);
@@ -1280,8 +1428,8 @@ private:
         expectP(P_LParen);
         n->a = expression();
         expectP(P_RParen);
-        n->b = statement();
-        if (eatK(k.else_)) n->c = statement();
+        n->b = subStatement(true);
+        if (eatK(k.else_)) n->c = subStatement(true);
         return n;
     }
 
@@ -1323,7 +1471,7 @@ private:
             n->a = init;
             n->b = n->type == N::ForOf ? assign() : expression();
             expectP(P_RParen);
-            n->d = statement();
+            n->d = loopBody();
             close(sc);
             return n;
         }
@@ -1339,7 +1487,7 @@ private:
         expectP(P_Semi);
         if (!isP(P_RParen)) n->c = expression();
         expectP(P_RParen);
-        n->d = statement();
+        n->d = loopBody();
         close(sc);
         return n;
     }
@@ -1357,6 +1505,7 @@ private:
                 finishDecl(mark);
                 expectP(P_RParen);
             }
+            nextBlockIsCatchBody = true;
             n->c = block(true);
             close(sc);
         }
@@ -1380,10 +1529,12 @@ private:
             else if (!eatK(k.default_)) unexpected();
             else c->flags = 1;
             expectP(P_Colon);
+            ++lab.breakables;
             while (!isP(P_RBrace) && !isK(k.case_) && !isK(k.default_)) {
                 if (t.type == Tok::End) unexpected();
                 c->list.push_back(statement());
             }
+            --lab.breakables;
             n->list.push_back(c);
         }
         advance();
@@ -1406,6 +1557,7 @@ private:
         } else {
             if (t.type != Tok::Ident || isRes(t.str)) unexpected();
             name = t.str;
+            checkBinding(name, t.esc, VK_FUNC);
             v = declare(name, VK_FUNC);
             advance();
         }
@@ -1425,12 +1577,16 @@ private:
         f.parent = fn;
         f.strict = fn->strict;
         fn = &f;
+        labStack.push_back(std::move(lab));
+        lab = Labels{};
         Scope* fs = open(Scope::Function);
         fs->fn = &f;
         f.scope = fs;
         return &f;
     }
     void endFn(FunctionInfo* f) {
+        lab = std::move(labStack.back());
+        labStack.pop_back();
         f->srcEnd = prevEnd;
         close(f->scope);
         fn = f->parent;
@@ -1446,9 +1602,11 @@ private:
                 r->a = bindingTarget(VK_PARAM);
                 f.params.push_back(r);
                 simple = false;
+                f.simpleParams = false;
+                if (!isP(P_RParen)) fail("Rest parameter must be last formal parameter");
             } else {
                 Node* p = bindingElement(VK_PARAM);
-                if (p->type != N::Ident) simple = false;
+                if (p->type != N::Ident) simple = false, f.simpleParams = false;
                 if (simple) f.length = (int)f.params.size() + 1;
                 f.params.push_back(p);
             }
@@ -1485,7 +1643,10 @@ private:
         expectP(P_LParen);
         params(*f);
         expectP(P_RParen);
+        if (methodKind == 2 && !f->params.empty()) fail("Getter must not have any formal parameters");
+        if (methodKind == 3 && (f->params.size() != 1 || f->params[0]->type == N::Rest)) fail("Setter must have exactly one formal parameter");
         body(*f);
+        checkFunction(f);
         endFn(f);
         n->fn = f;
         n->str = name;
@@ -1516,6 +1677,7 @@ private:
             f->body.push_back(r);
             f->exprBody = true;
         }
+        checkFunction(f);
         endFn(f);
         n->fn = f;
         return n;
@@ -1620,6 +1782,12 @@ private:
         Variable* outer = nullptr;
         if (t.type == Tok::Ident && !isK(k.extends_) && !isRes(t.str)) {
             n->str = t.str;
+            {  // a class name is bound in strict code
+                bool saved = fn->strict;
+                fn->strict = true;
+                checkBinding(t.str, t.esc, VK_CLASS);
+                fn->strict = saved;
+            }
             if (isDecl) {
                 size_t mark = declaredNow.size();
                 outer = declare(t.str, VK_CLASS);
@@ -1669,6 +1837,7 @@ private:
                 FunctionInfo* f = beginFn(nullptr, t.pos);
                 f->isMethod = true;
                 f->isFieldInit = true;
+                f->isStaticBlock = true;
                 f->strict = true;
                 advance();
                 while (!isP(P_RBrace)) {
@@ -1818,6 +1987,7 @@ private:
             n->op = t.p;
             if (n->op == P_Assign) left = toPattern(left);
             else if (left->type != N::Ident && left->type != N::Member && left->type != N::Index) fail("Invalid assignment target");
+            else if (left->type == N::Ident && fn->strict && isEvalOrArguments(left->str)) fail("Unexpected eval or arguments in strict mode");
             n->a = left;
             advance();
             n->b = assign(in);
@@ -1907,6 +2077,7 @@ private:
                 advance();
                 n->a = unary();
                 if (n->a->type != N::Ident && n->a->type != N::Member && n->a->type != N::Index) fail("Invalid update target");
+                if (n->a->type == N::Ident && fn->strict && isEvalOrArguments(n->a->str)) fail("Unexpected eval or arguments in strict mode");
                 return n;
             }
         } else if (t.type == Tok::Ident && !t.esc) {
@@ -1915,6 +2086,11 @@ private:
                 n->op = t.str == k.typeof_ ? P_Typeof : t.str == k.void_ ? P_Void : P_Delete;
                 advance();
                 n->a = unary();
+                if (n->op == P_Delete) {  // 13.5.1.1: not a private member, and in strict code not a plain name
+                    Node* x = n->a->type == N::OptChain ? n->a->a : n->a;
+                    if (x->type == N::Index && (x->flags & NF_PRIVATE)) fail("Private fields can not be deleted");
+                    if (x->type == N::Ident && fn->strict) fail("Delete of an unqualified identifier in strict mode");
+                }
                 return n;
             }
             if (t.str == k.await_ && fn->isAsync) {
@@ -1928,6 +2104,7 @@ private:
         Node* e = lhs();
         if (!t.nl && (isP(P_Inc) || isP(P_Dec))) {
             if (e->type != N::Ident && e->type != N::Member && e->type != N::Index) fail("Invalid update target");
+            if (e->type == N::Ident && fn->strict && isEvalOrArguments(e->str)) fail("Unexpected eval or arguments in strict mode");
             Node* n = mk(N::Update);
             n->op = t.p;
             n->a = e;
@@ -2111,12 +2288,14 @@ private:
     Node* primary() {
         switch (t.type) {
             case Tok::Num: {
+                if (t.oct && fn->strict) fail("Octal literals are not allowed in strict mode");
                 Node* n = mk(N::Num);
                 n->num = t.num;
                 advance();
                 return n;
             }
             case Tok::Str: {
+                if (t.oct && fn->strict) fail("Octal escape sequences are not allowed in strict mode");
                 Node* n = mk(N::Str);
                 n->str = t.str;
                 advance();
@@ -2177,6 +2356,8 @@ private:
                         JSString* name = nullptr;
                         if (t.type == Tok::Ident && !isRes(t.str)) {
                             name = t.str;
+                            if (name == k.yield_ && (gen || fn->strict)) fail("Unexpected identifier 'yield'");
+                            if (name == k.await_ && ast.moduleFn) fail("Unexpected reserved word 'await'");
                             advance();
                         }
                         return functionRest(name, start, false, gen, true);
@@ -2191,6 +2372,7 @@ private:
                             JSString* name = nullptr;
                             if (t.type == Tok::Ident && !isRes(t.str)) {
                                 name = t.str;
+                                if (name == k.await_ || (name == k.yield_ && (gen || fn->strict))) fail("Unexpected reserved word");
                                 advance();
                             }
                             return functionRest(name, start, true, gen, true);
@@ -2198,6 +2380,12 @@ private:
                     }
                     if (w == k.class_) return classNode(false);
                     if (isRes(w)) unexpected();
+                }
+                checkName(w, t.esc);
+                if (w == k.arguments_) {
+                    const FunctionInfo* f = fn;
+                    while (f->isArrow && f->parent) f = f->parent;
+                    if (f->isFieldInit) fail("'arguments' is not allowed in class field initializer or static initialization block");
                 }
                 Node* n = identRef(w);
                 advance();
@@ -2221,8 +2409,11 @@ private:
                 advance();
                 sp->a = assign();
                 a->list.push_back(sp);
-            } else
+                if (isP(P_Comma)) a->flags |= NF_TRAILING;
+            } else {
+                a->flags &= ~NF_TRAILING;
                 a->list.push_back(assign());
+            }
             if (!isP(P_RBrack)) expectP(P_Comma);
         }
         advance();
@@ -2288,9 +2479,12 @@ private:
     }
 
     // Reinterprets an expression as an assignment target (destructuring patterns included).
-    Node* toPattern(Node* n) {
+    Node* toPattern(Node* n, bool nested = false) {
+        if ((n->flags & NF_PAREN) && (n->type == N::Array || n->type == N::Object || (nested && n->type == N::Assign))) fail("Invalid destructuring assignment target");
         switch (n->type) {
             case N::Ident:
+                if (fn->strict && isEvalOrArguments(n->str)) fail("Unexpected eval or arguments in strict mode");
+                return n;
             case N::Member:
             case N::Index:
             case N::ArrayPat:
@@ -2301,20 +2495,24 @@ private:
                 n->type = N::ArrayPat;
                 for (Node*& e : n->list) {
                     if (e->type == N::Spread) {
+                        if (&e != &n->list.back() || (n->flags & NF_TRAILING)) fail("Rest element must be last element");
                         e->type = N::Rest;
-                        e->a = toPattern(e->a);
+                        e->a = toPattern(e->a, true);
+                        if (e->a->type == N::AssignPat) fail("Rest element may not have an initializer");
                     } else
-                        e = toPattern(e);
+                        e = toPattern(e, true);
                 }
                 return n;
             case N::Object:
                 n->type = N::ObjectPat;
                 for (Node*& p : n->list) {
                     if (p->op == PK_SPREAD) {
+                        if (&p != &n->list.back() || (n->flags & NF_TRAILING)) fail("Rest element must be last element");
+                        if (p->a->type != N::Ident && p->a->type != N::Member && p->a->type != N::Index) fail("Invalid rest element in an object pattern");
                         p->type = N::Rest;
-                        p->a = toPattern(p->a);
+                        p->a = toPattern(p->a, true);
                     } else if (p->op == PK_INIT)
-                        p->b = toPattern(p->b);
+                        p->b = toPattern(p->b, true);
                     else
                         fail("Invalid destructuring target");
                 }
@@ -2322,7 +2520,7 @@ private:
             case N::Assign:
                 if (n->op != P_Assign) break;
                 n->type = N::AssignPat;
-                n->a = toPattern(n->a);
+                n->a = toPattern(n->a, true);
                 return n;
             default: break;
         }
