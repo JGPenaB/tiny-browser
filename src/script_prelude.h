@@ -408,8 +408,8 @@ HTMLMediaElement.prototype.volume = 1; HTMLMediaElement.prototype.readyState = 0
 var F = HTMLFormElement.prototype;
 prop(HTMLFormElement, 'elements', function () { return this.querySelectorAll('input, select, textarea, button'); });
 prop(HTMLFormElement, 'length', function () { return this.elements.length; });
-F.submit = function () { var b = this.querySelector('button:not([type=button]), input[type=submit]'); if (b) b.click(); };
-F.requestSubmit = F.submit;
+
+
 F.reset = function () {};
 [HTMLFormElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLButtonElement].forEach(function (c) {
   c.prototype.checkValidity = c.prototype.reportValidity = function () { return true; };

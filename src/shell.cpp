@@ -160,6 +160,8 @@ struct Tab {
     int refreshCount = 0;
     double scriptDue = -1;  // when the page's script timers next need service (-1: nothing scheduled)
     bool navPending = false, navReplace = false;
+    Node* submitForm = nullptr;  // form a script asked to submit
+    Node* submitBy = nullptr;
     std::string navRequest;  // navigation asked for by script; done once the script has returned
 };
 
@@ -513,6 +515,7 @@ public:
         t.scroll = 0;
         t.scriptDue = -1;
         t.navPending = false;
+        t.submitForm = t.submitBy = nullptr;
         if (hwnd) KillTimer(hwnd, kScriptTimerBase + t.id);
         startScripts(t, r->scripts);
         if (!t.page) return;
@@ -550,6 +553,10 @@ public:
             tab.navRequest = url;
             tab.navReplace = replace;
             tab.navPending = true;
+        }
+        void submitForm(Node* form, Node* submitter) override {
+            tab.submitForm = form;
+            tab.submitBy = submitter;
         }
         void wake(double delayMs) override { app.scheduleScript(tab, delayMs); }
         std::function<void()> threadWake() override {
@@ -641,6 +648,12 @@ public:
     }
     // Called whenever control comes back from page script: carries out a navigation the script asked for.
     void afterScript(Tab& t) {
+        if (t.submitForm) {
+            Node* form = t.submitForm;
+            Node* by = t.submitBy;
+            t.submitForm = t.submitBy = nullptr;
+            if (&t == cur() && t.page) submitForm(form, by, false);
+        }
         if (t.navPending) {
             t.navPending = false;
             std::string url = t.navRequest;
@@ -1051,13 +1064,13 @@ public:
         return found;
     }
 
-    void submitForm(Node* from, Node* submitter) {
+    void submitForm(Node* from, Node* submitter, bool notify = true) {
         Tab* t = cur();
         if (!t || !t->page) return;
         Page& p = *t->page;
         Node* form = form_of(from);
         if (!form) return;
-        if (!fireEvent(*t, form, "submit")) return;  // a script handled the form itself
+        if (notify && !fireEvent(*t, form, "submit")) return;  // a script handled the form itself
         if (t->page.get() != &p) return;
         if (!submitter) submitter = defaultSubmit(form);
         std::string body, passVal, userVal, lastText;

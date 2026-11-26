@@ -1294,11 +1294,47 @@ JSFN(elementBlur) {
     if (im.client.focusedNode() == thisElem(ci)) im.client.focusNode(nullptr);
     return Value::undef();
 }
+Node* formOf(Node* n) {
+    for (Node* p = n; p; p = p->parent)
+        if (p->is("form")) return p;
+    return nullptr;
+}
+bool isSubmitButton(const Node* n) {
+    std::string type = n->attr("type") ? lower(*n->attr("type")) : "";
+    return (n->name == "button" && (type.empty() || type == "submit")) || (n->name == "input" && (type == "submit" || type == "image"));
+}
 JSFN(elementClick) {
     Impl& im = I(ci.vm);
     Node* n = thisElem(ci);
+    if (n->attr("disabled")) return Value::undef();
     Value ev = im.makeEvent("click", true, true);
-    im.fire(n, ev);
+    if (!im.fire(n, ev)) return Value::undef();
+    for (Node* a = n; a; a = a->parent)  // a click inside a link follows it
+        if (a->is("a") && a->attr("href")) {
+            std::string href = *a->attr("href");
+            if (!istarts(href, "javascript:")) im.client.navigate(resolve_url(im.doc.baseUrl, href), false);
+            return Value::undef();
+        }
+    if (isSubmitButton(n)) {
+        if (Node* form = formOf(n)) {
+            if (im.fire(form, im.makeEvent("submit", true, true))) im.client.submitForm(form, n);
+        }
+    } else if (n->name == "input" && n->attr("type") && (lower(*n->attr("type")) == "checkbox" || lower(*n->attr("type")) == "radio") && Impl::connected(n)) {
+        bool radio = lower(*n->attr("type")) == "radio";
+        im.client.setFormChecked(n, radio ? true : !im.client.formChecked(n));
+        im.fire(n, im.makeEvent("input", true, false));
+        im.fire(n, im.makeEvent("change", true, false));
+        im.changed();
+    }
+    return Value::undef();
+}
+JSFN(formSubmit) {  // data: 0 submit(), 1 requestSubmit(submitter)
+    Impl& im = I(ci.vm);
+    Node* form = thisElem(ci);
+    if (!form->is("form")) illegal(ci, "a form");
+    Node* submitter = toNode(ci.arg(0));
+    if (ci.callee->data.asInt() == 1 && !im.fire(form, im.makeEvent("submit", true, true))) return Value::undef();
+    im.client.submitForm(form, submitter);
     return Value::undef();
 }
 bool isControl(const Node* n) { return n->name == "input" || n->name == "textarea" || n->name == "select"; }
@@ -2460,7 +2496,9 @@ void ScriptHost::Impl::setup() {
     control(iface("HTMLSelectElement", elementProto, {"select"}, {{"name", "name", 0}, {"disabled", "disabled", 1}, {"required", "required", 1}, {"multiple", "multiple", 1}, {"size", "size", 3}, {"autofocus", "autofocus", 1}, {"autocomplete", "autocomplete", 0}}), false);
     control(iface("HTMLOptionElement", elementProto, {"option"}, {{"selected", "selected", 1}, {"defaultSelected", "selected", 1}, {"disabled", "disabled", 1}, {"label", "label", 0}}), false);
     control(iface("HTMLButtonElement", elementProto, {"button"}, {{"type", "type", 0}, {"name", "name", 0}, {"disabled", "disabled", 1}, {"autofocus", "autofocus", 1}, {"formAction", "formaction", 2}, {"formMethod", "formmethod", 0}}), false);
-    iface("HTMLFormElement", elementProto, {"form"}, {{"action", "action", 2}, {"method", "method", 0}, {"enctype", "enctype", 0}, {"encoding", "enctype", 0}, {"target", "target", 0}, {"name", "name", 0}, {"noValidate", "novalidate", 1}, {"acceptCharset", "accept-charset", 0}, {"autocomplete", "autocomplete", 0}});
+    JSObject* formProto = iface("HTMLFormElement", elementProto, {"form"}, {{"action", "action", 2}, {"method", "method", 0}, {"enctype", "enctype", 0}, {"encoding", "enctype", 0}, {"target", "target", 0}, {"name", "name", 0}, {"noValidate", "novalidate", 1}, {"acceptCharset", "accept-charset", 0}, {"autocomplete", "autocomplete", 0}});
+    method(formProto, "submit", formSubmit, 0, 0);
+    method(formProto, "requestSubmit", formSubmit, 0, 1);
     iface("HTMLLabelElement", elementProto, {"label"}, {{"htmlFor", "for", 0}});
     iface("HTMLFieldSetElement", elementProto, {"fieldset"}, {{"name", "name", 0}, {"disabled", "disabled", 1}});
     iface("HTMLIFrameElement", elementProto, {"iframe", "frame"}, {{"src", "src", 2}, {"name", "name", 0}, {"width", "width", 0}, {"height", "height", 0}, {"allow", "allow", 0}, {"sandbox", "sandbox", 0}, {"srcdoc", "srcdoc", 0}, {"loading", "loading", 0}, {"referrerPolicy", "referrerpolicy", 0}, {"allowFullscreen", "allowfullscreen", 1}, {"frameBorder", "frameborder", 0}, {"scrolling", "scrolling", 0}});

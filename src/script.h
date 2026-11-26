@@ -23,6 +23,7 @@ public:
         virtual void domChanged() = 0;  // the tree, attributes or text changed: restyle and lay out again
         virtual void consoleMessage(int level, const std::wstring& text) = 0;
         virtual void navigate(const std::string& url, bool replace) = 0;
+        virtual void submitForm(Node* form, Node* submitter) = 0;  // carried out after the script returns
         virtual void wake(double delayMs) = 0;  // call pump() after this long
         virtual std::function<void()> threadWake() = 0;  // callable from any thread: asks for a pump() soon
         virtual void ensureLayout() = 0;        // bring element boxes up to date before script reads them
