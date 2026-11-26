@@ -18,7 +18,7 @@ var $262 = {
   global: globalThis,
   evalScript: function (code) { return (0, eval)(code); },
   gc: function () {},
-  detachArrayBuffer: function (b) { if (typeof b.transfer === 'function') { b.transfer(); return null; } throw new Test262Error('detachArrayBuffer is not supported'); },
+  detachArrayBuffer: function (b) { if (!b.detached) b.transfer(); return null; },
   createRealm: function () { throw new Test262Error('createRealm is not supported'); },
   agent: { start: function () { throw new Test262Error('agents are not supported'); } }
 };
@@ -84,11 +84,13 @@ def build(path):
                      % repr(path.replace("\\", "/")))
         return "\n".join(parts), info
     parts = [HOST, harness("assert.js"), harness("sta.js")]
+    if "CanBlockIsFalse" in info["flags"]:
+        parts.append("__canBlock(false);")
     if "async" in info["flags"]:
         parts.append(harness("doneprintHandle.js"))
     for inc in info["includes"]:
         parts.append(harness(inc))
-    body = "\n".join(parts) + "\n" + src
+    body ="\n".join(parts) + "\n" + src
     if "onlyStrict" in info["flags"]:
         body = '"use strict";\n' + body
     return body, info

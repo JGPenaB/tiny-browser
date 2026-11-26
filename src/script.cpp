@@ -2201,8 +2201,7 @@ void buildRequest(CallInfo& ci, NetRequest& rq) {
             rq.opts.body.assign(b.begin(), b.end());
         } else if (o->cls == Cls::TypedArray || o->cls == Cls::DataView) {
             JSTypedArray* t = (JSTypedArray*)o;
-            static const int sizes[] = {1, 1, 1, 2, 2, 4, 4, 4, 8};
-            size_t n = (size_t)t->length * (o->cls == Cls::DataView ? 1 : sizes[(int)t->type]);
+            size_t n = (size_t)typedLength(t) * kTaSize[(int)t->type];
             const uint8_t* p = t->buffer->bytes.data() + t->offset;
             rq.opts.body.assign(p, p + n);
         }

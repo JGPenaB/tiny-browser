@@ -336,21 +336,38 @@ struct JSHost : JSObject {
 };
 
 // Binary data: an ArrayBuffer owns bytes; typed arrays and DataViews are windows onto a buffer.
-struct JSArrayBuffer : JSObject {
-    std::vector<uint8_t> bytes;
+struct JSArrayBuffer : JSObject {  // ArrayBuffer and SharedArrayBuffer
+    std::vector<uint8_t> bytes;  // empty once detached
+    double maxLen = -1;          // the most bytes a resizable buffer may grow to; -1 when the length is fixed
+    bool detached = false, shared = false, immutable = false;
     JSArrayBuffer() { cls = Cls::ArrayBuffer; }
 };
-enum class TA : uint8_t { I8, U8, U8C, I16, U16, I32, U32, F32, F64 };
+enum class TA : uint8_t { I8, U8, U8C, I16, U16, I32, U32, F32, F64, F16, I64, U64 };
+inline constexpr uint8_t kTaSize[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 2, 8, 8};
 struct JSTypedArray : JSObject {  // also backs DataView (cls DataView, lengths in bytes)
     JSArrayBuffer* buffer = nullptr;
-    uint32_t offset = 0, length = 0;  // byte offset into the buffer, length in elements
+    uint32_t offset = 0, length = 0;  // byte offset into the buffer; length in elements when it is fixed
     TA type = TA::U8;
+    bool tracking = false;  // the length follows a resizable buffer instead
     JSTypedArray() { cls = Cls::TypedArray; }
     void trace(Gc&) override;
 };
-Value typedGet(const JSTypedArray* t, uint32_t i);  // i must be below t->length
+// IsTypedArrayOutOfBounds (10.4.5.14): the buffer is detached or no longer holds the whole view
+inline bool typedOutOfBounds(const JSTypedArray* t) {
+    const JSArrayBuffer* b = t->buffer;
+    size_t have = b->bytes.size();
+    return b->detached || t->offset > have || (!t->tracking && (size_t)t->offset + (size_t)t->length * kTaSize[(int)t->type] > have);
+}
+// TypedArrayLength, and 0 for a view that is out of bounds
+inline uint32_t typedLength(const JSTypedArray* t) {
+    size_t have = t->buffer->bytes.size(), size = kTaSize[(int)t->type];
+    if (!t->tracking) return (size_t)t->offset + (size_t)t->length * size <= have ? t->length : 0;
+    return t->offset <= have ? (uint32_t)((have - t->offset) / size) : 0;
+}
+Value typedGet(Vm& vm, const JSTypedArray* t, uint32_t i);  // i must be below typedLength(t)
 void typedSet(Vm& vm, JSTypedArray* t, uint32_t i, Value v);
 JSTypedArray* newTypedArray(Vm& vm, TA type, uint32_t length);
+int typedKeyKind(Vm& vm, const JSTypedArray* t, PropKey k);  // 0 ordinary key, 1 an element, 2 numeric but no element
 
 // bigint.cpp
 JSBigInt* bigFromI64(Vm& vm, int64_t v);
@@ -543,6 +560,7 @@ public:
     // ---- conversions
     bool toBool(Value v);
     double toNumber(Value v);
+    double toIndex(Value v);  // typedarray.cpp
     Value toNumeric(Value v);             // a Number or a BigInt (bigint.cpp)
     JSBigInt* toBigInt(Value v);
     Value arith(int op, Value x, Value y);  // binary numeric operators when the operands are not both numbers
@@ -661,8 +679,19 @@ public:
              *generatorProto = nullptr, *dateProto = nullptr, *regexpProto = nullptr, *mapIterProto = nullptr, *setIterProto = nullptr,
              *stringIterProto = nullptr, *globalLex = nullptr;
     JSObject* errorProtos[7] = {};
-    JSObject* typedProtos[9] = {};
-    JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr;
+    JSObject* typedProtos[12] = {};
+    Value typedCtors[12];
+    JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr, *sharedBufferProto = nullptr;
+    Value arrayBufferCtor, sharedBufferCtor;
+    bool canBlock = false;  // may Atomics.wait put this thread to sleep?
+    struct AsyncWaiter {  // an Atomics.waitAsync call that has not been answered yet
+        JSArrayBuffer* buffer;
+        size_t pos;
+        Value resolve;
+        uint32_t id;
+    };
+    std::vector<AsyncWaiter> asyncWaiters;
+    uint32_t nextWaiterId = 1;
     JSObject *asyncIteratorProto = nullptr, *asyncGeneratorProto = nullptr, *asyncFromSyncProto = nullptr;
     JSObject* genReturnSignal = nullptr;  // thrown inside a generator to make it return through its finally blocks
     Value arrayCtorValue, arraySpeciesGetter;  // the built-in Array and the getter of Array[Symbol.species]

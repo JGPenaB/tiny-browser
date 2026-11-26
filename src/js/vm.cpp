@@ -451,7 +451,15 @@ void Vm::markRoots(Gc& g) {
         for (Value v : *vec) g.mark(v);
     for (auto& tracer : rootTracers) tracer(g);
     for (JSObject* p : typedProtos) g.mark(p);
+    for (Value v : typedCtors) g.mark(v);
     g.mark(arrayBufferProto);
+    g.mark(sharedBufferProto);
+    g.mark(arrayBufferCtor);
+    g.mark(sharedBufferCtor);
+    for (auto& w : asyncWaiters) {
+        g.mark(w.buffer);
+        g.mark(w.resolve);
+    }
     g.mark(dataViewProto);
     g.mark(importHook);
     g.mark(evalFn);
@@ -542,7 +550,10 @@ bool Vm::toBool(Value v) {
 
 double Vm::stringToNumber(const std::u16string& s) {
     size_t i = 0, n = s.size();
-    auto ws = [](char16_t c) { return c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0xFEFF || c == 0x2028 || c == 0x2029; };
+    auto ws = [](char16_t c) {
+        return c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0xFEFF || c == 0x2028 || c == 0x2029 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+               c == 0x202F || c == 0x205F || c == 0x3000;
+    };
     while (i < n && ws(s[i])) ++i;
     while (n > i && ws(s[n - 1])) --n;
     if (i == n) return 0;
@@ -1002,8 +1013,8 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
         case Cls::TypedArray: {
             if (!k.isIndex()) return false;
             JSTypedArray* t = (JSTypedArray*)o;
-            if (k.asIndex() >= t->length) return false;
-            out = {k, typedGet(t, k.asIndex()), (uint8_t)(PF_W | PF_E)};
+            if (k.asIndex() >= typedLength(t)) return false;
+            out = {k, typedGet(vm, t, k.asIndex()), (uint8_t)(t->buffer->immutable ? PF_E : PF_ALL)};
             return true;
         }
         case Cls::Host: {
@@ -1042,9 +1053,10 @@ bool Vm::getOwn(JSObject* o, PropKey k, Prop& out) {
 Value Vm::getObj(JSObject* o, PropKey k, Value receiver) {
     for (JSObject* cur = o; cur; cur = cur->proto) {
         if (cur->cls == Cls::Proxy) return proxyGet(cur, k, receiver);
-        if (k.isIndex() && cur->cls == Cls::TypedArray) {
+        if (cur->cls == Cls::TypedArray) {  // a numeric key stops here, whether or not it names an element
             JSTypedArray* t = (JSTypedArray*)cur;
-            return k.asIndex() < t->length ? typedGet(t, k.asIndex()) : Value::undef();
+            if (k.isIndex()) return k.asIndex() < typedLength(t) ? typedGet(*this, t, k.asIndex()) : Value::undef();
+            if (k.isString() && typedKeyKind(*this, t, k)) return Value::undef();
         }
         if (k.isIndex() && (cur->cls == Cls::Array || cur->cls == Cls::Arguments)) {
             JSArray* arr = (JSArray*)cur;
@@ -1107,11 +1119,18 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
         JSHost* h = (JSHost*)o;
         if (h->hooks && h->hooks->set && h->hooks->set(*this, o, k, v)) return true;
     }
-    if (o->cls == Cls::TypedArray && k.isIndex()) {
-        typedSet(*this, (JSTypedArray*)o, k.asIndex(), v);
-        return true;
-    }
     bool self = receiver.isObject() && receiver.asObject() == o;
+    if (o->cls == Cls::TypedArray) {  // 10.4.5.5
+        JSTypedArray* t = (JSTypedArray*)o;
+        if (int kind = typedKeyKind(*this, t, k)) {
+            if (t->buffer->immutable) return false;
+            if (self) {
+                typedSet(*this, t, k.isIndex() ? k.asIndex() : UINT32_MAX, v);
+                return true;
+            }
+            if (kind == 2) return true;
+        }
+    }
     if (o->cls == Cls::Array || o->cls == Cls::Arguments) {
         JSArray* arr = (JSArray*)o;
         if (k.isIndex()) {
@@ -1141,6 +1160,17 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
     bool ownMissing = false;
     for (JSObject* cur = o; cur; cur = cur->proto) {
         if (cur->cls == Cls::Proxy) return proxySet(cur, k, v, receiver);
+        if (cur != o && cur->cls == Cls::TypedArray) {  // a typed array further up the chain (10.4.5.5)
+            JSTypedArray* t = (JSTypedArray*)cur;
+            if (int kind = typedKeyKind(*this, t, k)) {
+                if (t->buffer->immutable) return false;
+                if (receiver.isObject() && receiver.asObject() == cur) {
+                    typedSet(*this, t, k.isIndex() ? k.asIndex() : UINT32_MAX, v);
+                    return true;
+                }
+                if (kind == 2) return true;
+            }
+        }
         Prop* p = cur->find(k);
         if (!p && cur->cls != Cls::Object && cur->cls != Cls::Host) {
             // properties that are not stored: array elements, a function's name and length, a string's characters.
@@ -1226,9 +1256,14 @@ void Vm::failedSet(Value target, PropKey k) {
 
 bool Vm::defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags) {
     if (o->cls == Cls::Proxy) return defineElement(o, k, v, flags);
-    if (o->cls == Cls::TypedArray && k.isIndex()) {
-        typedSet(*this, (JSTypedArray*)o, k.asIndex(), v);
-        return true;
+    if (o->cls == Cls::TypedArray) {
+        JSTypedArray* t = (JSTypedArray*)o;
+        if (int kind = typedKeyKind(*this, t, k)) {
+            if (kind == 2) return false;
+            if (flags != PF_ALL || t->buffer->immutable) return defineElement(o, k, v, flags);
+            typedSet(*this, t, k.asIndex(), v);
+            return true;
+        }
     }
     if ((o->cls == Cls::Array || o->cls == Cls::Arguments) && k.isIndex()) {
         JSArray* arr = (JSArray*)o;
@@ -1290,6 +1325,8 @@ bool Vm::hasOwn(JSObject* o, PropKey k) {
 bool Vm::has(JSObject* o, PropKey k) {
     for (JSObject* cur = o; cur; cur = cur->proto) {
         if (cur->cls == Cls::Proxy) return proxyHas(cur, k);
+        if (cur->cls == Cls::TypedArray)
+            if (int kind = typedKeyKind(*this, (JSTypedArray*)cur, k)) return kind == 1;
         if (hasOwn(cur, k)) return true;
     }
     return false;
@@ -1301,6 +1338,8 @@ bool Vm::del(JSObject* o, PropKey k) {
         if (h->hooks && h->hooks->del && h->hooks->del(*this, o, k)) return true;
         if (h->hooks && h->hooks->has && !(h->hooks->attrs & PF_C) && h->hooks->has(*this, o, k)) return false;
     }
+    if (o->cls == Cls::TypedArray)
+        if (int kind = typedKeyKind(*this, (JSTypedArray*)o, k)) return kind == 2;  // elements cannot be deleted
     if ((o->cls == Cls::Array || o->cls == Cls::Arguments) && k.isIndex()) {
         JSArray* arr = (JSArray*)o;
         uint32_t i = k.asIndex();
@@ -1350,7 +1389,7 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
     if (strings) {
         size_t firstIndex = out.size();
         if (o->cls == Cls::TypedArray)
-            for (uint32_t i = 0; i < ((JSTypedArray*)o)->length; ++i) out.push_back(PropKey::index(i));
+            for (uint32_t i = 0, n = typedLength((JSTypedArray*)o); i < n; ++i) out.push_back(PropKey::index(i));
         if (o->cls == Cls::Array || o->cls == Cls::Arguments) {
             JSArray* arr = (JSArray*)o;
             for (uint32_t i = 0; i < arr->elems.size(); ++i)
@@ -1377,7 +1416,7 @@ uint32_t Vm::lengthOf(Value v) {
     if (v.isObject() && v.asObject()->cls == Cls::Array) return arrayLen((JSArray*)v.asObject());
     if (v.isObject() && v.asObject()->cls == Cls::Arguments && !v.asObject()->find(PropKey::of(a.length)) && !(v.asObject()->oflags & OF_NO_LENGTH))
         return (uint32_t)((JSArray*)v.asObject())->elems.size();
-    if (v.isObject() && v.asObject()->cls == Cls::TypedArray) return ((JSTypedArray*)v.asObject())->length;
+    if (v.isObject() && v.asObject()->cls == Cls::TypedArray) return typedLength((JSTypedArray*)v.asObject());
     if (v.isString()) return (uint32_t)((JSString*)v.asCell())->length();
     double d = toInteger(get(v, a.length));
     if (d <= 0) return 0;
@@ -1635,6 +1674,8 @@ bool Vm::iterStep(JSIter* it, Value& out) {
         case Cls::ArrayIter: {
             Value t = it->target;
             if (t.isUndef()) return false;
+            if (t.isObject() && t.asObject()->cls == Cls::TypedArray && typedOutOfBounds((JSTypedArray*)t.asObject()))
+                throwError(Err::TypeError, "The typed array's buffer is detached or has become too small for it");
             uint32_t len = lengthOf(t);
             if (it->pos >= len) {
                 it->target = Value::undef();
@@ -2103,12 +2144,13 @@ static void inspectInto(Vm& vm, Value v, int depth, bool quote, std::u16string& 
     if (o->cls == Cls::TypedArray) {
         JSTypedArray* t = (JSTypedArray*)o;
         Value tag = vm.getObj(o, PropKey::of(vm.symToStringTag), v);
-        out += (tag.isString() ? tag.asString()->s : std::u16string(u"TypedArray")) + u"(" + ascii16(std::to_string(t->length)) + u") [";
-        for (uint32_t i = 0; i < t->length && i < 100; ++i) {
+        uint32_t count = typedLength(t);
+        out += (tag.isString() ? tag.asString()->s : std::u16string(u"TypedArray")) + u"(" + ascii16(std::to_string(count)) + u") [";
+        for (uint32_t i = 0; i < count && i < 100; ++i) {
             if (i) out += u", ";
-            out += vm.toString(typedGet(t, i))->s;
+            out += vm.toString(typedGet(vm, t, i))->s;
         }
-        if (t->length > 100) out += u", ...";
+        if (count > 100) out += u", ...";
         out += u"]";
         return;
     }
@@ -2388,7 +2430,7 @@ Value Vm::runFrames(size_t base) {
                                 JSObject* ob = o.asObject();
                                 if (ob->cls == Cls::TypedArray) {
                                     JSTypedArray* ta = (JSTypedArray*)ob;
-                                    R(i.a) = idx < ta->length ? typedGet(ta, idx) : Value::undef();
+                                    R(i.a) = idx < typedLength(ta) ? typedGet(*this, ta, idx) : Value::undef();
                                     break;
                                 }
                                 if (ob->cls == Cls::Array || ob->cls == Cls::Arguments) {
@@ -2413,7 +2455,7 @@ Value Vm::runFrames(size_t base) {
                         Value o = R(i.a), kv = R(i.b);
                         if (o.isObject() && kv.isInt() && kv.asInt() >= 0) {
                             JSObject* ob = o.asObject();
-                            if (ob->cls == Cls::TypedArray) {
+                            if (ob->cls == Cls::TypedArray && !((JSTypedArray*)ob)->buffer->immutable) {
                                 typedSet(*this, (JSTypedArray*)ob, (uint32_t)kv.asInt(), R(i.c));
                                 break;
                             }

@@ -40,4 +40,55 @@ test("text encoding and random values", function () {
   const r = crypto.getRandomValues(new Uint8Array(32)); ok(r.some(x => x !== 0)); ok(crypto.getRandomValues(new Uint32Array(4)).join() !== crypto.getRandomValues(new Uint32Array(4)).join());
   ok(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID()));
 });
+test("the shared TypedArray intrinsic", function () {
+  const TA = Object.getPrototypeOf(Int8Array);
+  eq([TA.name, Object.getPrototypeOf(Uint8Array) === TA, Object.getPrototypeOf(Int8Array.prototype) === TA.prototype, TA.prototype.toString === Array.prototype.toString, TA.prototype[Symbol.iterator] === TA.prototype.values], ["TypedArray", true, true, true, true]);
+  throws(() => new TA(), TypeError); throws(() => TA.prototype.length, TypeError); throws(() => Int8Array(1), TypeError);
+  eq([new Uint8Array(2)[Symbol.toStringTag], TA.prototype[Symbol.toStringTag], Object.getOwnPropertyNames(Int8Array.prototype).sort()], ["Uint8Array", undefined, ["BYTES_PER_ELEMENT", "constructor"]]);
+  class Mine extends Uint8Array { } const m = new Mine([3, 1, 2]);
+  ok(m.map(x => x * 2) instanceof Mine); ok(m.subarray(1) instanceof Mine); ok(m.toSorted() instanceof Uint8Array && !(m.toSorted() instanceof Mine));
+  eq([[...m.toSorted()], [...m.toReversed()], [...m.with(0, 9)], [...m], m.at(-1), m.findLast(x => x > 1), m.findLastIndex(x => x > 5)], [[1, 2, 3], [2, 1, 3], [9, 1, 2], [3, 1, 2], 2, 2, -1]);
+  eq([[...Float64Array.of(3, NaN, -0, 0, -1).sort()].map(x => Object.is(x, -0) ? "-0" : String(x)), [...new Int8Array([5, 1, 4]).sort((a, b) => b - a)]], [["-1", "-0", "0", "3", "NaN"], [5, 4, 1]]);
+});
+test("numeric keys on typed arrays", function () {
+  const t = new Uint8Array([7, 8]);
+  eq([t[5], t["-0"], t["1.5"], "1" in t, "2" in t, "-0" in t, "1.5" in t, delete t[5], Reflect.defineProperty(t, "2", { value: 1 }), Reflect.defineProperty(t, "0", { value: 9 }), t[0]], [undefined, undefined, undefined, true, false, false, false, true, false, true, 9]);
+  t[9] = 1; t["1.5"] = 1; t.foo = 1; eq([Object.keys(t), Object.getOwnPropertyDescriptor(t, 1)], [["0", "1", "foo"], { value: 8, writable: true, enumerable: true, configurable: true }]);
+  throws(() => (function () { "use strict"; delete t[0]; })(), TypeError); throws(() => Object.freeze(t), TypeError); ok(Object.isFrozen(Object.freeze(new Uint8Array(0))));
+  const child = Object.create(t); child[5] = 1; eq([Object.keys(child), child[0]], [[], 9]);
+  eq([new Uint8ClampedArray([1.5, 2.5, 300, -5, NaN]).join(), new Float16Array([1.337, 65520, 1e-8])[0], new Float16Array([65520])[0], Math.f16round(5.5), Math.f16round(2.00001)], ["2,2,255,0,0", 1.3369140625, Infinity, 5.5, 2]);
+});
+test("BigInt typed arrays", function () {
+  const b = new BigInt64Array([1n, -1n, 2n ** 63n]); const u = new BigUint64Array(b);
+  eq([String(b[2]), String(u[1]), typeof b[0], b.includes(-1n), b.indexOf(1n), String(b.toSorted()[0]), BigInt64Array.BYTES_PER_ELEMENT], ["-9223372036854775808", "18446744073709551615", "bigint", true, 0, "-9223372036854775808", 8]);
+  throws(() => { b[0] = 1; }, TypeError); throws(() => new BigInt64Array(new Int8Array(1)), TypeError); throws(() => new Int8Array(b), TypeError); throws(() => b.fill(1), TypeError);
+  const dv = new DataView(new ArrayBuffer(16)); dv.setBigInt64(0, -2n); dv.setBigUint64(8, 2n ** 64n - 1n, true); dv.setFloat16(2, 1.5);
+  eq([String(dv.getBigInt64(8)), String(dv.getBigUint64(8, true)), dv.getUint8(0), dv.getFloat16(2), dv.getUint16(2)], ["-1", "18446744073709551615", 255, 1.5, 0x3E00]);
+});
+test("resizable, detached and immutable buffers", function () {
+  const rab = new ArrayBuffer(4, { maxByteLength: 8 }); const tracking = new Uint8Array(rab), fixed = new Uint8Array(rab, 0, 4), dv = new DataView(rab, 2);
+  eq([rab.resizable, rab.maxByteLength, tracking.length, new ArrayBuffer(1).resizable], [true, 8, 4, false]);
+  rab.resize(8); eq([tracking.length, fixed.length, dv.byteLength, rab.byteLength], [8, 4, 6, 8]);
+  rab.resize(2); eq([tracking.length, fixed.length, fixed.byteLength, fixed.byteOffset, fixed[0], [...tracking]], [2, 0, 0, 0, undefined, [0, 0]]);
+  throws(() => fixed.fill(1), TypeError); throws(() => [...fixed], TypeError); throws(() => dv.getUint8(0), RangeError); throws(() => rab.resize(9), RangeError); throws(() => new ArrayBuffer(9, { maxByteLength: 8 }), RangeError);
+  const ab = new ArrayBuffer(8); const view = new Uint8Array(ab); view.set([1, 2, 3]);
+  const moved = ab.transfer(4); eq([ab.detached, ab.byteLength, view.length, view[0], moved.byteLength, [...new Uint8Array(moved)]], [true, 0, 0, undefined, 4, [1, 2, 3, 0]]);
+  throws(() => view.at(0), TypeError); throws(() => ab.slice(0), TypeError); throws(() => new Uint8Array(ab), TypeError); throws(() => ab.transfer(), TypeError);
+  eq([moved.transferToFixedLength(2).byteLength, new ArrayBuffer(2, { maxByteLength: 4 }).transfer().resizable, new ArrayBuffer(2, { maxByteLength: 4 }).transferToFixedLength().resizable], [2, true, false]);
+  const frozen = new Uint8Array([1, 2, 3]).buffer.transferToImmutable(); const fv = new Uint8Array(frozen);
+  eq([frozen.immutable, fv[1], Reflect.set(fv, 0, 9), fv[0], Object.getOwnPropertyDescriptor(fv, 0).writable, [...new Uint8Array(frozen.sliceToImmutable(1))]], [true, 2, false, 1, false, [2, 3]]);
+  throws(() => fv.fill(0), TypeError); throws(() => new DataView(frozen).setUint8(0, 1), TypeError); throws(() => frozen.transfer(), TypeError); throws(() => (function () { "use strict"; fv[0] = 1; })(), TypeError);
+  ok(Object.isFrozen(Object.freeze(fv)));
+});
+test("shared buffers, Atomics and byte text", function () {
+  const sab = new SharedArrayBuffer(8, { maxByteLength: 16 }); const ia = new Int32Array(sab);
+  eq([sab.growable, Atomics.add(ia, 0, 5), Atomics.sub(ia, 0, 2), Atomics.exchange(ia, 1, 7), Atomics.compareExchange(ia, 1, 7, 9), Atomics.load(ia, 1), Atomics.store(ia, 0, 2.9), Atomics.or(ia, 0, 5), Atomics.xor(ia, 0, 1), Atomics.and(ia, 0, 3), ia[0]], [true, 0, 5, 0, 7, 9, 2, 2, 7, 6, 2]);
+  sab.grow(16); eq([sab.byteLength, ia.length, Atomics.isLockFree(4), Atomics.notify(ia, 0), Atomics.wait(ia, 0, 5), Atomics.wait(ia, 0, 2, 10), Object.prototype.toString.call(Atomics)], [16, 4, true, 0, "not-equal", "timed-out", "[object Atomics]"]);
+  throws(() => sab.grow(8), RangeError); throws(() => Atomics.add(new Float64Array(1), 0, 1), TypeError); throws(() => Atomics.load(ia, 9), RangeError); throws(() => Atomics.wait(new Int32Array(4), 0, 0), TypeError);
+  eq([Atomics.waitAsync(ia, 0, 9).value, Atomics.waitAsync(ia, 0, 2, 0).value, Atomics.waitAsync(ia, 0, 2).async], ["not-equal", "timed-out", true]);
+  const bytes = new Uint8Array([72, 101, 108, 108, 111, 255, 254]);
+  eq([bytes.toBase64(), bytes.toBase64({ alphabet: "base64url", omitPadding: true }), bytes.toHex(), [...Uint8Array.fromBase64("SGVsbG8=")], [...Uint8Array.fromBase64(" SGVs bG8 ")], [...Uint8Array.fromHex("00ff10")]], ["SGVsbG///g==", "SGVsbG___g", "48656c6c6ffffe", [72, 101, 108, 108, 111], [72, 101, 108, 108, 111], [0, 255, 16]]);
+  const into = new Uint8Array(4); eq([into.setFromBase64("SGVsbG8="), [...into], into.setFromHex("0102"), [...into]], [{ read: 4, written: 3 }, [72, 101, 108, 0], { read: 4, written: 2 }, [1, 2, 108, 0]]);
+  throws(() => Uint8Array.fromBase64("SGVsbG8", { lastChunkHandling: "strict" }), SyntaxError); throws(() => Uint8Array.fromHex("abc"), SyntaxError); throws(() => Uint8Array.fromBase64("a-b_", { alphabet: "base64" }), SyntaxError); throws(() => bytes.toBase64({ alphabet: "x" }), TypeError);
+});
 done();

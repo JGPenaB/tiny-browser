@@ -9,6 +9,7 @@ static const char kScriptPrelude[] = R"JS((function () {
 var G = globalThis;
 var net = G.__net, netSync = G.__netSync, netAbort = G.__netAbort, parseUrl = G.__url;
 delete G.__net; delete G.__netSync; delete G.__netAbort; delete G.__url;
+delete G.SharedArrayBuffer;  // only for cross-origin isolated pages, which do not exist here yet
 
 class DOMException extends Error {
   constructor(message, name) { super(message); this.name = name || 'Error'; this.code = 0; }

@@ -243,12 +243,20 @@ bool Vm::defineOwnDesc(JSObject* o, PropKey k, const PropDesc& d) {
         if (!k.isIndex() && !k.isSymbol() && k.cell() == a.length) return arraySetLength(*this, arr, d);
         if (k.isIndex() && k.asIndex() >= arrayLen(arr) && (o->oflags & (OF_LENRO | OF_FROZEN))) return false;
     }
-    if (o->cls == Cls::TypedArray && k.isIndex()) {  // 10.4.5.3: elements are always writable, enumerable data
+    if (o->cls == Cls::TypedArray) {  // 10.4.5.3: elements are always writable, enumerable, configurable data
         JSTypedArray* t = (JSTypedArray*)o;
-        if (k.asIndex() >= t->length) return false;
-        if ((d.hasConfigurable && !d.configurable) || (d.hasEnumerable && !d.enumerable) || d.hasGet || d.hasSet || (d.hasWritable && !d.writable)) return false;
-        if (d.hasValue) typedSet(*this, t, k.asIndex(), d.value);
-        return true;
+        if (int kind = typedKeyKind(*this, t, k)) {
+            if (kind == 2) return false;
+            if (t->buffer->immutable) {  // nothing about an element of an immutable buffer can change
+                PropDesc cur;
+                cur.hasValue = cur.hasWritable = cur.hasEnumerable = cur.hasConfigurable = cur.enumerable = true;
+                cur.value = typedGet(*this, t, k.asIndex());
+                return compatibleDesc(false, d, true, cur);
+            }
+            if ((d.hasConfigurable && !d.configurable) || (d.hasEnumerable && !d.enumerable) || d.hasGet || d.hasSet || (d.hasWritable && !d.writable)) return false;
+            if (d.hasValue) typedSet(*this, t, k.asIndex(), d.value);
+            return true;
+        }
     }
     return ordinaryDefine(*this, o, k, d);
 }
@@ -312,8 +320,9 @@ bool Vm::setIntegrity(JSObject* o, bool frozen) {
         }
         return true;
     }
-    if (frozen && o->cls == Cls::TypedArray && ((JSTypedArray*)o)->length > 0) throwError(Err::TypeError, "Cannot freeze array buffer views with elements");
     o->oflags |= OF_NOEXT;
+    if (o->cls == Cls::TypedArray && typedLength((JSTypedArray*)o) > 0 && !((JSTypedArray*)o)->buffer->immutable)  // an element cannot be made non-configurable
+        throwError(Err::TypeError, frozen ? "Cannot freeze array buffer views with elements" : "Cannot seal array buffer views with elements");
     if (isArrayLike(o)) o->oflags |= frozen ? (OF_FROZEN | OF_SEALED) : OF_SEALED;  // covers the dense elements
     else if (frozen) o->oflags |= OF_FROZEN;
     auto fix = [&] {  // private members are not properties: freezing leaves them alone
