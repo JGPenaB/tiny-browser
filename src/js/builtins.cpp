@@ -34,7 +34,7 @@ void defSym(Vm& vm, JSObject* o, Symbol* sym, NativeFn fn, const char* name, int
     vm.defineOwn(o, PropKey::of(sym), V(vm.newNative(fn, name, length)), PF_W | PF_C);
 }
 
-static JSArray* fastArray(JSObject* o) { return (o->cls == Cls::Array || o->cls == Cls::Arguments) ? (JSArray*)o : nullptr; }
+static JSArray* fastArray(JSObject* o) { return o->cls == Cls::Array && !(o->oflags & OF_SLOWIDX) ? (JSArray*)o : nullptr; }
 
 static void needFn(Vm& vm, Value f) {
     if (!vm.isCallable(f)) vm.throwError(Err::TypeError, "%s is not a function", utf16to8(vm.inspect(f, 0)).c_str());
@@ -91,50 +91,38 @@ JSFN(objectAssign) {
 }
 
 static void defineFromDescriptor(Vm& vm, JSObject* o, PropKey k, Value desc) {
-    if (!desc.isObject()) vm.throwError(Err::TypeError, "Property description must be an object");
-    JSObject* d = desc.asObject();
-    auto field = [&](JSString* name, Value& out) {
-        PropKey fk = PropKey::of(name);
-        if (!vm.has(d, fk)) return false;
-        out = vm.getObj(d, fk, desc);
-        return true;
-    };
-    Value getter, setter, value, tmp;
-    bool hasGet = field(vm.a.get, getter), hasSet = field(vm.a.set, setter), hasValue = field(vm.a.value, value);
-    Prop cur{};
-    bool exists = vm.getOwn(o, k, cur);
-    uint8_t flags = exists ? (uint8_t)(cur.flags & PF_ALL) : 0;
-    if (field(vm.a.enumerable, tmp)) flags = vm.toBool(tmp) ? (flags | PF_E) : (flags & ~PF_E);
-    if (field(vm.a.configurable, tmp)) flags = vm.toBool(tmp) ? (flags | PF_C) : (flags & ~PF_C);
-    if (field(vm.a.writable, tmp)) flags = vm.toBool(tmp) ? (flags | PF_W) : (flags & ~PF_W);
-    if (exists && !(cur.flags & PF_C)) {
-        bool wasAcc = (cur.flags & PF_ACC) != 0;
-        bool bad = (hasGet || hasSet) || wasAcc || ((flags ^ cur.flags) & (PF_E | PF_C)) || (!(cur.flags & PF_W) && (flags & PF_W)) ||
-                   (hasValue && !(cur.flags & PF_W) && !vm.sameValue(value, cur.val));
-        if (bad) vm.throwError(Err::TypeError, u"Cannot redefine property: " + vm.toStr16(vm.keyToValue(k)));
-    }
-    if (hasGet || hasSet) {
-        if ((hasGet && !getter.isUndef() && !vm.isCallable(getter)) || (hasSet && !setter.isUndef() && !vm.isCallable(setter)))
-            vm.throwError(Err::TypeError, "Getter or setter must be a function");
-        vm.defineAccessor(o, k, hasGet ? getter : Value::empty(), hasSet ? setter : Value::empty(), flags);
-        return;
-    }
-    Value v = hasValue ? value : (exists && !(cur.flags & PF_ACC) ? cur.val : Value::undef());
-    if (exists && (cur.flags & PF_ACC)) o->remove(k);
-    if (!vm.defineOwn(o, k, v, flags)) vm.throwError(Err::TypeError, "Cannot define property, object is not extensible");
+    PropDesc d;
+    vm.toPropDesc(desc, d);
+    if (!vm.defineOwnDesc(o, k, d)) vm.throwError(Err::TypeError, u"Cannot redefine property: " + vm.toStr16(vm.keyToValue(k)));
 }
 
 JSFN(objectDefineProperty) {
     Vm& vm = ci.vm;
     if (!ci.arg(0).isObject()) vm.throwError(Err::TypeError, "Object.defineProperty called on non-object");
-    defineFromDescriptor(vm, ci.arg(0).asObject(), vm.toKey(ci.arg(1)), ci.arg(2));
+    PropKey k = vm.toKey(ci.arg(1));
+    defineFromDescriptor(vm, ci.arg(0).asObject(), k, ci.arg(2));
     return ci.arg(0);
 }
 static void defineProps(Vm& vm, JSObject* o, Value props) {
     JSObject* p = vm.toObject(props);
     std::vector<PropKey> keys;
-    vm.ownKeys(p, keys, true, true, true);
-    for (PropKey k : keys) defineFromDescriptor(vm, o, k, vm.getObj(p, k, V(p)));
+    vm.ownKeys(p, keys, true, true, false);
+    // every descriptor is read first, so a bad one leaves the object untouched (ECMA-262 20.1.2.3.1)
+    std::vector<std::pair<PropKey, PropDesc>> list;
+    std::vector<Value> keep;
+    RootScope roots(vm, keep);
+    for (PropKey k : keys) {
+        Prop own{};
+        if (!vm.getOwn(p, k, own) || !(own.flags & PF_E)) continue;
+        PropDesc d;
+        vm.toPropDesc(vm.getObj(p, k, V(p)), d);
+        keep.push_back(d.value);
+        keep.push_back(d.get);
+        keep.push_back(d.set);
+        list.push_back({k, d});
+    }
+    for (auto& e : list)
+        if (!vm.defineOwnDesc(o, e.first, e.second)) vm.throwError(Err::TypeError, u"Cannot redefine property: " + vm.toStr16(vm.keyToValue(e.first)));
 }
 JSFN(objectDefineProperties) {
     Vm& vm = ci.vm;
@@ -179,20 +167,9 @@ JSFN(objectGetOwnPropertyNames) { return keyList(ci.vm, ci.arg(0), true, false);
 JSFN(objectGetOwnPropertySymbols) { return keyList(ci.vm, ci.arg(0), false, true); }
 
 static Value descriptorOf(Vm& vm, JSObject* o, PropKey k) {
-    Prop p{};
-    if (!vm.getOwn(o, k, p)) return Value::undef();
-    JSObject* d = vm.newObject();
-    if (p.flags & PF_ACC) {
-        Accessor* acc = (Accessor*)p.val.asCell();
-        d->add(PropKey::of(vm.a.get), acc->get, PF_ALL);
-        d->add(PropKey::of(vm.a.set), acc->set, PF_ALL);
-    } else {
-        d->add(PropKey::of(vm.a.value), p.val, PF_ALL);
-        d->add(PropKey::of(vm.a.writable), Value::boolean((p.flags & PF_W) != 0), PF_ALL);
-    }
-    d->add(PropKey::of(vm.a.enumerable), Value::boolean((p.flags & PF_E) != 0), PF_ALL);
-    d->add(PropKey::of(vm.a.configurable), Value::boolean((p.flags & PF_C) != 0), PF_ALL);
-    return V(d);
+    PropDesc d;
+    if (!vm.getOwnDesc(o, k, d)) return Value::undef();
+    return vm.fromPropDesc(d);
 }
 JSFN(objectGetOwnPropertyDescriptor) { return descriptorOf(ci.vm, ci.vm.toObject(ci.arg(0)), ci.vm.toKey(ci.arg(1))); }
 JSFN(objectGetOwnPropertyDescriptors) {
@@ -201,7 +178,10 @@ JSFN(objectGetOwnPropertyDescriptors) {
     std::vector<PropKey> keys;
     vm.ownKeys(o, keys, true, true, false);
     JSObject* out = vm.newObject();
-    for (PropKey k : keys) vm.defineOwn(out, k, descriptorOf(vm, o, k), PF_ALL);
+    for (PropKey k : keys) {
+        Value d = descriptorOf(vm, o, k);
+        if (!d.isUndef()) vm.defineOwn(out, k, d, PF_ALL);
+    }
     return V(out);
 }
 
@@ -209,28 +189,16 @@ static Value restrict(CallInfo& ci, int level) {  // 0 preventExtensions, 1 seal
     Value v = ci.arg(0);
     if (!v.isObject()) return v;
     JSObject* o = v.asObject();
-    o->oflags |= OF_NOEXT;
-    if (level == 2) o->oflags |= OF_FROZEN;
-    for (auto& p : o->props) {
-        if (level >= 1) p.flags &= ~PF_C;
-        if (level == 2 && !(p.flags & PF_ACC)) p.flags &= ~PF_W;
-    }
+    if (level == 0) o->oflags |= OF_NOEXT;
+    else ci.vm.setIntegrity(o, level == 2);
     return v;
 }
 JSFN(objectPreventExtensions) { return restrict(ci, 0); }
 JSFN(objectSeal) { return restrict(ci, 1); }
 JSFN(objectFreeze) { return restrict(ci, 2); }
 JSFN(objectIsExtensible) { return Value::boolean(ci.arg(0).isObject() && !(ci.arg(0).asObject()->oflags & OF_NOEXT)); }
-JSFN(objectIsFrozen) { return Value::boolean(!ci.arg(0).isObject() || (ci.arg(0).asObject()->oflags & OF_FROZEN)); }
-JSFN(objectIsSealed) {
-    Value v = ci.arg(0);
-    if (!v.isObject()) return Value::boolean(true);
-    JSObject* o = v.asObject();
-    if (!(o->oflags & OF_NOEXT)) return Value::boolean(false);
-    for (auto& p : o->props)
-        if (p.flags & PF_C) return Value::boolean(false);
-    return Value::boolean(true);
-}
+JSFN(objectIsFrozen) { return Value::boolean(!ci.arg(0).isObject() || ci.vm.testIntegrity(ci.arg(0).asObject(), true)); }
+JSFN(objectIsSealed) { return Value::boolean(!ci.arg(0).isObject() || ci.vm.testIntegrity(ci.arg(0).asObject(), false)); }
 JSFN(objectFromEntries) {
     Vm& vm = ci.vm;
     JSObject* o = vm.newObject();
@@ -401,8 +369,12 @@ JSFN(arrayCtor) {
     if (ci.isConstruct()) a->proto = vm.protoFromNewTarget(ci.newTarget, vm.arrayProto);
     if (ci.argc == 1 && ci.args[0].isNumber()) {
         double n = ci.args[0].number();
-        if (n < 0 || n != std::floor(n) || n > 134217728.0) vm.throwError(Err::RangeError, "Invalid array length");
-        a->elems.assign((size_t)n, Value::empty());
+        if (n < 0 || n != std::floor(n) || n > 4294967295.0) vm.throwError(Err::RangeError, "Invalid array length");
+        if (n > 50000000.0) {  // too long to lay out: the length is kept on its own
+            a->oflags |= OF_SLOWIDX;
+            a->slowLen = (uint32_t)n;
+        } else
+            a->elems.assign((size_t)n, Value::empty());
     } else if (ci.argc)
         a->elems.assign(ci.args, ci.args + ci.argc);
     return V(a);
@@ -1196,13 +1168,10 @@ JSFN(reflectConstruct) {
 JSFN(reflectDefineProperty) {
     Vm& vm = ci.vm;
     JSObject* o = needObject(vm, ci.arg(0), "Reflect.defineProperty");
-    try {
-        defineFromDescriptor(vm, o, vm.toKey(ci.arg(1)), ci.arg(2));
-    } catch (JSThrow&) {
-        vm.pending = Value::undef();
-        return Value::boolean(false);
-    }
-    return Value::boolean(true);
+    PropKey k = vm.toKey(ci.arg(1));
+    PropDesc d;
+    vm.toPropDesc(ci.arg(2), d);
+    return Value::boolean(vm.defineOwnDesc(o, k, d));
 }
 JSFN(reflectDeleteProperty) { return Value::boolean(ci.vm.del(needObject(ci.vm, ci.arg(0), "Reflect.deleteProperty"), ci.vm.toKey(ci.arg(1)))); }
 JSFN(reflectGet) {

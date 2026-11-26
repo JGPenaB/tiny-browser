@@ -24,14 +24,17 @@ bool isWs(char16_t c) {
 }
 bool isLt(char16_t c) { return c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029; }
 bool isDigit(char16_t c) { return c >= '0' && c <= '9'; }
+// For one UTF-16 unit. Half of a surrogate pair is let through here; name() checks the whole character.
 bool idStart(char16_t c) {
     if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_';
-    return unicodeIdStart(c);
+    return (c >= 0xD800 && c <= 0xDFFF) || unicodeIdStart(c);
 }
 bool idPart(char16_t c) {
     if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_' || isDigit(c);
-    return c == 0x200C || c == 0x200D || unicodeIdContinue(c);
+    return c == 0x200C || c == 0x200D || (c >= 0xD800 && c <= 0xDFFF) || unicodeIdContinue(c);
 }
+bool idStartCp(uint32_t c) { return c < 0x80 ? idStart((char16_t)c) : unicodeIdStart(c); }
+bool idPartCp(uint32_t c) { return c < 0x80 ? idPart((char16_t)c) : c == 0x200C || c == 0x200D || unicodeIdContinue(c); }
 int hexVal(char16_t c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -66,10 +69,13 @@ public:
                 if (pos >= n || s[pos] != 'u') fail("Invalid Unicode escape sequence");
                 escape(id);
                 escaped = true;
-            } else
+            } else {
                 id += s[pos++];
-            char16_t ch = id[at];
-            if (at == first ? !idStart(ch) : !idPart(ch)) fail("Invalid or unexpected token");
+                if (id.back() >= 0xD800 && id.back() <= 0xDBFF && pos < n && s[pos] >= 0xDC00 && s[pos] <= 0xDFFF) id += s[pos++];
+            }
+            uint32_t ch = id[at];
+            if (ch >= 0xD800 && ch <= 0xDBFF && at + 1 < id.size()) ch = 0x10000 + ((ch - 0xD800) << 10) + (id[at + 1] - 0xDC00);
+            if (at == first ? !idStartCp(ch) : !idPartCp(ch)) fail("Invalid or unexpected token");
         }
     }
 
@@ -2144,6 +2150,8 @@ private:
                     Node* n = mk(N::Regex);
                     n->str = t.str;
                     n->str2 = t.raw;
+                    std::string error;  // a malformed literal is an early error (ECMA-262 13.2.7.2)
+                    if (!regexValidate(t.str->s, t.raw->s, error)) fail("Invalid regular expression: /" + utf16to8(t.str->s) + "/: " + error);
                     advance();
                     return n;
                 }

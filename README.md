@@ -76,6 +76,10 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    CSP and sandboxed frames, media playback, WebGL (own GLSL-to-HLSL translator), 3D page view (page layers as a movable
    parallax), save as PDF.
 
+JavaScript engine speed, after the spec-compliance work and without a JIT: hidden classes (shapes) with inline caches,
+lazy function parsing plus an on-disk bytecode cache, computed-goto style dispatch. Values are already NaN-boxed. Later
+candidates: generational GC, superinstructions, background parsing.
+
 Small features slotted between the engine steps: resource monitor (CPU, RAM, GPU, VRAM, GPU temperature, plus a network
 monitor), private windows, reader mode, page screenshots, RSS reader, translate selection, a frameless window with the tabs
 in the title strip, and a headless mode driven by JSON commands for automated scripts and AI agents.

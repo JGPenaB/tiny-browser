@@ -884,11 +884,14 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
             if (k.isIndex()) {
                 uint32_t i = k.asIndex();
                 if (i < arr->elems.size() && !arr->elems[i].isEmpty()) {
-                    out = {k, arr->elems[i], (uint8_t)((o->oflags & OF_FROZEN) ? PF_E : PF_ALL)};
+                    out = {k, arr->elems[i], (uint8_t)((o->oflags & OF_FROZEN) ? PF_E : (o->oflags & OF_SEALED) ? (PF_W | PF_E) : PF_ALL)};
                     return true;
                 }
-            } else if (k.cell() == vm.a.length) {
-                out = {k, Value::num((double)arr->elems.size()), PF_W};
+            } else if (k.cell() == vm.a.length && o->cls == Cls::Array) {
+                out = {k, Value::num((double)arrayLen(arr)), (uint8_t)((o->oflags & (OF_LENRO | OF_FROZEN)) ? 0 : PF_W)};
+                return true;
+            } else if (k.cell() == vm.a.length && !(o->oflags & OF_NO_LENGTH)) {  // arguments.length: an ordinary property
+                out = {k, Value::num((double)arr->elems.size()), (uint8_t)(PF_W | PF_C)};
                 return true;
             }
             return false;
@@ -975,7 +978,7 @@ Value Vm::getObj(JSObject* o, PropKey k, Value receiver) {
             JSArray* arr = (JSArray*)cur;
             uint32_t i = k.asIndex();
             if (i < arr->elems.size() && !arr->elems[i].isEmpty()) return arr->elems[i];
-            continue;
+            if (!(cur->oflags & OF_SLOWIDX)) continue;
         }
         if (Prop* p = cur->find(k)) {
             if (p->flags & PF_ACC) {
@@ -1034,32 +1037,39 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
         typedSet(*this, (JSTypedArray*)o, k.asIndex(), v);
         return true;
     }
+    bool self = receiver.isObject() && receiver.asObject() == o;
     if (o->cls == Cls::Array || o->cls == Cls::Arguments) {
         JSArray* arr = (JSArray*)o;
         if (k.isIndex()) {
-            if (o->oflags & OF_FROZEN) return false;
             uint32_t i = k.asIndex();
-            if (i >= arr->elems.size()) {
-                if (o->oflags & OF_NOEXT) return false;
-                if (i > arr->elems.size() + 50000000u) throwError(Err::RangeError, "Invalid array length");
-                arr->elems.resize((size_t)i + 1, Value::empty());
+            size_t size = arr->elems.size();
+            if (i < size && !arr->elems[i].isEmpty()) {  // an existing plain element
+                if (o->oflags & OF_FROZEN) return false;
+                if (self) {
+                    arr->elems[i] = v;
+                    return true;
+                }
+            } else if (self && !(o->oflags & (OF_SLOWIDX | OF_NOEXT | OF_LENRO)) && !protoIndexProps &&
+                       (arr->proto == arrayProto || (o->cls == Cls::Arguments && arr->proto == objectProto)) && (i < size || i - size <= (1u << 22))) {
+                // a hole or a slot past the end, and nothing on the prototypes that could intercept the write
+                if (i >= size) arr->elems.resize((size_t)i + 1, Value::empty());
+                arr->elems[i] = v;
+                return true;
             }
-            arr->elems[i] = v;
-            return true;
-        }
-        if (k.cell() == a.length && o->cls == Cls::Array) {
-            if (o->oflags & OF_FROZEN) return false;
-            double n = toNumber(v);
-            if (n < 0 || n != std::floor(n) || n > 4294967295.0) throwError(Err::RangeError, "Invalid array length");
-            arr->elems.resize((size_t)n, Value::empty());
-            return true;
+        } else if (self && o->cls == Cls::Array && !k.isSymbol() && k.cell() == a.length) {
+            PropDesc d;
+            d.hasValue = true;
+            d.value = v;
+            return defineOwnDesc(o, k, d);
         }
     }
+    // OrdinarySet (ECMA-262 10.1.9.2): find the property on the object or its prototypes
+    bool ownMissing = false;
     for (JSObject* cur = o; cur; cur = cur->proto) {
         Prop* p = cur->find(k);
-        if (!p && (cur->cls == Cls::Function || cur->cls == Cls::Native || cur->cls == Cls::String)) {
-            // properties that are not stored: a function's name and length and a string's characters are
-            // read-only; a function's prototype is created on first use and is then an ordinary property
+        if (!p && cur->cls != Cls::Object && cur->cls != Cls::Host) {
+            // properties that are not stored: array elements, a function's name and length, a string's characters.
+            // A function's prototype is created on first use and is then an ordinary property.
             Prop vp;
             if (virtualProp(*this, cur, k, vp)) {
                 p = cur->find(k);
@@ -1069,7 +1079,10 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
                 }
             }
         }
-        if (!p) continue;
+        if (!p) {
+            if (cur == o) ownMissing = true;
+            continue;
+        }
         if (p->flags & PF_ACC) {
             Accessor* acc = (Accessor*)p->val.asCell();
             if (acc->set.isUndef()) return false;
@@ -1077,14 +1090,29 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
             return true;
         }
         if (!(p->flags & PF_W)) return false;
-        if (cur == o) {
+        if (cur == o && self) {
             p->val = v;
             return true;
         }
         break;
     }
-    if (o->oflags & (OF_NOEXT | OF_FROZEN)) return false;
-    o->add(k, v, (o->cls == Cls::Function && !k.isIndex() && k.cell() == a.prototype) ? PF_W : PF_ALL);
+    // the value goes on the receiver: an existing writable data property is updated, otherwise one is created
+    if (!receiver.isObject()) return false;
+    JSObject* r = receiver.asObject();
+    if (r->cls != Cls::Host && !(self && ownMissing)) {
+        Prop existing{};
+        if (getOwn(r, k, existing)) {
+            if ((existing.flags & PF_ACC) || !(existing.flags & PF_W)) return false;
+            PropDesc d;
+            d.hasValue = true;
+            d.value = v;
+            return defineOwnDesc(r, k, d);
+        }
+    }
+    if ((r->cls == Cls::Array || r->cls == Cls::Arguments || r->cls == Cls::TypedArray) && k.isIndex()) return defineElement(r, k, v, PF_ALL);
+    if (r->oflags & (OF_NOEXT | OF_FROZEN)) return false;
+    if (k.isIndex() && (r == arrayProto || r == objectProto)) protoIndexProps = true;
+    r->add(k, v, (r->cls == Cls::Function && !k.isIndex() && k.cell() == a.prototype) ? PF_W : PF_ALL);
     return true;
 }
 
@@ -1129,14 +1157,15 @@ bool Vm::defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags) {
     if ((o->cls == Cls::Array || o->cls == Cls::Arguments) && k.isIndex()) {
         JSArray* arr = (JSArray*)o;
         uint32_t i = k.asIndex();
-        if (i >= arr->elems.size()) {
-            if (i > arr->elems.size() + 50000000u) throwError(Err::RangeError, "Invalid array length");
-            arr->elems.resize((size_t)i + 1, Value::empty());
-        }
+        size_t size = arr->elems.size();
+        if (flags != PF_ALL || (o->oflags & (OF_SLOWIDX | OF_NOEXT | OF_LENRO | OF_FROZEN | OF_SEALED)) || (i >= size && i - size > (1u << 22)))
+            return defineElement(o, k, v, flags);
+        if (i >= size) arr->elems.resize((size_t)i + 1, Value::empty());
         arr->elems[i] = v;
         return true;
     }
-    if (o->cls == Cls::Array && !k.isIndex() && k.cell() == a.length) return setObj(o, k, v, Value::cell(o));
+    if (o->cls == Cls::Array && !k.isIndex() && !k.isSymbol() && k.cell() == a.length) return setObj(o, k, v, Value::cell(o));
+    if (k.isIndex() && (o == arrayProto || o == objectProto)) protoIndexProps = true;
     if (Prop* p = o->find(k)) {
         p->val = v;
         p->flags = flags;
@@ -1148,6 +1177,16 @@ bool Vm::defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags) {
 }
 
 void Vm::defineAccessor(JSObject* o, PropKey k, Value getter, Value setter, uint8_t flags) {
+    if (k.isIndex() && (o->cls == Cls::Array || o->cls == Cls::Arguments || o == arrayProto || o == objectProto)) {
+        PropDesc d;
+        if (!getter.isEmpty()) d.hasGet = true, d.get = getter;
+        if (!setter.isEmpty()) d.hasSet = true, d.set = setter;
+        d.hasEnumerable = d.hasConfigurable = true;
+        d.enumerable = (flags & PF_E) != 0;
+        d.configurable = (flags & PF_C) != 0;
+        defineOwnDesc(o, k, d);
+        return;
+    }
     Accessor* acc = nullptr;
     if (Prop* p = o->find(k)) {
         if (p->flags & PF_ACC) {
@@ -1185,13 +1224,17 @@ bool Vm::del(JSObject* o, PropKey k) {
     }
     if ((o->cls == Cls::Array || o->cls == Cls::Arguments) && k.isIndex()) {
         JSArray* arr = (JSArray*)o;
-        if (o->oflags & OF_FROZEN) return false;
-        if (k.asIndex() < arr->elems.size()) arr->elems[k.asIndex()] = Value::empty();
-        return true;
+        uint32_t i = k.asIndex();
+        if (i < arr->elems.size() && !arr->elems[i].isEmpty()) {
+            if (o->oflags & (OF_FROZEN | OF_SEALED)) return false;
+            arr->elems[i] = Value::empty();
+            return true;
+        }
+        if (!(o->oflags & OF_SLOWIDX)) return true;  // otherwise it may be kept as an ordinary property
     }
     Prop* p = o->find(k);
     if (!p) {
-        if ((o->cls == Cls::Function || o->cls == Cls::Native) && !k.isIndex() && !k.isSymbol()) {
+        if ((o->cls == Cls::Function || o->cls == Cls::Native || o->cls == Cls::Arguments) && !k.isIndex() && !k.isSymbol()) {
             // a function's name and length are configurable: deleting one leaves a mark, since neither is stored
             if (k.cell() == a.name) o->oflags |= OF_NO_NAME;
             if (k.cell() == a.length) o->oflags |= OF_NO_LENGTH;
@@ -1213,6 +1256,7 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
         if (h->hooks && h->hooks->keys) h->hooks->keys(*this, o, out);
     }
     if (strings) {
+        size_t firstIndex = out.size();
         if (o->cls == Cls::TypedArray)
             for (uint32_t i = 0; i < ((JSTypedArray*)o)->length; ++i) out.push_back(PropKey::index(i));
         if (o->cls == Cls::Array || o->cls == Cls::Arguments) {
@@ -1226,7 +1270,8 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
         size_t mark = out.size();
         for (auto& p : o->props)
             if (p.key.isIndex() && (!onlyEnumerable || (p.flags & PF_E))) out.push_back(p.key);
-        if (out.size() - mark > 1) std::sort(out.begin() + mark, out.end(), [](PropKey x, PropKey y) { return x.asIndex() < y.asIndex(); });
+        if (out.size() > mark && out.size() - firstIndex > 1)  // index keys come first, in ascending order
+            std::sort(out.begin() + firstIndex, out.end(), [](PropKey x, PropKey y) { return x.asIndex() < y.asIndex(); });
         if (!onlyEnumerable && (o->cls == Cls::Array || o->cls == Cls::String)) out.push_back(PropKey::of(a.length));
         for (auto& p : o->props)
             if (p.key.isString() && (!onlyEnumerable || (p.flags & PF_E))) out.push_back(p.key);
@@ -1237,7 +1282,9 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
 }
 
 uint32_t Vm::lengthOf(Value v) {
-    if (v.isObject() && (v.asObject()->cls == Cls::Array || v.asObject()->cls == Cls::Arguments)) return (uint32_t)((JSArray*)v.asObject())->elems.size();
+    if (v.isObject() && v.asObject()->cls == Cls::Array) return arrayLen((JSArray*)v.asObject());
+    if (v.isObject() && v.asObject()->cls == Cls::Arguments && !v.asObject()->find(PropKey::of(a.length)) && !(v.asObject()->oflags & OF_NO_LENGTH))
+        return (uint32_t)((JSArray*)v.asObject())->elems.size();
     if (v.isObject() && v.asObject()->cls == Cls::TypedArray) return ((JSTypedArray*)v.asObject())->length;
     if (v.isString()) return (uint32_t)((JSString*)v.asCell())->length();
     double d = toInteger(get(v, a.length));
@@ -2213,7 +2260,7 @@ Value Vm::runFrames(size_t base) {
                                 typedSet(*this, (JSTypedArray*)ob, (uint32_t)kv.asInt(), R(i.c));
                                 break;
                             }
-                            if (ob->cls == Cls::Array && !(ob->oflags & (OF_FROZEN | OF_NOEXT))) {
+                            if (ob->cls == Cls::Array && !(ob->oflags & (OF_FROZEN | OF_NOEXT | OF_SLOWIDX | OF_LENRO)) && ob->proto == arrayProto && !protoIndexProps) {
                                 auto& e = ((JSArray*)ob)->elems;
                                 uint32_t idx = (uint32_t)kv.asInt();
                                 if (idx < e.size()) {

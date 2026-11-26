@@ -7,6 +7,7 @@
 #include <deque>
 
 #include "regex.h"
+#include "unicode_data.h"
 
 namespace tb::js {
 
@@ -42,74 +43,28 @@ uint32_t lowerOf(uint32_t c) {
     return (uint32_t)(uintptr_t)CharLowerW((LPWSTR)(uintptr_t)(wchar_t)c) & 0xFFFF;
 }
 
-enum UProp {
-    UP_Any, UP_ASCII, UP_L, UP_Lu, UP_Ll, UP_N, UP_P, UP_S, UP_Z, UP_M, UP_C, UP_Space, UP_Hex, UP_Emoji,
-    UP_Latin, UP_Greek, UP_Cyrillic, UP_Han, UP_Hiragana, UP_Katakana, UP_Hangul, UP_Arabic, UP_Hebrew, UP_Thai, UP_Devanagari
-};
-const struct {
-    const char* name;
-    int prop;
-} kPropNames[] = {
-    {"Any", UP_Any}, {"ASCII", UP_ASCII}, {"L", UP_L}, {"Letter", UP_L}, {"Alphabetic", UP_L}, {"Alpha", UP_L}, {"Lo", UP_L},
-    {"Lm", UP_L}, {"Lt", UP_Lu}, {"Lu", UP_Lu}, {"Uppercase_Letter", UP_Lu}, {"Uppercase", UP_Lu}, {"Ll", UP_Ll},
-    {"Lowercase_Letter", UP_Ll}, {"Lowercase", UP_Ll}, {"N", UP_N}, {"Number", UP_N}, {"Nd", UP_N}, {"Decimal_Number", UP_N},
-    {"Nl", UP_N}, {"No", UP_N}, {"P", UP_P}, {"Punctuation", UP_P}, {"Pc", UP_P}, {"Pd", UP_P}, {"Ps", UP_P}, {"Pe", UP_P},
-    {"Pi", UP_P}, {"Pf", UP_P}, {"Po", UP_P}, {"S", UP_S}, {"Symbol", UP_S}, {"Sm", UP_S}, {"Sc", UP_S}, {"Sk", UP_S}, {"So", UP_S},
-    {"Z", UP_Z}, {"Separator", UP_Z}, {"Zs", UP_Z}, {"Space_Separator", UP_Z}, {"M", UP_M}, {"Mark", UP_M}, {"Mn", UP_M},
-    {"Mc", UP_M}, {"Me", UP_M}, {"C", UP_C}, {"Other", UP_C}, {"Cc", UP_C}, {"Control", UP_C}, {"Cf", UP_C},
-    {"White_Space", UP_Space}, {"space", UP_Space}, {"ASCII_Hex_Digit", UP_Hex}, {"Hex_Digit", UP_Hex}, {"Emoji", UP_Emoji},
-    {"Emoji_Presentation", UP_Emoji}, {"Extended_Pictographic", UP_Emoji}, {"Latin", UP_Latin}, {"Latn", UP_Latin},
-    {"Greek", UP_Greek}, {"Grek", UP_Greek}, {"Cyrillic", UP_Cyrillic}, {"Cyrl", UP_Cyrillic}, {"Han", UP_Han}, {"Hani", UP_Han},
-    {"Hiragana", UP_Hiragana}, {"Hira", UP_Hiragana}, {"Katakana", UP_Katakana}, {"Kana", UP_Katakana}, {"Hangul", UP_Hangul},
-    {"Hang", UP_Hangul}, {"Arabic", UP_Arabic}, {"Arab", UP_Arabic}, {"Hebrew", UP_Hebrew}, {"Hebr", UP_Hebrew}, {"Thai", UP_Thai},
-    {"Devanagari", UP_Devanagari}, {"Deva", UP_Devanagari},
-};
-
-// Unicode properties are answered from Windows' character tables (approximate for the rarer categories).
+// Unicode properties come from generated tables (unicode_data.h). A property is the number of its table.
+int findProp(const std::string& name) {
+    size_t lo = 0, hi = sizeof(kUniNames) / sizeof(kUniNames[0]);
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        int c = strcmp(kUniNames[mid].name, name.c_str());
+        if (c == 0) return kUniNames[mid].table;
+        if (c < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return -1;
+}
 bool hasProp(int prop, uint32_t cp) {
-    auto in = [cp](uint32_t a, uint32_t b) { return cp >= a && cp <= b; };
-    switch (prop) {
-        case UP_Any: return true;
-        case UP_ASCII: return cp < 128;
-        case UP_Hex: return in('0', '9') || in('a', 'f') || in('A', 'F');
-        case UP_Latin: return in('A', 'Z') || in('a', 'z') || cp == 0xAA || cp == 0xBA || (in(0xC0, 0x24F) && cp != 0xD7 && cp != 0xF7) || in(0x1E00, 0x1EFF);
-        case UP_Greek: return in(0x370, 0x3FF) || in(0x1F00, 0x1FFF);
-        case UP_Cyrillic: return in(0x400, 0x52F) || in(0x1C80, 0x1C8F) || in(0x2DE0, 0x2DFF) || in(0xA640, 0xA69F);
-        case UP_Han: return in(0x4E00, 0x9FFF) || in(0x3400, 0x4DBF) || in(0x20000, 0x3134F) || in(0xF900, 0xFAFF) || cp == 0x3005 || cp == 0x3007;
-        case UP_Hiragana: return in(0x3041, 0x309F);
-        case UP_Katakana: return in(0x30A0, 0x30FF) || in(0x31F0, 0x31FF) || in(0xFF66, 0xFF9F);
-        case UP_Hangul: return in(0xAC00, 0xD7AF) || in(0x1100, 0x11FF) || in(0x3130, 0x318F);
-        case UP_Arabic: return in(0x600, 0x6FF) || in(0x750, 0x77F) || in(0xFB50, 0xFDFF) || in(0xFE70, 0xFEFF);
-        case UP_Hebrew: return in(0x590, 0x5FF) || in(0xFB1D, 0xFB4F);
-        case UP_Thai: return in(0xE00, 0xE7F);
-        case UP_Devanagari: return in(0x900, 0x97F);
-        case UP_Emoji:
-            return in(0x1F300, 0x1FAFF) || in(0x1F000, 0x1F2FF) || in(0x2600, 0x27BF) || in(0x2B00, 0x2BFF) || in(0x2190, 0x21FF) || in(0x2300, 0x23FF) ||
-                   cp == 0xA9 || cp == 0xAE || cp == 0x203C || cp == 0x2049 || cp == 0x2122 || cp == 0x2139 || cp == 0x3030 || cp == 0x303D;
-        default: break;
+    const UniTable& t = kUniTables[prop];
+    size_t lo = 0, hi = t.count;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cp < t.ranges[mid * 2]) hi = mid;
+        else if (cp > t.ranges[mid * 2 + 1]) lo = mid + 1;
+        else return true;
     }
-    if (cp > 0xFFFF) {  // beyond the tables: ideographs count as letters, everything else as symbols
-        bool ideograph = cp >= 0x20000 && cp <= 0x3FFFF;
-        return prop == UP_L ? ideograph : prop == UP_S ? !ideograph : false;
-    }
-    WORD t1 = 0, t3 = 0;
-    wchar_t w = (wchar_t)cp;
-    GetStringTypeW(CT_CTYPE1, &w, 1, &t1);
-    GetStringTypeW(CT_CTYPE3, &w, 1, &t3);
-    bool asciiSymbol = cp < 128 && cp && strchr("$+<=>^`|~", (char)cp);
-    switch (prop) {
-        case UP_L: return (t1 & C1_ALPHA) != 0 && !(t1 & C1_DIGIT);
-        case UP_Lu: return (t1 & C1_UPPER) != 0;
-        case UP_Ll: return (t1 & C1_LOWER) != 0;
-        case UP_N: return (t1 & C1_DIGIT) != 0;
-        case UP_P: return (t1 & C1_PUNCT) != 0 && !(t3 & C3_SYMBOL) && !asciiSymbol;
-        case UP_S: return asciiSymbol || ((t3 & C3_SYMBOL) != 0 && cp >= 128);
-        case UP_Z: return ((t1 & C1_BLANK) != 0 && cp != '\t') || cp == 0x2028 || cp == 0x2029;
-        case UP_Space: return (t1 & C1_SPACE) != 0 || cp == 0xFEFF;
-        case UP_M: return (t3 & (C3_NONSPACING | C3_DIACRITIC | C3_VOWELMARK)) != 0 && !(t1 & C1_ALPHA);
-        case UP_C: return (t1 & C1_CNTRL) != 0 || !(t1 & C1_DEFINED);
-        default: return false;
-    }
+    return false;
 }
 
 struct CharClass {
@@ -471,14 +426,9 @@ struct Parser {
         while (more() && src[i] != '}') name += (char)src[i++];
         if (!more()) fail("Invalid property name");
         ++i;
-        size_t eq = name.find('=');
-        if (eq != std::string::npos) name.erase(0, eq + 1);
-        for (auto& p : kPropNames)
-            if (name == p.name) {
-                cc.props.push_back({p.prop, negated});
-                return;
-            }
-        fail("Invalid property name");
+        int prop = findProp(name);
+        if (prop < 0) fail("Invalid property name");
+        cc.props.push_back({prop, negated});
     }
     RxNode* atomEscape() {
         ++i;
@@ -1068,25 +1018,27 @@ bool regexExec(const RegexProgram& p, const std::u16string& s, size_t from, bool
     return false;
 }
 
-bool unicodeIdStart(char16_t c) {
-    if (c >= 0xD800 && c <= 0xDFFF) return true;  // half of a supplementary character: letters, mostly
-    if (c == 0x2118 || c == 0x212E || c == 0x309B || c == 0x309C || c == 0x1885 || c == 0x1886) return true;  // Other_ID_Start
-    WORD t1 = 0, t3 = 0;
-    wchar_t w = (wchar_t)c;
-    GetStringTypeW(CT_CTYPE1, &w, 1, &t1);
-    if (!(t1 & C1_ALPHA)) return false;
-    GetStringTypeW(CT_CTYPE3, &w, 1, &t3);
-    return !(t3 & (C3_NONSPACING | C3_VOWELMARK)) || (t3 & C3_ALPHA);
+bool regexValidate(const std::u16string& pattern, const std::u16string& flags, std::string& error) {
+    RegexFlags f;
+    bool unicodeSets = false;
+    for (char16_t c : flags) {
+        bool* slot = c == 'g' ? &f.global : c == 'i' ? &f.ignoreCase : c == 'm' ? &f.multiline : c == 's' ? &f.dotAll : c == 'u' ? &f.unicode
+                     : c == 'y' ? &f.sticky : c == 'd' ? &f.hasIndices : c == 'v' ? &unicodeSets : nullptr;
+        if (!slot || *slot) {
+            error = "Invalid regular expression flags";
+            return false;
+        }
+        *slot = true;
+    }
+    if (unicodeSets && f.unicode) {
+        error = "Invalid regular expression flags";
+        return false;
+    }
+    if (unicodeSets) f.unicode = true;
+    return regexCompile(pattern, f, error) != nullptr;
 }
-bool unicodeIdContinue(char16_t c) {
-    if (unicodeIdStart(c)) return true;
-    if (c == 0xB7 || c == 0x387 || (c >= 0x1369 && c <= 0x1371) || c == 0x19DA) return true;  // Other_ID_Continue
-    if (c == 0x203F || c == 0x2040 || c == 0x2054 || c == 0xFE33 || c == 0xFE34 || (c >= 0xFE4D && c <= 0xFE4F) || c == 0xFF3F) return true;
-    WORD t1 = 0, t3 = 0;
-    wchar_t w = (wchar_t)c;
-    GetStringTypeW(CT_CTYPE1, &w, 1, &t1);
-    GetStringTypeW(CT_CTYPE3, &w, 1, &t3);
-    return (t1 & (C1_ALPHA | C1_DIGIT)) || (t3 & (C3_NONSPACING | C3_VOWELMARK | C3_DIACRITIC));
-}
+
+bool unicodeIdStart(uint32_t cp) { return hasProp(kUniIdStart, cp); }
+bool unicodeIdContinue(uint32_t cp) { return hasProp(kUniIdContinue, cp); }
 
 }  // namespace tb::js

@@ -145,7 +145,9 @@ struct PropKey {
 };
 
 enum : uint8_t { PF_W = 1, PF_E = 2, PF_C = 4, PF_ACC = 8, PF_ALL = 7 };
-enum : uint8_t { OF_NOEXT = 1, OF_FROZEN = 2, OF_CTOR = 4, OF_NO_NAME = 8, OF_NO_LENGTH = 16 };  // the last two: a function whose name/length was deleted
+// Arrays: OF_SLOWIDX some elements are kept as ordinary properties (own attributes, accessors, or far past the
+// dense part), OF_LENRO length is not writable, OF_SEALED the dense elements are not configurable.
+enum : uint8_t { OF_NOEXT = 1, OF_FROZEN = 2, OF_CTOR = 4, OF_NO_NAME = 8, OF_NO_LENGTH = 16, OF_SLOWIDX = 32, OF_LENRO = 64, OF_SEALED = 128 };  // the last two: a function whose name/length was deleted
 
 struct Prop {
     PropKey key;
@@ -170,9 +172,21 @@ struct JSObject : Cell {
 };
 
 struct JSArray : JSObject {
-    std::vector<Value> elems;
+    std::vector<Value> elems;  // the dense elements; a hole is Value::empty()
+    uint32_t slowLen = 0;      // with OF_SLOWIDX: the length when it reaches past the dense elements
     JSArray() { cls = Cls::Array; }
     void trace(Gc&) override;
+};
+inline uint32_t arrayLen(const JSArray* a) {
+    uint32_t n = (uint32_t)a->elems.size();
+    return (a->oflags & OF_SLOWIDX) && a->slowLen > n ? a->slowLen : n;
+}
+
+// A Property Descriptor (ECMA-262 6.2.6): fields that are absent stay unset.
+struct PropDesc {
+    Value value, get, set;
+    bool hasValue = false, hasGet = false, hasSet = false, hasWritable = false, hasEnumerable = false, hasConfigurable = false;
+    bool writable = false, enumerable = false, configurable = false;
 };
 
 struct JSPrimitive : JSObject {  // Boolean / Number / String / Symbol wrappers, Date (time value), RegExp (source)
@@ -523,6 +537,14 @@ public:
     bool set(Value target, PropKey k, Value v);  // false when the assignment did not happen ([[Set]] returned false)
     [[noreturn]] void failedSet(Value target, PropKey k);  // the TypeError strict code gets for that
     bool setObj(JSObject* o, PropKey k, Value v, Value receiver);
+    bool getOwnDesc(JSObject* o, PropKey k, PropDesc& d);
+    bool defineOwnDesc(JSObject* o, PropKey k, const PropDesc& d);
+    bool defineElement(JSObject* o, PropKey k, Value v, uint8_t flags);
+    void toPropDesc(Value v, PropDesc& d);
+    Value fromPropDesc(const PropDesc& d);
+    bool setIntegrity(JSObject* o, bool frozen);
+    bool testIntegrity(JSObject* o, bool frozen);
+    bool protoIndexProps = false;  // Array.prototype or Object.prototype has gained an index-named property
     void set(Value target, const char* name, Value v) { set(target, PropKey::of(atom(name)), v); }
     bool getOwn(JSObject* o, PropKey k, Prop& out);  // virtual properties included (array elements, length...)
     bool defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags);
