@@ -304,6 +304,7 @@ size_t ValueHash::operator()(Value v) const {
     if (v.isString()) return std::hash<std::u16string>()(v.asString()->s);
     if (v.isInt()) return std::hash<double>()((double)v.asInt());
     if (v.isDouble()) return std::hash<double>()(v.asDouble());
+    if (v.isBigInt()) return bigHash(v.asBigInt());
     return std::hash<uint64_t>()(v.b);
 }
 bool ValueEq::operator()(Value a, Value b) const {
@@ -313,6 +314,7 @@ bool ValueEq::operator()(Value a, Value b) const {
         double x = a.number(), y = b.number();
         return x == y || (x != x && y != y);
     }
+    if (a.isBigInt() && b.isBigInt()) return bigEquals(a.asBigInt(), b.asBigInt());
     return false;
 }
 
@@ -342,6 +344,7 @@ Vm::Vm() {
     setupTypedArrays(*this);
     setupAsyncIteration(*this);
     setupProxy(*this);
+    setupBigInt(*this);
     setupModules(*this);
     setupJsBuiltins(*this);
 }
@@ -533,6 +536,7 @@ bool Vm::toBool(Value v) {
     }
     if (v.isNullish() || v.isEmpty()) return false;
     if (v.isString()) return ((JSString*)v.asCell())->length() != 0;
+    if (v.isBigInt()) return !v.asBigInt()->d.empty();
     return true;
 }
 
@@ -576,6 +580,7 @@ double Vm::toNumber(Value v) {
     if (v.isBool()) return v.isTrue() ? 1 : 0;
     if (v.isString()) return stringToNumber(v.asString()->s);
     if (v.isSymbol()) throwError(Err::TypeError, "Cannot convert a Symbol value to a number");
+    if (v.isBigInt()) throwError(Err::TypeError, "Cannot convert a BigInt value to a number");
     return toNumber(toPrimitive(v, 1));
 }
 int32_t Vm::toInt32(Value v) {
@@ -669,6 +674,7 @@ JSString* Vm::toString(Value v) {
     if (v.isNull()) return a.null_;
     if (v.isBool()) return v.isTrue() ? a.true_ : a.false_;
     if (v.isSymbol()) throwError(Err::TypeError, "Cannot convert a Symbol value to a string");
+    if (v.isBigInt()) return str(bigToString(v.asBigInt()));
     return toString(toPrimitive(v, 2));
 }
 
@@ -686,6 +692,9 @@ JSObject* Vm::toObject(Value v) {
     } else if (v.isBool()) {
         p->cls = Cls::Boolean;
         p->proto = booleanProto;
+    } else if (v.isBigInt()) {
+        p->cls = Cls::BigInt;
+        p->proto = bigintProto;
     } else {
         p->cls = Cls::SymbolObj;
         p->proto = symbolProto;
@@ -745,6 +754,8 @@ PropKey Vm::toKey(Value v) {
         if (d >= 0 && d < 4294967295.0 && d == std::floor(d)) return PropKey::index((uint32_t)d);
     } else if (v.isObject()) {
         return toKey(toPrimitive(v, 2));
+    } else if (v.isBigInt()) {
+        return toKey(Value::cell(toString(v)));
     }
     return PropKey::of(atomOf(toString(v)));
 }
@@ -760,6 +771,7 @@ JSString* Vm::typeOf(Value v) {
     if (v.isNumber()) return a.number;
     if (v.isString()) return a.string;
     if (v.isSymbol()) return a.symbol;
+    if (v.isBigInt()) return atom("bigint");
     return isCallable(v) ? a.function : a.object;
 }
 bool Vm::isCallable(Value v) {
@@ -784,6 +796,7 @@ bool Vm::strictEquals(Value x, Value y) {
     if (x.b == y.b) return !(x.isDouble() && x.asDouble() != x.asDouble());
     if (x.isNumber() && y.isNumber()) return x.number() == y.number();
     if (x.isString() && y.isString()) return x.asString()->s == y.asString()->s;
+    if (x.isBigInt() && y.isBigInt()) return bigEquals(x.asBigInt(), y.asBigInt());
     return false;
 }
 bool Vm::sameValueZero(Value x, Value y) {
@@ -793,6 +806,7 @@ bool Vm::sameValueZero(Value x, Value y) {
         return p == q || (p != p && q != q);
     }
     if (x.isString() && y.isString()) return x.asString()->s == y.asString()->s;
+    if (x.isBigInt() && y.isBigInt()) return bigEquals(x.asBigInt(), y.asBigInt());
     return false;
 }
 bool Vm::sameValue(Value x, Value y) {
@@ -803,22 +817,39 @@ bool Vm::sameValue(Value x, Value y) {
     }
     return sameValueZero(x, y);
 }
+// IsLooselyEqual (7.2.13)
 bool Vm::looseEquals(Value x, Value y) {
     for (;;) {
         if (x.isNumber() && y.isNumber()) return x.number() == y.number();
         if (x.isString() && y.isString()) return x.asString()->s == y.asString()->s;
-        if (x.isNullish() && y.isNullish()) return true;
-        if (x.isNullish() || y.isNullish()) return false;
+        if (x.isNullish() || y.isNullish()) return x.isNullish() && y.isNullish();
         if (x.isObject() && y.isObject()) return x.b == y.b;
         if (x.isBool() && y.isBool()) return x.b == y.b;
-        if (x.isSymbol() || y.isSymbol()) return x.b == y.b;
-        if (x.isBool()) x = Value::i32(x.isTrue() ? 1 : 0);
-        else if (y.isBool()) y = Value::i32(y.isTrue() ? 1 : 0);
-        else if (x.isObject()) x = toPrimitive(x, 0);
-        else if (y.isObject()) y = toPrimitive(y, 0);
-        else if (x.isString()) x = Value::num(stringToNumber(x.asString()->s));
-        else if (y.isString()) y = Value::num(stringToNumber(y.asString()->s));
-        else return false;
+        if (x.isSymbol() && y.isSymbol()) return x.b == y.b;
+        if (x.isBigInt() && y.isBigInt()) return bigEquals(x.asBigInt(), y.asBigInt());
+        if (x.isNumber() && y.isString()) {
+            y = Value::num(stringToNumber(y.asString()->s));
+        } else if (x.isString() && y.isNumber()) {
+            x = Value::num(stringToNumber(x.asString()->s));
+        } else if (x.isBigInt() && y.isString()) {
+            JSBigInt* n = stringToBigInt(*this, y.asString()->s);
+            return n && bigEquals(x.asBigInt(), n);
+        } else if (x.isString() && y.isBigInt()) {
+            std::swap(x, y);
+        } else if (x.isBool()) {
+            x = Value::i32(x.isTrue() ? 1 : 0);
+        } else if (y.isBool()) {
+            y = Value::i32(y.isTrue() ? 1 : 0);
+        } else if (y.isObject()) {
+            y = toPrimitive(y, 0);
+        } else if (x.isObject()) {
+            x = toPrimitive(x, 0);
+        } else if (x.isBigInt() && y.isNumber()) {
+            return y.number() == y.number() && bigCompareDouble(x.asBigInt(), y.number()) == 0;
+        } else if (x.isNumber() && y.isBigInt()) {
+            return x.number() == x.number() && bigCompareDouble(y.asBigInt(), x.number()) == 0;
+        } else
+            return false;
     }
 }
 
@@ -848,15 +879,18 @@ Value Vm::concat(Value x, Value y) {
 
 Value Vm::add(Value x, Value y) {
     if (x.isString() && y.isString()) return concat(x, y);
-    Value px = toPrimitive(x, 0), py = toPrimitive(y, 0);
+    Value px = toPrimitive(x, 0);
+    Value py = toPrimitive(y, 0);
     if (px.isString() || py.isString()) {
         if (!px.isString()) px = Value::cell(toString(px));
         if (!py.isString()) py = Value::cell(toString(py));
         return concat(px, py);
     }
-    return Value::num(toNumber(px) + toNumber(py));
+    if (px.isNumber() && py.isNumber()) return Value::num(px.number() + py.number());
+    return arith(OP_Add, px, py);
 }
 
+// IsLessThan (7.2.12), with the operands in source order: -1 less, 0 equal, 1 greater, 2 when not comparable.
 int Vm::compare(Value x, Value y) {
     if (!(x.isNumber() && y.isNumber())) {
         x = toPrimitive(x, 1);
@@ -865,8 +899,24 @@ int Vm::compare(Value x, Value y) {
             int c = x.asString()->s.compare(y.asString()->s);
             return c < 0 ? -1 : c > 0 ? 1 : 0;
         }
+        if (x.isBigInt() && y.isString()) {
+            JSBigInt* n = stringToBigInt(*this, y.asString()->s);
+            return n ? bigCompare(x.asBigInt(), n) : 2;
+        }
+        if (x.isString() && y.isBigInt()) {
+            JSBigInt* n = stringToBigInt(*this, x.asString()->s);
+            return n ? bigCompare(n, y.asBigInt()) : 2;
+        }
+        x = toNumeric(x);
+        y = toNumeric(y);
+        if (x.isBigInt() || y.isBigInt()) {
+            if (x.isBigInt() && y.isBigInt()) return bigCompare(x.asBigInt(), y.asBigInt());
+            double d = x.isBigInt() ? y.number() : x.number();
+            if (d != d) return 2;
+            return x.isBigInt() ? bigCompareDouble(x.asBigInt(), d) : -bigCompareDouble(y.asBigInt(), d);
+        }
     }
-    double p = toNumber(x), q = toNumber(y);
+    double p = x.number(), q = y.number();
     if (p != p || q != q) return 2;
     return p < q ? -1 : p > q ? 1 : 0;
 }
@@ -1024,6 +1074,7 @@ JSObject* Vm::protoOf(Value v) {
     if (v.isNumber()) return numberProto;
     if (v.isBool()) return booleanProto;
     if (v.isSymbol()) return symbolProto;
+    if (v.isBigInt()) return bigintProto;
     return nullptr;
 }
 
@@ -1996,6 +2047,10 @@ static void inspectInto(Vm& vm, Value v, int depth, bool quote, std::u16string& 
         out += u"Symbol(" + (s->desc ? s->desc->s : std::u16string()) + u")";
         return;
     }
+    if (v.isBigInt()) {
+        out += bigToString(v.asBigInt()) + u"n";
+        return;
+    }
     if (!v.isObject()) {
         if (v.isDouble() && v.asDouble() == 0 && std::signbit(v.asDouble())) out += u"-0";
         else out += vm.toString(v)->s;
@@ -2467,8 +2522,10 @@ Value Vm::runFrames(size_t base) {
                         if (x.isInt() && y.isInt()) {
                             int64_t s = (int64_t)x.asInt() - y.asInt();
                             R(i.a) = (s >= INT32_MIN && s <= INT32_MAX) ? Value::i32((int32_t)s) : Value::dbl((double)s);
+                        } else if (x.isNumber() && y.isNumber()) {
+                            R(i.a) = Value::num(x.number() - y.number());
                         } else
-                            R(i.a) = Value::num((x.isNumber() ? x.number() : toNumber(x)) - (y.isNumber() ? y.number() : toNumber(y)));
+                            R(i.a) = arith(OP_Sub, x, y);
                         break;
                     }
                     case OP_Mul: {
@@ -2480,45 +2537,60 @@ Value Vm::runFrames(size_t base) {
                                 break;
                             }
                         }
-                        R(i.a) = Value::num((x.isNumber() ? x.number() : toNumber(x)) * (y.isNumber() ? y.number() : toNumber(y)));
+                        if (x.isNumber() && y.isNumber()) R(i.a) = Value::num(x.number() * y.number());
+                        else R(i.a) = arith(OP_Mul, x, y);
                         break;
                     }
                     case OP_Div: {
                         Value x = R(i.b), y = R(i.c);
-                        R(i.a) = Value::num((x.isNumber() ? x.number() : toNumber(x)) / (y.isNumber() ? y.number() : toNumber(y)));
+                        if (x.isNumber() && y.isNumber()) R(i.a) = Value::num(x.number() / y.number());
+                        else R(i.a) = arith(OP_Div, x, y);
                         break;
                     }
                     case OP_Mod: {
                         Value x = R(i.b), y = R(i.c);
-                        if (x.isInt() && y.isInt() && x.asInt() >= 0 && y.asInt() > 0) {
-                            R(i.a) = Value::i32(x.asInt() % y.asInt());
-                        } else {
-                            double p = x.isNumber() ? x.number() : toNumber(x), q = y.isNumber() ? y.number() : toNumber(y);
-                            R(i.a) = Value::num(std::fmod(p, q));
-                        }
+                        if (x.isInt() && y.isInt() && x.asInt() >= 0 && y.asInt() > 0) R(i.a) = Value::i32(x.asInt() % y.asInt());
+                        else if (x.isNumber() && y.isNumber()) R(i.a) = Value::num(std::fmod(x.number(), y.number()));
+                        else R(i.a) = arith(OP_Mod, x, y);
                         break;
                     }
-                    case OP_Exp: {
-                        double p = toNumber(R(i.b)), q = toNumber(R(i.c));
-                        R(i.a) = Value::num(std::pow(p, q));
+                    case OP_Exp:
+                    case OP_BitAnd:
+                    case OP_BitOr:
+                    case OP_BitXor:
+                    case OP_Shl:
+                    case OP_Shr:
+                    case OP_UShr: {
+                        Value x = R(i.b), y = R(i.c);
+                        if (x.isInt() && y.isInt() && i.op != OP_Exp) {
+                            int32_t p = x.asInt(), q = y.asInt();
+                            switch (i.op) {
+                                case OP_BitAnd: R(i.a) = Value::i32(p & q); break;
+                                case OP_BitOr: R(i.a) = Value::i32(p | q); break;
+                                case OP_BitXor: R(i.a) = Value::i32(p ^ q); break;
+                                case OP_Shl: R(i.a) = Value::i32((int32_t)((uint32_t)p << (q & 31))); break;
+                                case OP_Shr: R(i.a) = Value::i32(p >> (q & 31)); break;
+                                default: R(i.a) = Value::num((double)((uint32_t)p >> (q & 31))); break;
+                            }
+                        } else
+                            R(i.a) = arith(i.op, x, y);
                         break;
                     }
-                    case OP_BitAnd: R(i.a) = Value::i32(toInt32(R(i.b)) & toInt32(R(i.c))); break;
-                    case OP_BitOr: R(i.a) = Value::i32(toInt32(R(i.b)) | toInt32(R(i.c))); break;
-                    case OP_BitXor: R(i.a) = Value::i32(toInt32(R(i.b)) ^ toInt32(R(i.c))); break;
-                    case OP_Shl: R(i.a) = Value::i32((int32_t)((uint32_t)toInt32(R(i.b)) << (toInt32(R(i.c)) & 31))); break;
-                    case OP_Shr: R(i.a) = Value::i32(toInt32(R(i.b)) >> (toInt32(R(i.c)) & 31)); break;
-                    case OP_UShr: R(i.a) = Value::num((double)((uint32_t)toInt32(R(i.b)) >> (toInt32(R(i.c)) & 31))); break;
                     case OP_Neg: {
                         Value x = R(i.b);
                         if (x.isInt() && x.asInt() != 0 && x.asInt() != INT32_MIN) R(i.a) = Value::i32(-x.asInt());
-                        else R(i.a) = Value::num(-toNumber(x));
+                        else if (x.isNumber()) R(i.a) = Value::num(-x.number());
+                        else R(i.a) = unaryNumeric(OP_Neg, x);
                         break;
                     }
-                    case OP_Plus:
-                    case OP_ToNumeric: {
+                    case OP_Plus: {
                         Value x = R(i.b);
                         R(i.a) = x.isNumber() ? x : Value::num(toNumber(x));
+                        break;
+                    }
+                    case OP_ToNumeric: {
+                        Value x = R(i.b);
+                        R(i.a) = x.isNumber() ? x : toNumeric(x);
                         break;
                     }
                     case OP_Not: {
@@ -2526,17 +2598,23 @@ Value Vm::runFrames(size_t base) {
                         R(i.a) = Value::boolean(!(x.isBool() ? x.isTrue() : toBool(x)));
                         break;
                     }
-                    case OP_BitNot: R(i.a) = Value::i32(~toInt32(R(i.b))); break;
+                    case OP_BitNot: {
+                        Value x = R(i.b);
+                        R(i.a) = x.isInt() ? Value::i32(~x.asInt()) : unaryNumeric(OP_BitNot, x);
+                        break;
+                    }
                     case OP_Inc: {
                         Value x = R(i.b);
                         if (x.isInt() && x.asInt() != INT32_MAX) R(i.a) = Value::i32(x.asInt() + 1);
-                        else R(i.a) = Value::num(toNumber(x) + 1);
+                        else if (x.isNumber()) R(i.a) = Value::num(x.number() + 1);
+                        else R(i.a) = unaryNumeric(OP_Inc, x);
                         break;
                     }
                     case OP_Dec: {
                         Value x = R(i.b);
                         if (x.isInt() && x.asInt() != INT32_MIN) R(i.a) = Value::i32(x.asInt() - 1);
-                        else R(i.a) = Value::num(toNumber(x) - 1);
+                        else if (x.isNumber()) R(i.a) = Value::num(x.number() - 1);
+                        else R(i.a) = unaryNumeric(OP_Dec, x);
                         break;
                     }
                     case OP_Typeof: R(i.a) = Value::cell(typeOf(R(i.b))); break;

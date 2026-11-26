@@ -30,6 +30,7 @@ add_executable(tinybrowser WIN32
   src/js/typedarray.cpp
   src/js/module.cpp
   src/js/proxy.cpp
+  src/js/bigint.cpp
   src/js/prelude.cpp
   src/js/array.cpp
   src/js/props.cpp

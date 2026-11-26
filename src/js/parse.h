@@ -17,7 +17,7 @@ enum P : uint8_t {
 };
 
 enum class N : uint8_t {
-    Num, Str, Template, TaggedTemplate, Regex, Ident, This, Super, NewTarget, Null, True, False,
+    Num, BigInt, Str, Template, TaggedTemplate, Regex, Ident, This, Super, NewTarget, Null, True, False,
     Array, Object, Property, Function, Class,
     Unary, Update, Binary, Logical, Assign, Cond, Call, New, Member, Index, OptChain, Spread, Seq, Yield, Await, Hole,
     ArrayPat, ObjectPat, AssignPat, Rest,

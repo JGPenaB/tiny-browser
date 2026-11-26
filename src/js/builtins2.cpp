@@ -660,7 +660,7 @@ struct JsonWriter {
         out += u'"';
     }
     bool write(Value holder, PropKey key, Value v, const std::u16string& indent) {
-        if (v.isObject()) {
+        if (v.isObject() || v.isBigInt()) {
             Value tj = vm.get(v, vm.a.toJSON);
             if (vm.isCallable(tj)) {
                 Value k = vm.keyToValue(key);
@@ -675,8 +675,9 @@ struct JsonWriter {
             JSObject* o = v.asObject();
             if (o->cls == Cls::Number) v = Value::num(vm.toNumber(v));
             else if (o->cls == Cls::String) v = V(vm.toString(v));
-            else if (o->cls == Cls::Boolean) v = ((JSPrimitive*)o)->prim;
+            else if (o->cls == Cls::Boolean || o->cls == Cls::BigInt) v = ((JSPrimitive*)o)->prim;
         }
+        if (v.isBigInt()) vm.throwError(Err::TypeError, "Do not know how to serialize a BigInt");
         if (v.isNull()) {
             out += u"null";
             return true;

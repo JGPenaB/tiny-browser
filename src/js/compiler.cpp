@@ -517,7 +517,7 @@ private:
 
     static bool directOk(Node* v) {
         switch (v->type) {
-            case N::Num: case N::Str: case N::Null: case N::True: case N::False: case N::Binary: case N::Unary: case N::Call:
+            case N::Num: case N::BigInt: case N::Str: case N::Null: case N::True: case N::False: case N::Binary: case N::Unary: case N::Call:
             case N::New: case N::Member: case N::Index: case N::Function: case N::Regex: case N::This:
                 return true;
             default: return false;
@@ -548,6 +548,7 @@ private:
         };
         switch (n->type) {
             case N::Num: loadNum(need(), n->num); return dst;
+            case N::BigInt: emitX(OP_LoadK, need(), konst(Value::cell(bigFromLiteral(vm, n->str->s)))); return dst;
             case N::Str: emitX(OP_LoadK, need(), kstr(n->str)); return dst;
             case N::Null: emit(OP_LoadNull, need()); return dst;
             case N::True: emit(OP_LoadTrue, need()); return dst;

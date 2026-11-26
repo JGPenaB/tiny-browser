@@ -905,7 +905,11 @@ JSFN(booleanValueOf) { return Value::boolean(thisBoolean(ci)); }
 
 // ---------------------------------------------------------------------------- Number
 JSFN(numberCtor) {
-    Value n = ci.argc ? Value::num(ci.vm.toNumber(ci.args[0])) : Value::i32(0);
+    Value n = Value::i32(0);
+    if (ci.argc) {
+        n = ci.vm.toNumeric(ci.args[0]);
+        if (n.isBigInt()) n = Value::num(bigToDouble(n.asBigInt()));
+    }
     return ci.isConstruct() ? wrapPrimitive(ci, n, Cls::Number, ci.vm.numberProto) : n;
 }
 static double thisNumber(CallInfo& ci) {

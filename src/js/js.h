@@ -18,6 +18,7 @@ class Gc;
 struct Cell;
 struct JSString;
 struct Symbol;
+struct JSBigInt;
 struct JSObject;
 struct JSArray;
 struct JSFunction;
@@ -77,6 +78,8 @@ struct Value {
     Cell* asCell() const { return (Cell*)(uintptr_t)(b & PAYLOAD); }
     inline bool isString() const;
     inline bool isSymbol() const;
+    inline bool isBigInt() const;
+    inline JSBigInt* asBigInt() const;
     inline bool isObject() const;
     inline JSString* asString() const;
     inline JSObject* asObject() const;
@@ -85,10 +88,10 @@ struct Value {
 };
 
 // ---------------------------------------------------------------------------- heap cells
-enum class CK : uint8_t { String, Symbol, Object, Context, Code, Accessor };
+enum class CK : uint8_t { String, Symbol, Object, Context, Code, Accessor, BigInt };
 enum class Cls : uint8_t {
     Object, Array, Arguments, Function, Native, Bound, Error, Boolean, Number, String, SymbolObj, Date, RegExp,
-    Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host, ArrayBuffer, TypedArray, DataView, Proxy
+    Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host, ArrayBuffer, TypedArray, DataView, Proxy, BigInt
 };
 
 struct Cell {
@@ -120,6 +123,15 @@ struct Symbol : Cell {
     Symbol() { kind = CK::Symbol; }
     void trace(Gc&) override;
 };
+
+// A BigInt: sign and magnitude, least significant 32 bits first, no leading zero limbs. Zero has no limbs.
+struct JSBigInt : Cell {
+    bool neg = false;
+    std::vector<uint32_t> d;
+    JSBigInt() { kind = CK::BigInt; }
+};
+inline bool Value::isBigInt() const { return isCell() && asCell()->kind == CK::BigInt; }
+inline JSBigInt* Value::asBigInt() const { return (JSBigInt*)asCell(); }
 
 inline bool Value::isString() const { return isCell() && asCell()->kind == CK::String; }
 inline bool Value::isSymbol() const { return isCell() && asCell()->kind == CK::Symbol; }
@@ -340,6 +352,20 @@ Value typedGet(const JSTypedArray* t, uint32_t i);  // i must be below t->length
 void typedSet(Vm& vm, JSTypedArray* t, uint32_t i, Value v);
 JSTypedArray* newTypedArray(Vm& vm, TA type, uint32_t length);
 
+// bigint.cpp
+JSBigInt* bigFromI64(Vm& vm, int64_t v);
+JSBigInt* bigFromU64(Vm& vm, uint64_t v);
+JSBigInt* bigFromDouble(Vm& vm, double d);  // d must be a whole number
+JSBigInt* bigFromLiteral(Vm& vm, const std::u16string& text);
+JSBigInt* stringToBigInt(Vm& vm, const std::u16string& s);  // null when the text is not a whole number
+uint64_t bigToU64(const JSBigInt* b);  // the low 64 bits in two's complement
+double bigToDouble(const JSBigInt* b);
+std::u16string bigToString(const JSBigInt* b, int radix = 10);
+bool bigEquals(const JSBigInt* a, const JSBigInt* b);
+int bigCompare(const JSBigInt* a, const JSBigInt* b);
+int bigCompareDouble(const JSBigInt* b, double d);  // d must not be NaN
+size_t bigHash(const JSBigInt* b);
+
 struct ValueHash {
     size_t operator()(Value v) const;
 };
@@ -517,6 +543,10 @@ public:
     // ---- conversions
     bool toBool(Value v);
     double toNumber(Value v);
+    Value toNumeric(Value v);             // a Number or a BigInt (bigint.cpp)
+    JSBigInt* toBigInt(Value v);
+    Value arith(int op, Value x, Value y);  // binary numeric operators when the operands are not both numbers
+    Value unaryNumeric(int op, Value x);    // -, ~, ++ and -- likewise
     int32_t toInt32(Value v);
     uint32_t toUint32(Value v) { return (uint32_t)toInt32(v); }
     double toInteger(Value v);
@@ -626,7 +656,7 @@ public:
     // ---- well-known objects
     Atoms a;
     JSObject *objectProto = nullptr, *functionProto = nullptr, *arrayProto = nullptr, *stringProto = nullptr, *numberProto = nullptr,
-             *booleanProto = nullptr, *symbolProto = nullptr, *errorProto = nullptr, *iteratorProto = nullptr, *arrayIterProto = nullptr,
+             *booleanProto = nullptr, *symbolProto = nullptr, *bigintProto = nullptr, *errorProto = nullptr, *iteratorProto = nullptr, *arrayIterProto = nullptr,
              *mapProto = nullptr, *setProto = nullptr, *weakMapProto = nullptr, *weakSetProto = nullptr, *promiseProto = nullptr,
              *generatorProto = nullptr, *dateProto = nullptr, *regexpProto = nullptr, *mapIterProto = nullptr, *setIterProto = nullptr,
              *stringIterProto = nullptr, *globalLex = nullptr;

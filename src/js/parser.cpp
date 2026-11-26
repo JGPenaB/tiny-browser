@@ -11,7 +11,7 @@ namespace {
 struct Tok {
     enum T : uint8_t { End, Ident, Num, Str, Templ, Regex, Punct, Private } type = End;
     uint8_t p = P_None;
-    bool nl = false, tail = false, esc = false, oct = false;
+    bool nl = false, tail = false, esc = false, oct = false, big = false;
     uint32_t pos = 0, end = 0, line = 1;
     double num = 0;
     JSString* str = nullptr;
@@ -251,6 +251,8 @@ public:
     }
 
     bool sawOctal = false;  // the token being read used a legacy octal number or escape
+    bool sawBig = false;    // the number being read is a BigInt literal; its digits are in bigText
+    std::u16string bigText;
     Tok next() {
         Tok t;
         sawOctal = false;
@@ -270,8 +272,13 @@ public:
             t.str = vm.atom(id);
         } else if (isDigit(c) || (c == '.' && pos + 1 < n && isDigit(s[pos + 1]))) {
             t.type = Tok::Num;
+            sawBig = false;
             t.num = number();
             t.oct = sawOctal;
+            if (sawBig) {
+                t.big = true;
+                t.str = vm.atom(bigText);
+            }
         } else if (c == '"' || c == '\'') {
             ++pos;
             std::u16string v;
@@ -313,6 +320,7 @@ private:
         size_t n = s.size();
         char16_t c = s[pos];
         auto radix = [&](int r) {
+            bigText.assign(s, pos, 2);
             pos += 2;
             double v = 0;
             bool any = false;
@@ -328,11 +336,15 @@ private:
                 int h = hexVal(s[pos]);
                 if (h < 0 || h >= r) break;
                 v = v * r + h;
+                bigText += s[pos];
                 any = lastDigit = true;
                 ++pos;
             }
             if (!any) fail("Invalid number");
-            if (pos < n && s[pos] == 'n') ++pos;
+            if (pos < n && s[pos] == 'n') {
+                sawBig = true;
+                ++pos;
+            }
             if (pos < n && (idStart(s[pos]) || isDigit(s[pos]))) fail("Invalid number");
             return v;
         };
@@ -390,7 +402,13 @@ private:
             } else
                 pos = save;
         }
-        if (pos < n && s[pos] == 'n') ++pos;  // BigInt literals are read as numbers for now
+        if (pos < n && s[pos] == 'n') {
+            for (char ch : buf)
+                if (ch < '0' || ch > '9') fail("Invalid BigInt literal");
+            sawBig = true;
+            bigText.assign(buf.begin(), buf.end());
+            ++pos;
+        }
         if (pos < n && idStart(s[pos])) fail("Invalid number");
         return strtod(buf.c_str(), nullptr);
     }
@@ -2027,7 +2045,7 @@ private:
         }
         if (t.type == Tok::Num) {
             Node* n = mk(N::Str);
-            n->str = vm.atomOf(vm.numberToString(t.num));
+            n->str = t.big ? vm.atom(bigToString(bigFromLiteral(vm, t.str->s))) : vm.atomOf(vm.numberToString(t.num));
             advance();
             return n;
         }
@@ -2392,8 +2410,9 @@ private:
         switch (t.type) {
             case Tok::Num: {
                 if (t.oct && fn->strict) fail("Octal literals are not allowed in strict mode");
-                Node* n = mk(N::Num);
+                Node* n = mk(t.big ? N::BigInt : N::Num);
                 n->num = t.num;
+                n->str = t.big ? t.str : nullptr;
                 advance();
                 return n;
             }
