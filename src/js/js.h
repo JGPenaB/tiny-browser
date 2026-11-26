@@ -204,11 +204,30 @@ struct Handler {
     uint16_t isFinally = 0;  // cleanup code that reruns the exception: also taken when a generator is told to return
 };
 
+// What a direct eval call can see (ECMA-262 19.2.1.1 PerformEval): the scopes around the call that own a
+// runtime context, outermost first, with the variables each one holds.
+struct EvalScope {
+    struct Var {
+        JSString* name;
+        uint16_t slot;
+        uint8_t kind;  // VK_*
+        bool tdz;
+    };
+    std::vector<Var> vars;
+    bool isFunction = false, isArrow = false, isClass = false, isGlobal = false;
+    int thisVar = -1, argsVar = -1, newTargetVar = -1;  // positions in vars, for `this`, `arguments` and new.target
+};
+struct EvalSite {
+    std::vector<EvalScope> scopes;
+    bool strict = false;
+};
+
 struct FuncProto : Cell {
     std::vector<Ins> code;
     std::vector<Value> consts;
     std::vector<FuncProto*> inner;
     std::vector<Handler> handlers;
+    std::vector<EvalSite> evalSites;  // one per direct eval call in this function
     std::vector<uint32_t> lines;
     JSString* name = nullptr;
     uint16_t nparams = 0, length = 0;
@@ -561,6 +580,7 @@ public:
     JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr;
     JSObject *asyncIteratorProto = nullptr, *asyncGeneratorProto = nullptr, *asyncFromSyncProto = nullptr;
     JSObject* genReturnSignal = nullptr;  // thrown inside a generator to make it return through its finally blocks
+    Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
            *symToStringTag = nullptr, *symSpecies = nullptr;
@@ -634,6 +654,7 @@ struct ModuleInfo {
 FuncProto* compileScript(Vm& vm, std::shared_ptr<const std::u16string> src, const std::string& file, bool functionBody,
                          const std::u16string* params, ModuleInfo* module = nullptr);
 void moduleInit(Vm& vm, Value ns, Context* ctx);
+FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const EvalSite& site);
 
 std::u16string utf8to16(std::string_view s);
 std::string utf16to8(std::u16string_view s);

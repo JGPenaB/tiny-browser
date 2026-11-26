@@ -66,6 +66,12 @@ public:
         return end(fn);
     }
 
+    // Direct eval: the code runs as a function whose closure is the caller's context at the call site.
+    FuncProto* evalFunction() {
+        chain = ast.evalScopes;
+        return compileFunction(ast.evalFn);
+    }
+
 private:
     Vm& vm;
     Ast& ast;
@@ -238,7 +244,28 @@ private:
             } else
                 bindTarget(target, reg, true);
         }
+        if (info->isEvalBody)
+            for (Variable* v : ast.evalGlobals)
+                if (v->kind == VK_VAR) emitX(OP_DeclGlobalVar, 0, kstr(v->name));
         hoist(sc);
+        if (info->isEvalBody) {  // the value of eval(...) is the value of its last expression statement
+            int result = newReg();
+            emit(OP_LoadUndef, result);
+            for (Node* s : info->body) {
+                if (s->type == N::ExprStmt) {
+                    curLine = s->line;
+                    int mark = f->nextReg;
+                    expr(s->a, result);
+                    f->nextReg = mark;
+                } else
+                    stmt(s);
+            }
+            emit(OP_Return, result);
+            FuncProto* p = end(fn);
+            f = parent;
+            curLine = savedLine;
+            return p;
+        }
         if (info == ast.moduleFn) {
             // The module's scope now exists with its functions in place (ECMA-262 InitializeEnvironment). The
             // body waits here until the loader evaluates the module.
@@ -899,9 +926,38 @@ private:
         calleeInto(n->a, base);
         if (n->flags & NF_OPTIONAL) bail(base);
         if (args(n, base)) emit(OP_CallSpread, dst, base);
-        else emit(OP_Call, dst, base, (int)n->list.size());
+        else if (n->flags & NF_EVAL) {
+            // eval(...) by name: if the callee turns out to be the real eval, it runs with the scopes described here
+            emit(OP_DirectEval, dst, base, (int)n->list.size());
+            emitX(OP_Nop, 0, evalSite());
+        } else
+            emit(OP_Call, dst, base, (int)n->list.size());
         f->nextReg = mark;
         return dst;
+    }
+
+    // Records what a direct eval at this point can see: every scope with a context, outermost first.
+    uint32_t evalSite() {
+        EvalSite site;
+        site.strict = f->info->strict;
+        for (Scope* sc : chain) {
+            EvalScope es;
+            es.isFunction = sc->kind == Scope::Function;
+            es.isGlobal = sc->kind == Scope::Global;
+            es.isClass = sc->kind == Scope::Class;
+            es.isArrow = es.isFunction && sc->fn->isArrow;
+            for (Variable* v : sc->vars) {
+                if (v->isGlobal || !v->captured || v->kind == VK_IMPORT) continue;
+                bool owner = es.isFunction || es.isGlobal;
+                if (owner && v == sc->fn->thisVar) es.thisVar = (int)es.vars.size();
+                if (owner && v == sc->fn->argsVar) es.argsVar = (int)es.vars.size();
+                if (owner && v == sc->fn->newTargetVar) es.newTargetVar = (int)es.vars.size();
+                es.vars.push_back({v->name, (uint16_t)v->slot, v->kind, v->needsTdz});
+            }
+            site.scopes.push_back(std::move(es));
+        }
+        f->p->evalSites.push_back(std::move(site));
+        return (uint32_t)f->p->evalSites.size() - 1;
     }
 
     int update(Node* n, int dst, bool discard) {
@@ -1649,6 +1705,19 @@ private:
 };
 
 }  // namespace
+
+FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const EvalSite& site) {
+    Ast ast;
+    ast.src = std::move(src);
+    try {
+        parseEval(vm, ast, site);
+        Compiler c(vm, ast, "<eval>");
+        return c.evalFunction();
+    } catch (const SyntaxErr& e) {
+        std::string m = e.msg + " (<eval>:" + std::to_string(e.line) + ")";
+        vm.throwError(Err::SyntaxError, utf8to16(m));
+    }
+}
 
 FuncProto* compileScript(Vm& vm, std::shared_ptr<const std::u16string> src, const std::string& file, bool functionBody,
                          const std::u16string* params, ModuleInfo* module) {

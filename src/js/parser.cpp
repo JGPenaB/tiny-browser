@@ -458,6 +458,89 @@ public:
         close(g);
     }
 
+    // Direct eval (ECMA-262 19.2.1.1): the code is compiled as an arrow function placed at the call site, which
+    // gives it the caller's variables, `this` and `arguments`. The caller's scopes are rebuilt from the
+    // description recorded when the call was compiled.
+    void evalProgram(const EvalSite& site) {
+        FunctionInfo& top = ast.fns.emplace_back();
+        ast.top = &top;
+        fn = &top;
+        Scope* g = open(Scope::Global);
+        g->fn = &top;
+        top.scope = g;
+        evalVarScope = g;
+        for (const EvalScope& es : site.scopes) {
+            Scope* sc = g;
+            if (es.isFunction) {
+                FunctionInfo& f = ast.fns.emplace_back();
+                f.parent = fn;
+                f.isArrow = es.isArrow;
+                f.strict = site.strict;
+                fn = &f;
+                sc = open(Scope::Function);
+                f.scope = sc;
+                evalVarScope = sc;  // arrow functions keep their own `var`s too
+            } else if (!es.isGlobal)
+                sc = open(es.isClass ? Scope::Class : Scope::Block);
+            sc->hasCtx = true;
+            ast.evalScopes.push_back(sc);
+            for (size_t i = 0; i < es.vars.size(); ++i) {
+                Variable* v = newVar(sc, es.vars[i].name, es.vars[i].kind);
+                v->isGlobal = false;
+                v->captured = true;
+                v->slot = es.vars[i].slot;
+                v->needsTdz = es.vars[i].tdz;
+                v->declEnd = 0;
+                if ((int)i == es.thisVar) sc->fn->thisVar = v;
+                if ((int)i == es.argsVar) sc->fn->argsVar = v;
+                if ((int)i == es.newTargetVar) sc->fn->newTargetVar = v;
+            }
+        }
+        declaredNow.clear();
+        advance();
+        FunctionInfo* f = beginFn(nullptr, 0);
+        f->isArrow = true;
+        f->isEvalBody = true;
+        f->strict = site.strict;
+        evalScope = f->scope;
+        ast.evalFn = f;
+        directives(*f);
+        while (t.type != Tok::End) f->body.push_back(statement());
+        prevEnd = (uint32_t)s.size();
+        endFn(f);
+        while (scope) close(scope);  // names the eval code did not declare resolve against the caller's scopes
+    }
+
+private:
+    Scope* evalScope = nullptr;     // the eval code's own top-level scope
+    Scope* evalVarScope = nullptr;  // where the caller keeps its `var`s: the nearest function, or the global scope
+    // A call written as eval(...) may be a direct eval, so everything it could name has to stay in a context.
+    void markEval(Node* call) {
+        call->flags |= NF_EVAL;
+        for (Scope* sc = scope; sc; sc = sc->parent) sc->hasEval = true;
+        FunctionInfo* owner = fn;
+        while (owner->isArrow && owner->parent) owner = owner->parent;
+        auto force = [&](Variable* FunctionInfo::*slot, JSString* name) {
+            if (!(owner->*slot)) {
+                Variable& v = ast.vars.emplace_back();
+                v.name = name;
+                v.kind = VK_PSEUDO;
+                v.scope = owner->scope;
+                v.declEnd = 0;
+                owner->scope->vars.push_back(&v);
+                if (slot == &FunctionInfo::argsVar) owner->scope->map[name] = &v;
+                owner->*slot = &v;
+            }
+            (owner->*slot)->captured = true;
+        };
+        force(&FunctionInfo::thisVar, vm.atom("this"));
+        if (owner->scope->kind == Scope::Function && !owner->isArrow) {
+            if (!owner->scope->find(k.arguments_)) force(&FunctionInfo::argsVar, k.arguments_);
+            force(&FunctionInfo::newTargetVar, vm.atom("new.target"));
+        }
+    }
+public:
+
     // An ES module is compiled as `async function (namespace, meta) { ...module code... }`. Its top level is that
     // function's scope: exported variables are read out of the scope by the namespace object, and an imported
     // name is a variable that reads through the namespace of the module it comes from (a live binding).
@@ -745,6 +828,7 @@ private:
     FunctionInfo* fn = nullptr;
     std::unordered_map<JSString*, bool> reserved;
     std::vector<Variable*> declaredNow;
+    JSString* evalAtom = vm.atom("eval");
 
     [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, t.line}; }
     [[noreturn]] void unexpected() {
@@ -821,6 +905,20 @@ private:
     Variable* declare(JSString* name, uint8_t kind) {
         if (kind == VK_VAR || (kind == VK_FUNC && (scope->kind == Scope::Function || scope->kind == Scope::Global))) {
             Scope* fs = fnScope(scope);
+            if (evalScope && fs == evalScope && !fs->fn->strict) {
+                // sloppy direct eval: var and function declarations belong to the code that called eval
+                if (Variable* v = evalVarScope->find(name)) {
+                    if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)
+                        fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+                    return v;
+                }
+                if (evalVarScope->kind == Scope::Global) {
+                    Variable* v = newVar(evalVarScope, name, kind);
+                    v->declEnd = 0;
+                    ast.evalGlobals.push_back(v);
+                    return v;
+                }
+            }
             if (Variable* v = fs->find(name)) {
                 if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)
                     fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
@@ -842,6 +940,12 @@ private:
     void reference(Node* ident) { scope->refs.push_back({ident, false}); }
 
     void close(Scope* sc) {
+        if (sc->hasEval)
+            for (Variable* v : sc->vars) {
+                if (v->isGlobal) continue;
+                v->captured = true;
+                if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS) v->needsTdz = true;
+            }
         for (auto& [node, crossed] : sc->refs) {
             Variable* v = sc->find(node->str);
             if (!v && sc->kind == Scope::Function && node->str == k.arguments_ && !sc->fn->isArrow && !(node->flags & NF_PRIVATE)) {
@@ -964,6 +1068,7 @@ private:
                 return n;
             }
             if (w == k.return_) {
+                if (fn == ast.top || fn->isEvalBody || fn == ast.moduleFn) fail("Illegal return statement");
                 Node* n = mk(N::Return);
                 advance();
                 if (!isP(P_Semi) && !isP(P_RBrace) && t.type != Tok::End && !t.nl) n->a = expression();
@@ -1888,6 +1993,7 @@ private:
                     c->a = e;
                     c->flags = NF_OPTIONAL;
                     arguments(c);
+                    if (e->type == N::Ident && e->str == evalAtom) markEval(c);
                     e = c;
                 } else if (isP(P_LBrack)) {
                     Node* n = mk(N::Index);
@@ -1910,6 +2016,7 @@ private:
                 Node* c = mk(N::Call);
                 c->a = e;
                 arguments(c);
+                if (e->type == N::Ident && e->str == evalAtom) markEval(c);
                 e = c;
             } else if (t.type == Tok::Templ) {
                 Node* tt = mk(N::TaggedTemplate);
@@ -2198,6 +2305,11 @@ private:
 };
 
 }  // namespace
+
+void parseEval(Vm& vm, Ast& ast, const EvalSite& site) {
+    Parser p(vm, ast);
+    p.evalProgram(site);
+}
 
 void parseScript(Vm& vm, Ast& ast, bool asModule, const std::u16string*) {
     Parser p(vm, ast);

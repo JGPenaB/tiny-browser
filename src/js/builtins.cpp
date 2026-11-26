@@ -1599,6 +1599,7 @@ void Vm::setupGlobals() {
     defFn(global, "escape", globalEscape, 1);
     defFn(global, "unescape", globalUnescape, 1);
     defFn(global, "eval", globalEval, 1);
+    evalFn = get(V(global), "eval");
     defFn(global, "queueMicrotask", globalQueueMicrotask, 1);
 
     setupString(vm);

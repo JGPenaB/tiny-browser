@@ -74,6 +74,7 @@ enum Op : uint16_t {
     OP_DelegateCall,    // yield*: a = result of next/throw/return on the inner iterator at b (b+2 received, b+3 mode)
     OP_DelegateResult,  // yield*: read the result at b+4: c = done, a = final value when done
     OP_YieldDelegate,   // yield b from inside yield*; the resumption lands in a (value) and a+1 (mode)
+    OP_DirectEval,  // a = call b with c arguments; when b is the built-in eval, run the text in this scope (site: next word)
     OP_ClassInit,   // run the static block b with `this` set to the class a
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
     OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2

@@ -204,6 +204,9 @@ void Context::trace(Gc& g) {
     for (Value v : slots) g.mark(v);
 }
 void FuncProto::trace(Gc& g) {
+    for (auto& site : evalSites)
+        for (auto& sc : site.scopes)
+            for (auto& v : sc.vars) g.mark(v.name);
     for (Value v : consts) g.mark(v);
     for (FuncProto* p : inner) g.mark(p);
     g.mark(name);
@@ -445,6 +448,7 @@ void Vm::markRoots(Gc& g) {
     g.mark(arrayBufferProto);
     g.mark(dataViewProto);
     g.mark(importHook);
+    g.mark(evalFn);
     g.mark(asyncIteratorProto);
     g.mark(asyncGeneratorProto);
     g.mark(asyncFromSyncProto);
@@ -2818,6 +2822,24 @@ Value Vm::runFrames(size_t base) {
                             v = call(fv, R(i.a), nullptr, 0);
                         }
                         defineOwn(ctor, toKey(R(i.b)), v, PF_ALL);
+                        break;
+                    }
+                    case OP_DirectEval: {
+                        uint32_t site = (pc++)->bx;
+                        Value callee = R(i.b);
+                        fr->pc = pc;
+                        Value* argv = &R(i.b + 2);
+                        if (callee.isObject() && evalFn.isObject() && callee.asObject() == evalFn.asObject()) {
+                            if (i.c == 0 || !argv[0].isString()) {  // eval of a non-string returns it unchanged
+                                R(i.a) = i.c ? argv[0] : Value::undef();
+                                break;
+                            }
+                            auto src = std::make_shared<const std::u16string>(argv[0].asString()->s);
+                            FuncProto* code = compileEval(*this, src, fr->code->evalSites[site]);
+                            JSFunction* fn = makeClosure(code, fr->ctx, fr);
+                            R(i.a) = callFunction(fn, Value::undef(), nullptr, 0, Value::undef(), false);
+                        } else
+                            R(i.a) = call(callee, Value::undef(), argv, i.c);
                         break;
                     }
                     case OP_ClassInit: {

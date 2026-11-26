@@ -73,4 +73,20 @@ test("delete with optional chaining", function () {
   throws(() => delete o?.missing.x, TypeError);
   eq((function () { "use strict"; const f = Object.freeze({ k: 1 }); try { delete f?.k; return "no error"; } catch (e) { return e.constructor.name; } })(), "TypeError");
 });
+test("direct eval sees the caller's scope", function () {
+  var local = 5; let l2 = 6; const c = 7;
+  eq([eval("local + l2 + c"), eval("1; 2; var z = 3; 4"), eval(5), eval()], [18, 4, 5, undefined]);
+  eval("local = 9"); eq(local, 9); eval("var local = 10"); eq(local, 10);
+  eq((function (a, b) { return (() => eval("[this.v, a + b, arguments.length]"))(); }).call({ v: 1 }, 2, 3), [1, 5, 2]);
+  const e = eval; eq([typeof e("typeof local"), (0, eval)("typeof l2")], ["string", "undefined"]);
+  eq(eval("(function () { return c * 2; })")(), 14); eq(eval("function inner() { return 'fn'; } inner()"), "fn");
+  eval("let onlyInside = 1"); eq(typeof onlyInside, "undefined");
+  eq((function () { "use strict"; eval("var strictVar = 1"); return typeof strictVar; })(), "undefined");
+  const fs = []; for (let i = 0; i < 2; i++) fs.push(eval("() => i")); eq(fs.map(f => f()), [0, 1]);
+  eq((function () { var eval = s => "mine:" + s; return eval("1+1"); })(), "mine:1+1");
+  class A { #p = 5; m() { return eval("this.#p"); } } eq(new A().m(), 5);
+  throws(() => eval("return 1"), SyntaxError); throws(() => eval("var = ;"), SyntaxError); throws(() => eval("early; let early = 1"), ReferenceError);
+  try { throw 7; } catch (err) { eq(eval("err + 1"), 8); }
+  (0, eval)("var madeByIndirectEval = 1"); eq(typeof madeByIndirectEval, "number"); delete globalThis.madeByIndirectEval;
+});
 done();
