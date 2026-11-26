@@ -102,7 +102,7 @@ struct FunctionInfo {
     bool isArrow = false, isAsync = false, isGenerator = false, isMethod = false, isGetter = false, isSetter = false,
          isClassCtor = false, isDerived = false, strict = false, isDecl = false, exprBody = false, usesSuper = false,
          isFieldInit = false, isEvalBody = false, isStaticBlock = false, simpleParams = true, dupParams = false,
-         hasUseStrict = false, strictNames = false;
+         hasUseStrict = false, strictNames = false, namesValue = false;
     Variable *thisVar = nullptr, *argsVar = nullptr, *selfVar = nullptr, *newTargetVar = nullptr;
     Variable* evalVars = nullptr;  // sloppy function with a direct eval: holds the object of variables eval creates
     uint32_t srcStart = 0, srcEnd = 0, line = 0;

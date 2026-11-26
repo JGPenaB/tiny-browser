@@ -1890,6 +1890,14 @@ private:
         return n;
     }
 
+    // The name a method defined with a plain key gets: the key, with "get " or "set " in front for an accessor.
+    void nameMethod(Node* fnNode, JSString* key, uint8_t kind) {
+        if (!key) return;
+        fnNode->fn->name = kind == PK_GET ? vm.atom(u"get " + key->s) : kind == PK_SET ? vm.atom(u"set " + key->s) : key;
+    }
+    static bool anonymousFn(Node* value) {
+        return value && ((value->type == N::Function && !value->fn->name) || (value->type == N::Class && !value->str && !value->str2));
+    }
     void nameFn(Node* value, JSString* name) {
         if (!value || !name) return;
         if (value->type == N::Function && !value->fn->name) value->fn->name = name;
@@ -2005,6 +2013,7 @@ private:
             m->op = kind;
             m->b = functionRest((m->flags & NF_COMPUTED) ? nullptr : keyName, start, isAsync, gen, false, kind == PK_GET ? 2 : kind == PK_SET ? 3 : 1);
             m->b->fn->strict = true;
+            if (!(m->flags & NF_COMPUTED) || (m->flags & NF_PRIVATE)) nameMethod(m->b, m->a->str, kind);
             if (isCtor) {
                 m->b->fn->isClassCtor = true;
                 m->b->fn->isDerived = cls->a != nullptr;
@@ -2025,7 +2034,9 @@ private:
             Node* r = mk(N::Return);
             r->a = assign();
             f->body.push_back(r);
-            nameFn(r->a, keyName);
+            if (m->flags & NF_PRIVATE) nameFn(r->a, m->a->str);
+            else if (m->flags & NF_COMPUTED) f->namesValue = anonymousFn(r->a);
+            else nameFn(r->a, m->a->str);
         }
         endFn(f);
         Node* fnNode = mk(N::Function);
@@ -2574,6 +2585,7 @@ private:
                 if (isP(P_LParen)) {
                     p->op = kind == PK_INIT ? PK_METHOD : kind;
                     p->b = functionRest((p->flags & NF_COMPUTED) ? nullptr : name, start, isAsync, gen, false, kind == PK_GET ? 2 : kind == PK_SET ? 3 : 1);
+                    if (!(p->flags & NF_COMPUTED)) nameMethod(p->b, p->a->str, kind);
                 } else if (eatP(P_Colon)) {
                     p->op = PK_INIT;
                     p->b = assign();

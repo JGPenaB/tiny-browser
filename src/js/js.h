@@ -269,6 +269,7 @@ struct FuncProto : Cell {
     uint32_t nregs = 2;
     bool isArrow = false, isStrict = false, needsArgs = false, isGenerator = false, isAsync = false, isClassCtor = false,
          isDerived = false, isMethod = false;
+    bool namesValue = false;  // a field initialiser whose value is an anonymous function: it is named after the field's computed key
     std::shared_ptr<const std::u16string> source;
     uint32_t srcStart = 0, srcEnd = 0;
     std::string file;
@@ -671,6 +672,7 @@ public:
     Value promiseResolveWith(Value ctor, Value x);                // PromiseResolve (27.2.4.7.1)
     void promiseThenWith(JSPromise* p, Value onFul, Value onRej, Value resolve, Value reject);  // PerformPromiseThen
     Value speciesConstructor(JSObject* o, Value fallback);       // 7.3.22
+    void setFunctionName(Value fn, Value key, int prefix);       // 10.2.9, for a key only known at run time; prefix: 1 get, 2 set
     void enqueueJob(const Job& j) { jobQueue.push_back(j); }
     std::deque<Job> jobQueue;
     std::vector<Value> rejections;              // rejected promises nobody has handled yet

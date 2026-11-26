@@ -1587,6 +1587,22 @@ void Vm::addPrivateMember(JSObject* o, PropKey k, int kind, Value fn) {
 }
 
 // InitializeInstanceElements (7.3.34): private methods first, then the fields in order
+// SetFunctionName (10.2.9) at run time: only a function that has no name of its own yet takes one
+void Vm::setFunctionName(Value fn, Value key, int prefix) {
+    if (!fn.isObject() || fn.asObject()->cls != Cls::Function) return;
+    JSObject* f = fn.asObject();
+    PropKey nameKey = PropKey::of(a.name);
+    if (f->find(nameKey)) return;
+    std::u16string name;
+    if (key.isSymbol()) {
+        Symbol* s = (Symbol*)key.asCell();
+        if (s->desc) name = (s->isPrivate ? u"" : u"[") + s->desc->s + (s->isPrivate ? u"" : u"]");
+    } else
+        name = toStr16(key);
+    if (prefix) name = (prefix == 1 ? u"get " : u"set ") + name;
+    f->add(nameKey, strv(std::move(name)), PF_C);
+}
+
 void Vm::initFields(JSFunction* f, Value obj) {
     if (f->privates.isObject()) {
         JSArray* list = (JSArray*)f->privates.asObject();
@@ -1597,6 +1613,7 @@ void Vm::initFields(JSFunction* f, Value obj) {
     for (size_t i = 0; i + 1 < arr->elems.size(); i += 2) {
         Value fnv = arr->elems[i + 1];
         Value v = fnv.isUndef() ? Value::undef() : call(fnv, obj, nullptr, 0);
+        if (fnv.isObject() && ((JSFunction*)fnv.asObject())->code->namesValue) setFunctionName(v, arr->elems[i], 0);
         PropKey k = toKey(arr->elems[i]);
         if (k.isSymbol() && ((Symbol*)k.cell())->isPrivate) {  // PrivateFieldAdd: once per object, hidden, writable
             JSObject* o = obj.asObject();
@@ -2585,6 +2602,7 @@ Value Vm::runFrames(size_t base) {
                     }
                     case OP_DefField: defineOwn(R(i.a).asObject(), KEYK(i.b), R(i.c), PF_ALL); break;
                     case OP_DefElem: defineOwn(R(i.a).asObject(), toKey(R(i.b)), R(i.c), PF_ALL); break;
+                    case OP_SetFnName: setFunctionName(R(i.a), R(i.b), i.c); break;
                     case OP_DefMethod:
                     case OP_DefMethodE: {
                         JSObject* o = R(i.a).asObject();
@@ -3170,6 +3188,7 @@ Value Vm::runFrames(size_t base) {
                         if (fv.isObject()) {
                             if (fv.asObject()->cls == Cls::Function) ((JSFunction*)fv.asObject())->home = ctor;
                             v = call(fv, R(i.a), nullptr, 0);
+                            if (fv.asObject()->cls == Cls::Function && ((JSFunction*)fv.asObject())->code->namesValue) setFunctionName(v, R(i.b), 0);
                         }
                         defineOwn(ctor, toKey(R(i.b)), v, PF_ALL);
                         break;

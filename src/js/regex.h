@@ -28,6 +28,8 @@ bool regexValidate(const std::u16string& pattern, const std::u16string& flags, s
 
 // Unicode ID_Start and ID_Continue for code units outside ASCII (identifiers, ECMA-262 12.7).
 bool unicodeIdStart(uint32_t cp);
+bool unicodeCased(uint32_t cp);
+bool unicodeCaseIgnorable(uint32_t cp);
 bool unicodeIdContinue(uint32_t cp);
 
 }  // namespace tb::js

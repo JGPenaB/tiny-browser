@@ -661,7 +661,7 @@ install(Array, {
 // ---- strings: well-formed UTF-16 (22.1.3.10, 22.1.3.31), RegExp.escape (22.2.5.1), Error.isError
 function coerceString(self, name) {
   if (self === undefined || self === null) throw new $TypeError('String.prototype.' + name + ' called on null or undefined');
-  return '' + $String(self);
+  return natives.toString(self);
 }
 install($String.prototype, {
   isWellFormed() {

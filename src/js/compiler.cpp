@@ -164,6 +164,7 @@ private:
         fn.p->isClassCtor = info->isClassCtor;
         fn.p->isDerived = info->isDerived;
         fn.p->isMethod = info->isMethod;
+        fn.p->namesValue = info->namesValue;
         fn.p->source = ast.src;
         fn.p->srcStart = info->srcStart;
         fn.p->srcEnd = info->srcEnd;
@@ -1254,12 +1255,16 @@ private:
                     }
                 } else {
                     int kr = keyReg(p, p->a);
-                    emit(OP_DefElem, obj, kr, expr(p->b));
+                    bool anonymous = (p->b->type == N::Function && !p->b->fn->name) || (p->b->type == N::Class && !p->b->str && !p->b->str2);
+                    int v = expr(p->b);
+                    if (anonymous) emit(OP_SetFnName, v, kr, 0);
+                    emit(OP_DefElem, obj, kr, v);
                 }
             } else {
                 int kr = keyReg(p, p->a);
                 int fr = newReg();
                 closure(p->b->fn, fr);
+                if (p->flags & NF_COMPUTED) emit(OP_SetFnName, fr, kr, p->op == PK_GET ? 1 : p->op == PK_SET ? 2 : 0);
                 emit(p->op == PK_GET ? OP_DefGetterE : p->op == PK_SET ? OP_DefSetterE : OP_DefMethodE, obj, kr, fr);
             }
             f->nextReg = m2;
@@ -1362,6 +1367,7 @@ private:
             } else {
                 int fr = newReg();
                 closure(m->b->fn, fr);
+                if (m->flags & NF_COMPUTED) emit(OP_SetFnName, fr, kr, m->op == PK_GET ? 1 : m->op == PK_SET ? 2 : 0);
                 emit(m->op == PK_GET ? OP_DefGetter : m->op == PK_SET ? OP_DefSetter : OP_DefMethod, target, kr, fr);
             }
             f->nextReg = m2;

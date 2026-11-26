@@ -1040,5 +1040,13 @@ bool regexValidate(const std::u16string& pattern, const std::u16string& flags, s
 
 bool unicodeIdStart(uint32_t cp) { return hasProp(kUniIdStart, cp); }
 bool unicodeIdContinue(uint32_t cp) { return hasProp(kUniIdContinue, cp); }
+bool unicodeCased(uint32_t cp) {
+    static const int prop = findProp("Cased");
+    return hasProp(prop, cp);
+}
+bool unicodeCaseIgnorable(uint32_t cp) {
+    static const int prop = findProp("Case_Ignorable");
+    return hasProp(prop, cp);
+}
 
 }  // namespace tb::js

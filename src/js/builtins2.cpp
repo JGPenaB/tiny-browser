@@ -8,6 +8,8 @@
 #include <cstdlib>
 
 #include "builtins.h"
+#include "regex.h"
+#include "special_casing.h"
 
 namespace tb::js {
 
@@ -74,7 +76,12 @@ JSFN(stringCtor) {
     else s = vm.toString(v);
     return ci.isConstruct() ? wrapPrimitive(ci, V(s), Cls::String, vm.stringProto) : V(s);
 }
-JSFN(strToString) { return V(thisStr(ci, "toString")); }
+JSFN(strToString) {  // toString and valueOf: only for strings and String objects (ThisStringValue)
+    Value t = ci.thisv;
+    if (t.isString()) return t;
+    if (t.isObject() && t.asObject()->cls == Cls::String) return ((JSPrimitive*)t.asObject())->prim;
+    ci.vm.throwError(Err::TypeError, "String.prototype.%s requires that 'this' be a String", ci.callee->name ? utf16to8(ci.callee->name->s).c_str() : "toString");
+}
 JSFN(strCharAt) {
     JSString* s = thisStr(ci, "charAt");
     double i = ci.vm.toInteger(ci.arg(0));
@@ -194,8 +201,66 @@ static Value caseMap(CallInfo& ci, bool upper, const char* name) {
     }
     DWORD flag = upper ? LCMAP_UPPERCASE : LCMAP_LOWERCASE;
     int n = LCMapStringEx(LOCALE_NAME_INVARIANT, flag, (LPCWSTR)in.data(), (int)in.size(), nullptr, 0, nullptr, nullptr, 0);
-    std::u16string out(n > 0 ? n : 0, u'\0');
-    if (n > 0) LCMapStringEx(LOCALE_NAME_INVARIANT, flag, (LPCWSTR)in.data(), (int)in.size(), (LPWSTR)out.data(), n, nullptr, nullptr, 0);
+    std::u16string mapped(n > 0 ? n : 0, u'\0');
+    if (n > 0) LCMapStringEx(LOCALE_NAME_INVARIANT, flag, (LPCWSTR)in.data(), (int)in.size(), (LPWSTR)mapped.data(), n, nullptr, nullptr, 0);
+    if (mapped.size() != in.size()) return ci.vm.strv(std::move(mapped));
+    // The system maps unit for unit; SpecialCasing.txt adds the mappings that change the length and the final sigma.
+    std::u16string out;
+    out.reserve(in.size());
+    auto codePointAt = [&](size_t i, size_t& next) -> uint32_t {
+        char16_t c = in[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < in.size() && in[i + 1] >= 0xDC00 && in[i + 1] <= 0xDFFF) {
+            next = i + 2;
+            return 0x10000 + ((uint32_t)(c - 0xD800) << 10) + (in[i + 1] - 0xDC00);
+        }
+        next = i + 1;
+        return c;
+    };
+    auto codePointBefore = [&](size_t i, size_t& prev) -> uint32_t {  // the character that ends just before i
+        char16_t c = in[i - 1];
+        if (c >= 0xDC00 && c <= 0xDFFF && i >= 2 && in[i - 2] >= 0xD800 && in[i - 2] <= 0xDBFF) {
+            prev = i - 2;
+            return 0x10000 + ((uint32_t)(in[i - 2] - 0xD800) << 10) + (c - 0xDC00);
+        }
+        prev = i - 1;
+        return c;
+    };
+    for (size_t i = 0; i < in.size(); ++i) {
+        char16_t c = in[i];
+        if (upper) {
+            const UpperSpecial* lo = kUpperSpecial;
+            const UpperSpecial* hi = kUpperSpecial + sizeof(kUpperSpecial) / sizeof(kUpperSpecial[0]);
+            const UpperSpecial* hit = std::lower_bound(lo, hi, c, [](const UpperSpecial& e, char16_t v) { return e.from < v; });
+            if (hit != hi && hit->from == c) {
+                for (int k = 0; k < 4 && hit->to[k]; ++k) out += hit->to[k];
+                continue;
+            }
+        } else if (c == 0x0130) {
+            out += u"i\u0307";
+            continue;
+        } else if (c == 0x03A3) {  // Final_Sigma: after a cased letter, and not before one; case-ignorable characters do not count
+            bool before = false, after = false;
+            for (size_t j = i; j > 0;) {
+                size_t prev;
+                uint32_t cp = codePointBefore(j, prev);
+                j = prev;
+                if (unicodeCaseIgnorable(cp)) continue;
+                before = unicodeCased(cp);
+                break;
+            }
+            for (size_t j = i + 1; j < in.size();) {
+                size_t next;
+                uint32_t cp = codePointAt(j, next);
+                j = next;
+                if (unicodeCaseIgnorable(cp)) continue;
+                after = unicodeCased(cp);
+                break;
+            }
+            out += before && !after ? u'\u03C2' : u'\u03C3';
+            continue;
+        }
+        out += mapped[i];
+    }
     return ci.vm.strv(std::move(out));
 }
 JSFN(strToLowerCase) { return caseMap(ci, false, "toLowerCase"); }
@@ -501,13 +566,15 @@ void setupString(Vm& vm) {
         {"includes", strIncludes, 1}, {"startsWith", strStartsWith, 1}, {"endsWith", strEndsWith, 1}, {"slice", strSlice, 2},
         {"substring", strSubstring, 2}, {"substr", strSubstr, 2}, {"toLowerCase", strToLowerCase, 0},
         {"toUpperCase", strToUpperCase, 0}, {"toLocaleLowerCase", strToLowerCase, 0}, {"toLocaleUpperCase", strToUpperCase, 0},
-        {"trim", strTrim, 0}, {"trimStart", strTrimStart, 0}, {"trimEnd", strTrimEnd, 0}, {"trimLeft", strTrimStart, 0},
-        {"trimRight", strTrimEnd, 0}, {"padStart", strPadStart, 1}, {"padEnd", strPadEnd, 1}, {"repeat", strRepeat, 1},
+        {"trim", strTrim, 0}, {"trimStart", strTrimStart, 0}, {"trimEnd", strTrimEnd, 0}, {"padStart", strPadStart, 1}, {"padEnd", strPadEnd, 1}, {"repeat", strRepeat, 1},
         {"concat", strConcat, 1}, {"split", strSplit, 2}, {"replace", strReplace, 2}, {"replaceAll", strReplaceAll, 2},
         {"match", strMatch, 1}, {"matchAll", strMatchAll, 1}, {"search", strSearch, 1}, {"localeCompare", strLocaleCompare, 1},
         {"normalize", strNormalize, 0},
     };
     for (auto& f : fns) vm.defFn(vm.stringProto, f.name, f.fn, f.len);
+    // B.2.2.15 and B.2.2.16: trimLeft and trimRight are the very functions trimStart and trimEnd
+    vm.def(vm.stringProto, "trimLeft", vm.get(V(vm.stringProto), "trimStart"));
+    vm.def(vm.stringProto, "trimRight", vm.get(V(vm.stringProto), "trimEnd"));
     defSym(vm, vm.stringProto, vm.symIterator, strIterator, "[Symbol.iterator]", 0);
 }
 
