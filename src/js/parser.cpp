@@ -1069,7 +1069,8 @@ private:
             if (scope->catchBody && scope->parent && scope->parent->find(name)) fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
         }
         Variable* v = newVar(scope, name, kind);
-        if (kind == VK_PARAM || kind == VK_FUNC || kind == VK_CATCH || kind == VK_FUNCNAME) v->declEnd = 0;
+        // a parameter may not be read before it is bound: its default value can name only earlier parameters
+        if (kind == VK_FUNC || kind == VK_CATCH || kind == VK_FUNCNAME) v->declEnd = 0;
         return v;
     }
     void reference(Node* ident) { scope->refs.push_back({ident, false}); }
@@ -1093,6 +1094,7 @@ private:
                 if (crossed) v->captured = true;
                 if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)
                     if (crossed || node->pos < v->declEnd) v->needsTdz = true;
+                if (v->kind == VK_PARAM && v->declEnd != 0xFFFFFFFF && node->pos < v->declEnd) v->needsTdz = true;
             } else if (sc->parent) {
                 sc->parent->refs.push_back({node, crossed || sc->kind == Scope::Function});
             } else if (node->flags & NF_PRIVATE) {

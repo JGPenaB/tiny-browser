@@ -223,9 +223,32 @@ private:
         enterScope(sc, true);
         if (info == ast.moduleFn) emit(OP_ModuleInit, 2);  // r2 is the namespace argument
         prologuePseudo(info);
+        // Parameters read by a default value before they are bound (ECMA-262 10.2.11): the arguments are set
+        // aside and those parameters start out uninitialised.
+        bool paramTdz = false;
+        for (Variable* v : sc->vars)
+            if (v->kind == VK_PARAM && v->needsTdz) paramTdz = true;
+        std::vector<int> argReg(np);
+        for (int i = 0; i < np; ++i) argReg[i] = 2 + i;
+        if (paramTdz) {
+            for (int i = 0; i < np; ++i) {
+                argReg[i] = newReg();
+                emit(OP_Move, argReg[i], 2 + i);
+            }
+            for (Variable* v : sc->vars) {
+                if (v->kind != VK_PARAM || !v->needsTdz) continue;
+                if (v->captured) {
+                    int t = newReg();
+                    emit(OP_LoadEmpty, t);
+                    emit(OP_SetCtx, t, 0, v->slot);
+                    f->nextReg--;
+                } else
+                    emit(OP_LoadEmpty, v->reg);
+            }
+        }
         for (int i = 0; i < np; ++i) {
             Node* p = info->params[i];
-            int reg = 2 + i;
+            int reg = argReg[i];
             if (p->type == N::Rest) {
                 emit(OP_CreateRest, reg, i);
                 f->p->needsArgs = true;
@@ -240,9 +263,16 @@ private:
                 target = p->a;
             }
             if (target->type == N::Ident) {
-                if (target->var->captured) storeVar(target->var, target->str, reg, true);
+                if (target->var->captured || paramTdz) storeVar(target->var, target->str, reg, true);
             } else
                 bindTarget(target, reg, true);
+        }
+        if (info->isGenerator) {
+            // The arguments are bound when the generator is called; the body waits for the first next().
+            int t = newReg();
+            emit(OP_LoadUndef, t);
+            emit(OP_Yield, t, t);
+            f->nextReg--;
         }
         if (info->isEvalBody)
             for (Variable* v : ast.evalGlobals)

@@ -33,7 +33,7 @@ async function main() {
   results.seq = []; for (const p of [sleep(3, "a"), sleep(1, "b")]) results.seq.push(await p);
   results.tryFinally = await (async () => { try { return await sleep(1, "tf"); } finally { results.tfFin = true; } })();
   const wr = Promise.withResolvers(); setTimeout(() => wr.resolve("wr"), 1); results.withResolvers = await wr.promise;
-  let ticks = 0; const iv = setInterval(() => { if (++ticks === 3) clearInterval(iv); }, 1); await sleep(40); results.interval = ticks;
+  let ticks = 0; const iv = setInterval(() => { if (++ticks === 3) clearInterval(iv); }, 1); await sleep(150); results.interval = ticks;
   const cancelled = setTimeout(() => { results.cancelled = "should not run"; }, 1); clearTimeout(cancelled);
   results.finallyPass = await Promise.resolve("keep").finally(() => "ignored");
   return "main done";

@@ -1440,6 +1440,7 @@ void Vm::setupGlobals() {
     for (auto& f : arrayFns) defFn(arrayProto, f.name, f.fn, f.len);
     JSNative* values = defFn(arrayProto, "values", arrayValues, 0);
     defineOwn(arrayProto, PropKey::of(symIterator), V(values), PF_W | PF_C);
+    arrayValuesFn = V(values);
 
     // Errors
     JSNative* errorC = nullptr;

@@ -1538,6 +1538,7 @@ void Vm::setupCollections() {
         return p;
     };
     arrayIterProto = iterProto("Array Iterator");
+    arrayIterNextFn = get(V(arrayIterProto), a.next);
     mapIterProto = iterProto("Map Iterator");
     setIterProto = iterProto("Set Iterator");
     stringIterProto = iterProto("String Iterator");

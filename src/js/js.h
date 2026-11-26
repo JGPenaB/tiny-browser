@@ -379,6 +379,7 @@ struct JSGenerator : JSObject {  // also backs async functions
     bool isAsyncGen = false;        // an async generator: requests queue up and are answered with promises
     bool suspendedAtAwait = false;  // the body stopped at an await, not a yield
     bool delegating = false;        // stopped inside yield*: the next resumption goes to the inner iterator
+    bool atStart = false;           // parameters are bound, the body has not begun
     uint8_t agState = 0;            // [[AsyncGeneratorState]]: start, yield, executing, draining-queue, completed
     Value newTarget, promise;
     Value retVal;  // the value of a return() that is unwinding the body
@@ -602,6 +603,7 @@ public:
     JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr;
     JSObject *asyncIteratorProto = nullptr, *asyncGeneratorProto = nullptr, *asyncFromSyncProto = nullptr;
     JSObject* genReturnSignal = nullptr;  // thrown inside a generator to make it return through its finally blocks
+    Value arrayValuesFn, arrayIterNextFn;  // the original Array.prototype.values and array iterator next
     Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
@@ -615,6 +617,7 @@ public:
     Value callFunction(JSFunction* f, Value thisv, const Value* args, int argc, Value newTarget, bool construct);
     Value resumeGenerator(JSGenerator* g, Value sent, int mode, bool& done);  // mode 0 next, 1 throw, 2 return
     Value startGenerator(JSFunction* f, Value thisv, const Value* args, int argc);
+    bool plainArrayIteration();
     Value startAsyncGenerator(JSFunction* f, Value thisv, const Value* args, int argc);
     Value getAsyncIterator(Value src, Value& next);
     Value delegateCall(Value* regs);

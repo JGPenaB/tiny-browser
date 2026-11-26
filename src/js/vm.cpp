@@ -449,6 +449,8 @@ void Vm::markRoots(Gc& g) {
     g.mark(dataViewProto);
     g.mark(importHook);
     g.mark(evalFn);
+    g.mark(arrayValuesFn);
+    g.mark(arrayIterNextFn);
     g.mark(asyncIteratorProto);
     g.mark(asyncGeneratorProto);
     g.mark(asyncFromSyncProto);
@@ -1602,6 +1604,15 @@ bool Vm::iterate(Value iterable, const std::function<bool(Value)>& each) {
 }
 
 // ---------------------------------------------------------------------------- generators and async functions
+// True while Array.prototype[Symbol.iterator] and the array iterator's next() are the built-in ones, so that
+// iterating a plain array can skip the protocol without anyone being able to tell.
+bool Vm::plainArrayIteration() {
+    Prop* it = arrayProto->find(PropKey::of(symIterator));
+    if (!it || (it->flags & PF_ACC) || !it->val.isObject() || !arrayValuesFn.isObject() || it->val.asObject() != arrayValuesFn.asObject()) return false;
+    Prop* next = arrayIterProto->find(PropKey::of(a.next));
+    return next && !(next->flags & PF_ACC) && next->val.isObject() && arrayIterNextFn.isObject() && next->val.asObject() == arrayIterNextFn.asObject();
+}
+
 Value Vm::startGenerator(JSFunction* f, Value thisv, const Value* args, int argc) {
     FuncProto* p = f->code;
     JSGenerator* g = alloc<JSGenerator>();
@@ -1622,6 +1633,13 @@ Value Vm::startGenerator(JSFunction* f, Value thisv, const Value* args, int argc
     }
     g->pc = p->code.data();
     g->ctx = f->ctx;
+    if (p->isGenerator) {  // bind the parameters now: an error in a default value belongs to the call
+        Value keep = Value::cell(g);
+        bool done = false;
+        resumeGenerator(g, Value::undef(), 0, done);
+        g->atStart = !done;
+        return keep;
+    }
     return Value::cell(g);
 }
 
@@ -1632,7 +1650,8 @@ Value Vm::resumeGenerator(JSGenerator* g, Value sent, int mode, bool& done) {
         if (mode == 1) throwValue(sent);
         return mode == 2 ? sent : Value::undef();
     }
-    if (mode != 0 && g->state == 0) {  // not started: there is nothing to unwind
+    if (mode != 0 && (g->state == 0 || g->atStart)) {  // not started: there is nothing to unwind
+        g->atStart = false;
         g->state = 3;
         g->regs.clear();
         if (mode == 1) throwValue(sent);
@@ -1647,7 +1666,9 @@ Value Vm::resumeGenerator(JSGenerator* g, Value sent, int mode, bool& done) {
     frames.push_back(Frame{g->fn, p, g->pc, base, g->ctx, nullptr, g->newTarget, g->args, g, g->ctxDepth, true, false});
     stackTop = base + p->nregs;
     g->state = 2;
-    if (wasYield) {
+    if (wasYield && g->atStart) {
+        g->atStart = false;  // the first next(): its argument has nowhere to go
+    } else if (wasYield) {
         if (g->delegating) {  // inside yield*: the inner iterator is given the value, the throw or the return
             g->delegating = false;
             base[g->resumeReg] = sent;
@@ -2634,7 +2655,7 @@ Value Vm::runFrames(size_t base) {
                     case OP_GetIter: {
                         Value src = R(i.b);
                         fr->pc = pc;
-                        if (src.isObject() && (src.asObject()->cls == Cls::Array || src.asObject()->cls == Cls::Arguments)) {
+                        if (src.isObject() && src.asObject()->cls == Cls::Array && src.asObject()->proto == arrayProto && plainArrayIteration()) {
                             R(i.a) = Value::cell(newIter(Cls::ArrayIter, src, 0));
                             R(i.a + 1) = Value::empty();
                         } else if (src.isString()) {
