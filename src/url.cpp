@@ -79,6 +79,26 @@ Url Url::parse(std::string_view s) {
         for (char ch : u.port)
             if (!isdigit_(ch)) return Url{};
     }
+    else if (!rest.empty() && rest[0] == '/') {
+        u.generic = true;
+        if (rest.substr(0, 2) == "//") {
+            rest.remove_prefix(2);
+            size_t e = rest.find_first_of("/?");
+            std::string_view auth = rest.substr(0, e);
+            rest = e == npos ? std::string_view{} : rest.substr(e);
+            size_t at = auth.rfind('@');
+            if (at != npos) auth = auth.substr(at + 1);
+            size_t colon = auth.empty() || auth[0] == '[' ? npos : auth.rfind(':');
+            if (colon != npos) {
+                u.port = std::string(auth.substr(colon + 1));
+                auth = auth.substr(0, colon);
+                for (char ch : u.port)
+                    if (!isdigit_(ch)) return Url{};
+            }
+            u.host = std::string(auth);
+            u.hasAuthority = true;
+        }
+    }
     size_t q = rest.find('?');
     if (q != npos) {
         u.query = std::string(rest.substr(q + 1));
@@ -87,6 +107,7 @@ Url Url::parse(std::string_view s) {
     }
     u.path = std::string(rest);
     if (u.hierarchical) u.path = remove_dots(u.path.empty() ? "/" : u.path);
+    else if (u.generic && !u.path.empty()) u.path = remove_dots(u.path);
     if ((u.scheme == "http" || u.scheme == "https") && u.host.empty()) return Url{};
     u.valid = true;
     return u;
@@ -94,7 +115,7 @@ Url Url::parse(std::string_view s) {
 
 std::string Url::str(bool withFragment) const {
     std::string r = scheme + ":";
-    if (hierarchical) {
+    if (hierarchical || hasAuthority) {
         r += "//";
         r += hostport();
     }
@@ -128,13 +149,13 @@ std::string resolve_url(const std::string& base, std::string_view rel) {
         }
     }
     Url b = Url::parse(base);
-    if (!b.valid || !b.hierarchical) return std::string(r);
+    if (!b.valid || !(b.hierarchical || b.generic)) return std::string(r);
     if (r.empty()) {
         b.hasFragment = false;
         return b.str();
     }
     if (r.substr(0, 2) == "//") return Url::parse(b.scheme + ":" + std::string(r)).str();
-    std::string prefix = b.scheme + "://" + b.hostport();
+    std::string prefix = b.scheme + ":" + (b.hierarchical || b.hasAuthority ? "//" + b.hostport() : std::string());
     std::string out;
     if (r[0] == '#') {
         b.fragment = std::string(r.substr(1));

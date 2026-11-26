@@ -2260,7 +2260,11 @@ JSFN(netAbortFn) {
 JSFN(urlParse) {
     Vm& vm = ci.vm;
     std::string text = std::string(trim(str8(vm, ci.arg(0))));
-    if (!ci.arg(1).isUndef()) text = resolve_url(str8(vm, ci.arg(1)), text);
+    if (!ci.arg(1).isUndef()) {
+        std::string base = str8(vm, ci.arg(1));
+        if (!Url::parse(base).valid) return Value::null();  // a base that is not a URL fails even for an absolute input
+        text = resolve_url(base, text);
+    }
     Url u = Url::parse(text);
     if (!u.valid) return Value::null();
     JSArray* a = vm.newArray();

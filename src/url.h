@@ -6,6 +6,9 @@ namespace tb {
 struct Url {
     std::string scheme, host, port, path, query, fragment;
     bool valid = false, hierarchical = false, hasQuery = false, hasFragment = false;
+    // Schemes the browser has no special rules for (x:/path, app://host/path): `generic` when the path is a list
+    // of segments that relative references resolve against, `hasAuthority` when a host follows the scheme.
+    bool generic = false, hasAuthority = false;
 
     static Url parse(std::string_view s);
     std::string hostport() const { return port.empty() ? host : host + ":" + port; }

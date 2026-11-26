@@ -34,6 +34,9 @@
   u.searchParams.set('z', 'a&b'); u.hash = '';
   eq('URL updates', u.href, 'https://example.com:8443/a/b?x=1&y=two+words&z=a%26b');
   eq('relative URL', new URL('../up?q', 'http://h/a/b/c').href, 'http://h/a/up?q');
+  eq('URLs with other schemes', [new URL('/static/a.svg', 'x:/').href, new URL('b/../c?q#f', 'app://host/dir/file').href, new URL('x://h').pathname, new URL('y', 'x:/a/b').origin,
+    new URL('mailto:someone@example.com').pathname, new URL('data:text/plain,hi').protocol, new URL('//other/p', 'app://host/dir/').host], ['x:/static/a.svg', 'app://host/dir/c?q#f', '', 'null', 'someone@example.com', 'data:', 'other']);
+  threw = false; try { new URL('relative', 'mailto:a@b'); } catch (e) { threw = e instanceof TypeError; } eq('relative URL against an opaque base throws', threw, true);
   var threw = false; try { new URL('not a url'); } catch (e) { threw = e instanceof TypeError; } eq('invalid URL throws', threw, true);
   var sp = new URLSearchParams('a=1&a=2&b=%C3%A9'); sp.append('c', 'x y');
   eq('URLSearchParams', [sp.getAll('a'), sp.get('b'), sp.toString(), [...sp].length], [['1', '2'], '\u00e9', 'a=1&a=2&b=%C3%A9&c=x+y', 4]);
