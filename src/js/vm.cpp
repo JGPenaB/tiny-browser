@@ -340,6 +340,7 @@ Vm::Vm() {
     setupCollections();
     setupTypedArrays(*this);
     setupAsyncIteration(*this);
+    setupProxy(*this);
     setupModules(*this);
     setupJsBuiltins(*this);
 }
@@ -763,7 +764,7 @@ JSString* Vm::typeOf(Value v) {
 bool Vm::isCallable(Value v) {
     if (!v.isObject()) return false;
     Cls c = v.asObject()->cls;
-    return c == Cls::Function || c == Cls::Native || c == Cls::Bound;
+    return c == Cls::Function || c == Cls::Native || c == Cls::Bound || (c == Cls::Proxy && ((JSProxy*)v.asObject())->callable);
 }
 bool Vm::isConstructor(Value v) {
     if (!v.isObject()) return false;
@@ -774,6 +775,7 @@ bool Vm::isConstructor(Value v) {
     }
     if (o->cls == Cls::Native) return (o->oflags & OF_CTOR) != 0;
     if (o->cls == Cls::Bound) return isConstructor(((JSBound*)o)->target);
+    if (o->cls == Cls::Proxy) return ((JSProxy*)o)->constructible;
     return false;
 }
 
@@ -966,6 +968,19 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
 }
 
 bool Vm::getOwn(JSObject* o, PropKey k, Prop& out) {
+    if (o->cls == Cls::Proxy) {
+        PropDesc d;
+        if (!proxyGetOwn(o, k, d)) return false;
+        uint8_t flags = (uint8_t)((d.enumerable ? PF_E : 0) | (d.configurable ? PF_C : 0));
+        if (d.hasGet || d.hasSet) {
+            Accessor* acc = alloc<Accessor>();
+            acc->get = d.get;
+            acc->set = d.set;
+            out = {k, Value::cell(acc), (uint8_t)(flags | PF_ACC)};
+        } else
+            out = {k, d.value, (uint8_t)(flags | (d.writable ? PF_W : 0))};
+        return true;
+    }
     if (Prop* p = o->find(k)) {
         out = *p;
         return true;
@@ -975,6 +990,7 @@ bool Vm::getOwn(JSObject* o, PropKey k, Prop& out) {
 
 Value Vm::getObj(JSObject* o, PropKey k, Value receiver) {
     for (JSObject* cur = o; cur; cur = cur->proto) {
+        if (cur->cls == Cls::Proxy) return proxyGet(cur, k, receiver);
         if (k.isIndex() && cur->cls == Cls::TypedArray) {
             JSTypedArray* t = (JSTypedArray*)cur;
             return k.asIndex() < t->length ? typedGet(t, k.asIndex()) : Value::undef();
@@ -1034,6 +1050,7 @@ Value Vm::get(Value target, PropKey k) {
 }
 
 bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
+    if (o->cls == Cls::Proxy) return proxySet(o, k, v, receiver);
     if (o->cls == Cls::Host && !k.isSymbol()) {
         JSHost* h = (JSHost*)o;
         if (h->hooks && h->hooks->set && h->hooks->set(*this, o, k, v)) return true;
@@ -1071,6 +1088,7 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
     // OrdinarySet (ECMA-262 10.1.9.2): find the property on the object or its prototypes
     bool ownMissing = false;
     for (JSObject* cur = o; cur; cur = cur->proto) {
+        if (cur->cls == Cls::Proxy) return proxySet(cur, k, v, receiver);
         Prop* p = cur->find(k);
         if (!p && cur->cls != Cls::Object && cur->cls != Cls::Host) {
             // properties that are not stored: array elements, a function's name and length, a string's characters.
@@ -1114,7 +1132,7 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
             return defineOwnDesc(r, k, d);
         }
     }
-    if ((r->cls == Cls::Array || r->cls == Cls::Arguments || r->cls == Cls::TypedArray) && k.isIndex()) return defineElement(r, k, v, PF_ALL);
+    if (((r->cls == Cls::Array || r->cls == Cls::Arguments || r->cls == Cls::TypedArray) && k.isIndex()) || r->cls == Cls::Proxy) return defineElement(r, k, v, PF_ALL);
     if (r->oflags & (OF_NOEXT | OF_FROZEN)) return false;
     if (k.isIndex() && (r == arrayProto || r == objectProto)) protoIndexProps = true;
     r->add(k, v, (r->cls == Cls::Function && !k.isIndex() && k.cell() == a.prototype) ? PF_W : PF_ALL);
@@ -1155,6 +1173,7 @@ void Vm::failedSet(Value target, PropKey k) {
 }
 
 bool Vm::defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags) {
+    if (o->cls == Cls::Proxy) return defineElement(o, k, v, flags);
     if (o->cls == Cls::TypedArray && k.isIndex()) {
         typedSet(*this, (JSTypedArray*)o, k.asIndex(), v);
         return true;
@@ -1182,7 +1201,7 @@ bool Vm::defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags) {
 }
 
 void Vm::defineAccessor(JSObject* o, PropKey k, Value getter, Value setter, uint8_t flags) {
-    if (k.isIndex() && (o->cls == Cls::Array || o->cls == Cls::Arguments || o == arrayProto || o == objectProto)) {
+    if ((k.isIndex() && (o->cls == Cls::Array || o->cls == Cls::Arguments || o == arrayProto || o == objectProto)) || o->cls == Cls::Proxy) {
         PropDesc d;
         if (!getter.isEmpty()) d.hasGet = true, d.get = getter;
         if (!setter.isEmpty()) d.hasSet = true, d.set = setter;
@@ -1217,11 +1236,14 @@ bool Vm::hasOwn(JSObject* o, PropKey k) {
     return getOwn(o, k, tmp);
 }
 bool Vm::has(JSObject* o, PropKey k) {
-    for (JSObject* cur = o; cur; cur = cur->proto)
+    for (JSObject* cur = o; cur; cur = cur->proto) {
+        if (cur->cls == Cls::Proxy) return proxyHas(cur, k);
         if (hasOwn(cur, k)) return true;
+    }
     return false;
 }
 bool Vm::del(JSObject* o, PropKey k) {
+    if (o->cls == Cls::Proxy) return proxyDelete(o, k);
     if (o->cls == Cls::Host && !k.isSymbol()) {
         JSHost* h = (JSHost*)o;
         if (h->hooks && h->hooks->del && h->hooks->del(*this, o, k)) return true;
@@ -1256,6 +1278,19 @@ bool Vm::del(JSObject* o, PropKey k) {
 }
 
 void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symbols, bool onlyEnumerable) {
+    if (o->cls == Cls::Proxy) {
+        std::vector<PropKey> all;
+        proxyOwnKeys(o, all);
+        for (PropKey k : all) {
+            if (k.isSymbol() ? !symbols : !strings) continue;
+            if (onlyEnumerable) {
+                Prop p{};
+                if (!getOwn(o, k, p) || !(p.flags & PF_E)) continue;
+            }
+            out.push_back(k);
+        }
+        return;
+    }
     if (strings && o->cls == Cls::Host) {
         JSHost* h = (JSHost*)o;
         if (h->hooks && h->hooks->keys) h->hooks->keys(*this, o, out);
@@ -1306,7 +1341,7 @@ bool Vm::instanceOf(Value v, Value ctor) {
     if (!v.isObject()) return false;
     Value pv = get(ctor, a.prototype);
     if (!pv.isObject()) return false;
-    for (JSObject* p = v.asObject()->proto; p; p = p->proto)
+    for (JSObject* p = getProto(v.asObject()); p; p = getProto(p))
         if (p == pv.asObject()) return true;
     return false;
 }
@@ -1418,6 +1453,12 @@ Value Vm::call(Value fn, Value thisv, const Value* args, int argc) {
                 RootScope rs(*this, all);
                 return call(b->target, b->boundThis, all.data(), (int)all.size());
             }
+            case Cls::Proxy:
+                if (((JSProxy*)o)->callable) {
+                    DepthGuard guard(*this);
+                    return proxyCall(o, thisv, args, argc);
+                }
+                break;
             default: break;
         }
     }
@@ -1452,6 +1493,10 @@ Value Vm::construct(Value fn, const Value* args, int argc, Value newTarget) {
         JSNative* n = (JSNative*)o;
         CallInfo ci{*this, Value::undef(), (Value*)args, argc, newTarget, n};
         return n->fn(ci);
+    }
+    if (o->cls == Cls::Proxy) {
+        DepthGuard guard(*this);
+        return proxyConstruct(o, args, argc, newTarget);
     }
     JSBound* b = (JSBound*)o;
     std::vector<Value> all(b->args);
@@ -2803,7 +2848,7 @@ Value Vm::runFrames(size_t base) {
                             JSObject* o = toObject(src);
                             it->target = Value::cell(o);
                             std::vector<PropKey> keys, seen;
-                            for (JSObject* cur = o; cur; cur = cur->proto) {
+                            for (JSObject* cur = o; cur; cur = getProto(cur)) {
                                 keys.clear();
                                 ownKeys(cur, keys, true, false, false);
                                 for (PropKey k : keys) {

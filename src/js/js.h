@@ -88,7 +88,7 @@ struct Value {
 enum class CK : uint8_t { String, Symbol, Object, Context, Code, Accessor };
 enum class Cls : uint8_t {
     Object, Array, Arguments, Function, Native, Bound, Error, Boolean, Number, String, SymbolObj, Date, RegExp,
-    Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host, ArrayBuffer, TypedArray, DataView
+    Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host, ArrayBuffer, TypedArray, DataView, Proxy
 };
 
 struct Cell {
@@ -181,6 +181,13 @@ inline uint32_t arrayLen(const JSArray* a) {
     uint32_t n = (uint32_t)a->elems.size();
     return (a->oflags & OF_SLOWIDX) && a->slowLen > n ? a->slowLen : n;
 }
+
+struct JSProxy : JSObject {  // target and handler become null when the proxy is revoked
+    Value target = Value::null(), handler = Value::null();
+    bool callable = false, constructible = false;
+    JSProxy() { cls = Cls::Proxy; }
+    void trace(Gc&) override;
+};
 
 // A Property Descriptor (ECMA-262 6.2.6): fields that are absent stay unset.
 struct PropDesc {
@@ -526,7 +533,13 @@ public:
     bool sameValue(Value a, Value b);
     bool isCallable(Value v);
     bool isConstructor(Value v);
-    bool isArray(Value v) { return v.isObject() && v.asObject()->cls == Cls::Array; }
+    bool isArray(Value v) {  // IsArray (7.2.2): a proxy for an array counts
+        while (v.isObject() && v.asObject()->cls == Cls::Proxy) {
+            if (!((JSProxy*)v.asObject())->handler.isObject()) throwError(Err::TypeError, "Cannot perform 'IsArray' on a proxy that has been revoked");
+            v = ((JSProxy*)v.asObject())->target;
+        }
+        return v.isObject() && v.asObject()->cls == Cls::Array;
+    }
     Value add(Value a, Value b);
     Value concat(Value a, Value b);  // both must be strings
     int compare(Value a, Value b);  // -1 less, 0 equal, 1 greater, 2 unordered (NaN)
@@ -540,6 +553,21 @@ public:
     [[noreturn]] void failedSet(Value target, PropKey k);  // the TypeError strict code gets for that
     bool setObj(JSObject* o, PropKey k, Value v, Value receiver);
     bool getOwnDesc(JSObject* o, PropKey k, PropDesc& d);
+    bool compatibleDesc(bool extensible, const PropDesc& d, bool exists, const PropDesc& current);
+    // the object's internal methods that are not plain property access (10.1.1 to 10.1.4), proxy-aware
+    JSObject* getProto(JSObject* o);
+    bool setProtoOf(JSObject* o, JSObject* proto);
+    bool isExtensible(JSObject* o);
+    bool preventExtensions(JSObject* o);
+    bool proxyGetOwn(JSObject* o, PropKey k, PropDesc& out);
+    bool proxyDefineOwn(JSObject* o, PropKey k, const PropDesc& d);
+    bool proxyHas(JSObject* o, PropKey k);
+    Value proxyGet(JSObject* o, PropKey k, Value receiver);
+    bool proxySet(JSObject* o, PropKey k, Value v, Value receiver);
+    bool proxyDelete(JSObject* o, PropKey k);
+    void proxyOwnKeys(JSObject* o, std::vector<PropKey>& out);
+    Value proxyCall(JSObject* o, Value thisv, const Value* args, int argc);
+    Value proxyConstruct(JSObject* o, const Value* args, int argc, Value newTarget);
     bool defineOwnDesc(JSObject* o, PropKey k, const PropDesc& d);
     bool defineElement(JSObject* o, PropKey k, Value v, uint8_t flags);
     void toPropDesc(Value v, PropDesc& d);

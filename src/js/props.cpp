@@ -193,7 +193,29 @@ bool arraySetLength(Vm& vm, JSArray* arr, const PropDesc& d) {
 
 }  // namespace
 
+// The validation half of ValidateAndApplyPropertyDescriptor: may `d` be applied where `current` is (or nothing)
+bool Vm::compatibleDesc(bool extensible, const PropDesc& d, bool exists, const PropDesc& cur) {
+    if (!exists) return extensible;
+    bool dAcc = d.hasGet || d.hasSet, dData = d.hasValue || d.hasWritable;
+    bool curAcc = cur.hasGet || cur.hasSet;
+    if (!dAcc && !dData && !d.hasEnumerable && !d.hasConfigurable) return true;
+    if (!cur.configurable) {
+        if (d.hasConfigurable && d.configurable) return false;
+        if (d.hasEnumerable && d.enumerable != cur.enumerable) return false;
+        if ((dAcc || dData) && dAcc != curAcc) return false;
+        if (curAcc) {
+            if (d.hasGet && !sameValue(d.get, cur.get)) return false;
+            if (d.hasSet && !sameValue(d.set, cur.set)) return false;
+        } else if (!cur.writable) {
+            if (d.hasWritable && d.writable) return false;
+            if (d.hasValue && !sameValue(d.value, cur.value)) return false;
+        }
+    }
+    return true;
+}
+
 bool Vm::getOwnDesc(JSObject* o, PropKey k, PropDesc& d) {
+    if (o->cls == Cls::Proxy) return proxyGetOwn(o, k, d);
     Prop p{};
     if (!getOwn(o, k, p)) return false;
     d = PropDesc{};
@@ -215,6 +237,7 @@ bool Vm::getOwnDesc(JSObject* o, PropKey k, PropDesc& d) {
 
 // [[DefineOwnProperty]]: false when the object refuses the change.
 bool Vm::defineOwnDesc(JSObject* o, PropKey k, const PropDesc& d) {
+    if (o->cls == Cls::Proxy) return proxyDefineOwn(o, k, d);
     if (o->cls == Cls::Array) {
         JSArray* arr = (JSArray*)o;
         if (!k.isIndex() && !k.isSymbol() && k.cell() == a.length) return arraySetLength(*this, arr, d);
@@ -273,6 +296,22 @@ Value Vm::fromPropDesc(const PropDesc& d) {
 
 // SetIntegrityLevel (7.3.15): sealed, or frozen as well
 bool Vm::setIntegrity(JSObject* o, bool frozen) {
+    if (o->cls == Cls::Proxy) {  // the general algorithm, through the traps
+        if (!preventExtensions(o)) return false;
+        std::vector<PropKey> keys;
+        proxyOwnKeys(o, keys);
+        for (PropKey k : keys) {
+            PropDesc d;
+            d.hasConfigurable = true;
+            if (frozen) {
+                PropDesc cur;
+                if (!getOwnDesc(o, k, cur)) continue;
+                if (cur.hasValue || cur.hasWritable) d.hasWritable = true;
+            }
+            if (!defineOwnDesc(o, k, d)) throwError(Err::TypeError, u"Cannot redefine property: " + toStr16(keyToValue(k)));
+        }
+        return true;
+    }
     if (frozen && o->cls == Cls::TypedArray && ((JSTypedArray*)o)->length > 0) throwError(Err::TypeError, "Cannot freeze array buffer views with elements");
     o->oflags |= OF_NOEXT;
     if (isArrayLike(o)) o->oflags |= frozen ? (OF_FROZEN | OF_SEALED) : OF_SEALED;  // covers the dense elements
@@ -298,7 +337,7 @@ bool Vm::setIntegrity(JSObject* o, bool frozen) {
 
 // TestIntegrityLevel (7.3.16)
 bool Vm::testIntegrity(JSObject* o, bool frozen) {
-    if (!(o->oflags & OF_NOEXT)) return false;
+    if (isExtensible(o)) return false;
     std::vector<PropKey> keys;
     ownKeys(o, keys, true, true, false);
     for (PropKey k : keys) {

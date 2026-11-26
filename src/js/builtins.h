@@ -27,6 +27,7 @@ void setupDate(Vm& vm);
 void setupRegExp(Vm& vm);
 void setupTypedArrays(Vm& vm);
 void setupModules(Vm& vm);
+void setupProxy(Vm& vm);
 void setupJsBuiltins(Vm& vm);
 // File name of the built-ins written in JavaScript: their functions print as native code.
 constexpr const char* kBuiltinFile = "<builtins>";

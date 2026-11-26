@@ -141,17 +141,16 @@ JSFN(objectCreate) {
 JSFN(objectGetPrototypeOf) {
     Vm& vm = ci.vm;
     if (ci.arg(0).isNullish()) vm.throwError(Err::TypeError, "Cannot convert undefined or null to object");
-    JSObject* p = vm.protoOf(ci.arg(0));
+    JSObject* p = ci.arg(0).isObject() ? vm.getProto(ci.arg(0).asObject()) : vm.protoOf(ci.arg(0));
     return p ? V(p) : Value::null();
 }
 static void setProto(Vm& vm, Value o, Value p) {
     if (!p.isObject() && !p.isNull()) vm.throwError(Err::TypeError, "Object prototype may only be an Object or null");
     if (!o.isObject()) return;
-    for (JSObject* q = p.isObject() ? p.asObject() : nullptr; q; q = q->proto)
-        if (q == o.asObject()) vm.throwError(Err::TypeError, "Cyclic __proto__ value");
-    o.asObject()->proto = p.isObject() ? p.asObject() : nullptr;
+    if (!vm.setProtoOf(o.asObject(), p.isObject() ? p.asObject() : nullptr)) vm.throwError(Err::TypeError, "Cannot set the prototype of this object");
 }
 JSFN(objectSetPrototypeOf) {
+    if (ci.arg(0).isNullish()) ci.vm.throwError(Err::TypeError, "Object.setPrototypeOf called on null or undefined");
     setProto(ci.vm, ci.arg(0), ci.arg(1));
     return ci.arg(0);
 }
@@ -189,14 +188,14 @@ static Value restrict(CallInfo& ci, int level) {  // 0 preventExtensions, 1 seal
     Value v = ci.arg(0);
     if (!v.isObject()) return v;
     JSObject* o = v.asObject();
-    if (level == 0) o->oflags |= OF_NOEXT;
-    else ci.vm.setIntegrity(o, level == 2);
+    bool ok = level == 0 ? ci.vm.preventExtensions(o) : ci.vm.setIntegrity(o, level == 2);
+    if (!ok) ci.vm.throwError(Err::TypeError, "Cannot prevent extensions of this object");
     return v;
 }
 JSFN(objectPreventExtensions) { return restrict(ci, 0); }
 JSFN(objectSeal) { return restrict(ci, 1); }
 JSFN(objectFreeze) { return restrict(ci, 2); }
-JSFN(objectIsExtensible) { return Value::boolean(ci.arg(0).isObject() && !(ci.arg(0).asObject()->oflags & OF_NOEXT)); }
+JSFN(objectIsExtensible) { return Value::boolean(ci.arg(0).isObject() && ci.vm.isExtensible(ci.arg(0).asObject())); }
 JSFN(objectIsFrozen) { return Value::boolean(!ci.arg(0).isObject() || ci.vm.testIntegrity(ci.arg(0).asObject(), true)); }
 JSFN(objectIsSealed) { return Value::boolean(!ci.arg(0).isObject() || ci.vm.testIntegrity(ci.arg(0).asObject(), false)); }
 JSFN(objectFromEntries) {
@@ -218,7 +217,7 @@ JSFN(objProtoHasOwnProperty) {
 JSFN(objProtoIsPrototypeOf) {
     Value v = ci.arg(0);
     if (!v.isObject() || !ci.thisv.isObject()) return Value::boolean(false);
-    for (JSObject* p = v.asObject()->proto; p; p = p->proto)
+    for (JSObject* p = ci.vm.getProto(v.asObject()); p; p = ci.vm.getProto(p))
         if (p == ci.thisv.asObject()) return Value::boolean(true);
     return Value::boolean(false);
 }
@@ -255,7 +254,7 @@ JSFN(objProtoToLocaleString) { return ci.vm.invoke(ci.thisv, "toString"); }
 JSFN(objProtoValueOf) { return V(ci.vm.toObject(ci.thisv)); }
 JSFN(objProtoGetProto) {
     if (ci.thisv.isNullish()) ci.vm.throwError(Err::TypeError, "Cannot convert undefined or null to object");
-    JSObject* p = ci.vm.protoOf(ci.thisv);
+    JSObject* p = ci.thisv.isObject() ? ci.vm.getProto(ci.thisv.asObject()) : ci.vm.protoOf(ci.thisv);
     return p ? V(p) : Value::null();
 }
 JSFN(objProtoSetProto) {
@@ -1188,21 +1187,20 @@ JSFN(reflectOwnKeys) {
     return keyList(ci.vm, ci.arg(0), true, true);
 }
 JSFN(reflectGetPrototypeOf) {
-    JSObject* p = needObject(ci.vm, ci.arg(0), "Reflect.getPrototypeOf")->proto;
+    JSObject* p = ci.vm.getProto(needObject(ci.vm, ci.arg(0), "Reflect.getPrototypeOf"));
     return p ? V(p) : Value::null();
 }
 JSFN(reflectSetPrototypeOf) {
-    needObject(ci.vm, ci.arg(0), "Reflect.setPrototypeOf");
-    setProto(ci.vm, ci.arg(0), ci.arg(1));
-    return Value::boolean(true);
+    JSObject* o = needObject(ci.vm, ci.arg(0), "Reflect.setPrototypeOf");
+    if (!ci.arg(1).isObject() && !ci.arg(1).isNull()) ci.vm.throwError(Err::TypeError, "Object prototype may only be an Object or null");
+    return Value::boolean(ci.vm.setProtoOf(o, ci.arg(1).isObject() ? ci.arg(1).asObject() : nullptr));
 }
 JSFN(reflectGetOwnPropertyDescriptor) {
     return descriptorOf(ci.vm, needObject(ci.vm, ci.arg(0), "Reflect.getOwnPropertyDescriptor"), ci.vm.toKey(ci.arg(1)));
 }
-JSFN(reflectIsExtensible) { return Value::boolean(!(needObject(ci.vm, ci.arg(0), "Reflect.isExtensible")->oflags & OF_NOEXT)); }
+JSFN(reflectIsExtensible) { return Value::boolean(ci.vm.isExtensible(needObject(ci.vm, ci.arg(0), "Reflect.isExtensible"))); }
 JSFN(reflectPreventExtensions) {
-    needObject(ci.vm, ci.arg(0), "Reflect.preventExtensions")->oflags |= OF_NOEXT;
-    return Value::boolean(true);
+    return Value::boolean(ci.vm.preventExtensions(needObject(ci.vm, ci.arg(0), "Reflect.preventExtensions")));
 }
 
 // ---------------------------------------------------------------------------- console
