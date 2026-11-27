@@ -7,7 +7,7 @@ JavaScript engine. The only dependencies are Windows system APIs:
 |---|---|
 | HTML | Own tokenizer + tree builder (`src/html.cpp`) |
 | CSS | Own parser, selectors, specificity, cascade, inheritance, media queries, custom properties (`src/css.cpp`) |
-| Layout | Own block / inline / table / flexbox layout, inline-block, absolute / relative / fixed positioning, overflow clipping (`src/layout_engine.cpp`) |
+| Layout | Own block / inline / table / flexbox layout, inline-block, absolute / relative / fixed positioning, overflow clipping, boxes that scroll (`src/layout_engine.cpp`) |
 | Rendering | Display list painted on the GPU with Direct2D 1.1 on a Direct3D 11 flip-model swap chain (`src/gpu.cpp`, `src/render.cpp`) |
 | Text | DirectWrite (shaping, font fallback, color emoji) with word-width caches (`src/text.cpp`) |
 | Networking | WinHTTP transport (HTTPS via SChannel, HTTP/2, gzip/deflate/brotli); our own redirect handling, GET/POST, Referer/Origin policy; plus `file:` and `data:` (`src/http.cpp`) |
@@ -15,7 +15,7 @@ JavaScript engine. The only dependencies are Windows system APIs:
 | Forms | Text fields, passwords, checkboxes, radios, dropdowns, textareas, buttons; GET and POST submission; `<meta refresh>` (`src/shell.cpp`) |
 | Images | Windows Imaging Component: PNG, JPEG, GIF, BMP, ICO, WebP (`src/http.cpp`) |
 | Passwords | Save prompt after sign-in, autofill on return; DPAPI-encrypted vault that is only decrypted while in use (`src/storage.cpp`, `src/shell.cpp`) |
-| JavaScript | Own engine in `src/js/`: parser, bytecode compiler, register VM, mark-and-sweep garbage collector, standard library, and a backtracking regular expression engine. Not connected to pages yet (milestone 4) |
+| JavaScript | Own engine in `src/js/`: parser, bytecode compiler, register VM, mark-and-sweep garbage collector, standard library, and a backtracking regular expression engine. Pages reach it through the DOM bindings in `src/script.cpp` |
 | Shell | Tabs, address bar, history, bookmarks bar, devtools with Elements, Network, Performance and a JavaScript Console (`src/shell.cpp`) |
 
 Release build is ~1.5 MB with no DLLs beyond what ships with Windows.
@@ -36,13 +36,20 @@ tinybrowser.exe [url]
 tinybrowser.exe --selftest [results.txt]          # engine unit tests, exit code 0 = pass
 tinybrowser.exe --js <script.js> [output.txt]     # run a script in the JavaScript engine (console, timers, agents)
 tinybrowser.exe --screenshot <url> <out.png> [--size 1280x860] [--devtools elements|network|perf|console] [--scroll N]
-                [--do "click:x,y;type:text;key:enter;key:tab;key:save"] [--vault test-vault.dat]
+                [--do "click:x,y;wheel:x,y,delta;type:text;key:enter;key:tab;key:save"] [--vault test-vault.dat]
 ```
 
 `--screenshot` renders headlessly (same drawing code, offscreen target) and writes `<out.png>.txt` with timings and the
-position of every form control. `--do` scripts clicks and typing so forms can be tested without a window; cookies stay in
-memory in this mode. `python tests/server.py` runs a local test site on http://localhost:8765 with GET/POST forms, cookies,
-a redirect and layout samples.
+position of every form control. `--do` scripts clicks, the mouse wheel (`delta` as the mouse reports it: -120 is one
+notch down) and typing, so pages can be tested without a window; cookies stay in memory in this mode.
+`python tests/server.py` runs a local test site on http://localhost:8765 with GET/POST forms, cookies, a redirect and
+layout samples.
+
+The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
+`dom.html`, `components.html` and `layout.html` are opened as `file:` URLs; `net.html`, `modules.html` and `late.html`
+come from the test server (`http://localhost:8765/pages/...`). `layout.html` also wants
+`--do "wheel:300,300,-120;click:300,300;click:300,122"`: the wheel must log `WHEEL 100 of 100`, the first click
+`CLICK wheel 6`, and the second click, which lands on a row that was scrolled out of view, nothing.
 
 `python tests/run_js_tests.py` runs the JavaScript suites in `tests/js/` (language, built-ins, async, garbage collection,
 regular expressions). In the browser, F12 then Console gives a prompt for the same engine; a script that runs longer than
@@ -73,7 +80,13 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    `tests/pages/components.html`, whose expectations were compared with a reference browser. Style sheets and pictures
    that a script adds after the page was loaded are fetched in the background and applied when they arrive, with `load`
    and `error` events (`tests/pages/late.html`, served by `tests/server.py`), and IntersectionObserver and
-   ResizeObserver report for real. Still open: incremental restyle/relayout, per-site controls (JavaScript, cookies, images), the security baseline
+   ResizeObserver report for real. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
+   `getComputedStyle` returns resolved values (CSSOM), `max-height` and `min-height` bound a box as CSS 2 section 10.7
+   says, column flex containers shrink their items and flex containers size themselves to their items (Flexbox 9.7
+   and 9.9), and `overflow: auto` boxes scroll with the wheel and `scrollTop` (`tests/pages/layout.html`). Known gaps
+   there: margins, paddings and insets read as computed values (a percentage or `auto` is not turned into px), boxes
+   scroll only vertically and their thumb cannot be dragged, a fixed box moves with the page when the page scrolls,
+   and the page itself fires no `scroll` event. Still open: incremental restyle/relayout, per-site controls (JavaScript, cookies, images), the security baseline
    (script time and memory limits, certificate and mixed-content warnings, per-site exceptions), content blocker
    (EasyList-format lists), tab sleeping.
 5. **Milestone 5 - performance, security, graphics:** GPU layer compositor, off-thread layout, HTTP cache, process isolation,

@@ -123,6 +123,11 @@ struct Box {
     float staticX = 0, staticY = 0;
     bool fixed = false, oof = false, replaced = false;
     bool fillItem = false;  // (Anon inside a replaced wrapper) the image/control takes the wrapper's width
+    float naturalH = 0;  // the height of the content, whatever height the box itself was given
+    // A box that clips its content: what it holds in the display list and the place kept for its scroll thumb.
+    // placeScrolled() uses these once every box has its final size.
+    Mark scroll0, scroll1;
+    size_t thumbIdx = SIZE_MAX;
 };
 
 struct Ctx {
@@ -132,6 +137,7 @@ struct Ctx {
     Box* root = nullptr;
     int layer = 0;
     float maxBottom = 0;
+    std::vector<Box*> scrollers;  // the boxes that clip their content
 };
 
 Mark mark(Ctx& c) { return {c.out.items.size(), c.out.links.size(), c.boxed.size(), c.out.widgets.size()}; }
@@ -392,6 +398,7 @@ void setBox(Ctx& c, Node* n, float x, float y, float w, float h) {
     n->by = y;
     n->bw = w;
     n->bh = h;
+    n->layer = (int16_t)std::clamp(c.layer, -30000, 30000);
 }
 
 void unionBox(Ctx& c, Node* n, float x, float y, float w, float h) {
@@ -794,10 +801,12 @@ void intrinsic(Ctx& c, Box& b) {
                 if (k->kind == BK::Marker) continue;
                 intrinsic(c, *k);
                 float kmn = k->minW, kmx = k->maxW;
+                // What an item adds to the container's width (Flexbox 9.9.3) is its own intrinsic width, capped by
+                // its flex base size when it cannot grow and floored by it when it cannot shrink.
                 if (!colDir && k->kind != BK::Anon && k->st && k->st->flexBasis.u == Len::Px) {
-                    float w = k->st->flexBasis.v + (k->st->borderBox ? 0 : hpbOf(*k)) + k->m[1] + k->m[3];
-                    kmx = w;
-                    kmn = std::min(kmn, w);
+                    float base = k->st->flexBasis.v + (k->st->borderBox ? 0 : hpbOf(*k)) + k->m[1] + k->m[3];
+                    if (k->st->flexGrow <= 0) kmn = std::min(kmn, base), kmx = std::min(kmx, base);
+                    if (k->st->flexShrink <= 0) kmn = std::max(kmn, base), kmx = std::max(kmx, base);
                 }
                 if (colDir) {
                     mn = std::max(mn, kmn);
@@ -1194,7 +1203,9 @@ bool hasGrowKid(const Box& b) {
 }
 
 // Flexbox: single- and multi-line rows, columns, grow/shrink, gaps, justify-content, align-items, auto margins.
-float layoutFlex(Ctx& c, Box& b, float ix, float iy, float W, float availH) {
+// `lower` is the main (column) or cross (row) size the container must reach and `upper` the one it may not pass; -1
+// stands for none. They are equal when the container's height is definite.
+float layoutFlex(Ctx& c, Box& b, float ix, float iy, float W, float lower, float upper) {
     const Style& s = *b.st;
     bool col = s.flexDir >= 2, rev = s.flexDir == 1 || s.flexDir == 3;
     std::vector<Box*> items;
@@ -1210,7 +1221,7 @@ float layoutFlex(Ctx& c, Box& b, float ix, float iy, float W, float availH) {
     }
     if (rev) std::reverse(items.begin(), items.end());
     size_t n = items.size();
-    if (!n) return std::max(0.f, availH);
+    if (!n) return std::max(0.f, lower);
     auto fst = [](Box* it) -> const Style* { return it->kind == BK::Anon ? nullptr : it->st; };
     auto alignOf = [&](Box* it) -> uint8_t {
         const Style* st = fst(it);
@@ -1263,8 +1274,8 @@ float layoutFlex(Ctx& c, Box& b, float ix, float iy, float W, float availH) {
             if (b.firstBaseline < 0 && it->firstBaseline >= 0) b.firstBaseline = it->firstBaseline;
         }
         float total = y - gap - iy;
-        if (availH > total + 0.5f) {
-            float freeY = availH - total, sumGrow = 0;
+        if (lower > total + 0.5f) {
+            float freeY = lower - total, sumGrow = 0;
             for (auto& e : ci)
                 if (const Style* st = fst(e.b)) sumGrow += st->flexGrow;
             if (sumGrow > 0) {
@@ -1294,7 +1305,52 @@ float layoutFlex(Ctx& c, Box& b, float ix, float iy, float W, float availH) {
                     off += between;
                 }
             }
-            total = availH;
+            total = lower;
+        } else if (upper >= 0 && total > upper + 0.5f) {
+            // Negative free space (Flexbox 9.7): items give up height in proportion to flex-shrink times their inner
+            // size, each down to its minimum: its min-height, or when that is automatic (4.5) nothing for a scroll
+            // container and the height of its content for any other item.
+            struct Part {
+                float size, target, floor, weight;
+                bool frozen;
+            };
+            std::vector<Part> parts;
+            for (auto& e : ci) {
+                const Style* st = fst(e.b);
+                float size = e.b->h, edge = vpbOf(*e.b);
+                float floor = e.b->naturalH + edge;
+                if (st && st->minHeight.u == Len::Px) floor = st->minHeight.v + (st->borderBox ? 0 : edge);
+                else if (st && st->overflow != 0) floor = edge;
+                float weight = (st ? st->flexShrink : 1) * std::max(0.f, size - edge);
+                parts.push_back({size, size, std::min(floor, size), weight, weight <= 0});
+            }
+            float over = total - upper;
+            for (size_t round = 0; round <= parts.size(); ++round) {
+                float given = 0, weights = 0;
+                for (auto& part : parts) {
+                    if (part.frozen) given += part.size - part.target;
+                    else weights += part.weight;
+                }
+                if (weights <= 0 || over - given <= 0) break;
+                bool violated = false;
+                for (auto& part : parts) {
+                    if (part.frozen) continue;
+                    part.target = part.size - (over - given) * part.weight / weights;
+                    if (part.target < part.floor) {
+                        part.target = part.floor;
+                        part.frozen = violated = true;
+                    }
+                }
+                if (!violated) break;
+            }
+            float cut = 0;
+            for (size_t i = 0; i < ci.size(); ++i) {
+                moveBox(c, *ci[i].b, ci[i].m0, ci[i].m1, 0, -cut);
+                if (parts[i].target >= parts[i].size) continue;
+                setHeight(c, *ci[i].b, parts[i].target);
+                cut += parts[i].size - parts[i].target;
+            }
+            total -= cut;
         }
         return std::max(0.f, total);
     }
@@ -1444,7 +1500,7 @@ float layoutFlex(Ctx& c, Box& b, float ix, float iy, float W, float availH) {
                 x += f.hm + it->w + gap + between;
                 if (f.mrA) x += perAuto;
             }
-            if (single && availH > lineH) lineH = availH;
+            if (single && lower > lineH) lineH = lower;
         };
         pass();
         // A stretched column container that distributes space needs a second pass with its final height.
@@ -1625,19 +1681,26 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         DItem d;
         d.k = DItem::K::PushClip;
         b.clipIdx = push(c, std::move(d));
+        b.scroll0 = mark(c);
     }
 
     float defH = -1;
     if (b.forcedH >= 0) defH = std::max(0.f, b.forcedH - vpb);
     else if (own && !b.replaced && s->height.u == Len::Px) defH = std::max(0.f, s->height.v - (s->borderBox ? vpb : 0));
     float minH = (own && !b.replaced && s->minHeight.u == Len::Px) ? std::max(0.f, s->minHeight.v - (s->borderBox ? vpb : 0)) : 0;
+    float maxH = (own && !b.replaced && s->maxHeight.u == Len::Px) ? std::max(0.f, s->maxHeight.v - (s->borderBox ? vpb : 0)) : -1;
+    // CSS 2 section 10.7: a height is held to max-height first and then raised to min-height.
+    auto bounded = [&](float h) { return std::max(maxH >= 0 ? std::min(h, maxH) : h, minH); };
 
     float contentH = 0;
     switch (b.kind) {
         case BK::Marker: break;
         case BK::Anon: contentH = layoutInline(c, b, ix, iy, contentW); break;
         case BK::Table: contentH = layoutTable(c, b, ix, iy, contentW); break;
-        case BK::Flex: contentH = layoutFlex(c, b, ix, iy, contentW, defH >= 0 ? defH : (minH > 0 ? minH : -1.f)); break;
+        case BK::Flex:
+            if (defH >= 0) contentH = layoutFlex(c, b, ix, iy, contentW, bounded(defH), bounded(defH));
+            else contentH = layoutFlex(c, b, ix, iy, contentW, minH > 0 ? minH : -1.f, maxH);
+            break;
         default: {
             float y = iy, pend = 0;
             bool firstKid = true;
@@ -1661,10 +1724,8 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
             contentH = firstKid ? 0 : std::max(0.f, y + pend - iy);
         }
     }
-    if (defH >= 0) contentH = defH;
-    if (contentH < minH) contentH = minH;
-    if (own && !b.replaced && s->maxHeight.u == Len::Px && s->overflow != 0)
-        contentH = std::min(contentH, std::max(0.f, s->maxHeight.v - (s->borderBox ? vpb : 0)));
+    b.naturalH = contentH;
+    contentH = bounded(defH >= 0 ? defH : contentH);
     b.h = contentH + vpb;
     if (b.paintIdx != SIZE_MAX) {
         DItem& d = c.out.items[b.paintIdx];
@@ -1700,6 +1761,11 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     for (size_t i = 0; i < b.abs.size(); ++i) layoutAbs(c, b, *b.abs[i]);
 
     if (clips) {
+        b.scroll1 = mark(c);
+        DItem thumb;  // empty until placeScrolled() finds that the box scrolls
+        thumb.k = DItem::K::Rect;
+        b.thumbIdx = push(c, std::move(thumb));
+        c.scrollers.push_back(&b);
         DItem& d = c.out.items[b.clipIdx];
         d.x = b.x + b.b[3];
         d.y = b.y + b.b[0];
@@ -1754,6 +1820,28 @@ void sortRange(std::vector<DItem>& src, size_t a, size_t e, std::vector<DItem>& 
     }
 }
 
+// Scroll containers (CSS Overflow 3). Once every box has its final size, this records how far each clipping box
+// can scroll, holds its scroll offset within that and moves its content up by the offset. An `overflow: auto` box
+// that can scroll gets a thumb at its right edge that shows where it is.
+void placeScrolled(Ctx& c) {
+    std::sort(c.scrollers.begin(), c.scrollers.end());  // a box that was laid out twice is listed twice
+    c.scrollers.erase(std::unique(c.scrollers.begin(), c.scrollers.end()), c.scrollers.end());
+    for (Box* b : c.scrollers) {
+        Node* n = b->node;
+        n->scrollRange = std::max(0.f, b->naturalH - (b->h - vpbOf(*b)));
+        n->scrollTop = std::clamp(n->scrollTop, 0.f, n->scrollRange);
+        shift(c, b->scroll0, b->scroll1, 0, -n->scrollTop, SIZE_MAX, n);
+        if (n->scrollRange <= 0 || b->st->overflow != 2) continue;
+        const DItem& port = c.out.items[b->clipIdx];
+        DItem& thumb = c.out.items[b->thumbIdx];
+        thumb.w = 5;
+        thumb.h = std::max(20.f, port.h * port.h / (port.h + n->scrollRange));
+        thumb.x = port.x + port.w - thumb.w - 2;
+        thumb.y = port.y + (port.h - thumb.h) * n->scrollTop / n->scrollRange;
+        thumb.c = {0, 0, 0, 0.35f};
+    }
+}
+
 }  // namespace
 
 LayoutOut layout_document(const LayoutInput& in) {
@@ -1764,6 +1852,7 @@ LayoutOut layout_document(const LayoutInput& in) {
         Node* n = stack.back();
         stack.pop_back();
         n->hasBox = false;
+        n->scrollRange = 0;
         for (auto& k : n->kids) stack.push_back(k.get());
         if (n->shadow) stack.push_back(n->shadow.get());
     }
@@ -1783,6 +1872,7 @@ LayoutOut layout_document(const LayoutInput& in) {
     edges(*root, in.vw);
     layoutBox(c, *root, 0, root->m[0], in.vw);
     out.height = std::max(root->y + root->h + root->m[2], c.maxBottom);
+    placeScrolled(c);
 
     bool layered = false;
     for (auto& it : out.items)

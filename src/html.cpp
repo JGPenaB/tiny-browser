@@ -49,8 +49,12 @@ static const std::string& slot_name_of(const Node* child) {
     return a ? *a : none;
 }
 Node* assigned_slot(const Node* n) {
-    if (!n->parent || !n->parent->shadow || n->type == Node::T::Comment) return nullptr;
+    if (!n->parent || !n->parent->shadow || n->type == Node::T::Comment || n->isShadowRoot()) return nullptr;
     return find_slot(n->parent->shadow.get(), slot_name_of(n));
+}
+Node* flat_parent(const Node* n) {
+    Node* slot = assigned_slot(n);
+    return slot ? slot : n->parent;
 }
 void assigned_nodes(const Node* slot, std::vector<Node*>& out) {
     Node* root = shadow_root_of(slot);

@@ -34,6 +34,7 @@ public:
         virtual void ensureLayout() = 0;        // bring element boxes up to date before script reads them
         virtual void viewport(float& w, float& h, float& scrollY) = 0;
         virtual void scrollTo(float y) = 0;
+        virtual void elementScrolled() = 0;     // an element's scroll offset changed: lay out again
         virtual std::wstring formValue(Node* n) = 0;
         virtual void setFormValue(Node* n, const std::wstring& v) = 0;
         virtual bool formChecked(Node* n) = 0;

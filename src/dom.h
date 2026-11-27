@@ -27,6 +27,10 @@ struct Node {
     // Border box from the last layout (document coordinates), used by devtools.
     float bx = 0, by = 0, bw = 0, bh = 0;
     bool hasBox = false;
+    int16_t layer = 0;  // the paint layer of that box (DItem::layer): of two boxes at a point, the higher one is on top
+    // A scroll container (CSS Overflow 3): how far its content is scrolled down, and how far it can be. Layout sets
+    // the range and holds the offset within it; scripts and the mouse wheel change the offset.
+    float scrollTop = 0, scrollRange = 0;
     uint8_t ceState = 0;  // custom element state (HTML 4.13.3): 0 not custom, or not yet; 1 custom; 2 its constructor failed
 
     Node();
@@ -80,6 +84,7 @@ private:
 };
 Node* shadow_root_of(const Node* n);            // the shadow root whose tree holds n, or null
 Node* assigned_slot(const Node* n);             // the <slot> a child of a shadow host is assigned to, or null
+Node* flat_parent(const Node* n);               // the parent in the flat tree: the slot of an assigned node, a shadow root's host
 void assigned_nodes(const Node* slot, std::vector<Node*>& out);  // the host's children assigned to this slot
 extern int g_shadowRoots;  // shadow roots made so far in this process: while 0, every flat tree is the plain tree
 

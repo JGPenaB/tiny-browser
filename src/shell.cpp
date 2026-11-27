@@ -162,6 +162,7 @@ struct Page {
     std::vector<NetEntry> net;
     LayoutOut lo;
     float layoutW = -1;
+    bool scrollDirty = false;  // an element was scrolled: lay out again, with the styles as they are
     bool hasMedia = false;
     size_t rules = 0;
     double tFetch = 0, tParse = 0, tSub = 0, tStyle = 0, tLayout = 0;
@@ -608,6 +609,10 @@ public:
             h = app.contentRect().h();
             sy = tab.scroll;
         }
+        void elementScrolled() override {
+            if (Page* p = page()) p->scrollDirty = true;
+            app.invalidate();
+        }
         void scrollTo(float y) override {
             app.ensureLayout(tab);
             tab.scroll = y;
@@ -758,14 +763,35 @@ public:
         afterScript(t);
         return go;
     }
-    // The innermost element whose box contains a document point.
+    // Whether an element can be seen at a document point that is inside its box. It cannot where a box further up
+    // that clips its content (CSS Overflow 3) does not hold the point: content that is clipped away, or scrolled out
+    // of view, is not there to be clicked. An absolutely positioned box is clipped only from its containing block
+    // upwards, and a fixed one not at all.
+    bool visibleAt(Page& p, const Node* n, float dx, float dy) {
+        enum { Clipped, UntilPositioned, Never } by = Clipped;
+        for (const Node* e = n; e; e = flat_parent(e)) {
+            if (!e->style) continue;
+            const Style& st = *e->style;
+            if (e != n && e->hasBox) {
+                if (by == UntilPositioned && st.position != 0) by = Clipped;  // the containing block
+                bool clips = st.overflow != 0 && e != p.doc->body && e != p.doc->html;
+                if (by == Clipped && clips && (dx < e->bx || dx >= e->bx + e->bw || dy < e->by || dy >= e->by + e->bh)) return false;
+            }
+            if (st.position == 3) by = Never;
+            else if (st.position == 2 && by == Clipped) by = UntilPositioned;
+        }
+        return true;
+    }
+    // The element at a document point that is painted on top: of the boxes that contain the point, the one in the
+    // highest paint layer, and within a layer the one that comes last in the tree.
     Node* nodeAt(Page& p, float dx, float dy) {
         Node* best = p.doc->body;
         std::vector<Node*> st{p.doc->root.get()};
         while (!st.empty()) {
             Node* n = st.back();
             st.pop_back();
-            if (n->type == Node::T::Element && n->hasBox && dx >= n->bx && dx < n->bx + n->bw && dy >= n->by && dy < n->by + n->bh) best = n;
+            bool inside = n->type == Node::T::Element && n->hasBox && dx >= n->bx && dx < n->bx + n->bw && dy >= n->by && dy < n->by + n->bh;
+            if (inside && n->layer >= best->layer && visibleAt(p, n, dx, dy)) best = n;
             for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
             if (n->shadow) st.push_back(n->shadow.get());
         }
@@ -946,8 +972,10 @@ public:
         if (!t.page || !t.page->doc) return;
         Page& p = *t.page;
         float vw = viewportW();
-        if (std::fabs(p.layoutW - vw) < 0.5f) return;
-        if (p.layoutW < 0 || p.hasMedia) restyle(p, vw);
+        bool widthChanged = std::fabs(p.layoutW - vw) >= 0.5f;
+        if (!widthChanged && !p.scrollDirty) return;
+        if (p.layoutW < 0 || (p.hasMedia && widthChanged)) restyle(p, vw);
+        p.scrollDirty = false;
         bindImages(p);
         double t0 = now_ms();
         LayoutInput in;
@@ -1223,7 +1251,7 @@ public:
         int best = -1;
         for (size_t i = 0; i < p->lo.widgets.size(); ++i) {
             auto& w = p->lo.widgets[i];
-            if (dx >= w.x && dx < w.x + w.w && dy >= w.y && dy < w.y + w.h && !w.st->hidden)
+            if (dx >= w.x && dx < w.x + w.w && dy >= w.y && dy < w.y + w.h && !w.st->hidden && visibleAt(*p, w.node, dx, dy))
                 if (best < 0 || w.layer >= p->lo.widgets[best].layer) best = (int)i;
         }
         return best;
@@ -2203,7 +2231,7 @@ public:
         auto& links = cur()->page->lo.links;
         for (size_t i = links.size(); i-- > 0;) {
             auto& l = links[i];
-            if (dx >= l.x && dx < l.x + l.w && dy >= l.y && dy < l.y + l.h) return l.a;
+            if (dx >= l.x && dx < l.x + l.w && dy >= l.y && dy < l.y + l.h && visibleAt(*cur()->page, l.a, dx, dy)) return l.a;
         }
         return nullptr;
     }
@@ -2491,7 +2519,27 @@ public:
             invalidate();
             return;
         }
-        scrollBy(-delta / 120.f * 100.f);
+        float dy = -delta / 120.f * 100.f;
+        if (!scrollInside(x, y, dy)) scrollBy(dy);
+    }
+    // The wheel over a scroll container (CSS Overflow 3): the innermost one under the pointer that can still move
+    // that way is scrolled. False when there is none, and then the page takes the scroll.
+    bool scrollInside(float x, float y, float dy) {
+        Tab* t = cur();
+        float docX, docY;
+        if (!toDoc(x, y, docX, docY)) return false;
+        ensureLayout(*t);
+        for (Node* n = nodeAt(*t->page, docX, docY); n; n = flat_parent(n)) {
+            if (!n->hasBox || !n->style || n->style->overflow != 2) continue;
+            float to = std::clamp(n->scrollTop + dy, 0.f, n->scrollRange);
+            if (to == n->scrollTop) continue;
+            n->scrollTop = to;
+            t->page->scrollDirty = true;
+            invalidate();
+            fireEvent(*t, n, "scroll", false, false);
+            return true;
+        }
+        return false;
     }
 
     std::wstring clipboard() {
@@ -2999,6 +3047,11 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
             else if (arg == L"dismiss") app.answerSave(false);
         } else if (op == L"scroll") {
             app.scrollBy((float)_wtof(arg.c_str()));
+        } else if (op == L"wheel") {  // wheel:x,y,delta with delta as the mouse reports it: -120 is one notch down
+            float x = 0, y = 0;
+            int delta = 0;
+            swscanf_s(arg.c_str(), L"%f,%f,%d", &x, &y, &delta);
+            app.onWheel(x, y, delta);
         } else if (op == L"wait") {
             Sleep((DWORD)_wtoi(arg.c_str()));
         }

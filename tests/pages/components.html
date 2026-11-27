@@ -151,6 +151,14 @@
   var cs = function (el, prop) { return getComputedStyle(el)[prop]; };
   eq('shadow: its styles stay inside', cs(inner, 'fontWeight') + ':' + (cs(inner, 'color') !== 'rgb(1, 2, 3)') + ':' + cs(sh1, 'marginTop'), '700:true:0px');
   eq('shadow: :host and ::slotted', cs(sh1, 'display') + ':' + cs(sh1, 'borderLeftWidth') + ':' + cs(span, 'fontStyle') + ':' + cs(span, 'color'), 'block:4px:italic:rgb(9, 9, 9)');
+  // A minimum size depends on the box that holds the element's box, which is found across the shadow boundary.
+  eq('shadow: resolved minimum sizes inside a shadow tree', cs(inner, 'minWidth') + ':' + cs(span, 'minWidth') + ':' + cs(sh1, 'minHeight'), '0px:0px:0px');
+  var flexHost = document.createElement('div');
+  flexHost.innerHTML = '<b>slotted</b>';
+  flexHost.attachShadow({ mode: 'open' }).innerHTML = '<div id="row" style="display: flex"><slot></slot></div>';
+  document.body.appendChild(flexHost);
+  eq('shadow: a slotted child of a flex box is a flex item', cs(flexHost.firstChild, 'minWidth') + ':' + cs(flexHost.shadowRoot.getElementById('row'), 'minWidth'), 'auto:0px');
+  flexHost.remove();
   sh1.className = 'wide';
   eq('shadow: :host() with a selector', cs(inner, 'fontStyle'), 'italic');
   var box = function (el) { return el.getBoundingClientRect(); };

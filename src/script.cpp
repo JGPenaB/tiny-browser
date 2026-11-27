@@ -1563,12 +1563,13 @@ JSFN(getClientRects) {  // one rectangle per box; none for an element that is no
     if (n->hasBox) a->elems.push_back(getBoundingClientRect(ci));
     return keep;
 }
-JSFN(metric) {  // data: 0 width, 1 height, 2 left, 3 top, 4 scrollTop/scrollLeft and other zeros
+JSFN(metric) {  // data: 0 width, 1 height, 2 left, 3 top, 4 scrollLeft and other zeros, 5 scrollHeight
     Impl& im = I(ci.vm);
     Node* n = thisElem(ci);
     int w = ci.callee->data.asInt();
     if (w == 4) return Value::i32(0);
     Box b = boxOf(im, n);
+    if (w == 5) return Value::num(std::round(b.h + n->scrollRange));
     if ((n->name == "html" || n->name == "body") && w <= 1) {
         float vw, vh, sy;
         im.client.viewport(vw, vh, sy);
@@ -1576,6 +1577,30 @@ JSFN(metric) {  // data: 0 width, 1 height, 2 left, 3 top, 4 scrollTop/scrollLef
         if (ci.callee->data2.asInt() == 1) return Value::num(std::round(vh));  // clientHeight of the root is the viewport
     }
     return Value::num(std::round(w == 0 ? b.w : w == 1 ? b.h : w == 2 ? b.x : b.y));
+}
+// __scrollTop(element[, offset]) (CSSOM View, scrollTop): how far the element is scrolled down. With an offset it
+// scrolls the element there, as far as it can go, and says whether it moved. The root element stands for the page.
+JSFN(scrollTopFn) {
+    Impl& im = I(ci.vm);
+    Node* n = toNode(ci.arg(0));
+    if (!n || n->type != Node::T::Element) ci.vm.throwError(Err::TypeError, "scrollTop: not an Element");
+    im.client.ensureLayout();
+    bool page = n == im.doc.html;
+    float vw, vh, pageY;
+    im.client.viewport(vw, vh, pageY);
+    float was = page ? pageY : n->scrollTop;
+    if (ci.argc < 2) return Value::num(was);
+    float to = (float)ci.vm.toNumber(ci.arg(1));
+    if (page) {
+        im.client.scrollTo(to);
+        im.client.viewport(vw, vh, pageY);
+        return Value::boolean(pageY != was);
+    }
+    to = std::clamp(to, 0.f, n->scrollRange);
+    if (to == was) return Value::boolean(false);
+    n->scrollTop = to;
+    im.client.elementScrolled();
+    return Value::boolean(true);
 }
 JSFN(offsetParent) {
     Node* n = thisElem(ci);
@@ -1911,9 +1936,8 @@ JSFN(datasetGet) {
 // ---- getComputedStyle
 // The element whose box holds this element's box: its parent in the flat tree, since shadow roots and slots have no box.
 const Node* boxParent(const Node* n) {
-    const Node* slot = assigned_slot(n);
-    const Node* p = slot ? slot : n->parent;
-    while (p && (p->isShadowRoot() || p->name == "slot")) p = p->parent;
+    const Node* p = flat_parent(n);
+    while (p && (p->isShadowRoot() || p->name == "slot")) p = flat_parent(p);
     return p;
 }
 // The resolved value of a property (CSSOM 9, "Resolved Values") for the properties the style engine keeps. A property
@@ -1965,13 +1989,13 @@ std::string resolvedValue(const Node* n, const Style& s, const std::string& name
             for (int side : {horizontal ? 1 : 0, horizontal ? 3 : 2}) used -= s.border[side] + s.padding[side].resolve(0);
         return number(std::max(0.f, used), "px");
     }
-    // An automatic minimum size resolves to zero where there is no box and on a box laid out the CSS 2 way, which
-    // leaves flex items (CSS Sizing 3, 3.1.2).
-    const Node* holder = n->hasBox ? boxParent(n) : nullptr;
-    bool flexItem = holder && holder->style && (holder->style->display == Display::Flex || holder->style->display == Display::InlineFlex);
-    const char* autoMinimum = flexItem ? "auto" : "0px";
-    if (name == "min-width") return length(s.minWidth, autoMinimum);
-    if (name == "min-height") return length(s.minHeight, autoMinimum);
+    if (name == "min-width" || name == "min-height") {
+        // An automatic minimum size resolves to zero where there is no box and on a box laid out the CSS 2 way,
+        // which leaves flex items (CSS Sizing 3, 3.1.2).
+        const Node* holder = n->hasBox ? boxParent(n) : nullptr;
+        bool flexItem = holder && holder->style && (holder->style->display == Display::Flex || holder->style->display == Display::InlineFlex);
+        return length(name == "min-width" ? s.minWidth : s.minHeight, flexItem ? "auto" : "0px");
+    }
     if (name == "max-width") return length(s.maxWidth, "none");
     if (name == "max-height") return length(s.maxHeight, "none");
     if (name == "display") return display_name(s.display);
@@ -2775,8 +2799,8 @@ void ScriptHost::Impl::setup() {
         const char* name;
         int which, root;
     } metrics[] = {{"offsetWidth", 0, 0}, {"offsetHeight", 1, 0}, {"offsetLeft", 2, 0}, {"offsetTop", 3, 0}, {"clientWidth", 0, 0},
-                   {"clientHeight", 1, 1}, {"scrollWidth", 0, 0}, {"scrollHeight", 1, 0}, {"clientLeft", 4, 0}, {"clientTop", 4, 0},
-                   {"scrollLeft", 4, 0}, {"scrollTop", 4, 0}};
+                   {"clientHeight", 1, 1}, {"scrollWidth", 0, 0}, {"scrollHeight", 5, 0}, {"clientLeft", 4, 0}, {"clientTop", 4, 0},
+                   {"scrollLeft", 4, 0}};
     for (auto& m : metrics) getter(elementProto, m.name, metric, m.which == 4 ? noopFn : nullptr, m.which, m.root);
     getter(elementProto, "offsetParent", offsetParent);
     method(elementProto, "scrollIntoView", scrollIntoView, 0);
@@ -3140,6 +3164,7 @@ void ScriptHost::Impl::setup() {
     vm.defFn(G, "__ceHook", ceHookSet, 1);
     vm.defFn(G, "__ceState", ceStateFn, 2);
     vm.defFn(G, "__isConstructor", isConstructorFn, 1);
+    vm.defFn(G, "__scrollTop", scrollTopFn, 2);
     try {
         vm.eval(utf8to16(kScriptPrelude), "browser:prelude");
     } catch (JSThrow&) {

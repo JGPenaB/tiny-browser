@@ -1008,6 +1008,25 @@ class ResizeObserver {
   }
 }
 
+// ---- scrollTop (CSSOM View): the scroll event is not fired from inside the setter but in a task of its own, once
+// for however many times the target scrolled until then, and at the document (where it bubbles) when it was the
+// page that scrolled
+var scrollTopOf = G.__scrollTop;  // scrollTopOf(element[, offset]): reads, or scrolls and says whether it moved
+delete G.__scrollTop;
+var scrollEventsOwed = new Set();
+Object.defineProperty(Element.prototype, 'scrollTop', {
+  get: function () { return scrollTopOf(this); },
+  set: function (y) {
+    y = +y;
+    if (!scrollTopOf(this, isFinite(y) ? y : 0)) return;
+    var target = this === document.documentElement ? document : this;
+    if (scrollEventsOwed.has(target)) return;
+    scrollEventsOwed.add(target);
+    setTimeout(function () { scrollEventsOwed.delete(target); target.dispatchEvent(new Event('scroll', { bubbles: target === document })); }, 0);
+  },
+  enumerable: true, configurable: true
+});
+
 var exported = { IntersectionObserver: IntersectionObserver, IntersectionObserverEntry: IntersectionObserverEntry, ResizeObserver: ResizeObserver,
   ResizeObserverEntry: ResizeObserverEntry, CSSStyleSheet: CSSStyleSheet, DOMException: DOMException, EventTarget: EventTarget, AbortController: AbortController, AbortSignal: AbortSignal, URL: URL, URLSearchParams: URLSearchParams,
   Blob: Blob, File: File, FormData: FormData, Headers: Headers, Request: Request, Response: Response, fetch: fetch, XMLHttpRequest: XMLHttpRequest,
