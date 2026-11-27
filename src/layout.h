@@ -60,12 +60,14 @@ struct LayoutOut {
     std::vector<WidgetArea> widgets;
     float height = 0;
     Color canvas{1, 1, 1, 1};
+    bool fixed = false;  // the page has fixed boxes: they have to be laid out again when the page scrolls
 };
 
 struct LayoutInput {
     Document* doc = nullptr;
     TextSystem* ts = nullptr;
     float vw = 800, vh = 600;
+    float scrollY = 0;  // how far the page is scrolled: where the viewport is, and with it every fixed box
     const std::vector<ImageRes>* images = nullptr;
     const std::unordered_map<const Node*, int>* imgNode = nullptr;
 };

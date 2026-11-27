@@ -1579,7 +1579,8 @@ JSFN(metric) {  // data: 0 width, 1 height, 2 left, 3 top, 4 scrollLeft and othe
     return Value::num(std::round(w == 0 ? b.w : w == 1 ? b.h : w == 2 ? b.x : b.y));
 }
 // __scrollTop(element[, offset]) (CSSOM View, scrollTop): how far the element is scrolled down. With an offset it
-// scrolls the element there, as far as it can go, and says whether it moved. The root element stands for the page.
+// scrolls the element there, as far as it can go, and says whether it moved, which is when the caller owes the
+// element a scroll event. The root element stands for the page, and the shell tells the document about that.
 JSFN(scrollTopFn) {
     Impl& im = I(ci.vm);
     Node* n = toNode(ci.arg(0));
@@ -1593,8 +1594,7 @@ JSFN(scrollTopFn) {
     float to = (float)ci.vm.toNumber(ci.arg(1));
     if (page) {
         im.client.scrollTo(to);
-        im.client.viewport(vw, vh, pageY);
-        return Value::boolean(pageY != was);
+        return Value::boolean(false);
     }
     to = std::clamp(to, 0.f, n->scrollRange);
     if (to == was) return Value::boolean(false);

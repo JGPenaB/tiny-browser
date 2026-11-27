@@ -211,6 +211,7 @@ void flow(Ctx& c, Box& box, Node* e, Box* cb);
 Box* addAbs(Ctx& c, Node* n, Box* cb) {
     auto a = buildBox(c, n, cb);
     a->fixed = n->style->position == 3;
+    if (a->fixed) c.out.fixed = true;
     a->oof = true;
     Box* raw = a.get();
     Box* owner = (a->fixed || !cb) ? c.root : cb;
@@ -1545,8 +1546,11 @@ float layoutFlex(Ctx& c, Box& b, float ix, float iy, float W, float lower, float
 void layoutAbs(Ctx& c, Box& cbBox, Box& A) {
     const Style* s = A.st;
     float px, py, pw, ph;
+    // A fixed box is held by the viewport, wherever the page is scrolled to (CSS Positioned Layout 3, section 2.1).
+    float viewportY = A.fixed ? c.in.scrollY : 0;
     if (A.fixed || &cbBox == c.root) {
-        px = py = 0;
+        px = 0;
+        py = viewportY;
         pw = c.in.vw;
         ph = c.in.vh;
     } else {
@@ -1579,7 +1583,7 @@ void layoutAbs(Ctx& c, Box& cbBox, Box& A) {
     float bw = A.forcedW >= 0 ? A.forcedW : s->width.resolve(pw) + (s->borderBox ? 0 : hpb);
     float cx = L ? px + l : R ? px + pw - r - bw - hm : A.staticX;
     if (L && R && s->margin[3].u == Len::Auto && s->margin[1].u == Len::Auto) cx = px + l + std::max(0.f, (pw - l - r - bw) / 2);
-    float topY = T ? py + t + A.m[0] : (Bm ? 0 : A.staticY + A.m[0]);
+    float topY = T ? py + t + A.m[0] : (Bm ? 0 : viewportY + A.staticY + A.m[0]);
     Mark a0 = mark(c);
     layoutBox(c, A, cx, topY, pw);
     if (!T && Bm) moveBox(c, A, a0, mark(c), 0, (py + ph - bo - A.m[2] - A.h) - A.y);

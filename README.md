@@ -83,10 +83,10 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    ResizeObserver report for real. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
    `getComputedStyle` returns resolved values (CSSOM), `max-height` and `min-height` bound a box as CSS 2 section 10.7
    says, column flex containers shrink their items and flex containers size themselves to their items (Flexbox 9.7
-   and 9.9), and `overflow: auto` boxes scroll with the wheel and `scrollTop` (`tests/pages/layout.html`). Known gaps
-   there: margins, paddings and insets read as computed values (a percentage or `auto` is not turned into px), boxes
-   scroll only vertically and their thumb cannot be dragged, a fixed box moves with the page when the page scrolls,
-   and the page itself fires no `scroll` event. Still open: incremental restyle/relayout, per-site controls (JavaScript, cookies, images), the security baseline
+   and 9.9), `overflow: auto` boxes scroll with the wheel and `scrollTop`, fixed boxes stay in the viewport, and
+   scrolling fires `scroll` events at the element or the document (`tests/pages/layout.html`). Known gaps there:
+   margins, paddings and insets read as computed values (a percentage or `auto` is not turned into px), boxes scroll
+   only vertically and their thumb cannot be dragged, and there is no `scrollend` event. Still open: incremental restyle/relayout, per-site controls (JavaScript, cookies, images), the security baseline
    (script time and memory limits, certificate and mixed-content warnings, per-site exceptions), content blocker
    (EasyList-format lists), tab sleeping.
 5. **Milestone 5 - performance, security, graphics:** GPU layer compositor, off-thread layout, HTTP cache, process isolation,

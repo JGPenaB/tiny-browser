@@ -183,6 +183,7 @@ struct Tab {
     bool loading = false;
     uint64_t gen = 0;
     float scroll = 0;
+    float scrollSeen = 0;    // the scroll offset the page's scripts have been told about
     std::string refreshUrl;  // pending <meta http-equiv=refresh>
     float refreshDelay = 0;
     uint64_t refreshGen = 0;
@@ -549,7 +550,7 @@ public:
         if (&t == cur()) resetHover();
         t.page = std::move(p);
         t.loading = false;
-        t.scroll = 0;
+        t.scroll = t.scrollSeen = 0;
         t.scriptDue = -1;
         t.navPending = false;
         t.submitForm = t.submitBy = nullptr;
@@ -617,6 +618,7 @@ public:
             app.ensureLayout(tab);
             tab.scroll = y;
             app.clampScroll(tab);
+            if (Page* p = page(); p && p->lo.fixed) p->scrollDirty = true;  // the script may ask where a fixed box is now
             app.invalidate();
         }
         std::wstring formValue(Node* n) override {
@@ -726,8 +728,18 @@ public:
         t.scriptDue = t.scriptDue < 0 ? due : std::min(t.scriptDue, due);
         if (hwnd) SetTimer(hwnd, kScriptTimerBase + t.id, (UINT)std::max(1.0, t.scriptDue - now_ms()), nullptr);
     }
+    // The page was scrolled since its scripts were last told: the document gets a scroll event, which bubbles to the
+    // window (CSSOM View, scrolling events), and fixed boxes are laid out again where the viewport is now. Called
+    // between tasks and before a frame is painted, never from inside a script.
+    void noticeScroll(Tab& t) {
+        if (!t.page || t.scroll == t.scrollSeen) return;
+        t.scrollSeen = t.scroll;
+        if (t.page->lo.fixed) t.page->scrollDirty = true;
+        fireEvent(t, t.page->doc->root.get(), "scroll", true, false);
+    }
     void runScriptTimers(Tab& t) {
         t.scriptDue = -1;
+        noticeScroll(t);
         if (!t.page) return;
         takeLate(t);
         if (!t.page || !t.page->script) return;
@@ -983,6 +995,7 @@ public:
         in.ts = &ts;
         in.vw = vw;
         in.vh = contentRect().h();
+        in.scrollY = t.scroll;
         in.images = &p.images;
         in.imgNode = &p.imgNode;
         p.lo = layout_document(in);
@@ -995,6 +1008,10 @@ public:
         }
         if (&t == cur()) popup = -1;
         clampScroll(t);
+        if (t.scroll != in.scrollY && p.lo.fixed) {  // the page got shorter and the scroll offset with it
+            in.scrollY = t.scroll;
+            p.lo = layout_document(in);
+        }
     }
 
     float maxScroll(Tab& t) {
@@ -2207,6 +2224,7 @@ public:
 
     void paint() {
         if (W < 1 || H < 1) return;
+        if (Tab* t = cur()) noticeScroll(*t);
         double t0 = now_ms();
         ID2D1DeviceContext* dc = gpu.begin();
         if (!dc) return;
@@ -3056,7 +3074,10 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
             Sleep((DWORD)_wtoi(arg.c_str()));
         }
         followRefresh();
-        if (Tab* c = app.cur()) app.pumpScripts(*c, 800);
+        if (Tab* c = app.cur()) {
+            app.noticeScroll(*c);
+            app.pumpScripts(*c, 800);
+        }
     }
     Tab& ft = *app.cur();
     app.settle(ft, 2000);

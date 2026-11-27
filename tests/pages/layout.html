@@ -46,6 +46,9 @@
   <div id="capped20" style="flex: 0 1 20px; min-width: 0"><div style="width: 50px; height: 10px"></div></div>
 </div></div>
 
+<!-- CSS Positioned Layout 3: a fixed box is held by the viewport and stays there when the page scrolls -->
+<div id="pinned" style="position: fixed; top: 10px; right: 0; width: 20px; height: 20px; background: #c5221f"></div>
+
 <div id="results"><b>Results</b></div>
 <script>
   var pass = 0, fail = 0;
@@ -96,6 +99,19 @@
   scroller.scrollTop = 20;
   eq('the scroll event is not fired from inside the setter', scrollEvents.length, 0);
   setTimeout(function () { eq('the scroll event is fired at the element and does not bubble', scrollEvents.join(), 'scroller:false:20'); }, 20);
+
+  // ---- scrolling the page
+  var pageScrolls = [];
+  document.addEventListener('scroll', function (e) { pageScrolls.push('document:' + e.bubbles + ':' + scrollY); });
+  window.addEventListener('scroll', function (e) { pageScrolls.push('window:' + (e.target === document)); });
+  eq('before the page scrolls', [topOf('pinned'), topOf('wheelBox')].join(), '10,16');
+  scrollTo(0, 150);
+  eq('a fixed box stays where it is in the viewport', [scrollY, topOf('pinned'), topOf('wheelBox')].join(), '150,10,-134');
+  eq('the scroll event is not fired from inside scrollTo', pageScrolls.length, 0);
+  setTimeout(function () {
+    eq('the page scrolling is told to the document and bubbles to the window', pageScrolls.join(), 'document:true:150,window:true');
+    scrollTo(0, 0);
+  }, 30);
 
   // After the summary the test runner sends this box a wheel event and two clicks: one where a row can be seen and
   // one just above the box, where a row that was scrolled out of view lies. See the README for the command.
