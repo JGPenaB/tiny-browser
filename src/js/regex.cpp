@@ -71,6 +71,7 @@ struct CharClass {
     std::vector<std::pair<uint32_t, uint32_t>> ranges;
     std::vector<std::pair<int, bool>> props;  // Unicode property, negated?
     bool negate = false;
+    bool icase = false;  // ignoreCase was in force where the class was written
     bool ascii[128] = {};  // final answer for ASCII, filled in once the class is complete
 };
 
@@ -95,7 +96,8 @@ bool classMatchSlow(const CharClass& cc, uint32_t cp, bool ignoreCase) {
     }
     return in != cc.negate;
 }
-void finishClass(CharClass& cc, bool ignoreCase) {
+void finishClass(CharClass& cc) {
+    bool ignoreCase = cc.icase;
     std::sort(cc.ranges.begin(), cc.ranges.end());
     std::vector<std::pair<uint32_t, uint32_t>> merged;
     for (auto& r : cc.ranges) {
@@ -133,6 +135,8 @@ struct RxNode {
     int cap = -1;    // Group: capture number (-1: not capturing), BackRef: group referred to
     uint32_t min = 0, max = 0;
     bool greedy = true, behind = false, negative = false;
+    bool icase = false, multiline = false, dotAll = false;  // the flags in force where the node was written: (?i:...) changes them
+    std::vector<int> caps;  // BackRef by name: every group of that name
     std::vector<RxNode*> kids;
     std::u16string name;  // named back reference, resolved after parsing
 };
@@ -147,6 +151,11 @@ struct Parser {
     std::vector<CharClass> classes;
     std::vector<std::pair<std::u16string, int>> names;
     std::vector<RxNode*> namedRefs;
+    // Where each named group sits: the alternatives it is inside, as (disjunction, alternative) pairs. Two groups may
+    // share a name only when some disjunction puts them in different alternatives.
+    std::vector<std::vector<std::pair<int, int>>> namePaths;
+    std::vector<std::pair<int, int>> altPath;
+    int nextDisjunction = 0;
     int ncaps = 1, totalCaps = 1, depth = 0;
     bool hasNamed = false;
     std::string err;
@@ -158,6 +167,9 @@ struct Parser {
     RxNode* mk(RxNode::T t) {
         arena.emplace_back();
         arena.back().t = t;
+        arena.back().icase = fl.ignoreCase;
+        arena.back().multiline = fl.multiline;
+        arena.back().dotAll = fl.dotAll;
         return &arena.back();
     }
     RxNode* chr(uint32_t c) {
@@ -166,6 +178,7 @@ struct Parser {
         return n;
     }
     RxNode* classNode(CharClass&& cc) {
+        cc.icase = fl.ignoreCase;
         classes.push_back(std::move(cc));
         RxNode* n = mk(RxNode::Class);
         n->c = (uint32_t)classes.size() - 1;
@@ -210,20 +223,30 @@ struct Parser {
         if (more()) fail(src[i] == ')' ? "Unmatched ')'" : "Unexpected character");
         for (RxNode* r : namedRefs) {
             for (auto& n : names)
-                if (n.first == r->name) r->cap = n.second;
+                if (n.first == r->name) {
+                    r->cap = n.second;
+                    r->caps.push_back(n.second);
+                }
             if (r->cap < 0) fail("Invalid named capture referenced");
         }
         return root;
     }
     RxNode* disjunction() {
+        int id = nextDisjunction++, index = 0;
+        altPath.push_back({id, index});
         RxNode* first = alternative();
-        if (!more() || src[i] != '|') return first;
+        if (!more() || src[i] != '|') {
+            altPath.pop_back();
+            return first;
+        }
         RxNode* alt = mk(RxNode::Alt);
         alt->kids.push_back(first);
         while (more() && src[i] == '|') {
             ++i;
+            altPath.back().second = ++index;
             alt->kids.push_back(alternative());
         }
+        altPath.pop_back();
         return alt;
     }
     RxNode* alternative() {
@@ -233,7 +256,8 @@ struct Parser {
             uint32_t mn = 0, mx = 0;
             bool greedy = true;
             if (quantifier(mn, mx, greedy)) {
-                if (t->t == RxNode::Bol || t->t == RxNode::Eol || t->t == RxNode::WordB || t->t == RxNode::NWordB || (t->t == RxNode::Look && t->behind))
+                if (t->t == RxNode::Bol || t->t == RxNode::Eol || t->t == RxNode::WordB || t->t == RxNode::NWordB ||
+                    (t->t == RxNode::Look && (t->behind || fl.unicode)))
                     fail("Nothing to repeat");
                 RxNode* r = mk(RxNode::Repeat);
                 r->min = mn;
@@ -310,6 +334,56 @@ struct Parser {
             default: return chr(nextCp());
         }
     }
+    // A group name, from just after '<' to the closing '>': an identifier, which may use \u escapes.
+    std::u16string groupName() {
+        std::u16string name;
+        for (bool first = true;; first = false) {
+            if (!more()) fail("Invalid capture group name");
+            if (src[i] == '>') {
+                ++i;
+                break;
+            }
+            uint32_t cp = 0;
+            if (src[i] == '\\') {
+                ++i;
+                if (!more() || src[i] != 'u') fail("Invalid capture group name");
+                ++i;
+                if (more() && src[i] == '{') {
+                    size_t k = i + 1;
+                    int n = 0;
+                    while (k < src.size() && hexVal(src[k]) >= 0) {
+                        cp = cp * 16 + hexVal(src[k++]);
+                        if (cp > 0x10FFFF) fail("Invalid capture group name");
+                        ++n;
+                    }
+                    if (!n || k >= src.size() || src[k] != '}') fail("Invalid capture group name");
+                    i = k + 1;
+                } else {
+                    if (!hexN(4, cp)) fail("Invalid capture group name");
+                    uint32_t lo = 0;
+                    size_t save = i;
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < src.size() && src[i] == '\\' && src[i + 1] == 'u') {
+                        i += 2;
+                        if (hexN(4, lo) && lo >= 0xDC00 && lo <= 0xDFFF) cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        else i = save;
+                    }
+                }
+            } else {
+                char16_t c = src[i++];
+                cp = c;
+                if (isHigh(c) && more() && isLow(src[i])) cp = 0x10000 + ((c - 0xD800) << 10) + (src[i++] - 0xDC00);
+            }
+            bool ok = cp == '$' || cp == '_' || (first ? unicodeIdStart(cp) : (unicodeIdContinue(cp) || cp == 0x200C || cp == 0x200D));
+            if (!ok) fail("Invalid capture group name");
+            if (cp > 0xFFFF) {
+                name += (char16_t)(0xD800 + ((cp - 0x10000) >> 10));
+                name += (char16_t)(0xDC00 + ((cp - 0x10000) & 0x3FF));
+            } else
+                name += (char16_t)cp;
+        }
+        if (name.empty()) fail("Invalid capture group name");
+        return name;
+    }
     RxNode* group() {
         ++i;
         RxNode* g = mk(RxNode::Group);
@@ -326,13 +400,46 @@ struct Parser {
                     g->behind = true;
                     g->negative = src[i++] == '!';
                 } else {
-                    std::u16string name;
-                    while (more() && src[i] != '>') name += src[i++];
-                    if (!more() || name.empty()) fail("Invalid capture group name");
-                    ++i;
+                    std::u16string name = groupName();
                     g->cap = ncaps++;
+                    for (size_t n = 0; n < names.size(); ++n) {
+                        if (names[n].first != name) continue;
+                        bool apart = false;
+                        for (auto& a : namePaths[n])
+                            for (auto& b : altPath)
+                                if (a.first == b.first && a.second != b.second) apart = true;
+                        if (!apart) fail("Duplicate capture group name");
+                    }
                     names.push_back({name, g->cap});
+                    namePaths.push_back(altPath);
                 }
+            } else if (k == 'i' || k == 'm' || k == 's' || k == '-') {  // modifiers: (?ims-ims:...)
+                --i;
+                RegexFlags saved = fl;
+                bool add = true, any = false, seen[3] = {};
+                for (;; ++i) {
+                    if (!more()) fail("Invalid group");
+                    char16_t c = src[i];
+                    if (c == ':') break;
+                    if (c == '-') {
+                        if (!add) fail("Invalid group");
+                        add = false;
+                        continue;
+                    }
+                    int which = c == 'i' ? 0 : c == 'm' ? 1 : c == 's' ? 2 : -1;
+                    if (which < 0 || seen[which]) fail("Invalid group");
+                    seen[which] = any = true;
+                    (which == 0 ? fl.ignoreCase : which == 1 ? fl.multiline : fl.dotAll) = add;
+                }
+                if (!add && !any) fail("Invalid group");
+                ++i;
+                if (++depth > 200) fail("Regular expression too deeply nested");
+                g->kids.push_back(disjunction());
+                --depth;
+                fl = saved;
+                if (!more() || src[i] != ')') fail("Unterminated group");
+                ++i;
+                return g;
             } else if (k != ':')
                 fail("Invalid group");
         } else
@@ -460,16 +567,20 @@ struct Parser {
             if (!more() || src[i] != '<') fail("Invalid named reference");
             ++i;
             RxNode* r = mk(RxNode::BackRef);
-            while (more() && src[i] != '>') r->name += src[i++];
-            if (!more()) fail("Invalid named reference");
-            ++i;
+            r->name = groupName();
             namedRefs.push_back(r);
             return r;
         }
         if (c == 'd' || c == 'D' || c == 'w' || c == 'W' || c == 's' || c == 'S') {
             ++i;
             CharClass cc;
-            addEscapeClass(cc, c);
+            if ((c == 'w' || c == 'W') && fl.unicode && fl.ignoreCase) {
+                addEscapeClass(cc, 'w');
+                cc.ranges.push_back({0x17F, 0x17F});
+                cc.ranges.push_back({0x212A, 0x212A});
+                cc.negate = c == 'W';
+            } else
+                addEscapeClass(cc, c);
             return classNode(std::move(cc));
         }
         if ((c == 'p' || c == 'P') && fl.unicode) {
@@ -522,7 +633,10 @@ struct Parser {
             }
             bool isSet = false;
             uint32_t lo = classAtom(cc, isSet);
-            if (isSet) continue;
+            if (isSet) {
+                if (fl.unicode && more() && src[i] == '-' && i + 1 < src.size() && src[i + 1] != ']') fail("Invalid character class");
+                continue;
+            }
             if (more() && src[i] == '-' && i + 1 < src.size() && src[i + 1] != ']') {
                 ++i;
                 bool isSet2 = false;
@@ -626,11 +740,11 @@ struct Compiler {
     bool single(RxNode* n) const { return n->t == RxNode::Char || n->t == RxNode::Any || n->t == RxNode::Class; }
     void one(RxNode* n, uint8_t& op, uint32_t& x) {
         if (n->t == RxNode::Char) {
-            op = P.fl.ignoreCase ? I_CHAR_I : I_CHAR;
-            x = P.fl.ignoreCase ? upperOf(n->c) : n->c;
+            op = n->icase ? I_CHAR_I : I_CHAR;
+            x = n->icase ? upperOf(n->c) : n->c;
         } else if (n->t == RxNode::Any) {
             op = I_ANY;
-            x = 0;
+            x = n->dotAll ? 1 : 0;
         } else {
             op = I_CLASS;
             x = n->c;
@@ -670,11 +784,17 @@ struct Compiler {
                 gen(n->kids[0]);
                 if (n->cap >= 0) emit(I_SAVE, n->cap * 2 + 1);
                 break;
-            case RxNode::Bol: emit(I_BOL); break;
-            case RxNode::Eol: emit(I_EOL); break;
-            case RxNode::WordB: emit(I_WORDB); break;
-            case RxNode::NWordB: emit(I_NWORDB); break;
-            case RxNode::BackRef: emit(I_BACKREF, (uint32_t)n->cap); break;
+            case RxNode::Bol: emit(I_BOL, n->multiline ? 1 : 0); break;
+            case RxNode::Eol: emit(I_EOL, n->multiline ? 1 : 0); break;
+            case RxNode::WordB: emit(I_WORDB, n->icase && P.fl.unicode ? 1 : 0); break;
+            case RxNode::NWordB: emit(I_NWORDB, n->icase && P.fl.unicode ? 1 : 0); break;
+            case RxNode::BackRef:
+                // by name, with several groups of that name: at most one of them took part, the others match nothing
+                if (n->caps.size() > 1) {
+                    for (int cap : n->caps) emit(I_BACKREF, (uint32_t)cap, 0, 0, n->icase ? 1 : 0);
+                } else
+                    emit(I_BACKREF, (uint32_t)n->cap, 0, 0, n->icase ? 1 : 0);
+                break;
             case RxNode::Look: {
                 size_t at = emit(I_LOOK, 0, 0, 0, (uint8_t)((n->behind ? 1 : 0) | (n->negative ? 2 : 0)));
                 gen(n->kids[0]);
@@ -767,7 +887,7 @@ struct Matcher {
     }
     bool classHit(uint32_t idx, uint32_t cp) const {
         const CharClass& cc = P.classes[idx];
-        return cp < 128 ? cc.ascii[cp] : classMatchSlow(cc, cp, icase);
+        return cp < 128 ? cc.ascii[cp] : classMatchSlow(cc, cp, cc.icase);
     }
     // Tests one character with a single-character matcher (the operand of I_REP, or a plain instruction).
     bool one(uint8_t op, uint32_t x, int pos, int& w) const {
@@ -776,7 +896,7 @@ struct Matcher {
         switch (op) {
             case I_CHAR: return cp == x;
             case I_CHAR_I: return cp == x || upperOf(cp) == x;
-            case I_ANY: return P.flags.dotAll || !isLineEnd(cp);
+            case I_ANY: return x || !isLineEnd(cp);
             default: return classHit(x, cp);
         }
     }
@@ -832,16 +952,17 @@ struct Matcher {
                     ++pc;
                     continue;
                 case I_BOL:
-                    if (!(pos == 0 || (P.flags.multiline && isLineEnd(s[pos - 1])))) goto fail;
+                    if (!(pos == 0 || (in.x && isLineEnd(s[pos - 1])))) goto fail;
                     ++pc;
                     continue;
                 case I_EOL:
-                    if (!(pos == len || (P.flags.multiline && isLineEnd(s[pos])))) goto fail;
+                    if (!(pos == len || (in.x && isLineEnd(s[pos])))) goto fail;
                     ++pc;
                     continue;
                 case I_WORDB:
                 case I_NWORDB: {
-                    bool before = pos > 0 && isWord(s[pos - 1]), after = pos < len && isWord(s[pos]);
+                    auto word = [&](char16_t ch) { return isWord(ch) || (in.x && (ch == 0x17F || ch == 0x212A)); };
+                    bool before = pos > 0 && word(s[pos - 1]), after = pos < len && word(s[pos]);
                     if ((before != after) != (in.op == I_WORDB)) goto fail;
                     ++pc;
                     continue;
@@ -853,7 +974,7 @@ struct Matcher {
                         if (pos + n > len) goto fail;
                         for (int k = 0; k < n; ++k) {
                             char16_t p = s[a + k], q = s[pos + k];
-                            if (p != q && !(icase && upperOf(p) == upperOf(q))) goto fail;
+                            if (p != q && !(in.flag && upperOf(p) == upperOf(q))) goto fail;
                         }
                         pos += n;
                     }
@@ -979,11 +1100,11 @@ std::shared_ptr<RegexProgram> regexCompile(const std::u16string& pattern, const 
     prog->ncaps = parser.ncaps;
     prog->names = std::move(parser.names);
     prog->classes = std::move(parser.classes);
-    for (auto& cc : prog->classes) finishClass(cc, flags.ignoreCase);
+    for (auto& cc : prog->classes) finishClass(cc);
     const Inst& first = prog->code[1];
     if (first.op == I_CHAR && first.x <= 0xFFFF) prog->firstChar = (int)first.x;
     if (first.op == I_REP && first.a == I_CHAR && first.y >= 1 && first.x <= 0xFFFF) prog->firstChar = (int)first.x;
-    if (first.op == I_BOL && !flags.multiline) prog->anchoredStart = true;
+    if (first.op == I_BOL && !first.x) prog->anchoredStart = true;
     return prog;
 }
 
@@ -1001,6 +1122,7 @@ bool regexExec(const RegexProgram& p, const std::u16string& s, size_t from, bool
     for (int start = (int)from; start <= len; ++start) {
         if (!sticky && p.firstChar >= 0) {
             size_t f = s.find((char16_t)p.firstChar, (size_t)start);
+            while (f != std::u16string::npos && p.flags.unicode && f > 0 && isLow(s[f]) && isHigh(s[f - 1])) f = s.find((char16_t)p.firstChar, f + 1);
             if (f == std::u16string::npos) return false;
             start = (int)f;
         }

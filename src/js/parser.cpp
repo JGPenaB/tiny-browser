@@ -233,6 +233,7 @@ public:
             if (pos >= n || isLt(s[pos])) fail("Unterminated regular expression");
             char16_t c = s[pos];
             if (c == '\\') {
+                if (pos + 1 >= n || isLt(s[pos + 1])) fail("Unterminated regular expression");
                 pos += 2;
                 continue;
             }
