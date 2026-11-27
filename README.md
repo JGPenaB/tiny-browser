@@ -80,22 +80,24 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 `python tests/run_test262.py [path filter ...] [--jobs N] [--save name]` runs the ECMAScript conformance suite (test262,
 cloned into the git-ignored `third_party/test262`; the script's header has the command) and writes the failures to
-`out/test262-<name>.txt`. Fourteenth full run, 2026-11-27: 43,817 of 48,803 tests pass (89.8%). Without the 4,616 tests
-for Temporal, a proposal that is not part of ECMA-262 yet, that is 99.2%.
+`out/test262-<name>.txt`. Fifteenth full run, 2026-11-27: 43,898 of 48,803 tests pass (89.9%). Without the 4,616 tests
+for Temporal, a proposal that is not part of ECMA-262 yet, that is 99.3%. Every test of ECMA-262 itself passes.
 
 What the engine covers: the whole core language with its early errors (classes with private members and static
 blocks, generators and async generators, destructuring, modules, direct and indirect `eval`, `with`, Annex B, proper
 tail calls, `using` and `await using`), Proxy and Reflect, BigInt, typed arrays with resizable and shared buffers,
-Atomics (with waiting and notifying between agents: threads that have an engine each and share memory), RegExp (named groups, lookbehind, Unicode properties, the `v` flag with set operations), Promise combinators,
+Atomics (with waiting and notifying between agents: threads that have an engine each and share memory), RegExp (named groups, lookbehind, Unicode properties, the `v` flag with set operations and the emoji sequence properties), Promise combinators,
 iterator helpers (including `concat`, `zip`, `chunks`, `windows`), Set methods, `Array.fromAsync`,
 `Error.prototype.stack`, `JSON.rawJSON`, `Math.sumPrecise`, DisposableStack, mapped `arguments` objects, import
 attributes with JSON modules, and several realms in one engine (each with its own global object and built-ins, which
-is what frames in a page will use).
+is what frames in a page will use). Of the proposals: ShadowRealm, and importing bytes.
 
-What still fails, largest first: Temporal (4,616, a proposal), `import defer` and source-phase imports (about 260, both
-proposals), ShadowRealm (64, a proposal), decorators (22, a proposal), emoji sequence properties in regular expressions
-(12, they need Unicode data files), `import` of bytes (5, a proposal). Nothing else fails: inside ECMA-262 itself only
-the emoji data is left.
+What still fails are proposals only, largest first: Temporal (4,616), `import defer` and source-phase imports (about
+260), decorators (22).
+
+The Unicode tables are generated: `tools/gen_unicode.py` and `tools/gen_casing.py` read the test262 clone, and
+`tools/gen_emoji.py` reads Unicode's `emoji-sequences.txt` and `emoji-zwj-sequences.txt`, downloaded into the
+git-ignored `third_party/unicode-emoji`.
 
 ## Engine speed
 
