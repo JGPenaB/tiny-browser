@@ -32,7 +32,8 @@ struct DItem {
     float bw[4] = {};
     Color bc[4];
     Microsoft::WRL::ComPtr<IDWriteTextLayout> tl;
-    int img = -1;  // image index, or widget index for K::Widget
+    int img = -1;  // image index, or widget index for K::Widget; for K::Image -1 is a picture that did not come (a grey
+                   // box is shown) and -2 an img that represents nothing (HTML 15.4.2), which shows nothing
 };
 
 struct LinkArea {

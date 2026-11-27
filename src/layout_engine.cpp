@@ -139,6 +139,9 @@ struct Ctx {
     int layer = 0;
     float maxBottom = 0;
     std::vector<Box*> scrollers;  // the boxes that clip their content
+    // The content height of the block whose lines are being laid out, when it is definite: what a percentage height
+    // of a replaced element on those lines is resolved against (CSS 2 section 10.5). -1 when it is not definite.
+    float lineBlockH = -1;
 };
 
 Mark mark(Ctx& c) { return {c.out.items.size(), c.out.links.size(), c.boxed.size(), c.out.widgets.size()}; }
@@ -572,8 +575,19 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
             else if (h < 0)
                 h = w * im->h / std::max(1, im->w);
         } else if (w < 0 || h < 0) {
+            // No picture (HTML 15.4.2): an img whose alternative text says something is that text. Any other is a
+            // replaced element with no natural size, so its own width and height (a percentage is resolved on the
+            // line) are what it gets, and it shows nothing.
             auto alt = n->attr("alt");
-            if (alt && !alt->empty()) addText(b, *alt, s, link, n, bg);
+            if (alt && !alt->empty()) {
+                addText(b, *alt, s, link, n, bg);
+                return;
+            }
+            it.k = Item::Image;
+            it.w = std::max(0.f, w);
+            it.h = std::max(0.f, h);
+            it.img = -2;
+            b.items.push_back(std::move(it));
             return;
         }
         it.k = Item::Image;
@@ -1095,6 +1109,7 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                         if (wk != WidgetKind::Check && wk != WidgetKind::Radio) it.w = avail;
                     }
                     if (it.k == Item::Image && it.w != ow && ow > 0 && it.st->height.u != Len::Px) it.h = oh * it.w / ow;
+                    if (it.k == Item::Image && it.st->height.u == Len::Pct && c.lineBlockH >= 0) it.h = it.st->height.resolve(c.lineBlockH);
                 }
                 ensureW(c, it);
                 if (!line.empty() && x + it.w > avail + 0.01f && it.brk && wraps(it.st)) commit(false);
@@ -1709,7 +1724,7 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     float contentH = 0;
     switch (b.kind) {
         case BK::Marker: break;
-        case BK::Anon: contentH = layoutInline(c, b, ix, iy, contentW); break;
+        case BK::Anon: contentH = layoutInline(c, b, ix, iy, contentW); break;  // lineBlockH was set by the parent
         case BK::Table: contentH = layoutTable(c, b, ix, iy, contentW); break;
         case BK::Flex:
             if (defH >= 0) contentH = layoutFlex(c, b, ix, iy, contentW, bounded(defH), bounded(defH));
@@ -1718,6 +1733,8 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         default: {
             float y = iy, pend = 0;
             bool firstKid = true;
+            float outerLineBlockH = c.lineBlockH;
+            c.lineBlockH = defH;
             for (auto& k : b.kids) {
                 if (k->kind == BK::Marker) {
                     if (k->target) {
@@ -1736,6 +1753,7 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
                 if (b.firstBaseline < 0 && k->firstBaseline >= 0) b.firstBaseline = k->firstBaseline;
             }
             contentH = firstKid ? 0 : std::max(0.f, y + pend - iy);
+            c.lineBlockH = outerLineBlockH;
         }
     }
     b.naturalH = contentH;

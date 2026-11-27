@@ -55,6 +55,12 @@
 <div style="display: flex; width: 100px"><div id="wide120" style="width: 120px"><div style="width: 30px; height: 10px"></div></div></div>
 <div style="display: flex; width: 100px"><div id="clipped" style="flex: 1; overflow: hidden"><div style="width: 80px; height: 10px"></div></div><div id="beside" style="flex: 1"><div style="width: 80px; height: 10px"></div></div></div>
 
+<!-- HTML 15.4.2: an img without a picture and without alternative text is a replaced element with no natural size,
+     so the sizes given to it in CSS apply (percentages included); with alternative text it is that text -->
+<div style="position: relative; width: 120px; height: 60px"><div style="position: absolute; top: 0; left: 0; width: 100%; height: 100%">
+  <img id="noSource" style="display: inline-block; width: 100%; height: 100%"></div></div>
+<p><img id="emptyAlt" alt="" style="width: 40px"> <img id="altText" alt="described"></p>
+
 <!-- CSS Positioned Layout 3: a fixed box is held by the viewport and stays there when the page scrolls -->
 <div id="pinned" style="position: fixed; top: 10px; right: 0; width: 20px; height: 20px; background: #c5221f"></div>
 
@@ -95,6 +101,10 @@
   eq('row items keep the width their content needs', [widthOf('needs80a'), widthOf('needs80b')].join(), '80,80');
   eq('an item wider than its content shrinks to fit', widthOf('wide120'), 100);
   eq('a scroll container has no automatic minimum', [widthOf('clipped'), widthOf('beside')].join(), '20,80');
+
+  var sizeOf = function (id) { var r = $(id).getBoundingClientRect(); return px(r.width) + 'x' + px(r.height); };
+  eq('an img without a picture takes the size it is given', [sizeOf('noSource'), sizeOf('emptyAlt')].join(), '120x60,40x0');
+  eq('an img with alternative text and no picture is that text', $('altText').getBoundingClientRect().width > 30, true);
 
   // ---- scrolling inside a box
   var scroller = $('scroller');

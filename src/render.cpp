@@ -87,7 +87,7 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
                         im.gen = gen;
                     }
                     if (im.bmp) rt->DrawBitmap(im.bmp.Get(), r, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                } else if (it.w > 2 && it.h > 2) {
+                } else if (it.img == -1 && it.w > 2 && it.h > 2) {
                     br->SetColor(D2D1::ColorF(0xf1f3f4));
                     rt->FillRectangle(r, br);
                     br->SetColor(D2D1::ColorF(0xc4c7c5));
