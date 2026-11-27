@@ -70,8 +70,10 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    bindings and events, classic and module scripts (import maps, `defer`, `nomodule`), timers + event loop, `fetch`/XHR with
    CORS, storage, cookies, MutationObserver, template contents, custom elements, shadow DOM (slots, scoped styles with
    `:host` and `::slotted()`, declarative shadow roots, style sheets made by script and adopted). These are checked by
-   `tests/pages/components.html`, whose expectations were compared with a reference browser. Still open: images added
-   by script, incremental restyle/relayout, per-site controls (JavaScript, cookies, images), the security baseline
+   `tests/pages/components.html`, whose expectations were compared with a reference browser. Style sheets and pictures
+   that a script adds after the page was loaded are fetched in the background and applied when they arrive, with `load`
+   and `error` events (`tests/pages/late.html`, served by `tests/server.py`), and IntersectionObserver and
+   ResizeObserver report for real. Still open: incremental restyle/relayout, per-site controls (JavaScript, cookies, images), the security baseline
    (script time and memory limits, certificate and mixed-content warnings, per-site exceptions), content blocker
    (EasyList-format lists), tab sleeping.
 5. **Milestone 5 - performance, security, graphics:** GPU layer compositor, off-thread layout, HTTP cache, process isolation,
