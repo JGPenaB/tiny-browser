@@ -72,6 +72,12 @@
 <div id="holder" style="transform: translateZ(0); margin-left: 30px; height: 10px"><div id="pinnedInside" style="position: fixed; top: 0; left: 0; width: 5px; height: 5px"></div></div>
 <div id="badTransform" style="width: 10px; height: 10px; transform: translate(5px) spin(3)"></div>
 
+<!-- HTML 15.5.3: a button lays its content out like an inline-block; clicking anything inside it presses it -->
+<form id="buttonForm" action="/nowhere" style="position: fixed; top: 2px; left: 600px; margin: 0">
+  <button id="iconButton" style="padding: 0; border: 0"><span id="buttonInside" style="display: inline-block; width: 60px; height: 20px; background: #1a73e8"></span></button>
+</form>
+<p><button id="twoLines" type="button"><b>bold</b><br>second line</button></p>
+
 <!-- CSS Positioned Layout 3: a fixed box is held by the viewport and stays there when the page scrolls -->
 <div id="pinned" style="position: fixed; top: 10px; right: 0; width: 20px; height: 20px; background: #c5221f"></div>
 
@@ -126,6 +132,11 @@
   eq('a transformed box holds fixed descendants', relative('pinnedInside', 'holder'), '0,0');
   eq('an invalid transform is ignored', getComputedStyle($('badTransform')).transform, 'none');
 
+  var buttonBox = $('iconButton').getBoundingClientRect();  // the line it is on adds the font's descent below
+  eq('a button is as big as its content', [px(buttonBox.width), buttonBox.height >= 20 && buttonBox.height < 26].join(), '60,true');
+  eq('a button lays out what it holds', $('twoLines').getBoundingClientRect().height > 25 && $('twoLines').querySelector('b').getBoundingClientRect().width > 0, true);
+  $('buttonForm').addEventListener('submit', function (e) { e.preventDefault(); console.log('BUTTON submitted by ' + (e.submitter ? e.submitter.id : '?')); });
+
   // ---- scrolling inside a box
   var scroller = $('scroller');
   eq('scrollHeight and clientHeight', [scroller.scrollHeight, scroller.clientHeight, scroller.scrollTop].join(), '300,150,0');
@@ -157,7 +168,8 @@
   }, 30);
 
   // After the summary the test runner sends this box a wheel event and two clicks: one where a row can be seen and
-  // one just above the box, where a row that was scrolled out of view lies. See the README for the command.
+  // one just above the box, where a row that was scrolled out of view lies. A third click lands on the span inside
+  // the fixed button. See the README for the command.
   $('wheelBox').addEventListener('scroll', function () { console.log('WHEEL ' + this.scrollTop + ' of ' + (this.scrollHeight - this.clientHeight)); });
   $('wheelBox').addEventListener('click', function (e) { console.log('CLICK ' + e.target.textContent); });
 

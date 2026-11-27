@@ -59,6 +59,8 @@ public:
     void fireLoadEvents();
     // Fires a user-interface event at a node (null: the window). Returns false when a listener cancelled it.
     bool dispatch(Node* target, const std::string& type, bool bubbles = true, bool cancelable = true);
+    // Fires the submit event (a SubmitEvent naming the submitter, HTML 4.10.21.3) at a form. False when cancelled.
+    bool submitEvent(Node* form, Node* submitter);
     // Runs timers that are due. The shell calls this when a wake() delay has passed.
     void pump();
     // The tab went to another session history entry of this document, which loads nothing (HTML 7.4.6.2): the entry

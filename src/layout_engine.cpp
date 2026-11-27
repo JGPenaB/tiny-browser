@@ -607,7 +607,7 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
         b.items.push_back(std::move(it));
         return;
     }
-    if (nm == "input" || nm == "button" || nm == "select" || nm == "textarea") {
+    if (nm == "input" || nm == "select" || nm == "textarea") {  // a <button> lays its content out as an inline-block
         WidgetKind wk = widget_kind(n);
         if (wk == WidgetKind::None) return;
         it.k = Item::Widget;

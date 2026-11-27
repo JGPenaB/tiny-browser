@@ -1383,7 +1383,11 @@ public:
         Page& p = *t->page;
         Node* form = form_of(from);
         if (!form) return;
-        if (notify && !fireEvent(*t, form, "submit")) return;  // a script handled the form itself
+        if (notify && p.script) {  // a script may handle the form itself
+            bool go = p.script->submitEvent(form, submitter);
+            afterScript(*t);
+            if (!go) return;
+        }
         if (t->page.get() != &p) return;
         if (!submitter) submitter = defaultSubmit(form);
         std::string body, passVal, userVal, lastText;
@@ -1536,6 +1540,22 @@ public:
         vault.lock();
     }
 
+    // The activation behaviour of a button (HTML 4.10.6): submit or reset its form. <input> buttons are widgets;
+    // a <button> is laid out like any element, so a click anywhere inside it reaches it here.
+    void pressButton(Page& p, Node* n) {
+        if (n->attr("disabled")) return;
+        focus = n;
+        std::string type = n->attr("type") ? lower(*n->attr("type")) : (n->name == "button" ? "submit" : "");
+        if (n->name == "button" && type != "reset" && type != "button") type = "submit";  // an invalid type means submit
+        if (type == "submit" || type == "image") submitForm(n, n);
+        else if (type == "reset") {
+            if (Node* form = form_of(n))
+                for_each_element(form, [&](Node* e) {
+                    p.fs.erase(e);
+                    return true;
+                });
+        }
+    }
     void activateWidget(int wi, float dx, float dy) {
         Page* p = curPage();
         if (!p || wi < 0 || wi >= (int)p->lo.widgets.size()) return;
@@ -1583,19 +1603,7 @@ public:
                 popup = popup == wi ? -1 : wi;
                 popupScroll = std::max(0, stateOf(*p, n).sel - 5);
                 break;
-            case WidgetKind::Button: {
-                focus = n;
-                std::string type = n->attr("type") ? lower(*n->attr("type")) : (n->name == "button" ? "submit" : "");
-                if (type == "submit" || type == "image") submitForm(n, n);
-                else if (type == "reset") {
-                    if (Node* form = form_of(n))
-                        for_each_element(form, [&](Node* e) {
-                            p->fs.erase(e);
-                            return true;
-                        });
-                }
-                break;
-            }
+            case WidgetKind::Button: pressButton(*p, n); break;
             default: break;
         }
         invalidate();
@@ -2521,7 +2529,16 @@ public:
             return;
         }
         focus = nullptr;
-        if (Node* a = linkAt(x, y)) {
+        Node* a = linkAt(x, y);
+        for (Node* e = nodeAt(p, dx, dy); e && !middle; e = e->parent) {
+            if (e == a) break;  // a link inside a button is followed instead
+            if (e->type == Node::T::Element && e->name == "button") {
+                pressButton(p, e);
+                invalidate();
+                return;
+            }
+        }
+        if (a) {
             std::string href = hrefOf(a);
             if (!href.empty()) {
                 auto target = a->attr("target");

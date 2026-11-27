@@ -757,6 +757,11 @@ struct ScriptHost::Impl {
     }
 
     // ---- events
+    Value submitEvent(Node* submitter) {  // a SubmitEvent for `submit`, with the button that submitted, or null
+        Value ev = makeEvent("submit", true, true);
+        ((JSHost*)ev.asObject())->slotA = submitter ? wrap(submitter) : Value::null();
+        return ev;
+    }
     // The interface of an event that the browser itself fires, from its type (UI Events 3, Pointer Events, HTML).
     JSObject* eventProtoFor(const std::string& type) {
         static const std::pair<const char*, const char*> kinds[] = {
@@ -1746,7 +1751,7 @@ JSFN(elementClick) {
         }
     if (isSubmitButton(n)) {
         if (Node* form = formOf(n)) {
-            if (im.fire(form, im.makeEvent("submit", true, true))) im.client.submitForm(form, n);
+            if (im.fire(form, im.submitEvent(n))) im.client.submitForm(form, n);
         }
     } else if (n->name == "input" && n->attr("type") && (lower(*n->attr("type")) == "checkbox" || lower(*n->attr("type")) == "radio") && Impl::connected(n)) {
         bool radio = lower(*n->attr("type")) == "radio";
@@ -1762,7 +1767,7 @@ JSFN(formSubmit) {  // data: 0 submit(), 1 requestSubmit(submitter)
     Node* form = thisElem(ci);
     if (!form->is("form")) illegal(ci, "a form");
     Node* submitter = toNode(ci.arg(0));
-    if (ci.callee->data.asInt() == 1 && !im.fire(form, im.makeEvent("submit", true, true))) return Value::undef();
+    if (ci.callee->data.asInt() == 1 && !im.fire(form, im.submitEvent(ci.argc > 0 ? toNode(ci.arg(0)) : nullptr))) return Value::undef();
     im.client.submitForm(form, submitter);
     return Value::undef();
 }
@@ -2232,6 +2237,7 @@ JSFN(eventCtor) {
     };
     JSHost* host = (JSHost*)e;
     if (is("PopStateEvent")) host->slotA = take("state", Value::null());
+    if (is("SubmitEvent")) host->slotA = take("submitter", Value::null());
     if (is("HashChangeEvent")) {
         host->slotA = vm.strv(vm.toStr16(take("oldURL", V(vm.a.empty))));
         host->slotB = vm.strv(vm.toStr16(take("newURL", V(vm.a.empty))));
@@ -2240,7 +2246,8 @@ JSFN(eventCtor) {
 }
 JSFN(eventSlotGet) {  // data: 0 for the first value kept inside the event, 1 for the second
     JSHost* e = thisHost(ci, HK_Event);
-    return ci.callee->data.asInt() == 0 ? e->slotA : e->slotB;
+    Value v = ci.callee->data.asInt() == 0 ? e->slotA : e->slotB;
+    return v.isUndef() ? Value::null() : v;
 }
 JSFN(eventPreventDefault) {
     JSHost* e = thisHost(ci, HK_Event);
@@ -3113,6 +3120,7 @@ void ScriptHost::Impl::setup() {
     getter(eventProtos["PopStateEvent"], "state", eventSlotGet, nullptr, 0);
     getter(eventProtos["HashChangeEvent"], "oldURL", eventSlotGet, nullptr, 0);
     getter(eventProtos["HashChangeEvent"], "newURL", eventSlotGet, nullptr, 1);
+    getter(eventProtos["SubmitEvent"], "submitter", eventSlotGet, nullptr, 0);
 
     // ---- one constructor and prototype per kind of node, so properties such as `value` or `async` exist only
     // on the elements that have them
@@ -3495,6 +3503,18 @@ bool ScriptHost::dispatch(Node* target, const std::string& type, bool bubbles, b
     Entry entry(im);
     try {
         return im.fire(target, im.makeEvent(type, bubbles, cancelable));
+    } catch (JSThrow&) {
+        im.reportError();
+        return true;
+    }
+}
+
+bool ScriptHost::submitEvent(Node* form, Node* submitter) {
+    Impl& im = *impl_;
+    if (im.dead) return true;
+    Entry entry(im);
+    try {
+        return im.fire(form, im.submitEvent(submitter));
     } catch (JSThrow&) {
         im.reportError();
         return true;
