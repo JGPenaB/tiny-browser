@@ -119,6 +119,8 @@ Sheet parse_sheet(std::string_view css);
 std::vector<Decl> parse_decls(std::string_view body);
 bool parse_color(std::string_view v, Color& out);
 const char* display_name(Display d);
+// True for an element that layout sizes as one box whatever its `display` says: replaced elements and form controls.
+bool replaced_like(const Node* n);
 std::string color_str(const Color& c);
 bool selector_parse(std::string_view text, Selector& out);
 bool selector_matches(const Selector& s, const Node* e);

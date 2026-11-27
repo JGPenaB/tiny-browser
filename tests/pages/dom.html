@@ -26,6 +26,10 @@
   <form id="form" action="/nowhere"><input name="q" value="x"><button id="submit">Submit</button></form>
 </div>
 <div id="box" style="width: 120px; height: 40px; background: #dde6f7">box</div>
+<div id="resolved" style="position: relative; z-index: 3; top: 5px; box-sizing: border-box; width: 100px; height: 30px; padding: 4px 6px; border: 2px solid red; margin: 1px 0 3px 7px; max-width: 300px; min-height: 12px; overflow: hidden; text-align: center; white-space: nowrap; line-height: 20px; opacity: 0.5; --tone: teal">resolved</div>
+<div id="padded" style="width: 80px; padding: 5px; border: 3px solid">padded <span id="inlineBox" style="width: 50px">inline</span></div>
+<div id="unboxed" class="hidden" style="width: 50px; margin-left: 10%">never shown</div>
+<div id="flexBox" style="display: flex; flex-direction: column"><i id="flexItem">flex</i></div>
 <div class="card" id="results"><b>Results</b></div>
 <script>
   var pass = 0, fail = 0;
@@ -110,6 +114,24 @@
   eq('getComputedStyle', getComputedStyle(box).display, 'block');
   document.querySelector('noscript') && eq('noscript hidden', getComputedStyle(document.querySelector('noscript')).display, 'none');
   eq('innerWidth', innerWidth > 200 && innerWidth === window.innerWidth, true);
+
+  // ---- resolved values (CSSOM 9)
+  var resolved = function (id, props) {
+    var style = getComputedStyle(document.getElementById(id));
+    return props.split(' ').map(function (p) { return style[p]; }).join(' ');
+  };
+  eq('resolved: nothing set', resolved('box', 'position top right bottom left zIndex maxWidth maxHeight minWidth minHeight'), 'static auto auto auto auto auto none none 0px 0px');
+  eq('resolved: initial keywords', resolved('box', 'boxSizing overflow cssFloat whiteSpace lineHeight opacity'), 'content-box visible none normal normal 1');
+  eq('resolved: positioned', resolved('resolved', 'position zIndex top'), 'relative 3 5px');
+  eq('resolved: border-box size', resolved('resolved', 'boxSizing width height maxWidth minHeight'), 'border-box 100px 30px 300px 12px');
+  eq('resolved: content-box size', resolved('padded', 'width paddingLeft borderLeftWidth'), '80px 5px 3px');
+  eq('resolved: edges', resolved('resolved', 'marginTop marginBottom marginLeft paddingTop paddingRight borderTopWidth borderTopColor'), '1px 3px 7px 4px 6px 2px rgb(255, 0, 0)');
+  eq('resolved: text', resolved('resolved', 'overflow textAlign whiteSpace lineHeight opacity'), 'hidden center nowrap 20px 0.5');
+  eq('resolved: custom property', getComputedStyle(document.getElementById('resolved')).getPropertyValue('--tone'), 'teal');
+  eq('resolved: width does not apply to an inline box', resolved('inlineBox', 'display width'), 'inline 50px');
+  eq('resolved: computed values without a box', resolved('unboxed', 'display width marginLeft top'), 'none 50px 10% auto');
+  eq('resolved: flex container', resolved('flexBox', 'display flexDirection flexWrap minWidth'), 'flex column nowrap 0px');
+  eq('resolved: automatic minimum size of a flex item', resolved('flexItem', 'minWidth minHeight'), 'auto auto');
 
   // ---- events
   var clicks = 0, order = [];

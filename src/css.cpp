@@ -377,6 +377,12 @@ bool parse_color(std::string_view sv, Color& out) {
     return false;
 }
 
+bool replaced_like(const Node* n) {
+    const std::string& nm = n->name;
+    return nm == "img" || nm == "input" || nm == "select" || nm == "textarea" || nm == "button" || nm == "svg" ||
+           nm == "canvas" || nm == "video" || nm == "iframe" || nm == "object" || nm == "embed" || nm == "audio";
+}
+
 const char* display_name(Display d) {
     switch (d) {
         case Display::Inline: return "inline";

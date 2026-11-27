@@ -178,12 +178,6 @@ bool blockLevel(Display d) {
 }
 bool isAbs(const Style* s) { return s->position == 2 || s->position == 3; }
 
-bool replacedLike(const Node* n) {
-    const std::string& nm = n->name;
-    return nm == "img" || nm == "input" || nm == "select" || nm == "textarea" || nm == "button" || nm == "svg" ||
-           nm == "canvas" || nm == "video" || nm == "iframe" || nm == "object" || nm == "embed" || nm == "audio";
-}
-
 bool containsBlock(const Node* n, int depth = 0) {
     if (depth > 48) return false;
     for (Node* k : FlatKids(n)) {
@@ -303,7 +297,7 @@ void flexKids(Ctx& c, Box& box, Node* e, Box* cb) {
 std::unique_ptr<Box> buildBox(Ctx& c, Node* e, Box* cb) {
     Display d = e->style->display;
     BK k = d == Display::Table ? BK::Table : (d == Display::Flex || d == Display::InlineFlex) ? BK::Flex : BK::Block;
-    bool repl = replacedLike(e);
+    bool repl = replaced_like(e);
     if (repl) k = BK::Block;
     auto b = mk(k, e);
     b->cb = cb;

@@ -1909,46 +1909,103 @@ JSFN(datasetGet) {
 }
 
 // ---- getComputedStyle
+// The element whose box holds this element's box: its parent in the flat tree, since shadow roots and slots have no box.
+const Node* boxParent(const Node* n) {
+    const Node* slot = assigned_slot(n);
+    const Node* p = slot ? slot : n->parent;
+    while (p && (p->isShadowRoot() || p->name == "slot")) p = p->parent;
+    return p;
+}
+// The resolved value of a property (CSSOM 9, "Resolved Values") for the properties the style engine keeps. A property
+// it does not keep reads as the element's inline declaration, or as nothing.
+// Layout records an element's border box and nothing more, so width and height are the only used values there are.
+// Margins, paddings and insets report their computed value instead: right for a length in px, while a percentage or
+// `auto` reads as it was written, not in px.
+std::string resolvedValue(const Node* n, const Style& s, const std::string& name) {
+    char buf[64];
+    auto number = [&](float v, const char* unit) {
+        snprintf(buf, sizeof buf, "%g%s", v, unit);
+        return std::string(buf);
+    };
+    // `keyword` is the name this property gives to Len::Auto or Len::None
+    auto length = [&](const Len& l, const char* keyword) -> std::string {
+        if (l.u == Len::Px) return number(l.v, "px");
+        if (l.u != Len::Pct) return keyword;
+        if (l.off == 0) return number(l.v, "%");
+        snprintf(buf, sizeof buf, "calc(%g%% + %gpx)", l.v, l.off);
+        return buf;
+    };
+    auto rgb = [&](const Color& c) {  // rgb(r, g, b), or rgba() when not opaque
+        int r = int(c.r * 255 + .5f), g = int(c.g * 255 + .5f), bl = int(c.b * 255 + .5f);
+        if (c.a >= 0.999f) snprintf(buf, sizeof buf, "rgb(%d, %d, %d)", r, g, bl);
+        else snprintf(buf, sizeof buf, "rgba(%d, %d, %d, %g)", r, g, bl, c.a < 0 ? 0.0 : (double)c.a);
+        return std::string(buf);
+    };
+    auto oneOf = [](size_t i, std::initializer_list<const char*> keywords) { return std::string(i < keywords.size() ? keywords.begin()[i] : ""); };
+
+    if (name.rfind("--", 0) == 0) {  // a custom property
+        if (s.vars)
+            if (auto it = s.vars->find(name); it != s.vars->end()) return it->second;
+        return {};
+    }
+    static const char* sides[] = {"top", "right", "bottom", "left"};
+    for (int i = 0; i < 4; ++i) {
+        if (name == sides[i]) return length(s.inset[i], "auto");
+        if (name == std::string("margin-") + sides[i]) return length(s.margin[i], "auto");
+        if (name == std::string("padding-") + sides[i]) return length(s.padding[i], "0px");
+        if (name == std::string("border-") + sides[i] + "-width") return number(s.border[i], "px");
+        if (name == std::string("border-") + sides[i] + "-color") return rgb(s.borderColor[i]);
+    }
+    if (name == "width" || name == "height") {
+        bool horizontal = name == "width";
+        // the property does not apply to an inline box that is not replaced, and without a box there is no used value
+        if (!n->hasBox || (s.display == Display::Inline && !replaced_like(n))) return length(horizontal ? s.width : s.height, "auto");
+        float used = horizontal ? n->bw : n->bh;
+        if (!s.borderBox && !replaced_like(n))  // layout gives a replaced element neither padding nor border
+            for (int side : {horizontal ? 1 : 0, horizontal ? 3 : 2}) used -= s.border[side] + s.padding[side].resolve(0);
+        return number(std::max(0.f, used), "px");
+    }
+    // An automatic minimum size resolves to zero where there is no box and on a box laid out the CSS 2 way, which
+    // leaves flex items (CSS Sizing 3, 3.1.2).
+    const Node* holder = n->hasBox ? boxParent(n) : nullptr;
+    bool flexItem = holder && holder->style && (holder->style->display == Display::Flex || holder->style->display == Display::InlineFlex);
+    const char* autoMinimum = flexItem ? "auto" : "0px";
+    if (name == "min-width") return length(s.minWidth, autoMinimum);
+    if (name == "min-height") return length(s.minHeight, autoMinimum);
+    if (name == "max-width") return length(s.maxWidth, "none");
+    if (name == "max-height") return length(s.maxHeight, "none");
+    if (name == "display") return display_name(s.display);
+    if (name == "visibility") return s.hidden ? "hidden" : "visible";
+    if (name == "color") return rgb(s.color);
+    if (name == "background-color") return rgb(s.bg);
+    if (name == "opacity") return number(s.opacity, "");
+    if (name == "position") return oneOf(s.position, {"static", "relative", "absolute", "fixed", "sticky"});
+    if (name == "z-index") return s.zAuto ? "auto" : std::to_string(s.zIndex);
+    if (name == "box-sizing") return s.borderBox ? "border-box" : "content-box";
+    if (name == "overflow" || name == "overflow-x" || name == "overflow-y") return oneOf(s.overflow, {"visible", "hidden", "auto"});
+    if (name == "float") return oneOf(s.floatSide, {"none", "left", "right"});
+    if (name == "font-size") return number(s.fontSize, "px");
+    if (name == "font-weight") return std::to_string(s.weight);
+    if (name == "font-style") return s.italic ? "italic" : "normal";
+    // `normal` is kept as the factor 1.2, so a line-height of exactly 1.2 reads as normal too
+    if (name == "line-height") return s.lhPx < 0 && s.lhFactor == 1.2f ? "normal" : number(s.lh(), "px");
+    // the style keeps `left` and the initial `start` as one value
+    if (name == "text-align") return oneOf(s.textAlign, {"start", "right", "center"});
+    if (name == "white-space") return oneOf(s.whiteSpace, {"normal", "pre", "nowrap", "pre-wrap", "pre-line"});
+    if (name == "text-transform") return oneOf(s.textTransform, {"none", "uppercase", "lowercase", "capitalize"});
+    if (name == "vertical-align") return oneOf(s.vAlign, {"baseline", "top", "middle", "bottom", "sub", "super"});
+    if (name == "text-decoration-line" || name == "text-decoration")
+        return s.underline && s.strike ? "underline line-through" : s.underline ? "underline" : s.strike ? "line-through" : "none";
+    if (name == "flex-direction") return oneOf(s.flexDir, {"row", "row-reverse", "column", "column-reverse"});
+    if (name == "flex-wrap") return s.flexWrap ? "wrap" : "nowrap";
+    if (name == "flex-grow") return number(s.flexGrow, "");
+    if (name == "flex-shrink") return number(s.flexShrink, "");
+    return styleValue(n, name);
+}
 bool computedHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
     if (ownsKey(o, k)) return false;
     Node* n = (Node*)((JSHost*)o)->ptr;
-    std::string name = cssName(k.str()->s), val;
-    const Style* s = n->style.get();
-    char buf[64];
-    if (s) {
-        static const char* sides[] = {"top", "right", "bottom", "left"};
-        auto rgb = [&](const Color& c) {  // CSSOM 6.7.2: rgb(r, g, b), or rgba() when not opaque
-            int r = int(c.r * 255 + .5f), g = int(c.g * 255 + .5f), b = int(c.b * 255 + .5f);
-            if (c.a >= 0.999f) snprintf(buf, sizeof buf, "rgb(%d, %d, %d)", r, g, b);
-            else snprintf(buf, sizeof buf, "rgba(%d, %d, %d, %g)", r, g, b, c.a < 0 ? 0.0 : (double)c.a);
-            return std::string(buf);
-        };
-        int side = -1;
-        for (int i = 0; i < 4; ++i)
-            if (name == std::string("margin-") + sides[i] || name == std::string("padding-") + sides[i] || name == std::string("border-") + sides[i] + "-width") side = i;
-        if (side >= 0) {
-            if (name[0] == 'b') snprintf(buf, sizeof buf, "%gpx", s->borderStyle[side] ? s->border[side] : 0.f), val = buf;
-            else {
-                const Len& l = name[0] == 'm' ? s->margin[side] : s->padding[side];
-                if (l.u == Len::Px) snprintf(buf, sizeof buf, "%gpx", l.v), val = buf;
-                else val = styleValue(n, name);
-            }
-        } else if (name == "display") val = display_name(s->display);
-        else if (name == "visibility") val = s->hidden ? "hidden" : "visible";
-        else if (name == "color") val = rgb(s->color);
-        else if (name == "background-color") val = rgb(s->bg);
-        else if (name == "font-style") val = s->italic ? "italic" : "normal";
-        else if (name == "opacity") snprintf(buf, sizeof buf, "%g", s->opacity), val = buf;
-        else if (name == "position") val = s->position == 1 ? "relative" : s->position == 2 ? "absolute" : s->position == 3 ? "fixed" : s->position == 4 ? "sticky" : "static";
-        else if (name == "font-size") snprintf(buf, sizeof buf, "%gpx", s->fontSize), val = buf;
-        else if (name == "font-weight") val = std::to_string(s->weight);
-        else if (name == "width" || name == "height") {
-            if (n->hasBox) snprintf(buf, sizeof buf, "%gpx", name == "width" ? n->bw : n->bh), val = buf;
-            else val = "auto";
-        } else
-            val = styleValue(n, name);
-    }
-    out = val8(vm, val);
+    out = val8(vm, n->style ? resolvedValue(n, *n->style, cssName(k.str()->s)) : std::string());
     return true;
 }
 const HostHooks kComputedHooks{computedHookGet, nullptr, nullptr, nullptr};
