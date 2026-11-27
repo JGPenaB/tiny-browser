@@ -103,6 +103,11 @@
   holder.append('text via append ', document.createElement('i'));
   eq('append', holder.lastChild.tagName, 'I');
 
+  // ---- document.all: an object that passes for undefined everywhere but in ===
+  eq('document.all', [typeof document.all, document.all === undefined, document.all == null, !document.all, document.all instanceof HTMLAllCollection,
+    document.all.length === document.getElementsByTagName('*').length, document.all(0) === document.documentElement, document.all.item('title').id,
+    document.all.namedItem('q') === document.querySelector('[name=q]'), String(document.all.namedItem('0')), String(document.all())].join(), 'undefined,false,true,true,true,true,true,title,true,null,null');
+
   // ---- style and layout
   var box = document.getElementById('box');
   eq('style read', box.style.width, '120px');

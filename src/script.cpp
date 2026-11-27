@@ -175,6 +175,7 @@ struct ScriptHost::Impl {
     bool manualScrollRestoration = false;
     std::vector<std::pair<std::string, std::string>> hashChanges;  // old and new URL of hashchange events still owed
     JSObject* historyObject = nullptr;
+    JSNative* allCollection = nullptr;  // document.all
     // The prototype of each event interface, by its name ("MouseEvent"). Every interface has one of its own that
     // inherits from its parent interface's (DOM 2.2, UI Events 3, HTML 8.1.8.3).
     std::unordered_map<std::string, JSObject*> eventProtos;
@@ -1411,6 +1412,42 @@ JSFN(getElementsByTagName) {
     });
     return I(ci.vm).list(out);
 }
+// ---- document.all (HTML 2.6.3.1, HTMLAllCollection). It has [[IsHTMLDDA]]: typeof says "undefined" and it counts
+// as false, yet it is an object, and pages tell it from undefined with ===. It can be called like its item().
+// Not done: reading it by index or name as a property (all[0], all.name), and a collection for a name that
+// several elements share: the first of them is returned.
+JSFN(allItem) {  // data: 0 for all(x) and item(x), which also take an index; 1 for namedItem(x)
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    if (ci.argc == 0 || ci.arg(0).isUndef()) return Value::null();
+    std::string key = str8(vm, ci.arg(0));
+    bool index = ci.callee->data.asInt() == 0 && !key.empty() && key.size() < 10 && key.find_first_not_of("0123456789") == std::string::npos;
+    if (key.empty()) return Value::null();
+    size_t at = index ? (size_t)atoll(key.c_str()) : 0, seen = 0;
+    static const char* named[] = {"a", "button", "embed", "form", "frame", "frameset", "iframe", "img", "input", "map", "meta", "object", "select", "textarea"};
+    Node* found = nullptr;
+    eachElement(im.doc.root.get(), [&](Node* e) {
+        if (index) {
+            if (seen++ == at) found = e;
+        } else if (e->id == key) {
+            found = e;
+        } else if (const std::string* name = e->attr("name"); name && *name == key) {
+            for (const char* tag : named)
+                if (e->name == tag) found = e;
+        }
+        return !found;
+    });
+    return im.wrap(found);
+}
+JSFN(allLength) {
+    int count = 0;
+    eachElement(I(ci.vm).doc.root.get(), [&](Node*) {
+        ++count;
+        return true;
+    });
+    return Value::i32(count);
+}
+JSFN(documentAll) { return V(I(ci.vm).allCollection); }
 JSFN(getElementsByClassName) {
     std::string names = str8(ci.vm, ci.arg(0));
     std::vector<std::string> want;
@@ -2815,6 +2852,7 @@ void ScriptHost::Impl::setup() {
         g.mark(currentScript);
         for (auto& e : session) g.mark(e.state);
         if (historyObject) g.mark(V(historyObject));
+        if (allCollection) g.mark(V(allCollection));
         for (auto& ep : eventProtos) g.mark(V(ep.second));
         g.mark(domException);
         g.mark(cloneFn);
@@ -2978,6 +3016,17 @@ void ScriptHost::Impl::setup() {
     getter(documentProto, "documentElement", docElementGet, nullptr, 0);
     getter(documentProto, "head", docElementGet, nullptr, 1);
     getter(documentProto, "body", docElementGet, nullptr, 2);
+    JSObject* allProto = vm.newObject();
+    makeCtor(vm, "HTMLAllCollection", illegalCtor, 0, allProto);
+    allCollection = vm.newNative(allItem, "all", 1);
+    allCollection->data = Value::i32(0);
+    allCollection->htmlDda = true;
+    allCollection->proto = allProto;
+    for (const char* own : {"length", "name"}) vm.del(allCollection, PropKey::of(vm.atom(own)));  // a function's own, which would hide the collection's
+    getter(allProto, "length", allLength);
+    method(allProto, "item", allItem, 0, 0);
+    method(allProto, "namedItem", allItem, 1, 1);
+    getter(documentProto, "all", documentAll);
     getter(documentProto, "title", docTitleGet, docTitleSet);
     getter(documentProto, "URL", docUrlGet);
     getter(documentProto, "documentURI", docUrlGet);

@@ -488,7 +488,7 @@ Object.setPrototypeOf(G, windowProto);
 named('Window').prototype = windowProto;
 ['Range', 'Selection', 'NamedNodeMap', 'Attr', 'DocumentType', 'ProcessingInstruction', 'CDATASection', 'XMLDocument', 'MediaQueryList', 'StyleSheet',
  'CSSRule', 'CSSRuleList', 'StyleSheetList', 'MutationRecord', 'DOMRectList', 'DataTransfer', 'FileList', 'ValidityState', 'Touch', 'TextMetrics', 'ImageData',
- 'CanvasRenderingContext2D', 'MediaError', 'TimeRanges', 'HTMLAllCollection', 'DOMImplementation', 'DOMStringMap', 'NodeIterator', 'Plugin', 'MimeType', 'PluginArray', 'MimeTypeArray'].forEach(function (n) { named(n); });
+ 'CanvasRenderingContext2D', 'MediaError', 'TimeRanges', 'DOMImplementation', 'DOMStringMap', 'NodeIterator', 'Plugin', 'MimeType', 'PluginArray', 'MimeTypeArray'].forEach(function (n) { named(n); });
 class DOMRect {
   constructor(x, y, w, h) { this.x = x || 0; this.y = y || 0; this.width = w || 0; this.height = h || 0; }
   get left() { return this.x; } get top() { return this.y; } get right() { return this.x + this.width; } get bottom() { return this.y + this.height; }
