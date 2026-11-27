@@ -383,6 +383,19 @@ private:
     }
 
     void insert(Tok& t) {
+        // A declarative shadow root (HTML 13.2.6.4.4, a template start tag with shadowrootmode): the template's
+        // content becomes the shadow tree of the element it is written in.
+        if (t.name == "template" && foreign_ == 0 && cur() == place() && !cur()->shadow && cur()->type == Node::T::Element && st_.size() < kMaxDepth)
+            for (auto& a : t.attrs)
+                if (a.first == "shadowrootmode" && (a.second == "open" || a.second == "closed")) {
+                    Node* host = cur();
+                    host->shadow = mk("#shadow-root");
+                    host->shadow->parent = host;
+                    host->shadow->attrs.push_back({"mode", a.second});
+                    ++g_shadowRoots;
+                    st_.push_back(host->shadow.get());
+                    return;
+                }
         auto e = mk(t.name);
         e->attrs = std::move(t.attrs);
         Node* raw = place()->append(std::move(e));
@@ -555,7 +568,7 @@ private:
         bool tableish = in(name, {"table", "tr", "td", "th", "tbody", "thead", "tfoot", "caption"});
         for (size_t k = st_.size(); k-- > 0;) {
             Node* x = st_[k];
-            if (x->name == name) {
+            if (x->name == name || (name == "template" && x->isShadowRoot())) {
                 popTo(k);
                 return;
             }
@@ -584,6 +597,7 @@ void finalize(Document& d) {
         stack.pop_back();
         if (inDocument) ++count;
         if (n->content) templates.push_back(n->content.get());
+        if (n->shadow) stack.push_back(n->shadow.get());
         if (n->type == Node::T::Element) {
             if (auto v = n->attr("id")) n->id = *v;
             if (auto c = n->attr("class")) {

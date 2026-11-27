@@ -20,6 +20,7 @@
 <div id="slot"></div>
 <div id="sh1"><span slot="title">Slotted title</span><b>default one</b> text <i slot="none">unassigned</i></div>
 <div id="sh2">hidden light text</div>
+<div id="dsd"><template shadowrootmode="open"><style>:host { display: block; } .made { font-style: italic; }</style><p class="made" id="dsd-p">declared <slot></slot></p></template><span>light</span></div>
 <div class="card" id="results"><b>Results</b></div>
 <script>
   var pass = 0, fail = 0;
@@ -176,6 +177,10 @@
   class NoShadow extends HTMLElement { static get disabledFeatures() { return ['shadow']; } }
   customElements.define('x-noshadow', NoShadow);
   eq('shadow: disabledFeatures', thrown(function () { new NoShadow().attachShadow({ mode: 'open' }); }), 'NotSupportedError');
+
+  var dsd = document.getElementById('dsd');
+  eq('shadow: declared in the markup', (dsd.shadowRoot instanceof ShadowRoot) + ':' + dsd.children.length + ':' + String(dsd.querySelector('template')) + ':' + dsd.shadowRoot.querySelector('.made').id + ':' +
+    cs(dsd.shadowRoot.querySelector('.made'), 'fontStyle') + ':' + dsd.shadowRoot.querySelector('slot').assignedElements()[0].textContent + ':' + String(document.getElementById('dsd-p')), 'true:1:null:dsd-p:italic:light:null');
 
   window.addEventListener('load', function () {
     setTimeout(function () {
