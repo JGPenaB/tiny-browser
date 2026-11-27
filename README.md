@@ -34,7 +34,7 @@ Requires Visual Studio 2022 (Desktop C++ workload) and CMake.
 ```text
 tinybrowser.exe [url]
 tinybrowser.exe --selftest [results.txt]          # engine unit tests, exit code 0 = pass
-tinybrowser.exe --js <script.js> [output.txt]     # run a script in the JavaScript engine (console, timers)
+tinybrowser.exe --js <script.js> [output.txt]     # run a script in the JavaScript engine (console, timers, agents)
 tinybrowser.exe --screenshot <url> <out.png> [--size 1280x860] [--devtools elements|network|perf|console] [--scroll N]
                 [--do "click:x,y;type:text;key:enter;key:tab;key:save"] [--vault test-vault.dat]
 ```
@@ -65,7 +65,7 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
    devtools Console. Behavior follows the ECMAScript specification (ECMA-262) and is checked against the test262
-   conformance suite: see "Conformance" below. Still open: Temporal, `using` declarations, Intl.
+   conformance suite: see "Conformance" below. Still open: Temporal, Intl.
 4. **Milestone 4 - DOM + Web APIs (in progress; required by Google results, YouTube and Reddit):** done so far: DOM
    bindings and events, classic and module scripts (import maps, `defer`, `nomodule`), timers + event loop, `fetch`/XHR with
    CORS, storage, cookies, MutationObserver. Still open: custom elements and shadow DOM (Reddit), styles and images added
@@ -80,22 +80,22 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 `python tests/run_test262.py [path filter ...] [--jobs N] [--save name]` runs the ECMAScript conformance suite (test262,
 cloned into the git-ignored `third_party/test262`; the script's header has the command) and writes the failures to
-`out/test262-<name>.txt`. Thirteenth full run, 2026-11-27: 43,705 of 48,803 tests pass (89.6%). Without the 4,616 tests
-for Temporal, a proposal that is not part of ECMA-262 yet, that is 98.9%.
+`out/test262-<name>.txt`. Fourteenth full run, 2026-11-27: 43,817 of 48,803 tests pass (89.8%). Without the 4,616 tests
+for Temporal, a proposal that is not part of ECMA-262 yet, that is 99.2%.
 
 What the engine covers: the whole core language with its early errors (classes with private members and static
 blocks, generators and async generators, destructuring, modules, direct and indirect `eval`, `with`, Annex B, proper
 tail calls, `using` and `await using`), Proxy and Reflect, BigInt, typed arrays with resizable and shared buffers,
-Atomics, RegExp (named groups, lookbehind, Unicode properties, the `v` flag with set operations), Promise combinators,
+Atomics (with waiting and notifying between agents: threads that have an engine each and share memory), RegExp (named groups, lookbehind, Unicode properties, the `v` flag with set operations), Promise combinators,
 iterator helpers (including `concat`, `zip`, `chunks`, `windows`), Set methods, `Array.fromAsync`,
 `Error.prototype.stack`, `JSON.rawJSON`, `Math.sumPrecise`, DisposableStack, mapped `arguments` objects, import
 attributes with JSON modules, and several realms in one engine (each with its own global object and built-ins, which
 is what frames in a page will use).
 
 What still fails, largest first: Temporal (4,616, a proposal), `import defer` and source-phase imports (about 260, both
-proposals), Atomics tests that need worker agents (112), ShadowRealm (64, a proposal), decorators (22, a proposal), emoji
-sequence properties in regular expressions (12, they need Unicode data files), `import` of bytes (5, a proposal). Nothing
-else fails: inside ECMA-262 itself only the agent tests and the emoji data are left.
+proposals), ShadowRealm (64, a proposal), decorators (22, a proposal), emoji sequence properties in regular expressions
+(12, they need Unicode data files), `import` of bytes (5, a proposal). Nothing else fails: inside ECMA-262 itself only
+the emoji data is left.
 
 ## Engine speed
 
