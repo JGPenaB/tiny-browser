@@ -6,6 +6,7 @@
 #include <cstring>
 #include <deque>
 
+#include "emoji_data.h"
 #include "regex.h"
 #include "unicode_data.h"
 
@@ -749,11 +750,23 @@ struct Parser {
             std::string name;
             size_t k = i + 1;
             while (k < src.size() && src[k] != '}') name += (char)src[k++];
-            if (k < src.size() && name == "Emoji_Keycap_Sequence") {  // a property of strings (22.2.2.9, table 68)
+            // a property of strings (22.2.2.9, table 68): one of the emoji sequence sets, or RGI_Emoji, which is all of them
+            ClassSet s;
+            bool known = false;
+            for (const EmojiProperty& e : kEmojiProperties) {
+                if (k >= src.size() || (name != e.name && name != "RGI_Emoji")) continue;
+                known = true;
+                for (uint32_t n = 0; n < e.rangeWords; n += 2) s.r.push_back({e.ranges[n], e.ranges[n + 1]});
+                for (uint32_t n = 0; n < e.seqWords; ++n) {
+                    std::u32string seq;
+                    for (; e.seqs[n]; ++n) seq += (char32_t)e.seqs[n];
+                    s.strs.push_back(std::move(seq));
+                }
+            }
+            if (known) {
                 if (negated) fail("Invalid property name");
                 i = k + 1;
-                ClassSet s;
-                for (char32_t c : std::u32string(U"#*0123456789")) s.strs.push_back(std::u32string{c, 0xFE0F, 0x20E3});
+                tidy(s.r);
                 return s;
             }
         }

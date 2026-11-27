@@ -106,4 +106,18 @@ test("case-insensitive matching by the flag in force (22.2.5.6 Canonicalize)", f
   eq([/[\u0390]/ui.test("\u1fd3"), /[\u1fd3]/ui.test("\u0390"), /[\ufb05]/ui.test("\ufb06"), /\u03c2/iu.test("\u03a3"), /\u00df/iu.test("\u1e9e"), /i/iu.test("\u0130")], [true, true, true, true, true, false]);
   eq([/(?=(abc))?a/.exec("abc").slice(), /(?:(a)|b)?c/.exec("c").slice(), /(a*)?b/.exec("b").slice()], [["a", undefined], ["c", undefined], ["b", undefined]]);
 });
+test("properties of strings: the emoji sequences (table 68)", function () {
+  const family = "\u{1F468}‍\u{1F469}‍\u{1F467}‍\u{1F466}", flag = "\u{1F1EB}\u{1F1F7}", thumb = "\u{1F44D}\u{1F3FD}", keycap = "#️⃣";
+  const england = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}", watch = "⌚", heart = "❤️";
+  eq([/^\p{RGI_Emoji_ZWJ_Sequence}$/v.test(family), /^\p{RGI_Emoji_Flag_Sequence}$/v.test(flag), /^\p{RGI_Emoji_Modifier_Sequence}$/v.test(thumb),
+    /^\p{Emoji_Keycap_Sequence}$/v.test(keycap), /^\p{RGI_Emoji_Tag_Sequence}$/v.test(england), /^\p{Basic_Emoji}$/v.test(watch), /^\p{Basic_Emoji}$/v.test(heart)],
+    [true, true, true, true, true, true, true]);
+  eq(/^\p{RGI_Emoji}+$/v.test(family + flag + thumb + keycap + england + watch + heart), true);
+  eq([/^\p{RGI_Emoji_Flag_Sequence}$/v.test(family), /^\p{Basic_Emoji}$/v.test(flag), /^\p{RGI_Emoji}$/v.test("a"), /^\p{RGI_Emoji}$/v.test("\u{1F1EB}")], [false, false, false, false]);
+  // the longest sequence is tried first, and set operations work on the strings
+  eq([/\p{RGI_Emoji}/v.exec(family + "x")[0] === family, /^[\p{RGI_Emoji}--\p{RGI_Emoji_Flag_Sequence}]$/v.test(flag), /^[\p{RGI_Emoji}&&\p{Basic_Emoji}]$/v.test(watch)],
+    [true, false, true]);
+  for (const src of ["\\p{RGI_Emoji}", "\\p{Basic_Emoji}"]) throws(() => new RegExp(src, "u"), SyntaxError, src);
+  for (const src of ["\\P{RGI_Emoji}", "[^\\p{RGI_Emoji}]", "\\p{RGI_Emoji_Sequence}"]) throws(() => new RegExp(src, "v"), SyntaxError, src);
+});
 done();
