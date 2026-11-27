@@ -80,20 +80,21 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 `python tests/run_test262.py [path filter ...] [--jobs N] [--save name]` runs the ECMAScript conformance suite (test262,
 cloned into the git-ignored `third_party/test262`; the script's header has the command) and writes the failures to
-`out/test262-<name>.txt`. Ninth full run, 2026-11-27: 43,208 of 48,803 tests pass (88.5%). Without the 4,616 Temporal
-tests, which is the one large piece of the language not written yet, that is 97.8%.
+`out/test262-<name>.txt`. Tenth full run, 2026-11-27: 43,451 of 48,803 tests pass (89.0%). Without the 4,616 tests
+for Temporal, a proposal that is not part of ECMA-262 yet, that is 98.3%.
 
 What the engine covers: the whole core language with its early errors (classes with private members and static
-blocks, generators and async generators, destructuring, modules, direct and indirect `eval`, `with`, Annex B),
-Proxy and Reflect, BigInt, typed arrays with resizable and shared buffers, Atomics, RegExp (named groups, lookbehind,
-Unicode properties, the `v` flag with set operations), Promise combinators, iterator helpers (including `concat`, `zip`,
-`chunks`, `windows`), Set methods, `Array.fromAsync`, `Error.prototype.stack`, `JSON.rawJSON`, `Math.sumPrecise`,
-DisposableStack, mapped `arguments` objects.
+blocks, generators and async generators, destructuring, modules, direct and indirect `eval`, `with`, Annex B, proper
+tail calls, `using` and `await using`), Proxy and Reflect, BigInt, typed arrays with resizable and shared buffers,
+Atomics, RegExp (named groups, lookbehind, Unicode properties, the `v` flag with set operations), Promise combinators,
+iterator helpers (including `concat`, `zip`, `chunks`, `windows`), Set methods, `Array.fromAsync`,
+`Error.prototype.stack`, `JSON.rawJSON`, `Math.sumPrecise`, DisposableStack, mapped `arguments` objects, import
+attributes with JSON modules.
 
-What still fails, largest first: Temporal (4,616), `import defer` and source-phase imports (about 250, both proposals),
-`using` and `await using` declarations (about 120), Atomics tests that need worker agents (112), tests that need a
-second realm (about 190) or ShadowRealm (64), proper tail calls (35), decorators (20), emoji sequence properties in
-regular expressions (13), lookbehind capture order (6).
+What still fails, largest first: Temporal (4,616, a proposal), `import defer` and source-phase imports (about 250, both
+proposals), tests that need a second realm (about 190), Atomics tests that need worker agents (112), ShadowRealm (64, a
+proposal), decorators (20, a proposal), emoji sequence properties in regular expressions (13, they need Unicode data
+files).
 
 ## Engine speed
 
