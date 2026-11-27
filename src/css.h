@@ -54,6 +54,9 @@ struct Style {
     uint8_t floatSide = 0; // 1 left, 2 right (parsed; float layout is not implemented yet)
     float radius = 0;      // border-radius in px (uniform)
     bool opacity0 = false, animated = false;
+    // opacity: the element's own value, and `alpha`, that value times the ancestors'. There is no compositor yet,
+    // so an element is not blended as a group: each thing it paints is made that much see-through instead.
+    float opacity = 1, alpha = 1;
     bool masked = false;   // mask-image icons: the solid background would be a filled square without mask support
     // Flex container
     uint8_t flexDir = 0;   // 0 row, 1 row-reverse, 2 column, 3 column-reverse

@@ -3055,6 +3055,14 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
                 const std::string* nm = wd.node->attr("name");
                 fprintf(fp, "widget %s name=%s at %.0f,%.0f %0.fx%.0f\n", wd.node->name.c_str(), nm ? nm->c_str() : "", wd.x, wd.y, wd.w, wd.h);
             }
+            if (getenv("TB_DUMP_ITEMS")) {  // debugging aid: the canvas colour and the large boxes of the display list, in paint order
+                const LayoutOut& lo = ft.page->lo;
+                fprintf(fp, "canvas %.2f %.2f %.2f %.2f\n", lo.canvas.r, lo.canvas.g, lo.canvas.b, lo.canvas.a);
+                for (auto& it : lo.items)
+                    if ((it.k == DItem::K::Box || it.k == DItem::K::Rect || it.k == DItem::K::Image) && it.w >= 200 && it.h >= 100)
+                        fprintf(fp, "item %d layer=%d at %.0f,%.0f %.0fx%.0f color %.2f %.2f %.2f %.2f img=%d\n", (int)it.k, it.layer, it.x, it.y, it.w, it.h,
+                                it.c.r, it.c.g, it.c.b, it.c.a, it.img);
+            }
             for (auto& e : ft.page->net) fprintf(fp, "net %d %zu %s %s\n", e.status, e.bytes, e.url.c_str(), e.error.c_str());
             fprintf(fp, "scripts=%d stopped=%d\n", ft.page->script ? 1 : 0, ft.page->script && ft.page->script->stopped() ? 1 : 0);
             static const char* kinds[] = {"log", "info", "warn", "error", "input", "result"};

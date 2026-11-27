@@ -7,6 +7,12 @@
 
 namespace tb {
 
+// A colour as an element paints it: its opacity, with that of its ancestors, makes it that much see-through.
+static Color faded(Color c, const Style& s) {
+    c.a *= s.alpha;
+    return c;
+}
+
 // ---------------------------------------------------------------- form control helpers (shared with the shell)
 
 WidgetKind widget_kind(const Node* n) {
@@ -871,7 +877,7 @@ void emitText(Ctx& c, float x, float y, float w, float h, const Style& st, const
     d.y = y;
     d.w = w;
     d.h = h;
-    d.c = st.color;
+    d.c = faded(st.color, st);
     d.tl = c.in.ts->layout(st, txt, st.underline, st.strike);
     if (d.tl) push(c, std::move(d));
 }
@@ -967,7 +973,7 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                             bgd.y = iy;
                             bgd.w = it.w;
                             bgd.h = it.h;
-                            bgd.c = it.st->bg;
+                            bgd.c = faded(it.st->bg, *it.st);
                             push(c, std::move(bgd));
                         }
                         DItem d;
@@ -1017,7 +1023,7 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                 d.y = ty;
                 d.w = wsum;
                 d.h = a + de;
-                d.c = it.bg;
+                d.c = faded(it.bg, *it.st);
                 push(c, std::move(d));
             }
             if (!it.st->hidden) emitText(c, fx, ty, wsum, a + de, *it.st, txt);
@@ -1140,7 +1146,7 @@ float layoutTable(Ctx& c, Box& t, float ix, float iy, float availW) {
         if (r.st && !r.st->bg.transparent() && !r.st->hidden) {
             DItem d;
             d.k = DItem::K::Rect;
-            d.c = r.st->bg;
+            d.c = faded(r.st->bg, *r.st);
             rowPaint = push(c, std::move(d));
         }
         float x = ix + sp, rowH = 0;
@@ -1612,11 +1618,11 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     if (own && !b.replaced && !s->hidden && (!s->bg.transparent() || b.b[0] > 0 || b.b[1] > 0 || b.b[2] > 0 || b.b[3] > 0)) {
         DItem d;
         d.k = DItem::K::Box;
-        d.c = s->bg;
+        d.c = faded(s->bg, *s);
         d.radius = s->radius;
         for (int i = 0; i < 4; ++i) {
             d.bw[i] = b.b[i];
-            d.bc[i] = s->borderColor[i];
+            d.bc[i] = faded(s->borderColor[i], *s);
         }
         b.paintIdx = push(c, std::move(d));
     }

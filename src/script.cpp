@@ -1938,7 +1938,7 @@ bool computedHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
         else if (name == "color") val = rgb(s->color);
         else if (name == "background-color") val = rgb(s->bg);
         else if (name == "font-style") val = s->italic ? "italic" : "normal";
-        else if (name == "opacity") val = s->opacity0 ? "0" : "1";
+        else if (name == "opacity") snprintf(buf, sizeof buf, "%g", s->opacity), val = buf;
         else if (name == "position") val = s->position == 1 ? "relative" : s->position == 2 ? "absolute" : s->position == 3 ? "fixed" : s->position == 4 ? "sticky" : "static";
         else if (name == "font-size") snprintf(buf, sizeof buf, "%gpx", s->fontSize), val = buf;
         else if (name == "font-weight") val = std::to_string(s->weight);

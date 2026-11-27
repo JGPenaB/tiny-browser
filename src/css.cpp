@@ -1112,6 +1112,7 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
 }
 
 void inherit(Style& s, const Style& p) {
+    s.alpha = p.alpha;
     s.color = p.color;
     s.fontSize = p.fontSize;
     s.weight = p.weight;
@@ -1515,7 +1516,10 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
     } else if (prop == "opacity") {
         float v;
         std::string_view u;
-        if (parse_num(lv, v, u)) s.opacity0 = (u == "%" ? v / 100.f : v) <= 0.01f;
+        if (parse_num(lv, v, u)) {
+            s.opacity = std::clamp(u == "%" ? v / 100.f : v, 0.f, 1.f);
+            s.opacity0 = s.opacity <= 0.01f;
+        }
     } else if (prop == "animation" || prop == "animation-name") {
         s.animated = lv != "none";
     } else if (prop == "mask-image" || prop == "-webkit-mask-image" || prop == "mask" || prop == "-webkit-mask") {
@@ -1868,6 +1872,7 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
     }
     // No compositor yet: fully transparent elements are simply not painted (unless an animation would reveal them).
     if (s->opacity0 && !s->animated) s->hidden = true;
+    s->alpha = parent.alpha * (s->opacity0 ? 1.f : s->opacity);  // an animated element that starts at 0 is shown as it will end
     if (s->masked) s->bg = Color{};
     // Out-of-flow boxes are blockified.
     if (s->position == 2 || s->position == 3) {
