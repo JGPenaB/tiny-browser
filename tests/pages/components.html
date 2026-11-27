@@ -182,6 +182,20 @@
   eq('shadow: declared in the markup', (dsd.shadowRoot instanceof ShadowRoot) + ':' + dsd.children.length + ':' + String(dsd.querySelector('template')) + ':' + dsd.shadowRoot.querySelector('.made').id + ':' +
     cs(dsd.shadowRoot.querySelector('.made'), 'fontStyle') + ':' + dsd.shadowRoot.querySelector('slot').assignedElements()[0].textContent + ':' + String(document.getElementById('dsd-p')), 'true:1:null:dsd-p:italic:light:null');
 
+  var sheet = new CSSStyleSheet(), docSheet = new CSSStyleSheet();
+  sheet.replaceSync('.made { font-weight: 700; } :host { border-left: 3px solid red; }');
+  dsd.shadowRoot.adoptedStyleSheets = [sheet];
+  docSheet.replaceSync('#dsd > span { font-style: italic; }');
+  document.adoptedStyleSheets.push(docSheet);
+  eq('sheets made by script', cs(dsd.shadowRoot.querySelector('.made'), 'fontWeight') + ':' + cs(dsd, 'borderLeftWidth') + ':' + cs(dsd.querySelector('span'), 'fontStyle') + ':' +
+    dsd.shadowRoot.adoptedStyleSheets.length + ':' + document.adoptedStyleSheets.includes(docSheet), '700:3px:italic:1:true');
+  sheet.replaceSync('.made { font-weight: 400; }');
+  eq('sheets made by script: replaced', cs(dsd.shadowRoot.querySelector('.made'), 'fontWeight') + ':' + cs(dsd, 'borderLeftWidth'), '400:0px');
+  var watched = [], mo = new MutationObserver(function (records) { records.forEach(function (r) { if (r.target.id !== 'results') watched.push(r.target.id || r.target.nodeName); }); });
+  mo.observe(document.body, { childList: true, subtree: true });
+  dsd.shadowRoot.appendChild(document.createElement('hr')); dsd.appendChild(document.createElement('hr'));
+  Promise.resolve().then(function () { eq('observers do not see into shadow trees', watched.join(), 'dsd'); mo.disconnect(); });
+
   window.addEventListener('load', function () {
     setTimeout(function () {
       document.title = 'Components test: ' + pass + ' passed, ' + fail + ' failed';

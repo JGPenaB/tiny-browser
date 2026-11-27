@@ -56,6 +56,9 @@ public:
     void pump();
     // Devtools console: evaluates in the page's global scope. Returns false and the error text on failure.
     bool eval(const std::wstring& source, std::wstring& out);
+    // Style sheets that scripts made and adopted (CSSOM 6.2, adoptedStyleSheets): the text of each with the tree
+    // it styles, a shadow root or null for the document.
+    std::vector<std::pair<const Node*, std::string>> adoptedStyles() const;
     bool stopped() const;  // scripts were halted (time limit)
     bool busy() const;     // network requests started by script are still in flight
 

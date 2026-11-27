@@ -191,6 +191,7 @@ struct ScriptHost::Impl {
         bool hadOld = false, hasNew = false;
     };
     std::deque<Reaction> reactions;
+    std::unordered_map<Node*, std::vector<std::string>> adopted;  // adoptedStyleSheets of the document node and of shadow roots, as text
     Value ceHook;  // the prelude's function that carries a reaction out; set when the first element is defined
 
     Impl(Document& d, const std::string& u, Client& c) : doc(d), url(u), client(c) {}
@@ -435,8 +436,11 @@ struct ScriptHost::Impl {
                 bool wants = type[0] == 'c' && type[1] == 'h' ? t.childList : type[0] == 'a' ? t.attributes : t.characterData;
                 if (!wants) continue;
                 if (t.node == target) hit = true;
-                else if (t.subtree)
-                    for (Node* a = target->parent; a && !hit; a = a->parent) hit = a == t.node;
+                else if (t.subtree && !target->isShadowRoot())
+                    for (Node* a = target->parent; a && !hit; a = a->parent) {
+                        hit = a == t.node;
+                        if (a->isShadowRoot()) break;  // a shadow tree is a tree of its own: observers above it do not see inside
+                    }
                 if (hit) break;
             }
             if (!hit) continue;
@@ -1242,6 +1246,18 @@ Node* thisShadow(CallInfo& ci) {
     Node* n = thisNode(ci);
     if (!n->isShadowRoot()) illegal(ci, "a ShadowRoot");
     return n;
+}
+JSFN(adoptFn) {  // __adopt(document or shadow root, [css text...]): the sheets that tree has adopted
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    Node* root = toNode(ci.arg(0));
+    if (!root || !ci.arg(1).isObject()) return Value::undef();
+    std::vector<std::string>& list = im.adopted[root];
+    list.clear();
+    uint32_t n = vm.lengthOf(ci.arg(1));
+    for (uint32_t i = 0; i < n; ++i) list.push_back(str8(vm, vm.get(ci.arg(1), PropKey::index(i))));
+    im.changed();
+    return Value::undef();
 }
 JSFN(shadowHost) { return I(ci.vm).wrap(thisShadow(ci)->parent); }
 JSFN(shadowMode) { return val8(ci.vm, *thisShadow(ci)->attr("mode")); }
@@ -2791,6 +2807,7 @@ void ScriptHost::Impl::setup() {
     getter(elementProto, "assignedSlot", assignedSlotGet);
     getter(textProto, "assignedSlot", assignedSlotGet);
     vm.defFn(G, "__shadowOf", shadowRootGet, 0)->data = Value::i32(1);
+    vm.defFn(G, "__adopt", adoptFn, 2);
     struct {
         const char* name;
         JSObject* proto;
@@ -2856,6 +2873,7 @@ void ScriptHost::Impl::setup() {
     iface("HTMLProgressElement", elementProto, {"progress", "meter"}, {{"value", "value", 3}, {"max", "max", 3}});
     iface("HTMLSlotElement", elementProto, {"slot"}, {{"name", "name", 0}});
     iface("HTMLTimeElement", elementProto, {"time"}, {{"dateTime", "datetime", 0}});
+    iface("HTMLDataElement", elementProto, {"data"}, {{"value", "value", 0}});
     iface("HTMLQuoteElement", elementProto, {"blockquote", "q"}, {{"cite", "cite", 2}});
     struct {
         const char* name;
@@ -3044,6 +3062,12 @@ bool ScriptHost::busy() const {
 }
 
 bool ScriptHost::stopped() const { return impl_->dead; }
+std::vector<std::pair<const Node*, std::string>> ScriptHost::adoptedStyles() const {
+    std::vector<std::pair<const Node*, std::string>> out;
+    for (auto& [root, list] : impl_->adopted)
+        for (auto& css : list) out.push_back({root->isShadowRoot() ? root : nullptr, css});
+    return out;
+}
 
 void ScriptHost::runScripts(const std::vector<ScriptSource>& scripts) {
     Impl& im = *impl_;

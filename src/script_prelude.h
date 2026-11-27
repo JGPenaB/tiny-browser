@@ -487,7 +487,7 @@ named('Navigator', navigator); named('Location', location); named('History', his
 var windowProto = Object.create(EventTarget.prototype);
 Object.setPrototypeOf(G, windowProto);
 named('Window').prototype = windowProto;
-['Range', 'Selection', 'NamedNodeMap', 'Attr', 'DocumentType', 'ProcessingInstruction', 'CDATASection', 'XMLDocument', 'MediaQueryList', 'StyleSheet', 'CSSStyleSheet',
+['Range', 'Selection', 'NamedNodeMap', 'Attr', 'DocumentType', 'ProcessingInstruction', 'CDATASection', 'XMLDocument', 'MediaQueryList', 'StyleSheet',
  'CSSRule', 'CSSRuleList', 'StyleSheetList', 'MutationRecord', 'DOMRectList', 'DataTransfer', 'FileList', 'ValidityState', 'Touch', 'TextMetrics', 'ImageData',
  'CanvasRenderingContext2D', 'MediaError', 'TimeRanges', 'HTMLAllCollection', 'DOMImplementation', 'DOMStringMap', 'NodeIterator', 'Plugin', 'MimeType', 'PluginArray', 'MimeTypeArray'].forEach(function (n) { named(n); });
 class DOMRect {
@@ -770,6 +770,53 @@ function upgradeAll(root, name) {
     if (shadow) upgradeAll(shadow, name);
   }
 }
+// ---- style sheets made by script (CSSOM 6.1.2 and 6.2): new CSSStyleSheet(), replaceSync, adoptedStyleSheets.
+// The engine gets the text of what each document or shadow root has adopted, again whenever that changes.
+var adopt = G.__adopt;
+delete G.__adopt;
+var adoptedBy = new WeakMap();  // document or shadow root -> its list of sheets
+function syncAdopted(root) {
+  var texts = [], list = adoptedBy.get(root) || [];
+  for (var i = 0; i < list.length; i++) if (!list[i].disabled) texts.push(list[i]._text);
+  adopt(root, texts);
+}
+class CSSStyleSheet {
+  constructor(options) {
+    Object.defineProperty(this, '_text', { value: '', writable: true });
+    Object.defineProperty(this, '_roots', { value: new Set() });
+    this.disabled = !!(options && options.disabled);
+    this.cssRules = []; this.rules = this.cssRules; this.ownerNode = null; this.media = { mediaText: (options && options.media) || '' };
+  }
+  replaceSync(text) { this._text = String(text); this._roots.forEach(syncAdopted); }
+  replace(text) { this.replaceSync(text); return Promise.resolve(this); }
+  insertRule(rule, index) { this._text += '\n' + rule; this._roots.forEach(syncAdopted); return index === undefined ? 0 : index; }
+  deleteRule() {}
+  addRule(selector, style) { return this.insertRule(selector + '{' + style + '}'); }
+  removeRule() {}
+}
+[Document.prototype, ShadowRoot.prototype].forEach(function (proto) {
+  Object.defineProperty(proto, 'adoptedStyleSheets', {
+    configurable: true, enumerable: true,
+    get: function () {
+      var root = this, list = adoptedBy.get(root);
+      if (!list) adoptedBy.set(root, list = []);
+      // an observable array: changing it in place counts as well
+      return new Proxy(list, {
+        set: function (t, k, v) { t[k] = v; if (v instanceof CSSStyleSheet) v._roots.add(root); syncAdopted(root); return true; },
+        deleteProperty: function (t, k) { delete t[k]; syncAdopted(root); return true; }
+      });
+    },
+    set: function (sheets) {
+      var list = Array.from(sheets), root = this;
+      list.forEach(function (sheet) {
+        if (!(sheet instanceof CSSStyleSheet)) throw new TypeError('adoptedStyleSheets takes CSSStyleSheet objects');
+        sheet._roots.add(root);
+      });
+      adoptedBy.set(root, list);
+      syncAdopted(root);
+    }
+  });
+});
 // attachShadow: the engine's refusals become DOMExceptions, and a custom element may have opted out of shadow trees
 var nativeAttachShadow = Element.prototype.attachShadow;
 Element.prototype.attachShadow = function attachShadow(init) {
@@ -853,7 +900,7 @@ Document.prototype.createElement = function createElement(name) {
   }
 };
 
-var exported = { DOMException: DOMException, EventTarget: EventTarget, AbortController: AbortController, AbortSignal: AbortSignal, URL: URL, URLSearchParams: URLSearchParams,
+var exported = { CSSStyleSheet: CSSStyleSheet, DOMException: DOMException, EventTarget: EventTarget, AbortController: AbortController, AbortSignal: AbortSignal, URL: URL, URLSearchParams: URLSearchParams,
   Blob: Blob, File: File, FormData: FormData, Headers: Headers, Request: Request, Response: Response, fetch: fetch, XMLHttpRequest: XMLHttpRequest,
   NodeFilter: NodeFilter, TreeWalker: TreeWalker, MessageChannel: MessageChannel, DOMParser: DOMParser, XMLSerializer: XMLSerializer, Intl: Intl };
 for (var name of Object.keys(exported)) Object.defineProperty(G, name, { value: exported[name], writable: true, configurable: true, enumerable: false });

@@ -732,6 +732,12 @@ public:
                 for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
             }
         }
+        if (p.script)
+            for (auto& [scope, css] : p.script->adoptedStyles()) {
+                auto& sheet = p.shadowSheets[css];
+                if (!sheet) sheet = std::make_unique<Sheet>(parse_sheet(css));
+                se.add(sheet.get(), false, scope);
+            }
         se.compute(*p.doc, vw, contentRect().h());
         p.hasMedia = se.hasMedia();
         p.rules = se.ruleCount();
