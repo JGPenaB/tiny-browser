@@ -91,4 +91,18 @@ test("shared buffers, Atomics and byte text", function () {
   const into = new Uint8Array(4); eq([into.setFromBase64("SGVsbG8="), [...into], into.setFromHex("0102"), [...into]], [{ read: 4, written: 3 }, [72, 101, 108, 0], { read: 4, written: 2 }, [1, 2, 108, 0]]);
   throws(() => Uint8Array.fromBase64("SGVsbG8", { lastChunkHandling: "strict" }), SyntaxError); throws(() => Uint8Array.fromHex("abc"), SyntaxError); throws(() => Uint8Array.fromBase64("a-b_", { alphabet: "base64" }), SyntaxError); throws(() => bytes.toBase64({ alphabet: "x" }), TypeError);
 });
+test("agents: threads with an engine each, sharing memory (9.7, 25.4)", function () {
+  const ia = new Int32Array(new SharedArrayBuffer(16));
+  const nextReport = () => { let r; while ((r = __agentGetReport()) === null) __agentSleep(1); return r; };
+  const wakeOne = () => { let n; while ((n = Atomics.notify(ia, 0, 1)) === 0) __agentSleep(1); return n; };
+  const body = "__agentReceive(function (sab) { var ia = new Int32Array(sab); Atomics.add(ia, 1, 1);" +
+    " __agentReport(NAME + ' ' + Atomics.wait(ia, 0, 0, LIMIT)); __agentLeaving(); });";
+  __agentStart("var NAME = 'first', LIMIT = Infinity; " + body); __agentStart("var NAME = 'second', LIMIT = Infinity; " + body);
+  __agentBroadcast(ia.buffer);
+  while (Atomics.load(ia, 1) !== 2);  // both agents run, and their additions arrive in this agent's view of the memory
+  eq(wakeOne(), 1); const one = nextReport(); eq(wakeOne(), 1); const two = nextReport();
+  eq([[one, two].sort(), Atomics.notify(ia, 0)], [["first ok", "second ok"], 0]);
+  __agentStart("var NAME = 'third', LIMIT = 20; " + body); __agentBroadcast(ia.buffer);
+  eq([nextReport(), Atomics.load(ia, 1)], ["third timed-out", 3]);
+});
 done();

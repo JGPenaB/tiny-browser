@@ -5,7 +5,9 @@
 #include <bcrypt.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 
 #include "builtins.h"
 
@@ -165,7 +167,7 @@ void storeElement(uint8_t* p, TA type, Value numeric) {
     } else
         storeNum(p, type, numeric.number());
 }
-uint8_t* at(const JSTypedArray* t, double i) { return t->buffer->bytes.data() + t->offset + (size_t)i * sizeOf(t->type); }
+uint8_t* at(const JSTypedArray* t, double i) { return t->buffer->data() + t->offset + (size_t)i * sizeOf(t->type); }
 
 // ---------------------------------------------------------------------------- shared helpers
 // ToIntegerOrInfinity with -0 turned into +0
@@ -228,14 +230,39 @@ JSArrayBuffer* allocBuffer(Vm& vm, JSObject* proto, double byteLength, double ma
     b->proto = proto;
     b->shared = shared;
     b->maxLen = maxLen;
-    try {
-        b->bytes.assign((size_t)byteLength, 0);
-    } catch (std::bad_alloc&) {
-        vm.throwError(Err::RangeError, "Array buffer allocation failed");
+    if (shared) {
+        b->block = newSharedBlock((size_t)byteLength, (size_t)std::max(byteLength, maxLen));
+        if (!b->block) vm.throwError(Err::RangeError, "Array buffer allocation failed");
+    } else {
+        try {
+            b->bytes.assign((size_t)byteLength, 0);
+        } catch (std::bad_alloc&) {
+            vm.throwError(Err::RangeError, "Array buffer allocation failed");
+        }
     }
-    vm.gc.noteExternal(b->bytes.size());
+    vm.gc.noteExternal(b->size());
     return b;
 }
+}  // namespace
+SharedBlock::~SharedBlock() {
+    if (base) VirtualFree(base, 0, MEM_RELEASE);
+}
+std::shared_ptr<SharedBlock> newSharedBlock(size_t length, size_t limit) {
+    auto b = std::make_shared<SharedBlock>();
+    b->limit = std::max<size_t>(limit, 1);
+    b->base = (uint8_t*)VirtualAlloc(nullptr, b->limit, MEM_RESERVE, PAGE_READWRITE);
+    if (!b->base || !growSharedBlock(*b, length)) return nullptr;
+    return b;
+}
+// New pages arrive zeroed, and asking again for pages already in use changes nothing: agents may grow at once.
+bool growSharedBlock(SharedBlock& b, size_t length) {
+    if (length > b.limit || (length && !VirtualAlloc(b.base, length, MEM_COMMIT, PAGE_READWRITE))) return false;
+    size_t now = b.length.load();
+    while (now < length && !b.length.compare_exchange_weak(now, length)) {
+    }
+    return true;
+}
+namespace {
 void detach(JSArrayBuffer* b) {
     std::vector<uint8_t>().swap(b->bytes);
     b->detached = true;
@@ -297,7 +324,7 @@ void initFromBuffer(Vm& vm, JSTypedArray* t, JSArrayBuffer* b, Value byteOffset,
     if (std::fmod(offset, sz) != 0) vm.throwError(Err::RangeError, "Start offset of %s should be a multiple of %d", name, sz);
     double newLength = length.isUndef() ? 0 : vm.toIndex(length);
     if (b->detached) vm.throwError(Err::TypeError, "Cannot make a %s on a detached ArrayBuffer", name);
-    double blen = (double)b->bytes.size();
+    double blen = (double)b->size();
     if (length.isUndef() && b->maxLen >= 0) {
         if (offset > blen) vm.throwError(Err::RangeError, "Start offset %g is outside the bounds of the buffer", offset);
         t->tracking = true;
@@ -344,7 +371,7 @@ JSFN(typedCtor) {
         uint32_t n = typedLength(src);
         attach(n);
         if (src->type == type) {
-            if (n) memcpy(t->buffer->bytes.data(), at(src, 0), (size_t)n * sz);
+            if (n) memcpy(t->buffer->data(), at(src, 0), (size_t)n * sz);
         } else {
             if (isBig(src->type) != isBig(type)) vm.throwError(Err::TypeError, "Cannot mix BigInt typed arrays with other typed arrays");
             for (uint32_t i = 0; i < n; ++i) storeElement(at(t, i), type, typedGet(vm, src, i));
@@ -752,8 +779,8 @@ JSFN(bufferCtor) {  // data: 1 = SharedArrayBuffer
 JSFN(bufferInfo) {  // data: 0 byteLength, 1 maxByteLength, 2 resizable or growable, 3 detached; data2: 1 = shared
     JSArrayBuffer* b = thisBuffer(ci, ci.callee->data2.asInt() == 1);
     switch (ci.callee->data.asInt()) {
-        case 0: return Value::num((double)b->bytes.size());
-        case 1: return Value::num(b->detached ? 0 : b->maxLen >= 0 ? b->maxLen : (double)b->bytes.size());
+        case 0: return Value::num((double)b->size());
+        case 1: return Value::num(b->detached ? 0 : b->maxLen >= 0 ? b->maxLen : (double)b->size());
         case 2: return Value::boolean(b->maxLen >= 0);
         case 3: return Value::boolean(b->detached);
         default: return Value::boolean(b->immutable);
@@ -766,9 +793,10 @@ JSFN(bufferResize) {  // data: 1 = SharedArrayBuffer.prototype.grow
     if (b->maxLen < 0) vm.throwError(Err::TypeError, "The buffer has a fixed length");
     double n = vm.toIndex(ci.arg(0));
     if (b->detached) vm.throwError(Err::TypeError, "The ArrayBuffer is detached");
-    double cur = (double)b->bytes.size();
+    double cur = (double)b->size();
     if (n > b->maxLen || (shared && n < cur)) vm.throwError(Err::RangeError, "Invalid length for this buffer");
-    b->bytes.resize((size_t)n, 0);
+    if (!shared) b->bytes.resize((size_t)n, 0);
+    else if (!growSharedBlock(*b->block, (size_t)n)) vm.throwError(Err::RangeError, "Array buffer allocation failed");
     if (n > cur) vm.gc.noteExternal((size_t)(n - cur));
     return Value::undef();
 }
@@ -777,7 +805,7 @@ JSFN(bufferSlice) {  // data: 1 = shared
     bool shared = ci.callee->data.asInt() == 1;
     JSArrayBuffer* b = thisBuffer(ci, shared);
     if (b->detached) vm.throwError(Err::TypeError, "The ArrayBuffer is detached");
-    double len = (double)b->bytes.size();
+    double len = (double)b->size();
     double first = clampIndex(vm, ci.arg(0), len);
     double final = ci.arg(1).isUndef() ? len : clampIndex(vm, ci.arg(1), len);
     double newLen = std::max(final - first, 0.0);
@@ -789,24 +817,24 @@ JSFN(bufferSlice) {  // data: 1 = shared
     if (nb->detached) vm.throwError(Err::TypeError, "The new ArrayBuffer is detached");
     if (nb->immutable) immutableError(vm);
     if (nb == b) vm.throwError(Err::TypeError, "The species constructor returned the same buffer");
-    if ((double)nb->bytes.size() < newLen) vm.throwError(Err::TypeError, "The new buffer is too small");
+    if ((double)nb->size() < newLen) vm.throwError(Err::TypeError, "The new buffer is too small");
     if (b->detached) vm.throwError(Err::TypeError, "The ArrayBuffer is detached");
-    double room = (double)b->bytes.size() - first;
-    if (room > 0) memcpy(nb->bytes.data(), b->bytes.data() + (size_t)first, (size_t)std::min(newLen, room));
+    double room = (double)b->size() - first;
+    if (room > 0) memcpy(nb->data(), b->data() + (size_t)first, (size_t)std::min(newLen, room));
     return made;
 }
 JSFN(bufferTransfer) {  // data: 0 transfer, 1 transferToFixedLength, 2 transferToImmutable
     Vm& vm = ci.vm;
     JSArrayBuffer* b = thisBuffer(ci, false);
     int mode = ci.callee->data.asInt();
-    double newLen = ci.arg(0).isUndef() ? (double)b->bytes.size() : vm.toIndex(ci.arg(0));
+    double newLen = ci.arg(0).isUndef() ? (double)b->size() : vm.toIndex(ci.arg(0));
     if (b->detached) vm.throwError(Err::TypeError, "The ArrayBuffer is detached");
     if (b->immutable) vm.throwError(Err::TypeError, "An immutable ArrayBuffer cannot be transferred");
     double maxLen = mode == 0 ? b->maxLen : -1;
     if (maxLen >= 0 && newLen > maxLen) vm.throwError(Err::RangeError, "The length is greater than maxByteLength");
     JSArrayBuffer* nb = allocBuffer(vm, vm.arrayBufferProto, newLen, maxLen);
-    size_t n = std::min(nb->bytes.size(), b->bytes.size());
-    if (n) memcpy(nb->bytes.data(), b->bytes.data(), n);
+    size_t n = std::min(nb->size(), b->size());
+    if (n) memcpy(nb->data(), b->data(), n);
     nb->immutable = mode == 2;
     detach(b);
     return V(nb);
@@ -815,14 +843,14 @@ JSFN(bufferSliceToImmutable) {
     Vm& vm = ci.vm;
     JSArrayBuffer* b = thisBuffer(ci, false);
     if (b->detached) vm.throwError(Err::TypeError, "The ArrayBuffer is detached");
-    double len = (double)b->bytes.size();
+    double len = (double)b->size();
     double first = clampIndex(vm, ci.arg(0), len);
     double final = ci.arg(1).isUndef() ? len : clampIndex(vm, ci.arg(1), len);
     double newLen = std::max(final - first, 0.0);
     if (b->detached) vm.throwError(Err::TypeError, "The ArrayBuffer is detached");
-    if ((double)b->bytes.size() < final) vm.throwError(Err::RangeError, "The ArrayBuffer became too short");
+    if ((double)b->size() < final) vm.throwError(Err::RangeError, "The ArrayBuffer became too short");
     JSArrayBuffer* nb = allocBuffer(vm, vm.arrayBufferProto, newLen);
-    if (newLen > 0) memcpy(nb->bytes.data(), b->bytes.data() + (size_t)first, (size_t)newLen);
+    if (newLen > 0) memcpy(nb->data(), b->data() + (size_t)first, (size_t)newLen);
     nb->immutable = true;
     return V(nb);
 }
@@ -839,7 +867,7 @@ JSFN(dataViewCtor) {
     if (!b) vm.throwError(Err::TypeError, "First argument to DataView constructor must be an ArrayBuffer");
     double offset = vm.toIndex(ci.arg(1));
     if (b->detached) vm.throwError(Err::TypeError, "The ArrayBuffer is detached");
-    double blen = (double)b->bytes.size();
+    double blen = (double)b->size();
     if (offset > blen) vm.throwError(Err::RangeError, "Start offset %g is outside the bounds of the buffer", offset);
     bool tracking = false;
     double viewLen = 0;
@@ -852,7 +880,7 @@ JSFN(dataViewCtor) {
     }
     JSObject* proto = vm.protoFromNewTarget(ci.newTarget, vm.dataViewProto);
     if (b->detached) vm.throwError(Err::TypeError, "The ArrayBuffer is detached");
-    blen = (double)b->bytes.size();
+    blen = (double)b->size();
     if (offset > blen || (!ci.arg(2).isUndef() && offset + viewLen > blen)) vm.throwError(Err::RangeError, "Invalid DataView length %g", viewLen);
     JSTypedArray* v = vm.alloc<JSTypedArray>();
     v->cls = Cls::DataView;
@@ -887,7 +915,7 @@ JSFN(dataViewAccess) {  // data: element type, data2: 1 = setter
     bool little = vm.toBool(ci.arg(isSet ? 2 : 1));
     if (typedOutOfBounds(v)) vm.throwError(Err::TypeError, "The DataView's buffer is detached or has become too small for it");
     if (pos + sz > (double)typedLength(v)) vm.throwError(Err::RangeError, "Offset is outside the bounds of the DataView");
-    uint8_t* p = v->buffer->bytes.data() + v->offset + (size_t)pos;
+    uint8_t* p = v->buffer->data() + v->offset + (size_t)pos;
     uint8_t tmp[8] = {};  // this machine is little-endian
     if (isSet) {
         storeElement(tmp, type, value);
@@ -898,7 +926,7 @@ JSFN(dataViewAccess) {  // data: element type, data2: 1 = setter
     return loadRaw(vm, tmp, type);
 }
 
-// ---------------------------------------------------------------------------- Atomics (one agent: every step is already atomic)
+// ---------------------------------------------------------------------------- Atomics
 // ValidateIntegerTypedArray (25.4.3.1)
 JSTypedArray* atomicArray(Vm& vm, Value v, bool waitable, bool write = false) {
     JSTypedArray* t = valid(vm, v, write);
@@ -914,10 +942,54 @@ size_t atomicPos(Vm& vm, JSTypedArray* t, Value index) {
 }
 uint8_t* revalidate(Vm& vm, JSTypedArray* t, size_t pos) {
     if (typedOutOfBounds(t)) outOfBounds(vm);
-    if (pos + sizeOf(t->type) > t->buffer->bytes.size()) vm.throwError(Err::RangeError, "Invalid atomic access index");
-    return t->buffer->bytes.data() + pos;
+    if (pos + sizeOf(t->type) > t->buffer->size()) vm.throwError(Err::RangeError, "Invalid atomic access index");
+    return t->buffer->data() + pos;
 }
 Value atomicValue(Vm& vm, JSTypedArray* t, Value v) { return isBig(t->type) ? V(vm.toBigInt(v)) : Value::num(toInt(vm, v)); }
+
+// One step on a place in a buffer that no other agent can come between (25.4.3.12 AtomicReadModifyWrite).
+// op: 0 add, 1 and, 2 exchange, 3 or, 4 sub, 5 xor, 6 load, 7 store, 8 compare with a and put b. Returns what was there.
+template <class T>
+uint64_t atomicStepOf(uint8_t* p, int op, uint64_t a, uint64_t b) {
+    std::atomic_ref<T> cell(*reinterpret_cast<T*>(p));
+    T v = (T)a;
+    switch (op) {
+        case 0: return cell.fetch_add(v);
+        case 1: return cell.fetch_and(v);
+        case 2: return cell.exchange(v);
+        case 3: return cell.fetch_or(v);
+        case 4: return cell.fetch_sub(v);
+        case 5: return cell.fetch_xor(v);
+        case 6: return cell.load();
+        case 7:
+            cell.store(v);
+            return v;
+        default:
+            cell.compare_exchange_strong(v, (T)b);
+            return v;
+    }
+}
+uint64_t atomicStep(uint8_t* p, TA type, int op, uint64_t a = 0, uint64_t b = 0) {
+    switch (sizeOf(type)) {
+        case 1: return atomicStepOf<uint8_t>(p, op, a, b);
+        case 2: return atomicStepOf<uint16_t>(p, op, a, b);
+        case 4: return atomicStepOf<uint32_t>(p, op, a, b);
+        default: return atomicStepOf<uint64_t>(p, op, a, b);
+    }
+}
+// An element's value as the bits it is stored with, and back
+uint64_t elementBits(TA type, Value v) {
+    uint8_t raw[8] = {};
+    storeElement(raw, type, v);
+    uint64_t bits = 0;
+    memcpy(&bits, raw, 8);
+    return bits;
+}
+Value bitsValue(Vm& vm, TA type, uint64_t bits) {
+    uint8_t raw[8];
+    memcpy(raw, &bits, 8);
+    return loadRaw(vm, raw, type);
+}
 
 JSFN(atomicsOp) {  // data: 0 add, 1 and, 2 exchange, 3 or, 4 sub, 5 xor
     Vm& vm = ci.vm;
@@ -925,23 +997,7 @@ JSFN(atomicsOp) {  // data: 0 add, 1 and, 2 exchange, 3 or, 4 sub, 5 xor
     size_t pos = atomicPos(vm, t, ci.arg(1));
     Value v = atomicValue(vm, t, ci.arg(2));
     uint8_t* p = revalidate(vm, t, pos);
-    int sz = sizeOf(t->type);
-    Value old = loadRaw(vm, p, t->type);
-    uint8_t operand[8] = {};
-    storeElement(operand, t->type, v);
-    uint64_t a = 0, b = 0;
-    memcpy(&a, p, sz);
-    memcpy(&b, operand, sz);
-    switch (ci.callee->data.asInt()) {
-        case 0: a += b; break;
-        case 1: a &= b; break;
-        case 2: a = b; break;
-        case 3: a |= b; break;
-        case 4: a -= b; break;
-        default: a ^= b; break;
-    }
-    memcpy(p, &a, sz);
-    return old;
+    return bitsValue(vm, t->type, atomicStep(p, t->type, ci.callee->data.asInt(), elementBits(t->type, v)));
 }
 JSFN(atomicsCompareExchange) {
     Vm& vm = ci.vm;
@@ -950,32 +1006,90 @@ JSFN(atomicsCompareExchange) {
     Value expected = atomicValue(vm, t, ci.arg(2));
     Value replacement = atomicValue(vm, t, ci.arg(3));
     uint8_t* p = revalidate(vm, t, pos);
-    int sz = sizeOf(t->type);
-    uint8_t e[8] = {}, r[8] = {};
-    storeElement(e, t->type, expected);
-    storeElement(r, t->type, replacement);
-    Value old = loadRaw(vm, p, t->type);
-    if (memcmp(p, e, sz) == 0) memcpy(p, r, sz);
-    return old;
+    return bitsValue(vm, t->type, atomicStep(p, t->type, 8, elementBits(t->type, expected), elementBits(t->type, replacement)));
 }
 JSFN(atomicsLoad) {
     Vm& vm = ci.vm;
     JSTypedArray* t = atomicArray(vm, ci.arg(0), false);
     size_t pos = atomicPos(vm, t, ci.arg(1));
-    return loadRaw(vm, revalidate(vm, t, pos), t->type);
+    return bitsValue(vm, t->type, atomicStep(revalidate(vm, t, pos), t->type, 6));
 }
 JSFN(atomicsStore) {
     Vm& vm = ci.vm;
     JSTypedArray* t = atomicArray(vm, ci.arg(0), false, true);
     size_t pos = atomicPos(vm, t, ci.arg(1));
     Value v = atomicValue(vm, t, ci.arg(2));
-    storeElement(revalidate(vm, t, pos), t->type, v);
+    atomicStep(revalidate(vm, t, pos), t->type, 7, elementBits(t->type, v));
     return v;
 }
 JSFN(atomicsIsLockFree) {
     double n = ci.vm.toInteger(ci.arg(0));
     return Value::boolean(n == 1 || n == 2 || n == 4 || n == 8);
 }
+
+// ---- waiting and notifying (25.4.1 WaiterList records, 25.4.3.14 DoWait). The lists of who waits where belong to
+// all agents together: they are keyed by the address of the place in shared memory, and one lock is the critical
+// section of every list.
+struct Waiter {
+    std::condition_variable wake;        // Atomics.wait: the thread sleeps on this until it is notified
+    bool notified = false;
+    Vm* vm = nullptr;                    // Atomics.waitAsync: the engine that owns the promise, and the waiter's id there
+    uint32_t id = 0;
+    std::shared_ptr<SharedBlock> block;  // keeps the address from being handed to another buffer meanwhile
+};
+struct WaitHub {
+    std::mutex lock;
+    std::unordered_map<const uint8_t*, std::deque<std::shared_ptr<Waiter>>> lists;  // oldest waiter first
+};
+WaitHub& waitHub() {
+    static WaitHub* hub = new WaitHub;  // never destroyed: other agents' threads may still run when the process ends
+    return *hub;
+}
+// Both need hub.lock held.
+void enlist(WaitHub& hub, const uint8_t* place, const std::shared_ptr<Waiter>& w) { hub.lists[place].push_back(w); }
+bool delist(WaitHub& hub, const uint8_t* place, const Waiter* w) {  // false when a notification took it first
+    auto at = hub.lists.find(place);
+    if (at == hub.lists.end()) return false;
+    auto& list = at->second;
+    auto it = std::find_if(list.begin(), list.end(), [w](const std::shared_ptr<Waiter>& x) { return x.get() == w; });
+    if (it == list.end()) return false;
+    list.erase(it);
+    if (list.empty()) hub.lists.erase(at);
+    return true;
+}
+double monotonicMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+// Settles this agent's waitAsync promise number `id`, if it is still waiting.
+void settleWaiter(Vm& vm, uint32_t id, const char* how) {
+    for (size_t i = 0; i < vm.asyncWaiters.size(); ++i)
+        if (vm.asyncWaiters[i].id == id) {
+            Value resolve = vm.asyncWaiters[i].resolve;
+            vm.asyncWaiters.erase(vm.asyncWaiters.begin() + i);
+            Value v = vm.strv(how);
+            vm.call(resolve, Value::undef(), &v, 1);
+            return;
+        }
+}
+}  // namespace
+void settleNotifiedWaiters(Vm& vm) {
+    std::vector<uint32_t> ids;
+    {
+        std::lock_guard<std::mutex> g(vm.notifiedLock);
+        ids.swap(vm.notifiedWaiters);
+    }
+    for (uint32_t id : ids) settleWaiter(vm, id, "ok");
+}
+void forgetWaiters(Vm& vm) {
+    WaitHub& hub = waitHub();
+    std::lock_guard<std::mutex> critical(hub.lock);
+    for (auto at = hub.lists.begin(); at != hub.lists.end();) {
+        auto& list = at->second;
+        list.erase(std::remove_if(list.begin(), list.end(), [&vm](const std::shared_ptr<Waiter>& w) { return w->vm == &vm; }), list.end());
+        at = list.empty() ? hub.lists.erase(at) : std::next(at);
+    }
+}
+namespace {
+
 JSFN(atomicsNotify) {
     Vm& vm = ci.vm;
     JSTypedArray* t = atomicArray(vm, ci.arg(0), true);
@@ -983,61 +1097,103 @@ JSFN(atomicsNotify) {
     double count = INFINITY;
     if (!ci.arg(2).isUndef()) count = std::max(vm.toInteger(ci.arg(2)), 0.0);
     if (!t->buffer->shared) return Value::i32(0);
-    // nothing else runs in this agent, so the only waiters are the promises handed out by Atomics.waitAsync
-    std::vector<Value> woken;
-    RootScope keep(vm, woken);
-    for (size_t i = 0; i < vm.asyncWaiters.size() && (double)woken.size() < count;) {
-        if (vm.asyncWaiters[i].buffer == t->buffer && vm.asyncWaiters[i].pos == pos) {
-            woken.push_back(vm.asyncWaiters[i].resolve);
-            vm.asyncWaiters.erase(vm.asyncWaiters.begin() + i);
-        } else
-            ++i;
+    const uint8_t* place = t->buffer->data() + pos;
+    WaitHub& hub = waitHub();
+    std::vector<uint32_t> mine;  // this agent's own waitAsync promises among those woken
+    double woken = 0;
+    {
+        std::lock_guard<std::mutex> critical(hub.lock);
+        auto at = hub.lists.find(place);
+        while (at != hub.lists.end() && !at->second.empty() && woken < count) {
+            std::shared_ptr<Waiter> w = at->second.front();
+            at->second.pop_front();
+            ++woken;
+            if (!w->vm) {  // a sleeping thread
+                w->notified = true;
+                w->wake.notify_one();
+            } else if (w->vm == &vm) {
+                mine.push_back(w->id);
+            } else {  // another agent's promise: that agent settles it. Its engine cannot go away while the lock is held.
+                std::lock_guard<std::mutex> g(w->vm->notifiedLock);
+                w->vm->notifiedWaiters.push_back(w->id);
+            }
+        }
+        if (at != hub.lists.end() && at->second.empty()) hub.lists.erase(at);
     }
-    Value ok = vm.strv("ok");
-    for (Value resolve : woken) vm.call(resolve, Value::undef(), &ok, 1);
-    return Value::num((double)woken.size());
+    for (uint32_t id : mine) settleWaiter(vm, id, "ok");
+    return Value::num(woken);
 }
 JSFN(atomicsWaitTimedOut) {  // data: the waiter's id
     Vm& vm = ci.vm;
     uint32_t id = (uint32_t)ci.callee->data.asInt();
-    for (size_t i = 0; i < vm.asyncWaiters.size(); ++i)
-        if (vm.asyncWaiters[i].id == id) {
-            Value resolve = vm.asyncWaiters[i].resolve;
-            vm.asyncWaiters.erase(vm.asyncWaiters.begin() + i);
-            Value v = vm.strv("timed-out");
-            vm.call(resolve, Value::undef(), &v, 1);
-            break;
+    for (const Vm::AsyncWaiter& a : vm.asyncWaiters) {
+        if (a.id != id) continue;
+        WaitHub& hub = waitHub();
+        bool waiting = false;
+        {
+            std::lock_guard<std::mutex> critical(hub.lock);
+            auto at = hub.lists.find(a.place);
+            if (at != hub.lists.end())
+                for (const std::shared_ptr<Waiter>& w : at->second)
+                    if (w->vm == &vm && w->id == id) {
+                        waiting = delist(hub, a.place, w.get());
+                        break;
+                    }
         }
+        if (waiting) settleWaiter(vm, id, "timed-out");  // otherwise a notification is on its way
+        break;
+    }
     return Value::undef();
+}
+// The arguments of Atomics.wait and Atomics.waitAsync, checked and converted in the order DoWait gives
+struct WaitCall {
+    JSTypedArray* t;
+    size_t pos;
+    uint64_t expected;
+    double timeout;  // milliseconds, possibly infinite
+};
+WaitCall waitCall(CallInfo& ci, const char* name) {
+    Vm& vm = ci.vm;
+    WaitCall c;
+    c.t = atomicArray(vm, ci.arg(0), true);
+    if (!c.t->buffer->shared) vm.throwError(Err::TypeError, "%s needs a typed array on a SharedArrayBuffer", name);
+    c.pos = atomicPos(vm, c.t, ci.arg(1));
+    c.expected = isBig(c.t->type) ? bigToU64(vm.toBigInt(ci.arg(2))) : (uint64_t)(uint32_t)vm.toInt32(ci.arg(2));
+    double q = vm.toNumber(ci.arg(3));
+    c.timeout = q != q ? INFINITY : std::max(q, 0.0);
+    return c;
 }
 // DoWait (25.4.3.14) in its asynchronous form
 JSFN(atomicsWaitAsync) {
     Vm& vm = ci.vm;
-    JSTypedArray* t = atomicArray(vm, ci.arg(0), true);
-    if (!t->buffer->shared) vm.throwError(Err::TypeError, "Atomics.waitAsync needs a typed array on a SharedArrayBuffer");
-    size_t pos = atomicPos(vm, t, ci.arg(1));
-    uint64_t expected = isBig(t->type) ? bigToU64(vm.toBigInt(ci.arg(2))) : (uint64_t)(uint32_t)vm.toInt32(ci.arg(2));
-    double q = vm.toNumber(ci.arg(3));
-    double timeout = q != q ? INFINITY : std::max(q, 0.0);
+    WaitCall c = waitCall(ci, "Atomics.waitAsync");
+    uint8_t* place = c.t->buffer->data() + c.pos;
     JSObject* result = vm.newObject();
-    uint64_t witness = 0;
-    memcpy(&witness, t->buffer->bytes.data() + pos, sizeOf(t->type));
-    if (witness != expected || timeout == 0) {
+    WaitHub& hub = waitHub();
+    std::unique_lock<std::mutex> critical(hub.lock);
+    uint64_t witness = atomicStep(place, c.t->type, 6);
+    if (witness != c.expected || c.timeout == 0) {
+        critical.unlock();
         vm.def(result, "async", Value::boolean(false), PF_ALL);
-        vm.def(result, "value", vm.strv(witness != expected ? "not-equal" : "timed-out"), PF_ALL);
+        vm.def(result, "value", vm.strv(witness != c.expected ? "not-equal" : "timed-out"), PF_ALL);
         return V(result);
     }
+    auto w = std::make_shared<Waiter>();
+    w->vm = &vm;
+    w->id = vm.nextWaiterId++;
+    w->block = c.t->buffer->block;
+    enlist(hub, place, w);
+    critical.unlock();
     JSPromise* promise = vm.newPromise();
     Value fns[2];
     makeResolvingFunctions(vm, promise, fns);
-    uint32_t id = vm.nextWaiterId++;
-    vm.asyncWaiters.push_back({t->buffer, pos, fns[0], id});
-    if (timeout != INFINITY) {
+    vm.asyncWaiters.push_back({fns[0], w->id, place});
+    if (c.timeout != INFINITY) {
         Value setTimer = vm.get(V(vm.global), "setTimeout");
         if (vm.isCallable(setTimer)) {
             JSNative* onTimeout = vm.newNative(atomicsWaitTimedOut, "", 0);
-            onTimeout->data = Value::i32((int32_t)id);
-            Value args[2] = {V(onTimeout), Value::num(timeout)};
+            onTimeout->data = Value::i32((int32_t)w->id);
+            Value args[2] = {V(onTimeout), Value::num(c.timeout)};
             vm.call(setTimer, Value::undef(), args, 2);
         }
     }
@@ -1047,23 +1203,29 @@ JSFN(atomicsWaitAsync) {
 }
 JSFN(atomicsWait) {
     Vm& vm = ci.vm;
-    JSTypedArray* t = atomicArray(vm, ci.arg(0), true);
-    if (!t->buffer->shared) vm.throwError(Err::TypeError, "Atomics.wait needs a typed array on a SharedArrayBuffer");
-    size_t pos = atomicPos(vm, t, ci.arg(1));
-    uint64_t expected = isBig(t->type) ? bigToU64(vm.toBigInt(ci.arg(2))) : (uint64_t)(uint32_t)vm.toInt32(ci.arg(2));
-    double q = vm.toNumber(ci.arg(3));
-    double timeout = q != q ? INFINITY : std::max(q, 0.0);
+    WaitCall c = waitCall(ci, "Atomics.wait");
     if (!vm.canBlock) vm.throwError(Err::TypeError, "Atomics.wait cannot block this thread");
-    uint64_t witness = 0;
-    memcpy(&witness, t->buffer->bytes.data() + pos, sizeOf(t->type));
-    if (witness != expected) return vm.strv("not-equal");
-    // no other agent exists to send a notification: the wait can only time out
-    ULONGLONG start = GetTickCount64();
-    while ((double)(GetTickCount64() - start) < timeout) {
-        vm.pollInterrupt();
-        Sleep(1);
+    uint8_t* place = c.t->buffer->data() + c.pos;
+    WaitHub& hub = waitHub();
+    std::unique_lock<std::mutex> critical(hub.lock);
+    if (atomicStep(place, c.t->type, 6) != c.expected) return vm.strv("not-equal");
+    auto w = std::make_shared<Waiter>();
+    w->block = c.t->buffer->block;
+    enlist(hub, place, w);
+    double start = monotonicMs();
+    while (!w->notified) {
+        double left = c.timeout - (monotonicMs() - start);
+        if (left <= 0) break;
+        // short naps, so that a script past its time limit still stops
+        w->wake.wait_for(critical, std::chrono::duration<double, std::milli>(std::min(left, 20.0)));
+        uint64_t deadline = vm.deadlineTick;
+        if (deadline && GetTickCount64() > deadline) break;
     }
-    return vm.strv("timed-out");
+    bool notified = w->notified;
+    if (!notified) delist(hub, place, w.get());
+    critical.unlock();
+    if (!notified) vm.pollInterrupt();
+    return vm.strv(notified ? "ok" : "timed-out");
 }
 JSFN(atomicsPause) {
     Value n = ci.arg(0);
@@ -1293,14 +1455,13 @@ bool bytesOf(Value v, const uint8_t*& p, size_t& n) {
     if (!v.isObject()) return false;
     JSObject* o = v.asObject();
     if (o->cls == Cls::ArrayBuffer) {
-        auto& b = ((JSArrayBuffer*)o)->bytes;
-        p = b.data();
-        n = b.size();
+        p = ((JSArrayBuffer*)o)->data();
+        n = ((JSArrayBuffer*)o)->size();
         return true;
     }
     if (o->cls == Cls::TypedArray || o->cls == Cls::DataView) {
         JSTypedArray* t = (JSTypedArray*)o;
-        p = t->buffer->bytes.data() + t->offset;
+        p = t->buffer->data() + t->offset;
         n = (size_t)typedLength(t) * sizeOf(t->type);
         return true;
     }
@@ -1316,7 +1477,7 @@ JSFN(textEncode) {
     Vm& vm = ci.vm;
     std::string bytes = ci.arg(0).isUndef() ? std::string() : utf16to8(vm.toStr16(ci.arg(0)));
     JSTypedArray* t = newTypedArray(vm, TA::U8, (uint32_t)bytes.size());
-    if (!bytes.empty()) memcpy(t->buffer->bytes.data(), bytes.data(), bytes.size());
+    if (!bytes.empty()) memcpy(t->buffer->data(), bytes.data(), bytes.size());
     return V(t);
 }
 JSFN(textDecode) {
@@ -1336,7 +1497,7 @@ JSFN(cryptoGetRandomValues) {
         vm.throwError(Err::TypeError, "crypto.getRandomValues: the argument is not an integer typed array");
     size_t n = (size_t)typedLength(t) * sizeOf(t->type);
     if (n > 65536) vm.throwError(Err::Error, "QuotaExceededError: at most 65536 random bytes per call");
-    if (n) BCryptGenRandom(nullptr, t->buffer->bytes.data() + t->offset, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (n) BCryptGenRandom(nullptr, t->buffer->data() + t->offset, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     return v;
 }
 JSFN(cryptoRandomUUID) {

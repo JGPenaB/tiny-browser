@@ -2197,12 +2197,12 @@ void buildRequest(CallInfo& ci, NetRequest& rq) {
     } else if (body.isObject()) {
         JSObject* o = body.asObject();
         if (o->cls == Cls::ArrayBuffer) {
-            auto& b = ((JSArrayBuffer*)o)->bytes;
-            rq.opts.body.assign(b.begin(), b.end());
+            JSArrayBuffer* b = (JSArrayBuffer*)o;
+            rq.opts.body.assign(b->data(), b->data() + b->size());
         } else if (o->cls == Cls::TypedArray || o->cls == Cls::DataView) {
             JSTypedArray* t = (JSTypedArray*)o;
             size_t n = (size_t)typedLength(t) * kTaSize[(int)t->type];
-            const uint8_t* p = t->buffer->bytes.data() + t->offset;
+            const uint8_t* p = t->buffer->data() + t->offset;
             rq.opts.body.assign(p, p + n);
         }
     }

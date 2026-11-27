@@ -342,7 +342,9 @@ Vm::Vm() {
     realms.push_back(std::make_unique<RealmFields>());
     initRealm();
 }
-Vm::~Vm() {}
+Vm::~Vm() {
+    if (!asyncWaiters.empty()) forgetWaiters(*this);
+}
 
 // InitializeHostDefinedRealm (9.6) for the running realm, whose fields are still empty
 void Vm::initRealm() {
@@ -521,10 +523,7 @@ void Vm::markRoots(Gc& g) {
     for (auto* vec : rootVecs)
         for (Value v : *vec) g.mark(v);
     for (auto& tracer : rootTracers) tracer(g);
-    for (auto& w : asyncWaiters) {
-        g.mark(w.buffer);
-        g.mark(w.resolve);
-    }
+    for (auto& w : asyncWaiters) g.mark(w.resolve);
     g.mark(genReturnSignal);
 }
 
@@ -2412,7 +2411,7 @@ static void inspectInto(Vm& vm, Value v, int depth, bool quote, std::u16string& 
         return;
     }
     if (o->cls == Cls::ArrayBuffer) {
-        out += u"ArrayBuffer(" + ascii16(std::to_string(((JSArrayBuffer*)o)->bytes.size())) + u")";
+        out += u"ArrayBuffer(" + ascii16(std::to_string(((JSArrayBuffer*)o)->size())) + u")";
         return;
     }
     if (o->cls == Cls::TypedArray) {

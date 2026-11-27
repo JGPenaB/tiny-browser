@@ -30,7 +30,7 @@ struct JSRegExp : JSObject {
 // Compiled programs are shared between RegExp objects with the same source and flags (a literal inside a
 // loop or a function is evaluated again and again).
 std::unordered_map<std::u16string, std::shared_ptr<RegexProgram>>& programCache() {
-    static std::unordered_map<std::u16string, std::shared_ptr<RegexProgram>> cache;
+    static thread_local std::unordered_map<std::u16string, std::shared_ptr<RegexProgram>> cache;  // one per agent
     return cache;
 }
 

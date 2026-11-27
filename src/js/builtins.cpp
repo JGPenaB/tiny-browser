@@ -1353,7 +1353,7 @@ static Value minMax(CallInfo& ci, bool isMax) {
 JSFN(math_max) { return minMax(ci, true); }
 JSFN(math_min) { return minMax(ci, false); }
 JSFN(math_random) {
-    static uint64_t s0 = 0, s1 = 0;
+    static thread_local uint64_t s0 = 0, s1 = 0;
     if (!s0 && !s1) {
         LARGE_INTEGER q;
         QueryPerformanceCounter(&q);

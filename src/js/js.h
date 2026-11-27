@@ -1,11 +1,13 @@
 // Tiny Browser's own JavaScript engine: values, heap objects and the virtual machine interface.
 #pragma once
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -362,8 +364,22 @@ struct JSHost : JSObject {
 };
 
 // Binary data: an ArrayBuffer owns bytes; typed arrays and DataViews are windows onto a buffer.
+// The memory of a SharedArrayBuffer: one block that every agent holding the buffer reads and writes (25.2). Address
+// space for the largest size the buffer may grow to is reserved when it is made, so growing never moves the bytes.
+struct SharedBlock {
+    uint8_t* base = nullptr;
+    std::atomic<size_t> length{0};
+    size_t limit = 0;  // bytes of address space reserved
+    ~SharedBlock();
+};
+std::shared_ptr<SharedBlock> newSharedBlock(size_t length, size_t limit);  // null when the memory is not to be had
+bool growSharedBlock(SharedBlock& b, size_t length);                        // false when the memory is not to be had
+
 struct JSArrayBuffer : JSObject {  // ArrayBuffer and SharedArrayBuffer
-    std::vector<uint8_t> bytes;  // empty once detached
+    std::vector<uint8_t> bytes;          // an ArrayBuffer's bytes: empty once detached
+    std::shared_ptr<SharedBlock> block;  // a SharedArrayBuffer's bytes
+    uint8_t* data() const { return block ? block->base : const_cast<uint8_t*>(bytes.data()); }
+    size_t size() const { return block ? block->length.load(std::memory_order_relaxed) : bytes.size(); }
     double maxLen = -1;          // the most bytes a resizable buffer may grow to; -1 when the length is fixed
     bool detached = false, shared = false, immutable = false;
     JSArrayBuffer() { cls = Cls::ArrayBuffer; }
@@ -381,12 +397,12 @@ struct JSTypedArray : JSObject {  // also backs DataView (cls DataView, lengths 
 // IsTypedArrayOutOfBounds (10.4.5.14): the buffer is detached or no longer holds the whole view
 inline bool typedOutOfBounds(const JSTypedArray* t) {
     const JSArrayBuffer* b = t->buffer;
-    size_t have = b->bytes.size();
+    size_t have = b->size();
     return b->detached || t->offset > have || (!t->tracking && (size_t)t->offset + (size_t)t->length * kTaSize[(int)t->type] > have);
 }
 // TypedArrayLength, and 0 for a view that is out of bounds
 inline uint32_t typedLength(const JSTypedArray* t) {
-    size_t have = t->buffer->bytes.size(), size = kTaSize[(int)t->type];
+    size_t have = t->buffer->size(), size = kTaSize[(int)t->type];
     if (!t->tracking) return (size_t)t->offset + (size_t)t->length * size <= have ? t->length : 0;
     return t->offset <= have ? (uint32_t)((have - t->offset) / size) : 0;
 }
@@ -768,13 +784,17 @@ public:
     Atoms a;
     bool canBlock = false;  // may Atomics.wait put this thread to sleep?
     struct AsyncWaiter {  // an Atomics.waitAsync call that has not been answered yet
-        JSArrayBuffer* buffer;
-        size_t pos;
         Value resolve;
         uint32_t id;
+        const uint8_t* place;  // where in shared memory it waits
     };
     std::vector<AsyncWaiter> asyncWaiters;
     uint32_t nextWaiterId = 1;
+    // Agents (9.7) are threads, each with a Vm of its own, that share only the memory of SharedArrayBuffers. When
+    // another agent's Atomics.notify wakes one of this agent's waitAsync calls, the waiter's id is left here, and
+    // this agent settles the promise in its own time (settleNotifiedWaiters, called from the event loop).
+    std::mutex notifiedLock;
+    std::vector<uint32_t> notifiedWaiters;
     JSString* callerAtom = nullptr;
     JSObject* genReturnSignal = nullptr;  // thrown inside a generator to make it return through its finally blocks
     std::vector<JSObject*> joinStack;     // arrays whose join() is running, to stop self-reference
@@ -817,7 +837,7 @@ public:
 
     // ---- time limit: a script still running at deadlineTick (a GetTickCount64 value, 0 = no limit) is stopped.
     // Once terminated, try/catch in the script no longer sees the error, so it cannot keep itself alive.
-    uint64_t deadlineTick = 0;
+    std::atomic<uint64_t> deadlineTick{0};  // another agent's thread may set it, to stop this one
     bool terminated = false;
     uint16_t pollTicks = 0;
     void pollInterrupt();
@@ -827,6 +847,9 @@ public:
     void setupGlobals();
     void setupCollections();
 };
+
+void settleNotifiedWaiters(Vm& vm);  // typedarray.cpp: resolves the waitAsync promises other agents have notified
+void forgetWaiters(Vm& vm);          // typedarray.cpp: an engine that goes away waits for nothing any more
 
 // RAII: the code in its scope runs in the given realm.
 struct RealmScope {

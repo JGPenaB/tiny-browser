@@ -27,8 +27,16 @@ var $262 = {
     other.__evalScript(__hostSource);
     return other.$262;
   },
-  agent: { start: function () { throw new Test262Error('agents are not supported'); } }
+  agent: {  // other agents are threads of the shell, each with an engine of its own
+    start: function (source) { __agentStart(__agentHost + source); },
+    broadcast: function (buffer) { __agentBroadcast(buffer); },
+    getReport: function () { return __agentGetReport(); },
+    sleep: function (ms) { __agentSleep(ms); },
+    monotonicNow: function () { return __agentNow(); }
+  }
 };
+var __agentHost = 'var $262 = { agent: { receiveBroadcast: __agentReceive, report: __agentReport, leaving: __agentLeaving, ' +
+  'sleep: __agentSleep, monotonicNow: __agentNow } };\n';
 __modules.host.resolve = function (specifier, referrer) {
   if (!/^\.{1,2}\//.test(specifier)) throw new TypeError("Cannot resolve module specifier '" + specifier + "'");
   var parts = referrer.split('/');
