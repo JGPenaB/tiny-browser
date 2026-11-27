@@ -1389,7 +1389,15 @@ void Vm::defineAccessor(JSObject* o, PropKey k, Value getter, Value setter, uint
 bool Vm::hasOwn(JSObject* o, PropKey k) {
     if (o->cls == Cls::Host && !k.isSymbol()) {
         JSHost* h = (JSHost*)o;
-        if (h->hooks && h->hooks->has) return o->find(k) || h->hooks->has(*this, o, k);
+        if (h->hooks && h->hooks->has) {
+            if (o->find(k)) return true;
+            if (!h->hooks->has(*this, o, k)) return false;
+            if (h->hostKind == kModuleHostKind) {  // [[GetOwnProperty]] reads the binding: a ReferenceError while it is uninitialised
+                Value unused;
+                h->hooks->get(*this, o, k, unused);
+            }
+            return true;
+        }
     }
     Prop tmp;
     return getOwn(o, k, tmp);
@@ -1399,6 +1407,11 @@ bool Vm::has(JSObject* o, PropKey k) {
         if (cur->cls == Cls::Proxy) return proxyHas(cur, k);
         if (cur->cls == Cls::TypedArray)
             if (int kind = typedKeyKind(*this, (JSTypedArray*)cur, k)) return kind == 1;
+        if (cur->cls == Cls::Host && !k.isSymbol() && ((JSHost*)cur)->hostKind == kModuleHostKind) {  // [[HasProperty]] of a namespace does not read the binding
+            JSHost* h = (JSHost*)cur;
+            if (cur->find(k) || (h->hooks && h->hooks->has && h->hooks->has(*this, cur, k))) return true;
+            continue;
+        }
         if (hasOwn(cur, k)) return true;
     }
     return false;
@@ -2325,6 +2338,10 @@ static void inspectInto(Vm& vm, Value v, int depth, bool quote, std::u16string& 
             out += u"[Circular]";
             return;
         }
+    if (o->cls == Cls::Proxy) {  // describing a proxy must not run its traps
+        out += vm.isCallable(v) ? u"[Function: (proxy)]" : u"[object Proxy]";
+        return;
+    }
     if (vm.isCallable(v)) {
         Value nm = vm.get(v, vm.a.name);
         bool cls = o->cls == Cls::Function && ((JSFunction*)o)->code->isClassCtor;
@@ -2476,6 +2493,7 @@ static const Handler* findHandler(FuncProto* p, uint32_t at, bool finallyOnly) {
 }
 
 Value Vm::runFrames(size_t base) {
+    bool leaving = false;  // an error raised by a return itself: the returning function's handlers are passed over
     Frame* fr = &frames.back();
     const Ins* pc = fr->pc;
     const Ins* code = fr->code->code.data();
@@ -2623,7 +2641,7 @@ Value Vm::runFrames(size_t base) {
                     }
                     case OP_ThrowBadTarget:
                         fr->pc = pc;
-                        throwError(Err::ReferenceError, "Invalid left-hand side in assignment");
+                        throwError(Err::ReferenceError, i.a ? "Unsupported reference to 'super'" : "Invalid left-hand side in assignment");
                     case OP_PushCtx: {
                         Context* c = alloc<Context>();
                         c->parent = fr->ctx;
@@ -3173,12 +3191,18 @@ Value Vm::runFrames(size_t base) {
                     case OP_RetUndef: {
                         Value rv = i.op == OP_Return ? R(i.a) : Value::undef();
                         if (fr->construct && !rv.isObject()) {
+                            // [[Construct]] (10.2.2) makes these checks once the body has finished: its own try blocks do not see the errors
                             if (fr->code->isDerived && !rv.isUndef()) {
                                 fr->pc = pc;
+                                leaving = true;
                                 throwError(Err::TypeError, "Derived constructors may only return object or undefined");
                             }
                             rv = regs[1];
-                            if (rv.isEmpty()) throwError(Err::ReferenceError, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
+                            if (rv.isEmpty()) {
+                                fr->pc = pc;
+                                leaving = true;
+                                throwError(Err::ReferenceError, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
+                            }
                         }
                         bool entry = fr->entry;
                         Value* ret = fr->ret;
@@ -3501,10 +3525,16 @@ Value Vm::runFrames(size_t base) {
                         uint32_t site = (pc++)->bx;
                         Value callee = R(i.b);
                         fr->pc = pc;
-                        Value* argv = &R(i.b + 2);
+                        const Value* argv = &R(i.b + 2);
+                        int argc = i.c;
+                        if (i.c == 0xFFFF) {  // the arguments were spread into an array
+                            JSArray* list = (JSArray*)R(i.b + 2).asCell();
+                            argv = list->elems.data();
+                            argc = (int)list->elems.size();
+                        }
                         if (callee.isObject() && evalFn.isObject() && callee.asObject() == evalFn.asObject()) {
-                            if (i.c == 0 || !argv[0].isString()) {  // eval of a non-string returns it unchanged
-                                R(i.a) = i.c ? argv[0] : Value::undef();
+                            if (argc == 0 || !argv[0].isString()) {  // eval of a non-string returns it unchanged
+                                R(i.a) = argc ? argv[0] : Value::undef();
                                 break;
                             }
                             auto src = std::make_shared<const std::u16string>(argv[0].asString()->s);
@@ -3512,7 +3542,7 @@ Value Vm::runFrames(size_t base) {
                             JSFunction* fn = makeClosure(code, fr->ctx, fr);
                             R(i.a) = callFunction(fn, Value::undef(), nullptr, 0, Value::undef(), false);
                         } else
-                            R(i.a) = call(callee, Value::undef(), argv, i.c);
+                            R(i.a) = call(callee, R(i.b + 1), argv, argc);
                         break;
                     }
                     case OP_ClassInit: {
@@ -3629,7 +3659,9 @@ Value Vm::runFrames(size_t base) {
                 fr = &frames.back();
                 uint32_t at = (uint32_t)(pc - fr->code->code.data());
                 if (at > 0) --at;
-                if (const Handler* h = terminated ? nullptr : findHandler(fr->code, at, returning)) {
+                bool skip = terminated || leaving;
+                leaving = false;
+                if (const Handler* h = skip ? nullptr : findHandler(fr->code, at, returning)) {
                     while (fr->ctxDepth > h->ctxDepth) {
                         fr->ctx = fr->ctx->parent;
                         fr->ctxDepth--;

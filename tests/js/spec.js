@@ -219,4 +219,22 @@ test("declarations checked before they are made (16.1.7, 19.2.1.3, B.3)", functi
   e.stack = "s"; eq([Object.hasOwn(e, "stack"), e.stack], [true, "s"]);
   Array.prototype[1] = "p"; var holes = [0]; holes.length = 2; eq(holes.join(), "0,p"); delete Array.prototype[1];
 });
+test("syntax rules that were missing (13.6, 13.13, 13.3, 16.2)", function () {
+  for (const src of ["-x ** 2", "typeof x ** 2", "a ?? b || c", "a || b ?? c", "a ?? b && c", "a?.b`t`", "class C { #f; m() { #f in #f in this; } }", "const x;",
+    "class C extends (o.#x) { #x }"])
+    throws(() => new Function(src), SyntaxError, src);
+  for (const src of ["(-x) ** 2", "(a ?? b) || c", "a ?? (b || c)", "++x ** 2", "class C { #f; m() { return #f in this; } }"]) new Function(src);
+  var x = "global"; (function () { var x = "local"; eval(...["x = 1"]); eq(x, 1); })(); eq(x, "global");
+  (function () { var y = "local"; eval?.("var __viaOptional = typeof y"); })(); eq(__viaOptional, "undefined");
+  const o = { b() { return this.v; }, v: 42 }; eq([(o?.b)(), o?.b(), (o.b)?.()], [42, 42, 42]);
+  class Base { } class D extends Base { constructor() { super(); try { return 0; } catch (e) { return; } } } throws(() => new D(), TypeError);
+  throws(() => { class X extends X { } }, ReferenceError);
+  var seen; class F extends Base { field = seen(); constructor() { seen = () => this; super(); } } const f = new F(); eq(f.field === f, true);
+  class P extends Base { m() { delete super.x; } } throws(() => new P().m(), ReferenceError);
+  eq([JSON.stringify(JSON.parse('[1.0, "a"]', (k, v, ctx) => ctx.source ?? v)), JSON.stringify({ n: JSON.rawJSON("1e1000") }), JSON.isRawJSON(JSON.rawJSON("1"))],
+     ['["1.0","\\"a\\""]', '{"n":1e1000}', true]);
+  eq([(25).toExponential(0), (-0).toPrecision(2), Math.pow(1, NaN), Math.round(-0.2), Math.hypot(NaN, Infinity), Math.sumPrecise([1e20, 0.1, -1e20])], ["3e+1", "0.0", NaN, -0, Infinity, 0.1]);
+  eq([new Date(0)[Symbol.toPrimitive]("number"), typeof Date.prototype.setYear, Date.prototype.toGMTString === Date.prototype.toUTCString], [0, "function", true]);
+  throws(() => encodeURI("\uD800"), URIError); eq(decodeURI("%F0%9F%98%80"), "\u{1F600}");
+});
 done();

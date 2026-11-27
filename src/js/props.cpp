@@ -245,6 +245,13 @@ bool Vm::getOwnDesc(JSObject* o, PropKey k, PropDesc& d) {
 // [[DefineOwnProperty]]: false when the object refuses the change.
 bool Vm::defineOwnDesc(JSObject* o, PropKey k, const PropDesc& d) {
     if (o->cls == Cls::Proxy) return proxyDefineOwn(o, k, d);
+    if (o->cls == Cls::Host && !k.isSymbol() && ((JSHost*)o)->hostKind == kModuleHostKind) {  // 10.4.6.6: nothing about an export can change
+        JSHost* h = (JSHost*)o;
+        Value current;
+        if (!h->hooks || !h->hooks->get || !h->hooks->get(*this, o, k, current)) return false;
+        if ((d.hasConfigurable && d.configurable) || (d.hasEnumerable && !d.enumerable) || d.hasGet || d.hasSet || (d.hasWritable && !d.writable)) return false;
+        return !d.hasValue || sameValue(d.value, current);
+    }
     if (o->cls == Cls::Array) {
         JSArray* arr = (JSArray*)o;
         if (!k.isIndex() && !k.isSymbol() && k.cell() == a.length) return arraySetLength(*this, arr, d);
@@ -327,6 +334,12 @@ bool Vm::setIntegrity(JSObject* o, bool frozen) {
         }
         return true;
     }
+    if (frozen && o->cls == Cls::Host && ((JSHost*)o)->hostKind == kModuleHostKind) {  // an export cannot be made read-only (10.4.6.6)
+        JSHost* h = (JSHost*)o;
+        std::vector<PropKey> exported;
+        if (h->hooks && h->hooks->keys) h->hooks->keys(*this, o, exported);
+        if (!exported.empty()) return false;
+    }
     if (!preventExtensions(o)) return false;
     if (o->cls == Cls::TypedArray && typedLength((JSTypedArray*)o) > 0 && !((JSTypedArray*)o)->buffer->immutable)  // an element cannot be made non-configurable
         throwError(Err::TypeError, frozen ? "Cannot freeze array buffer views with elements" : "Cannot seal array buffer views with elements");
@@ -342,10 +355,10 @@ bool Vm::setIntegrity(JSObject* o, bool frozen) {
     };
     fix();
     if (o->cls == Cls::Function || o->cls == Cls::Native) {  // name and length exist without being stored
-        for (JSString* n : {a.name, a.length}) {
+        for (JSString* n : {a.name, a.length, a.arguments, callerAtom}) {
             Prop p{};
             PropKey k = PropKey::of(n);
-            if (!o->find(k) && getOwn(o, k, p)) o->add(k, p.val, 0);
+            if (!o->find(k) && getOwn(o, k, p)) o->add(k, n == callerAtom ? Value::null() : p.val, 0);
         }
         if (o->cls == Cls::Function) fnProtoProp((JSFunction*)o);
         fix();

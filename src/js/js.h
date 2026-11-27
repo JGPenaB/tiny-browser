@@ -650,6 +650,7 @@ public:
     bool testIntegrity(JSObject* o, bool frozen);
     bool protoIndexProps = false;  // Array.prototype or Object.prototype has gained an index-named property
     void pinArgumentsLength(JSObject* o);
+    static constexpr uint8_t kModuleHostKind = 200;  // JSHost::hostKind of a module namespace object
     static bool isHtmlDda(Value v) { return v.isObject() && v.asObject()->cls == Cls::Native && ((JSNative*)v.asObject())->htmlDda; }
     Value* mappedArg(JSObject* o, PropKey k);  // the parameter an arguments element is still tied to, or null
     void unmapArg(JSObject* o, PropKey k);
@@ -819,6 +820,7 @@ struct ModuleInfo {
         bool named;                // false: re-exports that module's whole namespace (export * as x)
     };
     std::vector<std::u16string> requests;  // module specifiers
+    std::vector<std::u16string> requestTypes;  // the `type` import attribute of each request, or empty
     std::vector<int> requestSlots;         // scope slot that receives each requested module's namespace
     std::vector<Export> exports;
     std::vector<int> stars;                               // export * from

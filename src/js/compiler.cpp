@@ -776,7 +776,11 @@ private:
                         Node* t = n->a->type == N::OptChain ? n->a->a : n->a;
                         bool chain = t != n->a && (t->type == N::Member || t->type == N::Index);
                         if (chain) f->chains.emplace_back();
-                        if (t->type == N::Member) {
+                        if ((t->type == N::Member || t->type == N::Index) && t->a->type == N::Super) {
+                            thisReg(t->a);
+                            if (t->type == N::Index) expr(t->b);
+                            emit(OP_ThrowBadTarget, 1);
+                        } else if (t->type == N::Member) {
                             int o = expr(t->a);
                             if (t->flags & NF_OPTIONAL) bail(o);
                             uint32_t k = kstr(t->str);
@@ -1031,6 +1035,15 @@ private:
             else if (c->b->type == N::Str && !(c->flags & NF_PRIVATE)) getProp(base, base + 1, c->b->str);
             else emit((c->flags & NF_PRIVATE) ? OP_GetPrivate : OP_GetElem, base, base + 1, expr(c->b));
             f->nextReg = m2;
+        } else if (c->type == N::OptChain && (c->a->type == N::Member || c->a->type == N::Index)) {
+            f->chains.emplace_back();
+            calleeInto(c->a, base);
+            size_t done = jump(OP_Jmp);
+            for (size_t j : f->chains.back()) patch(j);
+            f->chains.pop_back();
+            emit(OP_LoadUndef, base);
+            emit(OP_LoadUndef, base + 1);
+            patch(done);
         } else if (c->type == N::Ident && dynOf(c)) {  // a function found in a `with` object is called on that object
             emit(OP_LoadUndef, base + 1);
             dynLoad(c, *dynOf(c), base, 0, base + 1);
@@ -1087,15 +1100,31 @@ private:
                 f->nextReg = mark;
                 return dst;
             }
+            if (f->info->thisVar) {  // closures or eval share `this`: it is in its variable before the field initialisers run
+                emit(OP_Move, base, 0);
+                emit(OP_LoadNewTarget, base + 1);
+                bool spread = args(n, base);
+                emit(OP_SuperCallIn, dst, base, spread ? 0xFFFF : (int)n->list.size());
+                emit(OP_BindThis, dst, 1);
+                emit(OP_Move, 1, dst);
+                storeVar(f->info->thisVar, f->info->thisVar->name, dst, true);
+                emit(OP_InitFields, base, dst);
+                f->nextReg = mark;
+                return dst;
+            }
             if (args(n, base)) emit(OP_SuperCallSpread, dst, base);
             else emit(OP_SuperCall, dst, base, (int)n->list.size());
-            if (f->info->thisVar) storeVar(f->info->thisVar, f->info->thisVar->name, 1, true);
             f->nextReg = mark;
             return dst;
         }
         calleeInto(n->a, base);
         if (n->flags & NF_OPTIONAL) bail(base);
-        if (args(n, base)) emit(OP_CallSpread, dst, base);
+        bool spread = args(n, base);
+        if (spread && (n->flags & NF_EVAL)) {
+            emit(OP_DirectEval, dst, base, 0xFFFF);
+            emitX(OP_Nop, 0, evalSite((n->flags & NF_INPARAM) != 0));
+        } else if (spread)
+            emit(OP_CallSpread, dst, base);
         else if (n->flags & NF_EVAL) {
             // eval(...) by name: if the callee turns out to be the real eval, it runs with the scopes described here
             emit(OP_DirectEval, dst, base, (int)n->list.size());
@@ -1533,12 +1562,12 @@ private:
 
     int emitClass(Node* n, int dst) {
         int mark = f->nextReg;
+        ScopeMark sm = enterScope(n->scope);
         int parent = -1;
         if (n->a) {
             parent = newReg();
             expr(n->a, parent);
         }
-        ScopeMark sm = enterScope(n->scope);
         for (Variable* v : n->scope->vars)
             if (v->kind == VK_PRIVATE) {
                 int t = newReg();
@@ -2225,6 +2254,7 @@ FuncProto* compileScript(Vm& vm, std::shared_ptr<const std::u16string> src, cons
         FuncProto* p = c.program();
         if (module) {
             for (JSString* r : ast.requests) module->requests.push_back(r->s);
+            for (JSString* t : ast.requestTypes) module->requestTypes.push_back(t ? t->s : std::u16string());
             for (Variable* v : ast.requestVars) module->requestSlots.push_back(v->slot);
             for (auto& e : ast.exports)
                 module->exports.push_back({e.name->s, e.var ? e.var->slot : -1, e.request, e.importName ? e.importName->s : std::u16string(), e.importName != nullptr});

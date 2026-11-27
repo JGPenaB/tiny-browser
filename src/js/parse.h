@@ -149,6 +149,7 @@ struct Ast {
     FunctionInfo* moduleFn = nullptr;
     bool hasTLA = false;                 // the module body awaits at its top level
     std::vector<JSString*> requests;     // module specifiers in source order, without repeats
+    std::vector<JSString*> requestTypes; // the `type` import attribute that goes with each (null: none)
     std::vector<Variable*> requestVars;  // the variable that holds each requested module's namespace
     std::vector<Export> exports;
     std::vector<Import> imports;  // named imports, checked when the module is linked

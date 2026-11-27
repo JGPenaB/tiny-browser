@@ -106,9 +106,9 @@ public:
                 }
                 if (pos >= n) fail("Unterminated comment");
                 pos += 2;
-            } else if (c == '<' && s.compare(pos, 4, u"<!--") == 0) {
+            } else if (c == '<' && !noHtmlComments && s.compare(pos, 4, u"<!--") == 0) {
                 while (pos < n && !isLt(s[pos])) ++pos;
-            } else if (c == '-' && (nl || atStart) && s.compare(pos, 3, u"-->") == 0) {
+            } else if (c == '-' && !noHtmlComments && (nl || atStart) && s.compare(pos, 3, u"-->") == 0) {
                 while (pos < n && !isLt(s[pos])) ++pos;
             } else
                 break;
@@ -289,6 +289,7 @@ public:
     bool sawOctal = false;  // the token being read used a legacy octal number or escape
     bool templEsc = false, badEsc = false;  // reading a template's escape: a bad one is noted, not an error yet
     bool atStart = true;                     // nothing but white space and comments so far
+    bool noHtmlComments = false;             // module code: <!-- and --> are operators there
     bool sawBig = false;    // the number being read is a BigInt literal; its digits are in bigText
     std::u16string bigText;
     Tok next() {
@@ -726,6 +727,7 @@ public:
         g->fn = &outer;
         outer.scope = g;
         outer.strict = true;
+        lx.noHtmlComments = true;
         advance();
         Node* fnode = mk(N::Function);
         FunctionInfo* f = beginFn(nullptr, 0);
@@ -769,18 +771,20 @@ public:
     }
 
 private:
-    bool atModuleTop() const { return ast.moduleFn && fn == ast.moduleFn && scope == ast.moduleFn->scope; }
+    int subDepth = 0;  // how many bodies of if, loops and labels are open
+    bool atModuleTop() const { return ast.moduleFn && fn == ast.moduleFn && scope == ast.moduleFn->scope && subDepth == 0; }
     int requestOf(Variable* nsVar) {
         for (size_t i = 0; i < ast.requestVars.size(); ++i)
             if (ast.requestVars[i] == nsVar) return (int)i;
         return -1;
     }
     // Registers a module specifier and returns its index; the first use also creates its namespace variable.
-    int request(JSString* spec) {
+    int request(JSString* spec, JSString* type = nullptr) {  // a ModuleRequest: the specifier and its attributes (16.2.1.3)
         for (size_t i = 0; i < ast.requests.size(); ++i)
-            if (ast.requests[i]->s == spec->s) return (int)i;
+            if (ast.requests[i]->s == spec->s && ast.requestTypes[i] == type) return (int)i;
         int idx = (int)ast.requests.size();
         ast.requests.push_back(spec);
+        ast.requestTypes.push_back(type);
         Variable* v = newVar(ast.moduleFn->scope, vm.atom("%m" + std::to_string(idx)), VK_LET);
         v->declEnd = 0;
         v->captured = true;
@@ -791,6 +795,14 @@ private:
     bool isWord(const char* w) const { return t.type == Tok::Ident && !t.esc && t.str->s == std::u16string(w, w + strlen(w)); }
     JSString* moduleName() {  // a name in an import/export list: any word, or a string
         if (t.type != Tok::Ident && t.type != Tok::Str) unexpected();
+        if (t.type == Tok::Str) {
+            const std::u16string& w = t.str->s;
+            for (size_t i = 0; i < w.size(); ++i) {
+                bool high = w[i] >= 0xD800 && w[i] <= 0xDBFF, low = w[i] >= 0xDC00 && w[i] <= 0xDFFF;
+                if (high && i + 1 < w.size() && w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF) ++i;
+                else if (high || low) fail("Module export names must be well-formed Unicode");
+            }
+        }
         JSString* n = vm.atomOf(t.str);
         advance();
         return n;
@@ -801,35 +813,50 @@ private:
         if (t.type != Tok::Str) unexpected();
         JSString* spec = t.str;
         advance();
-        if (isWord("with") && !t.nl) {  // import attributes: none are supported, so naming one is an error
-            uint32_t line = t.line;
-            advance();
-            expectP(P_LBrace);
-            bool any = false;
-            while (!isP(P_RBrace)) {
-                moduleName();
-                expectP(P_Colon);
-                if (t.type != Tok::Str) unexpected();
-                advance();
-                any = true;
-                if (!eatP(P_Comma)) break;
-            }
-            expectP(P_RBrace);
-            if (any) throw SyntaxErr{"Import attributes are not supported", line};
-        }
+        withClause();
         return spec;
+    }
+    // with { key: "value", ... } (16.2.2 WithClause). `type` is the one attribute this host knows; its value is
+    // left in lastType for the request that follows.
+    JSString* lastType = nullptr;
+    void withClause() {
+        lastType = nullptr;
+        if (!isWord("with")) return;
+        uint32_t line = t.line;
+        advance();
+        expectP(P_LBrace);
+        std::vector<JSString*> seen;
+        while (!isP(P_RBrace)) {
+            if (t.type != Tok::Ident && t.type != Tok::Str) unexpected();
+            JSString* key = vm.atomOf(t.str);
+            advance();
+            expectP(P_Colon);
+            if (t.type != Tok::Str) unexpected();
+            JSString* value = vm.atomOf(t.str);
+            advance();
+            for (JSString* k2 : seen)
+                if (k2 == key) throw SyntaxErr{"Duplicate import attribute '" + utf16to8(key->s) + "'", line};
+            seen.push_back(key);
+            if (key->s != u"type") throw SyntaxErr{"Import attribute '" + utf16to8(key->s) + "' is not supported", line};
+            lastType = value;
+            if (!eatP(P_Comma)) break;
+        }
+        expectP(P_RBrace);
     }
     Node* importDecl() {
         advance();  // import
         if (t.type == Tok::Str) {  // import "module": only for its side effects
-            request(t.str);
+            JSString* spec = t.str;
             advance();
+            withClause();
+            request(spec, lastType);
             semi();
             return mk(N::Empty);
         }
         std::vector<Variable*> made;
         auto bind = [&](JSString* local, JSString* imported) {
             if (isRes(local)) fail("Unexpected reserved word '" + utf16to8(local->s) + "'");
+            if (isEvalOrArguments(local)) fail("Unexpected eval or arguments in strict mode");
             Variable* v = declare(local, VK_CONST);
             v->kind = VK_IMPORT;
             v->declEnd = 0;
@@ -872,7 +899,8 @@ private:
             expectP(P_RBrace);
         } else if (more)
             unexpected();
-        int idx = request(fromClause());
+        JSString* from = fromClause();
+        int idx = request(from, lastType);
         for (Variable* v : made) {
             v->importNs = ast.requestVars[idx];
             if (v->importName) ast.imports.push_back({idx, v->importName});
@@ -934,7 +962,8 @@ private:
                 advance();
                 as = moduleName();
             }
-            int idx = request(fromClause());
+            JSString* from = fromClause();
+            int idx = request(from, lastType);
             if (as) addExport(as, nullptr, idx, nullptr, line);
             else ast.starRequests.push_back(idx);
             semi();
@@ -960,7 +989,8 @@ private:
             }
             expectP(P_RBrace);
             if (isWord("from")) {
-                int idx = request(fromClause());
+                JSString* from = fromClause();
+                int idx = request(from, lastType);
                 for (auto& it : list) addExport(it.exported, nullptr, idx, it.local, line);
             } else
                 for (auto& it : list) {
@@ -1041,6 +1071,11 @@ private:
     }
     // The body of if, a loop or a label: one statement, where declarations are not allowed (14.6, 14.7, 14.13).
     Node* subStatement(bool ifBody = false, bool labelled = false) {
+        struct Depth {
+            int& d;
+            explicit Depth(int& x) : d(x) { ++d; }
+            ~Depth() { --d; }
+        } depth(subDepth);
         bool noLet = false;
         if (t.type == Tok::Ident && !t.esc) {
             JSString* w = t.str;
@@ -1257,7 +1292,9 @@ private:
                     sc->varNames.push_back(name);
                 }
             if (Variable* v = fs->find(name)) {
-                if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)
+                bool moduleTop = ast.moduleFn && fs == ast.moduleFn->scope;
+                if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS || v->kind == VK_IMPORT ||
+                    (moduleTop && (kind == VK_FUNC || v->kind == VK_FUNC) && (v->kind == VK_VAR || v->kind == VK_FUNC)))
                     fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
                 if (kind == VK_FUNC && v->kind == VK_VAR) v->kind = VK_FUNC;
                 return v;
@@ -2182,13 +2219,25 @@ private:
             unexpected();
         bool savedStrict = fn->strict;
         fn->strict = true;
-        if (eatK(k.extends_)) n->a = lhs();
+        // ClassDefinitionEvaluation (15.7.14): the class's own scope, with its name not yet initialised, is in place
+        // before the heritage expression is evaluated
         Scope* cs = open(Scope::Class);
         n->scope = cs;
         n->var2 = outer;
         if (n->str) {  // the name is also bound inside the class body, and set before static fields and blocks run
             n->var = newVar(cs, n->str, VK_CONST);
-            n->var->declEnd = 0;
+            declaredNow.pop_back();
+        }
+        if (eatK(k.extends_)) {
+            n->a = lhs();
+            // the heritage is outside the class's private names (15.7.1): what it mentions belongs to the classes around
+            for (size_t i = 0; i < cs->refs.size();) {
+                if (cs->refs[i].first->flags & NF_PRIVATE) {
+                    cs->parent->refs.push_back(cs->refs[i]);
+                    cs->refs.erase(cs->refs.begin() + (ptrdiff_t)i);
+                } else
+                    ++i;
+            }
         }
         expectP(P_LBrace);
         classPrivates.emplace_back();
@@ -2200,6 +2249,7 @@ private:
         classPrivates.pop_back();
         advance();
         n->num = (double)prevEnd;  // where the class's text ends
+        if (n->var) n->var->declEnd = prevEnd;
         close(cs);
         fn->strict = savedStrict;
         return n;
@@ -2399,6 +2449,7 @@ private:
         if (t.type == Tok::Punct && t.p >= P_Assign && t.p <= P_QQEq) {
             Node* n = mk(N::Assign);
             n->op = t.p;
+            if (internalRef(left)) fail("Invalid assignment target");
             if (n->op == P_Assign) left = toPattern(left);
             else if (left->type != N::Ident && left->type != N::Member && left->type != N::Index &&
                      !(left->type == N::Call && !fn->strict && n->op != P_AndAndEq && n->op != P_OrOrEq && n->op != P_QQEq))
@@ -2457,17 +2508,28 @@ private:
         return -1;
     }
 
+    bool unaryOperand = false;  // set by unary(): what it returned began with a unary operator
     Node* binary(int minPrec, bool in) {
         Node* left = unary();
+        bool unaryBase = unaryOperand;
+        if (left->type == N::Ident && (left->flags & NF_PRIVATE)) {  // #name is only ever the left operand of `in` (13.10.1)
+            uint8_t next = P_None;
+            if (precOf(in, next) < minPrec || next != P_In) fail("Unexpected private name");
+        }
+        auto bareLogical = [](Node* x, bool coalesce) { return x->type == N::Logical && !(x->flags & NF_PAREN) && (x->op == P_QQ) == coalesce; };
         for (;;) {
             uint8_t op = P_None;
             int prec = precOf(in, op);
             if (prec < 0 || prec < minPrec) break;
+            if (op == P_StarStar && unaryBase) fail("A unary operator cannot be used immediately before '**': add parentheses");
+            unaryBase = false;
             Node* n = mk((op == P_AndAnd || op == P_OrOr || op == P_QQ) ? N::Logical : N::Binary);
             n->op = op;
             advance();
             n->a = left;
             n->b = op == P_StarStar ? binary(prec, in) : binary(prec + 1, in);
+            if (op == P_QQ && (bareLogical(left, false) || bareLogical(n->b, false))) fail("'??' cannot be mixed with '||' or '&&' without parentheses");
+            if ((op == P_OrOr || op == P_AndAnd) && (bareLogical(left, true) || bareLogical(n->b, true))) fail("'??' cannot be mixed with '||' or '&&' without parentheses");
             left = n;
         }
         return left;
@@ -2480,6 +2542,7 @@ private:
                 n->op = t.p;
                 advance();
                 n->a = unary();
+                unaryOperand = true;
                 if (n->a->type == N::Num && (n->op == P_Minus || n->op == P_Plus)) {  // fold numeric literals
                     n->a->num = n->op == P_Minus ? -n->a->num : n->a->num;
                     return n->a;
@@ -2494,7 +2557,9 @@ private:
                 n->a = unary();
                 if (n->a->type != N::Ident && n->a->type != N::Member && n->a->type != N::Index && !(n->a->type == N::Call && !fn->strict))
                     fail("Invalid update target");
+                if (internalRef(n->a)) fail("Invalid update target");
                 if (n->a->type == N::Ident && fn->strict && isEvalOrArguments(n->a->str)) fail("Unexpected eval or arguments in strict mode");
+                unaryOperand = false;
                 return n;
             }
         } else if (t.type == Tok::Ident && !t.esc) {
@@ -2508,6 +2573,7 @@ private:
                     if (x->type == N::Index && (x->flags & NF_PRIVATE)) fail("Private fields can not be deleted");
                     if (x->type == N::Ident && fn->strict) fail("Delete of an unqualified identifier in strict mode");
                 }
+                unaryOperand = true;
                 return n;
             }
             if (t.str == k.await_ && fn->isAsync) {
@@ -2516,12 +2582,15 @@ private:
                 Node* n = mk(N::Await);
                 advance();
                 n->a = unary();
+                unaryOperand = true;
                 return n;
             }
         }
         Node* e = lhs();
+        unaryOperand = false;
         if (!t.nl && (isP(P_Inc) || isP(P_Dec))) {
             if (e->type != N::Ident && e->type != N::Member && e->type != N::Index && !(e->type == N::Call && !fn->strict)) fail("Invalid update target");
+            if (internalRef(e)) fail("Invalid update target");
             if (e->type == N::Ident && fn->strict && isEvalOrArguments(e->str)) fail("Unexpected eval or arguments in strict mode");
             Node* n = mk(N::Update);
             n->op = t.p;
@@ -2622,7 +2691,6 @@ private:
                     c->a = e;
                     c->flags = NF_OPTIONAL;
                     arguments(c);
-                    if (e->type == N::Ident && e->str == evalAtom) markEval(c);
                     e = c;
                 } else if (isP(P_LBrack)) {
                     Node* n = mk(N::Index);
@@ -2648,6 +2716,7 @@ private:
                 if (e->type == N::Ident && e->str == evalAtom) markEval(c);
                 e = c;
             } else if (t.type == Tok::Templ) {
+                if (chain) fail("A tagged template cannot be part of an optional chain");
                 Node* tt = mk(N::TaggedTemplate);
                 tt->a = e;
                 tt->b = templateLit(true);
@@ -2673,11 +2742,20 @@ private:
             n->type = N::NewTarget;
             FunctionInfo* owner = fn;
             while (owner->isArrow && owner->parent) owner = owner->parent;
-            if (!owner->scope || owner->scope->kind != Scope::Function) fail("new.target expression is not allowed here");
+            if (!owner->scope || owner->scope->kind != Scope::Function || owner == ast.moduleFn) fail("new.target expression is not allowed here");
             n->var = pseudo(&FunctionInfo::newTargetVar, "new.target");
             return n;
         }
-        Node* callee = isK(k.new_) ? newExpr() : primary();
+        Node* callee;
+        if (isK(k.import_)) {  // only import.meta can follow new
+            advance();
+            expectP(P_Dot);
+            if (!isWord("meta")) unexpected();
+            advance();
+            if (!ast.moduleFn) fail("Cannot use 'import.meta' outside a module");
+            callee = identRef(vm.atom("%meta"));
+        } else
+            callee = isK(k.new_) ? newExpr() : primary();
         for (;;) {
             if (isP(P_Dot)) {
                 advance();
@@ -2929,8 +3007,11 @@ private:
         return o;
     }
 
+    // import.meta is kept as a reference to a hidden variable; it is a value, never a target
+    static bool internalRef(Node* e) { return e->type == N::Ident && !(e->flags & NF_PRIVATE) && !e->str->s.empty() && e->str->s[0] == '%'; }
     // Reinterprets an expression as an assignment target (destructuring patterns included).
     Node* toPattern(Node* n, bool nested = false) {
+        if (internalRef(n)) fail("Invalid assignment target");
         if ((n->flags & NF_PAREN) && (n->type == N::Array || n->type == N::Object || (nested && n->type == N::Assign))) fail("Invalid destructuring assignment target");
         switch (n->type) {
             case N::Ident:

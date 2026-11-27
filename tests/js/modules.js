@@ -153,7 +153,15 @@ function strictSet(o, k, v) { "use strict"; o[k] = v; }
   ok(viaScript === A, "import() from a classic script");
   const p = import("mem:/a.js"); ok(p instanceof Promise);
   await rejects(import("mem:/nowhere.js"), TypeError); await rejects(import("bare"), TypeError); await rejects(import(Symbol("s")), TypeError);
-  await rejects(import("mem:/a.js", 5), TypeError); await rejects(import("mem:/a.js", { with: { type: "json" } }), TypeError); await rejects(import("mem:/e1.js"), SyntaxError);
+  await rejects(import("mem:/a.js", 5), TypeError); await rejects(import("mem:/a.js", { with: { type: "json" } }), SyntaxError); await rejects(import("mem:/e1.js"), SyntaxError);
+  await rejects(import("mem:/a.js", { with: { type: "css" } }), TypeError); await rejects(import("mem:/a.js", { with: { other: "x" } }), SyntaxError);
+  mod("data.json", '{"list": [1, 2], "__proto__": 5}'); mod("notes.txt", "plain text");
+  mod("usejson.js", `import data from './data.json' with { type: 'json' }; import again from './data.json' with { type: "json" };
+    import * as ns from './data.json' with { type: 'json' }; import text from './notes.txt' with { type: 'text' };
+    export const out = [data.list.join(), data === again, Object.keys(ns).join(), Object.hasOwn(data, '__proto__'), text];`);
+  eq((await load("usejson.js")).out, ["1,2", true, "default", true, "plain text"]);
+  eq((await import("mem:/data.json", { with: { type: "json" } })).default.list, [1, 2]);
+  mod("badattr.js", `import x from './data.json' with { kind: 'json' };`); await rejects(load("badattr.js"), SyntaxError);
   eq((await import("mem:/a.js", {})).x, 1); eq((await import("mem:/a.js", undefined)).x, 1);
   let order = []; const pending = import({ toString() { order.push("toString"); return "mem:/a.js"; } }); order.push("after"); await pending; eq(order, ["toString", "after"]);
 

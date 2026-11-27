@@ -125,17 +125,23 @@ void ensureNames(Vm& vm, JSModule* m) {
     m->namesReady = true;
 }
 
+JSString* exportName(Vm& vm, PropKey k) {
+    if (k.isIndex()) return vm.atom(std::to_string(k.asIndex()));
+    return k.isString() ? k.str() : nullptr;
+}
 bool nsHas(Vm& vm, JSObject* o, PropKey k) {
-    if (!k.isString()) return false;
+    JSString* name = exportName(vm, k);
+    if (!name) return false;
     JSModule* m = (JSModule*)o;
     ensureNames(vm, m);
-    return m->bindings.count(k.str()) != 0;
+    return m->bindings.count(name) != 0;
 }
 bool nsGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
-    if (!k.isString()) return false;
+    JSString* name = exportName(vm, k);
+    if (!name) return false;
     JSModule* m = (JSModule*)o;
     ensureNames(vm, m);
-    auto it = m->bindings.find(k.str());
+    auto it = m->bindings.find(name);
     if (it == m->bindings.end()) return false;
     const JSModule::Binding& b = it->second;
     if (b.slot < 0) {
@@ -144,14 +150,14 @@ bool nsGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
     }
     Context* env = b.module->scope;
     Value v = env && (size_t)b.slot < env->slots.size() ? env->slots[b.slot] : Value::empty();
-    if (v.isEmpty()) vm.throwError(Err::ReferenceError, "Cannot access '%s' before initialization", utf16to8(k.str()->s).c_str());
+    if (v.isEmpty()) vm.throwError(Err::ReferenceError, "Cannot access '%s' before initialization", utf16to8(name->s).c_str());
     out = v;
     return true;
 }
 void nsKeys(Vm& vm, JSObject* o, std::vector<PropKey>& out) {
     JSModule* m = (JSModule*)o;
     ensureNames(vm, m);
-    for (JSString* n : m->names) out.push_back(PropKey::of(n));
+    for (JSString* n : m->names) out.push_back(vm.toKey(V(n)));
 }
 // No set hook: [[Set]] on a namespace always fails, because the object is not extensible and has no own data.
 const HostHooks kNsHooks{nsGet, nullptr, nullptr, nsKeys, PF_W | PF_E, nsHas};
@@ -188,6 +194,10 @@ JSFN(moduleCompile) {
     out->elems.push_back(V(requests));
     for (JSString* r : m->requests) requests->elems.push_back(V(r));
     out->elems.push_back(Value::boolean(m->hasTLA));
+    JSArray* types = vm.newArray();
+    out->elems.push_back(V(types));
+    for (size_t i = 0; i < info.requests.size(); ++i)
+        types->elems.push_back(i < info.requestTypes.size() && !info.requestTypes[i].empty() ? vm.strv(info.requestTypes[i]) : Value::undef());
     return V(out);
 }
 
@@ -267,7 +277,10 @@ JSFN(moduleSetImport) {
 // side: LoadRequestedModules, Link, Evaluate (with top-level await) and dynamic import (ECMA-262 16.2.1.6, 13.3.10).
 const char kModuleLoader[] = R"JS((function (compile, bind, init, run, setImport) {
 'use strict';
-var G = globalThis, $Promise = G.Promise, $Map = G.Map, $Set = G.Set, $TypeError = G.TypeError, $Object = G.Object, min = G.Math.min;
+var G = globalThis, $Promise = G.Promise, $Map = G.Map, $Set = G.Set, $TypeError = G.TypeError, $SyntaxError = G.SyntaxError, $Object = G.Object,
+    min = G.Math.min, parseJSON = G.JSON.parse;
+// A module request is a specifier with its import attributes (only `type` is known here): both go into its key.
+function requestKey(specifier, type) { return type === undefined ? specifier : specifier + '\u0000' + type; }
 var fetching = new $Map();  // the module map: URL -> promise of its record
 var byFile = new $Map();    // the name a module was compiled under -> record, to find the referrer of import()
 var asyncCount = 0;
@@ -287,7 +300,10 @@ function Record(file, source, base) {
   this.file = file;
   this.base = base;
   this.ns = parsed[0];
-  this.requested = parsed[1];
+  this.specifiers = parsed[1];
+  this.types = parsed[3];
+  this.requested = [];  // the key of each request
+  for (var i = 0; i < parsed[1].length; i++) this.requested[i] = requestKey(parsed[1][i], parsed[3][i]);
   this.hasTLA = parsed[2];
   this.status = 'new';
   this.hasError = false;      // [[EvaluationError]] is set
@@ -316,9 +332,9 @@ function innerModuleLoading(state, module) {
     state.visited.add(module);
     state.pending += module.requested.length;
     for (var i = 0; i < module.requested.length; i++) {
-      var specifier = module.requested[i], record = module.loaded.get(specifier);
+      var record = module.loaded.get(module.requested[i]);
       if (record) innerModuleLoading(state, record);
-      else loadImportedModule(module, specifier, state);
+      else loadImportedModule(module, module.specifiers[i], module.types[i], state);
       if (!state.isLoading) return;
     }
   }
@@ -338,24 +354,31 @@ function continueModuleLoading(state, ok, value) {
   if (ok) innerModuleLoading(state, value);
   else { state.isLoading = false; state.capability.reject(value); }
 }
-function fetchRecord(url) {
-  var p = fetching.get(url);
+function fetchRecord(url, type) {
+  var key = requestKey(url, type), p = fetching.get(key);
   if (!p) {
-    p = new $Promise(function (resolve) { resolve(host.fetch(url)); }).then(function (r) {
-      return typeof r === 'string' ? new Record(url, r, url) : new Record(url, r.source, r.url || url);
+    p = new $Promise(function (resolve) { resolve(host.fetch(url, type)); }).then(function (r) {
+      var source = typeof r === 'string' ? r : r.source, base = typeof r === 'string' ? url : r.url || url;
+      if (type === undefined) return new Record(url, source, base);
+      // A synthetic module (16.2.1.8): its one export, default, is the parsed JSON or the text itself
+      if (type !== 'json' && type !== 'text') throw new $TypeError("Module type '" + type + "' is not supported");
+      var value = type === 'json' ? parseJSON(source) : source;
+      var record = new Record(key, 'export default import.meta.value;', base);
+      record.meta = { value: value };
+      return record;
     });
-    fetching.set(url, p);
+    fetching.set(key, p);
   }
   return p;
 }
 // HostLoadImportedModule, ending in FinishLoadingImportedModule. The referrer is a module record, or the URL of
 // a classic script that called import().
-function loadImportedModule(referrer, specifier, payload) {
-  var isRecord = typeof referrer !== 'string', promise;
-  try { promise = fetchRecord(host.resolve(specifier, isRecord ? referrer.base : referrer)); }
+function loadImportedModule(referrer, specifier, type, payload) {
+  var isRecord = typeof referrer !== 'string', promise, key = requestKey(specifier, type);
+  try { promise = fetchRecord(host.resolve(specifier, isRecord ? referrer.base : referrer), type); }
   catch (e) { promise = $Promise.reject(e); }
   promise.then(function (record) {
-    if (isRecord && !referrer.loaded.has(specifier)) referrer.loaded.set(specifier, record);
+    if (isRecord && !referrer.loaded.has(key)) referrer.loaded.set(key, record);
     finishLoading(payload, true, record);
   }, function (error) { finishLoading(payload, false, error); });
 }
@@ -504,7 +527,7 @@ function asyncModuleExecutionRejected(module, error) {
 function importCall(specifier, options, file) {
   var cap = capability();
   try {
-    var spec = `${specifier}`;
+    var spec = `${specifier}`, type;
     if (options !== undefined) {
       if ($Object(options) !== options) throw new $TypeError('The second argument of import() must be an object');
       var attributes = options.with;
@@ -513,10 +536,13 @@ function importCall(specifier, options, file) {
         var entries = $Object.entries(attributes);
         for (var i = 0; i < entries.length; i++)
           if (typeof entries[i][1] !== 'string') throw new $TypeError('Import attribute values must be strings');
-        if (entries.length) throw new $TypeError("Import attribute '" + entries[0][0] + "' is not supported");
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i][0] !== 'type') throw new $SyntaxError("Import attribute '" + entries[i][0] + "' is not supported");
+          type = entries[i][1];
+        }
       }
     }
-    loadImportedModule(byFile.get(file) || `${file}`, spec, cap);
+    loadImportedModule(byFile.get(file) || `${file}`, spec, type, cap);
   } catch (e) { cap.reject(e); }
   return cap.promise;
 }
