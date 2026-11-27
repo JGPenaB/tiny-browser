@@ -982,6 +982,35 @@ install(RegistryProto, {
 defineProperty(RegistryProto, symToStringTag, { value: 'FinalizationRegistry', writable: false, enumerable: false, configurable: true });
 hidden(globalThis, 'FinalizationRegistry', FinalizationRegistry);
 
+// ---- Object.prototype: the legacy accessor methods of Annex B (B.2.2)
+function thisObject(self) {
+  if (self === undefined || self === null) throw new $TypeError('Cannot convert undefined or null to object');
+  return $Object(self);
+}
+function lookupAccessor(self, P, which) {
+  var O = thisObject(self), key = natives.toPropertyKey(P);
+  while (O !== null) {
+    var desc = getOwnPropertyDescriptor(O, key);
+    if (desc !== undefined) return 'value' in desc ? undefined : desc[which];
+    O = getPrototypeOf(O);
+  }
+  return undefined;
+}
+install($Object.prototype, {
+  __defineGetter__(P, getter) {
+    var O = thisObject(this);
+    if (typeof getter !== 'function') throw new $TypeError('The getter must be a function');
+    defineProperty(O, P, { get: getter, enumerable: true, configurable: true });
+  },
+  __defineSetter__(P, setter) {
+    var O = thisObject(this);
+    if (typeof setter !== 'function') throw new $TypeError('The setter must be a function');
+    defineProperty(O, P, { set: setter, enumerable: true, configurable: true });
+  },
+  __lookupGetter__(P) { return lookupAccessor(this, P, 'get'); },
+  __lookupSetter__(P) { return lookupAccessor(this, P, 'set'); }
+});
+
 // ---- String.prototype: the HTML methods of Annex B (B.2.2)
 function createHTML(string, tag, attribute, value) {
   if (string === undefined || string === null) throw new $TypeError('String.prototype method called on null or undefined');

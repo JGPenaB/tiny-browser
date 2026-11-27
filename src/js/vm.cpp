@@ -335,7 +335,13 @@ Vm::Vm() {
     JSString** slots = &a.length;
     for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) slots[i] = atom(names[i]);
     objectProto = alloc<JSObject>();
-    functionProto = alloc<JSObject>();
+    {  // Function.prototype is itself a function: it takes anything and returns undefined (20.2.3)
+        JSNative* fp = alloc<JSNative>();
+        fp->cls = Cls::Native;
+        fp->fn = [](CallInfo&) { return Value::undef(); };
+        fp->name = a.empty;
+        functionProto = fp;
+    }
     functionProto->proto = objectProto;
     global = newObject(objectProto, Cls::Global);
     globalLex = alloc<JSObject>();
@@ -472,6 +478,7 @@ void Vm::markRoots(Gc& g) {
     g.mark(asyncGeneratorProto);
     g.mark(asyncFromSyncProto);
     g.mark(genReturnSignal);
+    g.mark(throwTypeError);
 }
 
 // ---------------------------------------------------------------------------- errors
@@ -992,6 +999,12 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
                 out = {k, Value::cell(f->code->name ? f->code->name : vm.a.empty), PF_C};
                 return true;
             }
+            // a sloppy function of the old kind has its own caller and arguments, which shadow the throwing accessors
+            if ((k.cell() == vm.a.arguments || k.cell() == vm.callerAtom) && !f->code->isStrict && !f->code->isArrow && !f->code->isMethod &&
+                !f->code->isGenerator && !f->code->isAsync && !f->code->isClassCtor) {
+                out = {k, Value::null(), 0};
+                return true;
+            }
             if (k.cell() == vm.a.length && !(o->oflags & OF_NO_LENGTH)) {
                 out = {k, Value::i32(f->code->length), PF_C};
                 return true;
@@ -1219,7 +1232,16 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
     if (((r->cls == Cls::Array || r->cls == Cls::Arguments || r->cls == Cls::TypedArray) && k.isIndex()) || r->cls == Cls::Proxy) return defineElement(r, k, v, PF_ALL);
     if (r->oflags & (OF_NOEXT | OF_FROZEN)) return false;
     if (k.isIndex() && (r == arrayProto || r == objectProto)) protoIndexProps = true;
-    r->add(k, v, (r->cls == Cls::Function && !k.isIndex() && k.cell() == a.prototype) ? PF_W : PF_ALL);
+    uint8_t flags = PF_ALL;
+    if (r->cls != Cls::Object && r->cls != Cls::Host) {  // arguments.length, a function's prototype: not stored until written
+        Prop vp;
+        if (virtualProp(*this, r, k, vp) && !r->find(k)) flags = vp.flags;
+        else if (Prop* now = r->find(k)) {
+            now->val = v;
+            return true;
+        }
+    }
+    r->add(k, v, flags);
     return true;
 }
 
@@ -1412,13 +1434,13 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
         if (!onlyEnumerable && (o->cls == Cls::Array || o->cls == Cls::String)) out.push_back(PropKey::of(a.length));
         bool fn = !onlyEnumerable && (o->cls == Cls::Function || o->cls == Cls::Native);
         if (fn)  // a function's length, name and prototype come first, in the order they are created
-            for (JSString* n : {a.length, a.name, a.prototype}) {
+            for (JSString* n : {a.length, a.name, a.arguments, callerAtom, a.prototype}) {
                 Prop tmp{};
                 if (getOwn(o, PropKey::of(n), tmp)) out.push_back(PropKey::of(n));
             }
         for (auto& p : o->props) {
             if (!p.key.isString() || (onlyEnumerable && !(p.flags & PF_E))) continue;
-            if (fn && (p.key.cell() == a.length || p.key.cell() == a.name || p.key.cell() == a.prototype)) continue;
+            if (fn && (p.key.cell() == a.length || p.key.cell() == a.name || p.key.cell() == a.prototype || p.key.cell() == a.arguments || p.key.cell() == callerAtom)) continue;
             out.push_back(p.key);
         }
     }
@@ -1438,15 +1460,20 @@ uint32_t Vm::lengthOf(Value v) {
     return d > 4294967295.0 ? 4294967295u : (uint32_t)d;
 }
 
+// InstanceofOperator (13.10.2)
 bool Vm::instanceOf(Value v, Value ctor) {
-    if (!ctor.isObject()) throwError(Err::TypeError, "Right-hand side of 'instanceof' is not callable");
+    if (!ctor.isObject()) throwError(Err::TypeError, "Right-hand side of 'instanceof' is not an object");
     Value hi = getObj(ctor.asObject(), PropKey::of(symHasInstance), ctor);
     if (!hi.isNullish()) return toBool(call(hi, ctor, &v, 1));
     if (!isCallable(ctor)) throwError(Err::TypeError, "Right-hand side of 'instanceof' is not callable");
-    while (ctor.asObject()->cls == Cls::Bound) ctor = ((JSBound*)ctor.asObject())->target;
+    return ordinaryHasInstance(ctor, v);
+}
+bool Vm::ordinaryHasInstance(Value ctor, Value v) {
+    if (!isCallable(ctor)) return false;
+    if (ctor.asObject()->cls == Cls::Bound) return instanceOf(v, ((JSBound*)ctor.asObject())->target);
     if (!v.isObject()) return false;
     Value pv = get(ctor, a.prototype);
-    if (!pv.isObject()) return false;
+    if (!pv.isObject()) throwError(Err::TypeError, "Function has a non-object prototype in instanceof check");
     for (JSObject* p = getProto(v.asObject()); p; p = getProto(p))
         if (p == pv.asObject()) return true;
     return false;
@@ -1573,6 +1600,7 @@ Value Vm::call(Value fn, Value thisv, const Value* args, int argc) {
 
 // PrivateMethodOrAccessorAdd (7.3.30): kind 0 method, 1 getter, 2 setter
 void Vm::addPrivateMember(JSObject* o, PropKey k, int kind, Value fn) {
+    if (!isExtensible(o)) throwError(Err::TypeError, "Cannot define a private member on a non-extensible object");
     Prop* p = o->find(k);
     if (kind == 0) {
         if (p) throwError(Err::TypeError, "Cannot initialize private methods of a class twice on the same object");
@@ -1623,6 +1651,7 @@ void Vm::initFields(JSFunction* f, Value obj) {
         if (k.isSymbol() && ((Symbol*)k.cell())->isPrivate) {  // PrivateFieldAdd: once per object, hidden, writable
             JSObject* o = obj.asObject();
             if (o->find(k)) throwError(Err::TypeError, "Cannot initialize a private field twice on the same object");
+            if (!isExtensible(o)) throwError(Err::TypeError, "Cannot define a private field on a non-extensible object");
             o->add(k, v, PF_W);
             continue;
         }
@@ -2644,7 +2673,15 @@ Value Vm::runFrames(size_t base) {
                         JSObject* o = R(i.a).asObject();
                         Value fv = R(i.c);
                         if (fv.isObject() && fv.asObject()->cls == Cls::Function) ((JSFunction*)fv.asObject())->home = o;
-                        defineOwn(o, toKey(R(i.b)), fv, i.op == OP_DefMethodE ? PF_ALL : (PF_W | PF_C));
+                        {
+                            PropKey mk = toKey(R(i.b));
+                            Prop* existing = o->find(mk);
+                            if (existing && !(existing->flags & PF_C)) {
+                                fr->pc = pc;
+                                throwError(Err::TypeError, "Cannot redefine property: %s", keyName(*this, mk).c_str());
+                            }
+                            defineOwn(o, mk, fv, i.op == OP_DefMethodE ? PF_ALL : (PF_W | PF_C));
+                        }
                         break;
                     }
                     case OP_DefGetter:
@@ -2656,6 +2693,13 @@ Value Vm::runFrames(size_t base) {
                         if (fv.isObject() && fv.asObject()->cls == Cls::Function) ((JSFunction*)fv.asObject())->home = o;
                         bool getter = i.op == OP_DefGetter || i.op == OP_DefGetterE;
                         bool en = i.op == OP_DefGetterE || i.op == OP_DefSetterE;
+                        {
+                            Prop* existing = o->find(toKey(R(i.b)));
+                            if (existing && !(existing->flags & PF_C)) {
+                                fr->pc = pc;
+                                throwError(Err::TypeError, "Cannot redefine property: %s", keyName(*this, toKey(R(i.b))).c_str());
+                            }
+                        }
                         defineAccessor(o, toKey(R(i.b)), getter ? fv : Value::empty(), getter ? Value::empty() : fv, (uint8_t)(PF_C | (en ? PF_E : 0)));
                         break;
                     }
@@ -2934,22 +2978,49 @@ Value Vm::runFrames(size_t base) {
                         fr->pc = pc;
                         JSObject* parent = fr->fn->proto;
                         if (!parent || !isConstructor(Value::cell(parent))) throwError(Err::TypeError, "Super constructor is not a constructor");
-                        if (!regs[1].isEmpty()) throwError(Err::ReferenceError, "Super constructor may only be called once");
                         Value r;
                         if (i.op == OP_SuperCall) r = construct(Value::cell(parent), b2 + 2, i.c, fr->newTarget);
                         else {
                             JSArray* arr = (JSArray*)b2[2].asCell();
                             r = construct(Value::cell(parent), arr->elems.data(), (int)arr->elems.size(), fr->newTarget);
                         }
+                        // BindThisValue comes after the parent has run (9.1.1.3.1)
+                        if (!regs[1].isEmpty()) throwError(Err::ReferenceError, "Super constructor may only be called once");
                         regs[1] = r;
                         initFields(fr->fn, r);
                         regs[i.a] = r;
                         break;
                     }
+                    case OP_SuperCallIn: {
+                        Value* b2 = regs + i.b;
+                        fr->pc = pc;
+                        JSObject* parent = b2[0].isObject() ? b2[0].asObject()->proto : nullptr;
+                        if (!parent || !isConstructor(Value::cell(parent))) throwError(Err::TypeError, "Super constructor is not a constructor");
+                        if (i.c == 0xFFFF) {
+                            JSArray* arr = (JSArray*)b2[2].asCell();
+                            regs[i.a] = construct(Value::cell(parent), arr->elems.data(), (int)arr->elems.size(), b2[1]);
+                        } else
+                            regs[i.a] = construct(Value::cell(parent), b2 + 2, i.c, b2[1]);
+                        break;
+                    }
+                    case OP_BindThis:
+                        if (!R(i.b).isEmpty()) {
+                            fr->pc = pc;
+                            throwError(Err::ReferenceError, "Super constructor may only be called once");
+                        }
+                        break;
+                    case OP_InitFields:
+                        fr->pc = pc;
+                        initFields((JSFunction*)R(i.a).asObject(), R(i.b));
+                        break;
                     case OP_Return:
                     case OP_RetUndef: {
                         Value rv = i.op == OP_Return ? R(i.a) : Value::undef();
                         if (fr->construct && !rv.isObject()) {
+                            if (fr->code->isDerived && !rv.isUndef()) {
+                                fr->pc = pc;
+                                throwError(Err::TypeError, "Derived constructors may only return object or undefined");
+                            }
                             rv = regs[1];
                             if (rv.isEmpty()) throwError(Err::ReferenceError, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
                         }
@@ -3172,6 +3243,12 @@ Value Vm::runFrames(size_t base) {
                         copy->cls = Cls::Arguments;
                         copy->proto = objectProto;
                         copy->add(PropKey::of(symIterator), getObj(arrayProto, PropKey::of(symIterator), Value::cell(arrayProto)), PF_W | PF_C);
+                        if (fr->code->isStrict || !fr->code->simpleParams) {  // CreateUnmappedArgumentsObject (10.4.4.6)
+                            Accessor* acc = alloc<Accessor>();
+                            acc->get = acc->set = throwTypeError;
+                            copy->add(PropKey::of(a.callee), Value::cell(acc), PF_ACC);
+                        } else
+                            copy->add(PropKey::of(a.callee), Value::cell(fr->fn), PF_W | PF_C);
                         R(i.a) = Value::cell(copy);
                         break;
                     }
@@ -3227,7 +3304,10 @@ Value Vm::runFrames(size_t base) {
                             v = call(fv, R(i.a), nullptr, 0);
                             if (fv.asObject()->cls == Cls::Function && ((JSFunction*)fv.asObject())->code->namesValue) setFunctionName(v, R(i.b), 0);
                         }
-                        defineOwn(ctor, toKey(R(i.b)), v, PF_ALL);
+                        {
+                            PropKey fk = toKey(R(i.b));
+                            if (!defineElement(ctor, fk, v, PF_ALL)) throwError(Err::TypeError, "Cannot redefine property: %s", keyName(*this, fk).c_str());
+                        }
                         break;
                     }
                     case OP_ScopeHas: {

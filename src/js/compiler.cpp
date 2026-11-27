@@ -159,6 +159,7 @@ private:
         fn.p->isDerived = info->isDerived;
         fn.p->isMethod = info->isMethod;
         fn.p->namesValue = info->namesValue;
+        fn.p->simpleParams = info->simpleParams;
         fn.p->source = ast.src;
         fn.p->srcStart = info->srcStart;
         fn.p->srcEnd = info->srcEnd;
@@ -198,6 +199,7 @@ private:
             f->nextReg--;
         }
         if (info->selfVar) storeVar(info->selfVar, info->selfVar->name, 0, true);
+        if (info->ctorVar) storeVar(info->ctorVar, info->ctorVar->name, 0, true);
     }
 
     FuncProto* compileFunction(FunctionInfo* info) {
@@ -310,6 +312,7 @@ private:
             f->nextReg--;
         }
         for (Node* s : info->body) stmt(s);
+        syncThis();
         emit(OP_RetUndef);
         FuncProto* p = end(fn);
         f = parent;
@@ -317,6 +320,12 @@ private:
         return p;
     }
 
+    // A derived constructor whose `this` is shared with arrow functions: super() may have run inside one of them, so
+    // the frame's own `this` is refreshed before the constructor returns.
+    void syncThis() {
+        FunctionInfo* info = f->info;
+        if (info->isClassCtor && info->isDerived && info->thisVar && info->thisVar->captured) emit(OP_GetCtx, 1, depthOf(info->thisVar), info->thisVar->slot);
+    }
     void closure(FunctionInfo* info, int dst) {
         FuncProto* p = compileFunction(info);
         f->p->inner.push_back(p);
@@ -524,8 +533,11 @@ private:
         if (superNode->var) {
             int r = newReg();
             emit(OP_GetCtx, r, depthOf(superNode->var), superNode->var->slot);
+            if (superNode->var->needsTdz) emitX(OP_CheckTDZ, r, kstr(superNode->var->name));
             return r;
         }
+        syncThis();
+        if (f->info->isClassCtor && f->info->isDerived) emit(OP_ThisCheck);
         return 1;
     }
 
@@ -577,6 +589,7 @@ private:
                     if (n->var->needsTdz) emitX(OP_CheckTDZ, dst, kstr(n->var->name));
                     return dst;
                 }
+                syncThis();
                 if (f->info->isClassCtor && f->info->isDerived) emit(OP_ThisCheck);
                 if (dst < 0) return 1;
                 emit(OP_Move, dst, 1);
@@ -776,8 +789,9 @@ private:
                 need();
                 int mark = f->nextReg;
                 if (n->a->type == N::Super) {
+                    int th = thisReg(n->a);
                     int k = superKey(n);
-                    emit(OP_GetSuper, dst, k, thisReg(n->a));
+                    emit(OP_GetSuper, dst, k, th);
                 } else {
                     int o = expr(n->a);
                     if (n->flags & NF_OPTIONAL) bail(o);
@@ -790,8 +804,9 @@ private:
                 need();
                 int mark = f->nextReg;
                 if (n->a->type == N::Super) {
+                    int th = thisReg(n->a);
                     int k = superKey(n);
-                    emit(OP_GetSuper, dst, k, thisReg(n->a));
+                    emit(OP_GetSuper, dst, k, th);
                 } else {
                     int o = operand(n->a, n->b);
                     if (n->flags & NF_OPTIONAL) bail(o);
@@ -973,7 +988,23 @@ private:
         int base = newReg();
         newReg();
         if (n->a->type == N::Super) {
-            if (!f->info->isClassCtor || !f->info->isDerived) fail("'super' call is only valid in a derived class constructor");
+            FunctionInfo* owner = f->info;
+            while (owner->isArrow && owner->parent) owner = owner->parent;
+            if (!owner->isClassCtor || !owner->isDerived) fail("'super' keyword unexpected here");
+            if (owner != f->info) {  // from an arrow function or eval code inside the constructor (13.3.7.1 SuperCall)
+                if (!owner->ctorVar || !owner->newTargetVar || !owner->thisVar) fail("'super' keyword unexpected here");
+                emit(OP_GetCtx, base, depthOf(owner->ctorVar), owner->ctorVar->slot);
+                emit(OP_GetCtx, base + 1, depthOf(owner->newTargetVar), owner->newTargetVar->slot);
+                bool spread = args(n, base);
+                emit(OP_SuperCallIn, dst, base, spread ? 0xFFFF : (int)n->list.size());
+                int cur = newReg();
+                emit(OP_GetCtx, cur, depthOf(owner->thisVar), owner->thisVar->slot);
+                emit(OP_BindThis, dst, cur);
+                storeVar(owner->thisVar, owner->thisVar->name, dst, true);
+                emit(OP_InitFields, base, dst);
+                f->nextReg = mark;
+                return dst;
+            }
             if (args(n, base)) emit(OP_SuperCallSpread, dst, base);
             else emit(OP_SuperCall, dst, base, (int)n->list.size());
             if (f->info->thisVar) storeVar(f->info->thisVar, f->info->thisVar->name, 1, true);
@@ -1125,6 +1156,12 @@ private:
             es.isGlobal = sc->kind == Scope::Global;
             es.isClass = sc->kind == Scope::Class;
             es.isArrow = es.isFunction && sc->fn->isArrow;
+            if (es.isFunction) {
+                es.isMethod = sc->fn->isMethod;
+                es.isFieldInit = sc->fn->isFieldInit;
+                es.isClassCtor = sc->fn->isClassCtor;
+                es.isDerived = sc->fn->isDerived;
+            }
             es.isWith = sc->kind == Scope::With;
             for (Variable* v : sc->vars) {
                 if (v->isGlobal || !v->captured || v->kind == VK_IMPORT) continue;
@@ -1132,6 +1169,7 @@ private:
                 if (owner && v == sc->fn->thisVar) es.thisVar = (int)es.vars.size();
                 if (owner && v == sc->fn->argsVar) es.argsVar = (int)es.vars.size();
                 if (owner && v == sc->fn->newTargetVar) es.newTargetVar = (int)es.vars.size();
+                if (owner && v == sc->fn->ctorVar) es.ctorVar = (int)es.vars.size();
                 if (es.isFunction && v == sc->fn->evalVars) es.evalVars = (int)es.vars.size();
                 if (es.isWith && v == sc->withVar) es.withVar = (int)es.vars.size();
                 es.vars.push_back({v->name, (uint16_t)v->slot, v->kind, v->needsTdz});
@@ -1162,7 +1200,16 @@ private:
         if (dst < 0) dst = newReg();
         int mark = f->nextReg;
         int oldv = newReg(), newv = newReg();
-        if (t->type == N::Ident && dynOf(t)) {
+        if ((t->type == N::Member || t->type == N::Index) && t->a->type == N::Super) {
+            int th = thisReg(t->a);
+            int k = newReg();
+            if (t->type == N::Member) emitX(OP_LoadK, k, kstr(t->str));
+            else emit(OP_ToPropKey, k, expr(t->b));
+            emit(OP_GetSuper, oldv, k, th);
+            emit(OP_ToNumeric, oldv, oldv);
+            emit(op, newv, oldv);
+            emit(OP_SetSuper, k, newv, th);
+        } else if (t->type == N::Ident && dynOf(t)) {
             int base = resolveDyn(t);
             loadResolved(t, base, oldv);
             emit(OP_ToNumeric, oldv, oldv);
@@ -1227,19 +1274,21 @@ private:
             int mark = f->nextReg;
             if (t->type == N::Member) {
                 if (t->a->type == N::Super) {
+                    int th = thisReg(t->a);
                     int k = superKey(t);
                     expr(n->b, dst);
-                    emit(OP_SetSuper, k, dst, thisReg(t->a));
+                    emit(OP_SetSuper, k, dst, th);
                 } else {
                     int o = operand(t->a, n->b);
                     expr(n->b, dst);
                     setProp(o, t->str, dst);
                 }
             } else if (t->type == N::Index && t->a->type == N::Super) {
+                int th = thisReg(t->a);
                 int k = newReg();
                 expr(t->b, k);
                 expr(n->b, dst);
-                emit(OP_SetSuper, k, dst, thisReg(t->a));
+                emit(OP_SetSuper, k, dst, th);
             } else if (t->type == N::Index) {
                 int o = operand(t->a, n->b);
                 int k = expr(t->b);
@@ -1267,8 +1316,14 @@ private:
         bool logical = n->op == P_AndAndEq || n->op == P_OrOrEq || n->op == P_QQEq;
         Op jop = n->op == P_AndAndEq ? OP_JmpF : n->op == P_OrOrEq ? OP_JmpT : OP_JmpNotNullish;
         int cur = newReg();
-        int o = -1, k = -1, dynBase = -1;
-        if (t->type == N::Ident && dynOf(t)) {
+        int o = -1, k = -1, dynBase = -1, superThis = -1;
+        if ((t->type == N::Member || t->type == N::Index) && t->a->type == N::Super) {
+            superThis = thisReg(t->a);
+            k = newReg();
+            if (t->type == N::Member) emitX(OP_LoadK, k, kstr(t->str));
+            else emit(OP_ToPropKey, k, expr(t->b));
+            emit(OP_GetSuper, cur, k, superThis);
+        } else if (t->type == N::Ident && dynOf(t)) {
             dynBase = resolveDyn(t);
             loadResolved(t, dynBase, cur);
         } else if (t->type == N::Ident) {
@@ -1293,7 +1348,8 @@ private:
             int r = expr(n->b);
             emit(binop(n->op), cur, cur, r);
         }
-        if (dynBase >= 0) storeResolved(t, dynBase, cur);
+        if (superThis >= 0) emit(OP_SetSuper, k, cur, superThis);
+        else if (dynBase >= 0) storeResolved(t, dynBase, cur);
         else if (t->type == N::Ident) storeIdent(t, cur, false);
         else if (t->type == N::Member) setProp(o, t->str, cur);
         else emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, k, cur);
@@ -1942,6 +1998,7 @@ private:
                     if (f->info->isAsync && f->info->isGenerator) emit(OP_Await, r, r);  // async generators await what they return
                 }
                 if (!f->fins.empty() || hasOpenIter()) unwind(0, -1, 0);
+                syncThis();
                 if (r >= 0) emit(OP_Return, r);
                 else emit(OP_RetUndef);
                 break;

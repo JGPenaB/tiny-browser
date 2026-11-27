@@ -57,7 +57,7 @@ main().then(v => {
     eq(results, { fin: true, chain: "e2", all: [1, 2, 3], race: "fast", settled: ["rejected", "fulfilled"], any: "any-ok", anyErr: 1, allRej: "rej", asyncThrow: "async throw",
       thenable: "thenable", nested: "inner", loop: 10, cls: 42, arrow: 2, seq: ["a", "b"], tfFin: true, tryFinally: "tf", withResolvers: "wr", interval: 3, finallyPass: "keep",
       species: [true, true, true, true, true, true, true, true, false, false, 5, true], keyed: [{ a: 1, b: 2 }, { status: "rejected", reason: 3 }, null],
-      combinators: [[1, 2], [1, 2], 5, ["a", "b"], true, "from finally"], capability: [true, true, ["length", "name", "prototype"], ["length", "name"], ["length", "name", "prototype", "m"]] });
+      combinators: [[1, 2], [1, 2], 5, ["a", "b"], true, "from finally"], capability: [true, true, ["length", "name", "arguments", "caller", "prototype"], ["length", "name"], ["length", "name", "prototype", "m"]] });
   });
   done();
 }, e => { console.log("FAIL main rejected: " + (e && e.stack || e)); });

@@ -87,6 +87,9 @@ enum Op : uint16_t {
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
     OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2
     OP_DefGlobalFuncD,  // like OP_DefGlobalFunc, from eval code: the property can be deleted
+    OP_SuperCallIn,   // super(...) from an arrow or eval: a = result, b = base (constructor in b, new.target in b+1, arguments after), c = count or 0xFFFF for a spread array
+    OP_BindThis,      // ReferenceError if b (the current `this`) is already set: super() ran twice
+    OP_InitFields,    // run the field initialisers of class constructor a on object b
     OP_IterCloseAbrupt,  // close iterator a because of b: quietly for an exception, checked when b is a generator's return
     OP_ThrowUnresolved,  // ReferenceError: consts[bx] is not defined
     OP_RequireObj,  // TypeError unless a can have properties (not undefined or null); consts[bx]: the key, for the message

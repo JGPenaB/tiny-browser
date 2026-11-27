@@ -28,6 +28,7 @@ JSFN(promiseThenNative) {  // PerformPromiseThen(promise, onFulfilled, onRejecte
     ci.vm.promiseThenWith((JSPromise*)ci.arg(0).asObject(), ci.arg(1), ci.arg(2), ci.arg(3), ci.arg(4));
     return Value::undef();
 }
+JSFN(toPropertyKeyNative) { return ci.vm.keyToValue(ci.vm.toKey(ci.arg(0))); }
 JSFN(isPromise) { return Value::boolean(ci.arg(0).isObject() && ci.arg(0).asObject()->cls == Cls::Promise); }
 JSFN(newPromiseCapability) {
     Vm& vm = ci.vm;
@@ -68,6 +69,7 @@ void setupJsBuiltins(Vm& vm) {
     vm.defFn(natives, "toInteger", toIntegerNative, 1);
     vm.defFn(natives, "regexpBuiltinExec", regexpExecNative, 2);
     vm.defFn(natives, "isPromise", isPromise, 1);
+    vm.defFn(natives, "toPropertyKey", toPropertyKeyNative, 1);
     vm.defFn(natives, "promiseThen", promiseThenNative, 5);
     vm.defFn(natives, "newPromiseCapability", newPromiseCapability, 1);
     vm.defFn(natives, "promiseResolve", promiseResolve, 2);

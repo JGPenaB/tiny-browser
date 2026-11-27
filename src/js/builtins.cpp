@@ -297,17 +297,25 @@ JSFN(fnBind) {
     Vm& vm = ci.vm;
     if (!vm.isCallable(ci.thisv)) vm.throwError(Err::TypeError, "Bind must be called on a function");
     JSBound* b = vm.alloc<JSBound>();
-    b->proto = vm.functionProto;
+    b->proto = vm.getProto(ci.thisv.asObject());
     b->target = ci.thisv;
     b->boundThis = ci.arg(0);
     for (int i = 1; i < ci.argc; ++i) b->args.push_back(ci.args[i]);
+    Value keep = V(b);
+    double len = 0;  // 20.2.3.2 steps 4 to 7: only a numeric own length counts
+    if (vm.hasOwn(ci.thisv.asObject(), PropKey::of(vm.a.length))) {
+        Value tl = vm.get(ci.thisv, vm.a.length);
+        if (tl.isNumber()) {
+            double d = tl.number();
+            len = d == INFINITY ? INFINITY : d == -INFINITY ? 0 : std::max(vm.toInteger(tl) - (ci.argc > 1 ? ci.argc - 1 : 0), 0.0) + 0.0;
+        }
+    }
+    b->add(PropKey::of(vm.a.length), Value::num(len), PF_C);
     std::u16string name = u"bound ";
     Value n = vm.get(ci.thisv, vm.a.name);
     if (n.isString()) name += n.asString()->s;
     b->add(PropKey::of(vm.a.name), vm.strv(name), PF_C);
-    double len = vm.toNumber(vm.get(ci.thisv, vm.a.length)) - (ci.argc > 1 ? ci.argc - 1 : 0);
-    b->add(PropKey::of(vm.a.length), Value::num(len > 0 ? len : 0), PF_C);
-    return V(b);
+    return keep;
 }
 JSFN(fnToString) {
     Vm& vm = ci.vm;
@@ -321,17 +329,7 @@ JSFN(fnToString) {
     Value n = vm.get(t, vm.a.name);
     return vm.strv(u"function " + (n.isString() ? n.asString()->s : std::u16string()) + u"() { [native code] }");
 }
-JSFN(fnHasInstance) {
-    Vm& vm = ci.vm;
-    Value ctor = ci.thisv, v = ci.arg(0);
-    if (!vm.isCallable(ctor) || !v.isObject()) return Value::boolean(false);
-    while (ctor.asObject()->cls == Cls::Bound) ctor = ((JSBound*)ctor.asObject())->target;
-    Value pv = vm.get(ctor, vm.a.prototype);
-    if (!pv.isObject()) return Value::boolean(false);
-    for (JSObject* p = v.asObject()->proto; p; p = p->proto)
-        if (p == pv.asObject()) return Value::boolean(true);
-    return Value::boolean(false);
-}
+JSFN(fnHasInstance) { return Value::boolean(ci.vm.ordinaryHasInstance(ci.thisv, ci.arg(0))); }
 
 // ---------------------------------------------------------------------------- Array
 // Uniform access to "this" for array methods: real arrays take the fast path, anything else goes through properties.
@@ -1358,6 +1356,8 @@ JSFN(globalQueueMicrotask) {
     return Value::undef();
 }
 
+JSFN(throwTypeErrorFn) { ci.vm.throwError(Err::TypeError, "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"); }
+
 // ---------------------------------------------------------------------------- setup
 void Vm::setupGlobals() {
     Vm& vm = *this;
@@ -1438,7 +1438,15 @@ void Vm::setupGlobals() {
     defFn(functionProto, "apply", fnApply, 2);
     defFn(functionProto, "bind", fnBind, 1);
     defFn(functionProto, "toString", fnToString, 0);
-    defSym(vm, functionProto, symHasInstance, fnHasInstance, "[Symbol.hasInstance]", 1);
+    {  // %ThrowTypeError%: one frozen function, the getter and setter of the restricted properties
+        callerAtom = atom("caller");
+        JSNative* thrower = newNative(throwTypeErrorFn, "", 0);
+        throwTypeError = V(thrower);
+        setIntegrity(thrower, true);
+        defineAccessor(functionProto, PropKey::of(callerAtom), throwTypeError, throwTypeError, PF_C);
+        defineAccessor(functionProto, PropKey::of(a.arguments), throwTypeError, throwTypeError, PF_C);
+    }
+    defineOwn(functionProto, PropKey::of(symHasInstance), V(newNative(fnHasInstance, "[Symbol.hasInstance]", 1)), 0);
 
     // Array
     JSNative* arrayC = makeCtor(vm, "Array", arrayCtor, 1, arrayProto);

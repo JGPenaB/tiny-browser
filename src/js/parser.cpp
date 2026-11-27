@@ -495,12 +495,12 @@ public:
                                "continue", "throw", "try", "catch", "finally", "switch", "case", "default", "new", "delete", "typeof",
                                "void", "in", "instanceof", "this", "super", "null", "true", "false", "async", "await", "yield", "of",
                                "get", "set", "static", "extends", "debugger", "import", "export", "with", "enum", "constructor",
-                               "arguments", "target", "use strict", "__proto__"};
+                               "arguments", "target", "use strict", "__proto__", "prototype"};
         JSString** slots[] = {&k.var_, &k.let_, &k.const_, &k.function_, &k.class_, &k.if_, &k.else_, &k.for_, &k.while_, &k.do_, &k.return_,
                               &k.break_, &k.continue_, &k.throw_, &k.try_, &k.catch_, &k.finally_, &k.switch_, &k.case_, &k.default_, &k.new_,
                               &k.delete_, &k.typeof_, &k.void_, &k.in_, &k.instanceof_, &k.this_, &k.super_, &k.null_, &k.true_, &k.false_,
                               &k.async_, &k.await_, &k.yield_, &k.of_, &k.get_, &k.set_, &k.static_, &k.extends_, &k.debugger_, &k.import_,
-                              &k.export_, &k.with_, &k.enum_, &k.constructor_, &k.arguments_, &k.target_, &k.useStrict, &k.proto_};
+                              &k.export_, &k.with_, &k.enum_, &k.constructor_, &k.arguments_, &k.target_, &k.useStrict, &k.proto_, &k.prototype_};
         for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) *slots[i] = vm.atom(names[i]);
         JSString* res[] = {k.var_, k.const_, k.function_, k.class_, k.if_, k.else_, k.for_, k.while_, k.do_, k.return_, k.break_,
                            k.continue_, k.throw_, k.try_, k.catch_, k.finally_, k.switch_, k.case_, k.default_, k.new_, k.delete_,
@@ -543,6 +543,10 @@ public:
                 FunctionInfo& f = ast.fns.emplace_back();
                 f.parent = fn;
                 f.isArrow = es.isArrow;
+                f.isMethod = es.isMethod;
+                f.isFieldInit = es.isFieldInit;
+                f.isClassCtor = es.isClassCtor;
+                f.isDerived = es.isDerived;
                 f.strict = site.strict;
                 fn = &f;
                 sc = open(Scope::Function);
@@ -562,6 +566,7 @@ public:
                 if ((int)i == es.thisVar) sc->fn->thisVar = v;
                 if ((int)i == es.argsVar) sc->fn->argsVar = v;
                 if ((int)i == es.newTargetVar) sc->fn->newTargetVar = v;
+                if ((int)i == es.ctorVar) sc->fn->ctorVar = v;
                 if ((int)i == es.evalVars) sc->fn->evalVars = v;
                 if ((int)i == es.withVar) sc->withVar = v;
             }
@@ -618,6 +623,7 @@ private:
         if (owner->scope->kind == Scope::Function && !owner->isArrow) {
             if (!owner->scope->find(k.arguments_)) force(&FunctionInfo::argsVar, k.arguments_);
             force(&FunctionInfo::newTargetVar, vm.atom("new.target"));
+            force(&FunctionInfo::ctorVar, vm.atom("%ctor"));
         }
     }
 public:
@@ -897,7 +903,7 @@ private:
         JSString *var_, *let_, *const_, *function_, *class_, *if_, *else_, *for_, *while_, *do_, *return_, *break_, *continue_,
             *throw_, *try_, *catch_, *finally_, *switch_, *case_, *default_, *new_, *delete_, *typeof_, *void_, *in_, *instanceof_,
             *this_, *super_, *null_, *true_, *false_, *async_, *await_, *yield_, *of_, *get_, *set_, *static_, *extends_, *debugger_,
-            *import_, *export_, *with_, *enum_, *constructor_, *arguments_, *target_, *useStrict, *proto_;
+            *import_, *export_, *with_, *enum_, *constructor_, *arguments_, *target_, *useStrict, *proto_, *prototype_;
     } k;
     Vm& vm;
     Ast& ast;
@@ -1283,7 +1289,7 @@ private:
                 return n;
             }
             if (w == k.return_) {
-                if (fn == ast.top || fn->isEvalBody || fn == ast.moduleFn) fail("Illegal return statement");
+                if (fn == ast.top || fn->isEvalBody || fn == ast.moduleFn || fn->isStaticBlock) fail("Illegal return statement");
                 Node* n = mk(N::Return);
                 advance();
                 if (!isP(P_Semi) && !isP(P_RBrace) && t.type != Tok::End && !t.nl) n->a = expression();
@@ -1983,17 +1989,32 @@ private:
             n->var->declEnd = 0;
         }
         expectP(P_LBrace);
+        classPrivates.emplace_back();
         while (!isP(P_RBrace)) {
             if (eatP(P_Semi)) continue;
             if (t.type == Tok::End) unexpected();
             n->list.push_back(classMember(n));
         }
+        classPrivates.pop_back();
         advance();
         close(cs);
         fn->strict = savedStrict;
         return n;
     }
 
+    // Private names of the class being read, with what declared them: 1 getter, 2 setter, 4 anything else, +8 static.
+    std::vector<std::vector<std::pair<JSString*, int>>> classPrivates;
+    void declarePrivate(JSString* name, int what) {
+        if (name->s == u"#constructor") fail("Classes may not have a private field named '#constructor'");
+        for (auto& p : classPrivates.back()) {
+            if (p.first != name) continue;
+            bool pair = ((p.second & 7) | (what & 7)) == 3 && (p.second & 7) != (what & 7) && (p.second & 8) == (what & 8);
+            if (!pair || (p.second & 7) == 3) fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+            p.second |= what;
+            return;
+        }
+        classPrivates.back().push_back({name, what});
+    }
     Node* classMember(Node* cls) {
         Node* m = mk(N::Property);
         uint32_t start = t.pos;
@@ -2006,6 +2027,7 @@ private:
         if (isK(k.static_) && nameFollows()) {
             isStatic = true;
             advance();
+            start = t.pos;  // the text of a method does not include `static`
             if (isP(P_LBrace)) {  // static { ... }: runs once while the class is defined, with `this` set to the class
                 m->op = PK_STATIC_BLOCK;
                 m->flags |= NF_STATIC;
@@ -2032,7 +2054,7 @@ private:
             advance();
         }
         if (eatP(P_Star)) gen = true;
-        if ((isK(k.get_) || isK(k.set_)) && nameFollows()) {
+        if ((isK(k.get_) || isK(k.set_)) && nameFollows() && !(peek().type == Tok::Punct && peek().p == P_Star)) {
             kind = isK(k.get_) ? PK_GET : PK_SET;
             advance();
         }
@@ -2054,7 +2076,15 @@ private:
             if (t.type == Tok::Ident || t.type == Tok::Str) keyName = t.str;
             m->a = propertyName(m);
         }
+        bool plainKey = !(m->flags & NF_COMPUTED);
+        if (m->flags & NF_PRIVATE) declarePrivate(m->a->str, (isP(P_LParen) ? (kind == PK_GET ? 1 : kind == PK_SET ? 2 : 4) : 4) | (isStatic ? 8 : 0));
         if (isP(P_LParen)) {
+            // 15.7.1 early errors: `constructor` is an ordinary method, declared once; no static method is called prototype
+            if (plainKey && !isStatic && keyName == k.constructor_) {
+                if (kind != PK_METHOD || isAsync || gen) fail("Class constructor may not be an accessor, a generator or async");
+                if (cls->c) fail("A class may only have one constructor");
+            }
+            if (plainKey && isStatic && keyName == k.prototype_) fail("Classes may not have a static property named 'prototype'");
             bool isCtor = !isStatic && kind == PK_METHOD && keyName == k.constructor_ && !(m->flags & NF_COMPUTED);
             m->op = kind;
             m->b = functionRest((m->flags & NF_COMPUTED) ? nullptr : keyName, start, isAsync, gen, false, kind == PK_GET ? 2 : kind == PK_SET ? 3 : 1);
@@ -2071,6 +2101,8 @@ private:
             return m;
         }
         // field: the initialiser is compiled as a small method so `this` refers to the instance (or the class).
+        if (isAsync || gen || kind != PK_METHOD) unexpected();
+        if (plainKey && (keyName == k.constructor_ || (isStatic && keyName == k.prototype_))) fail("Classes may not have a field named 'constructor', or a static one named 'prototype'");
         m->op = PK_FIELD;
         FunctionInfo* f = beginFn(nullptr, t.pos);
         f->isMethod = true;
@@ -2144,6 +2176,7 @@ private:
                     }
                 }
             } else if (t.str == k.yield_ && fn->isGenerator) {
+                if (fn == paramsOf) fail("Yield expression not allowed in formal parameter");
                 Node* y = mk(N::Yield);
                 advance();
                 if (!t.nl && !isP(P_RParen) && !isP(P_RBrack) && !isP(P_RBrace) && !isP(P_Comma) && !isP(P_Semi) && !isP(P_Colon) &&
@@ -2339,6 +2372,16 @@ private:
             fn->usesSuper = true;
             advance();
             if (!isP(P_Dot) && !isP(P_LBrack) && !isP(P_LParen)) unexpected();
+            {  // super.x needs a method (or a field initializer or constructor) around it: 15.7.1, 13.3.7 early errors
+                const FunctionInfo* owner = fn;
+                while (owner->isArrow && owner->parent) owner = owner->parent;
+                if (!isP(P_LParen) && !owner->isMethod && !owner->isClassCtor) fail("'super' keyword unexpected here");
+                if (isP(P_Dot) && peek().type == Tok::Private) fail("Unexpected private field");
+                if (isP(P_LParen) && owner != fn) {  // super() from an arrow: it needs the constructor and its new.target
+                    pseudo(&FunctionInfo::newTargetVar, "new.target");
+                    pseudo(&FunctionInfo::ctorVar, "%ctor");
+                }
+            }
         } else if (isK(k.import_)) {
             advance();
             if (eatP(P_Dot)) {  // import.meta

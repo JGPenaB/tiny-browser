@@ -104,6 +104,7 @@ struct FunctionInfo {
          isFieldInit = false, isEvalBody = false, isStaticBlock = false, simpleParams = true, dupParams = false,
          hasUseStrict = false, strictNames = false, namesValue = false;
     Variable *thisVar = nullptr, *argsVar = nullptr, *selfVar = nullptr, *newTargetVar = nullptr;
+    Variable* ctorVar = nullptr;  // the running function itself, for a super() call made from an arrow function or eval
     Variable* evalVars = nullptr;  // sloppy function with a direct eval: holds the object of variables eval creates
     uint32_t srcStart = 0, srcEnd = 0, line = 0;
     int length = 0;
