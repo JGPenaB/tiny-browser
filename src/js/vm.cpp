@@ -3202,6 +3202,29 @@ Value Vm::runFrames(size_t base) {
                         if (!R(i.a).isUndef()) pc = code + i.bx;
                         break;
 
+                    case OP_TailCall: {
+                        Value* b2 = regs + i.b;
+                        Value callee = b2[0];
+                        if (callee.isObject() && callee.asObject()->cls == Cls::Function && !fr->construct && !fr->gen) {
+                            JSFunction* f = (JSFunction*)callee.asObject();
+                            FuncProto* p = f->code;
+                            if (!p->isGenerator && !p->isAsync && !p->isClassCtor) {
+                                fr->pc = pc;
+                                if (gc.shouldCollect()) gc.collect();
+                                if (++pollTicks == 0) pollInterrupt();
+                                int argc = i.c;
+                                bool entry = fr->entry;
+                                Value* ret = fr->ret;
+                                Value* base = regs;
+                                memmove(base, b2, sizeof(Value) * (size_t)(2 + argc));  // the callee, its `this` and arguments move to the frame's start
+                                frames.pop_back();
+                                pushFrame(f, base, argc, Value::undef(), ret, entry, false);
+                                LOAD_FRAME();
+                                break;
+                            }
+                        }
+                    }
+                        [[fallthrough]];
                     case OP_Call: {
                         Value* b2 = regs + i.b;
                         Value callee = b2[0];
@@ -3635,8 +3658,28 @@ Value Vm::runFrames(size_t base) {
                         break;
                     case OP_DirectEval: {
                         uint32_t site = (pc++)->bx;
+                        bool tail = (site & 0x80000000u) != 0;
+                        site &= 0x7FFFFFFFu;
                         Value callee = R(i.b);
                         fr->pc = pc;
+                        if (tail && i.c != 0xFFFF && callee.isObject() && callee.asObject()->cls == Cls::Function && !fr->construct && !fr->gen &&
+                            !(evalFn.isObject() && callee.asObject() == evalFn.asObject())) {
+                            JSFunction* f = (JSFunction*)callee.asObject();
+                            FuncProto* p = f->code;
+                            if (!p->isGenerator && !p->isAsync && !p->isClassCtor) {
+                                if (gc.shouldCollect()) gc.collect();
+                                if (++pollTicks == 0) pollInterrupt();
+                                int argc = i.c;
+                                bool entry = fr->entry;
+                                Value* ret = fr->ret;
+                                Value* base = regs;
+                                memmove(base, regs + i.b, sizeof(Value) * (size_t)(2 + argc));
+                                frames.pop_back();
+                                pushFrame(f, base, argc, Value::undef(), ret, entry, false);
+                                LOAD_FRAME();
+                                break;
+                            }
+                        }
                         const Value* argv = &R(i.b + 2);
                         int argc = i.c;
                         if (i.c == 0xFFFF) {  // the arguments were spread into an array

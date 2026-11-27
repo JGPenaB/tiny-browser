@@ -26,6 +26,7 @@ struct Fn {
     int nextReg = 2, maxReg = 2, ctxDepth = 0;
     uint32_t templateSites = 0;  // tagged templates seen so far in this function
     int disposeReg = -1;         // the resource list of the innermost scope with `using` declarations
+    int tryDepth = 0;            // try blocks with a catch clause that are open: a call inside one is not a tail call
     size_t chainBase = 0;
     std::vector<Loop> loops;
     std::vector<Fin> fins;
@@ -84,6 +85,7 @@ private:
     std::vector<Scope*> chain;  // scopes that own a runtime context, innermost last
     int evalObjReg = -1;        // eval code: the register holding the caller's object of eval-made variables
     bool bindingParams = false; // the arguments are being put into the parameters: nothing to copy back yet
+    bool tailCall = false;      // the call about to be compiled is in tail position (15.10.2)
     uint32_t curLine = 1;
 
     [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, curLine}; }
@@ -710,6 +712,8 @@ private:
                 return dst;
             }
             case N::TaggedTemplate: {
+                bool tail = tailCall;
+                tailCall = false;
                 need();
                 int mark = f->nextReg;
                 int base = newReg();
@@ -740,7 +744,7 @@ private:
                     expr(e, r);
                     f->nextReg = r + 1;
                 }
-                emit(OP_Call, dst, base, 1 + (int)tl->list.size());
+                emit(tail ? OP_TailCall : OP_Call, dst, base, 1 + (int)tl->list.size());
                 f->nextReg = mark;
                 return dst;
             }
@@ -1086,7 +1090,43 @@ private:
         return true;
     }
 
+    // An expression in tail position (15.10.2 HasCallInTailPosition): the call it ends in, if any, may reuse the frame.
+    void tailExpr(Node* n, int dst) {
+        switch (n->type) {
+            case N::Cond: {
+                int mark = f->nextReg;
+                size_t j = jump(OP_JmpF, expr(n->a));
+                f->nextReg = mark;
+                tailExpr(n->b, dst);
+                size_t e = jump(OP_Jmp);
+                patch(j);
+                tailExpr(n->c, dst);
+                patch(e);
+                return;
+            }
+            case N::Logical: {
+                expr(n->a, dst);
+                size_t j = jump(n->op == P_AndAnd ? OP_JmpF : n->op == P_OrOr ? OP_JmpT : OP_JmpNotNullish, dst);
+                tailExpr(n->b, dst);
+                patch(j);
+                return;
+            }
+            case N::Seq:
+                for (size_t i = 0; i + 1 < n->list.size(); ++i) effect(n->list[i]);
+                tailExpr(n->list.back(), dst);
+                return;
+            case N::Call:
+            case N::TaggedTemplate:
+                tailCall = !(n->flags & NF_OPTIONAL) && n->a->type != N::Super;
+                expr(n, dst);
+                tailCall = false;
+                return;
+            default: expr(n, dst);
+        }
+    }
     int call(Node* n, int dst) {
+        bool tail = tailCall;
+        tailCall = false;
         int mark = f->nextReg;
         int base = newReg();
         newReg();
@@ -1136,9 +1176,9 @@ private:
         else if (n->flags & NF_EVAL) {
             // eval(...) by name: if the callee turns out to be the real eval, it runs with the scopes described here
             emit(OP_DirectEval, dst, base, (int)n->list.size());
-            emitX(OP_Nop, 0, evalSite((n->flags & NF_INPARAM) != 0));
+            emitX(OP_Nop, 0, evalSite((n->flags & NF_INPARAM) != 0) | (tail ? 0x80000000u : 0));
         } else
-            emit(OP_Call, dst, base, (int)n->list.size());
+            emit(tail ? OP_TailCall : OP_Call, dst, base, (int)n->list.size());
         f->nextReg = mark;
         return dst;
     }
@@ -2073,7 +2113,9 @@ private:
         bool hasFin = n->d != nullptr;
         if (hasFin) f->fins.push_back({n->d, depth, f->loops.size()});
         size_t start = here();
+        if (n->c) f->tryDepth++;
         stmt(n->a);
+        if (n->c) f->tryDepth--;
         size_t endTry = here();
         if (n->c) {
             size_t after = jump(OP_Jmp);
@@ -2220,7 +2262,11 @@ private:
                 int r = -1;
                 if (n->a) {
                     r = newReg();
-                    expr(n->a, r);
+                    FunctionInfo* in = f->info;
+                    bool tailOk = in->strict && !in->isGenerator && !in->isAsync && !in->isClassCtor && !in->isEvalBody && in != ast.top && in != ast.moduleFn &&
+                                  f->fins.empty() && !hasOpenIter() && f->tryDepth == 0;
+                    if (tailOk) tailExpr(n->a, r);
+                    else expr(n->a, r);
                     if (f->info->isAsync && f->info->isGenerator) emit(OP_Await, r, r);  // async generators await what they return
                 }
                 if (!f->fins.empty() || hasOpenIter()) unwind(0, -1, 0);

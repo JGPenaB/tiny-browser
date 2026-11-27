@@ -257,4 +257,19 @@ test("using and await using declarations (14.3.1, 9.5)", function () {
   throws(() => (0, eval)("using x = null;"), SyntaxError);
   for (let in { k: 1 }) ; eq(let, "k");
 });
+test("proper tail calls in strict code (15.10)", function () {
+  "use strict";
+  function count(n, acc) { if (n === 0) return acc; return count(n - 1, acc + 1); }
+  eq(count(200000, 0), 200000);
+  const even = n => n === 0 ? true : odd(n - 1), odd = n => n === 0 ? false : even(n - 1);
+  eq(even(100001), false);
+  function viaLogical(n) { return n === 0 || viaLogical(n - 1); } eq(viaLogical(150000), true);
+  function viaComma(n) { return n === 0 ? "done" : (0, viaComma(n - 1)); } eq(viaComma(150000), "done");
+  function inTry(n) { try { return n === 0 ? 0 : inTry(n - 1) + 0; } catch (e) { return "caught"; } }
+  eq(inTry(100), 0);
+  function deep(n) { try { return n === 0 ? 0 : deep(n - 1); } catch (e) { return e.constructor.name; } }
+  eq(deep(1e6), "RangeError");
+  function Ctor(n) { if (n > 0) return new Ctor(n - 1); this.depth = 0; } eq(new Ctor(50).depth, 0);
+  const o = { m(n) { return n === 0 ? this.v : this.m(n - 1); }, v: 7 }; eq(o.m(150000), 7);
+});
 done();
