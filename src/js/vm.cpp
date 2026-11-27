@@ -3630,6 +3630,7 @@ Value Vm::runFrames(size_t base) {
                         }
                         break;
                     }
+                    case OP_WithHas:
                     case OP_ScopeHas: {
                         Value o = R(i.b);
                         bool found = false;
@@ -3637,12 +3638,23 @@ Value Vm::runFrames(size_t base) {
                             fr->pc = pc;
                             PropKey k = toKey(R(i.c));
                             found = has(o.asObject(), k);
-                            if (found && o.asObject()->proto) {  // names an object asks to be left out of `with`
+                            if (found && i.op == OP_WithHas) {  // names an object asks to be left out of `with`
                                 Value blocked = getObj(o.asObject(), PropKey::of(symUnscopables), o);
                                 if (blocked.isObject() && toBool(getObj(blocked.asObject(), k, blocked))) found = false;
                             }
                         }
                         R(i.a) = Value::boolean(found);
+                        break;
+                    }
+                    case OP_WithGet: {  // the binding may have gone since it was found
+                        Value o = R(i.b);
+                        fr->pc = pc;
+                        PropKey k = toKey(R(i.c));
+                        if (!has(o.asObject(), k)) {
+                            if (fr->code->isStrict) throwError(Err::ReferenceError, "%s is not defined", keyName(*this, k).c_str());
+                            R(i.a) = Value::undef();
+                        } else
+                            R(i.a) = getObj(o.asObject(), k, o);
                         break;
                     }
                     case OP_NewScopeObj: R(i.a) = Value::cell(newObject(nullptr)); break;

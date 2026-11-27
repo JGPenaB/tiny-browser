@@ -1201,11 +1201,12 @@ private:
         emitX(OP_LoadK, name, kstr(n->str));
         std::vector<size_t> done;
         for (Variable* d : dl) {
+            bool with = d->scope->kind == Scope::With;
             loadScopeObj(d, o);
-            emit(OP_ScopeHas, flag, o, name);
+            emit(with ? OP_WithHas : OP_ScopeHas, flag, o, name);
             size_t next = jump(OP_JmpF, flag);
             if (mode == 2) emit(OP_DelElem, dst, o, name);
-            else emit(OP_GetElem, dst, o, name);
+            else emit(with ? OP_WithGet : OP_GetElem, dst, o, name);
             if (mode == 1) emit(OP_Typeof, dst, dst);
             if (thisReg >= 0 && d->scope->kind == Scope::With) emit(OP_Move, thisReg, o);
             done.push_back(jump(OP_Jmp));
@@ -1238,7 +1239,7 @@ private:
         std::vector<size_t> done;
         for (Variable* d : *dl) {
             loadScopeObj(d, o);
-            emit(OP_ScopeHas, flag, o, name);
+            emit(d->scope->kind == Scope::With ? OP_WithHas : OP_ScopeHas, flag, o, name);
             size_t next = jump(OP_JmpF, flag);
             emit(OP_Move, base, o);
             done.push_back(jump(OP_Jmp));
@@ -1258,7 +1259,7 @@ private:
         patch(dynamic);
         int name = newReg();
         emitX(OP_LoadK, name, kstr(id->str));
-        emit(OP_GetElem, dst, base, name);
+        emit(OP_WithGet, dst, base, name);
         patch(end);
         f->nextReg = mark;
     }
@@ -1270,12 +1271,14 @@ private:
         patch(dynamic);
         int name = newReg();
         emitX(OP_LoadK, name, kstr(id->str));
-        if (f->info->strict) {
+        {
             int still = newReg();
             emit(OP_ScopeHas, still, base, name);
-            size_t ok = jump(OP_JmpT, still);
-            emitX(OP_ThrowUnresolved, 0, kstr(id->str));
-            patch(ok);
+            if (f->info->strict) {
+                size_t ok = jump(OP_JmpT, still);
+                emitX(OP_ThrowUnresolved, 0, kstr(id->str));
+                patch(ok);
+            }
         }
         emit(OP_SetElem, base, name, src);
         patch(end);
@@ -1293,7 +1296,7 @@ private:
         std::vector<size_t> done;
         for (Variable* d : *dl) {
             loadScopeObj(d, o);
-            emit(OP_ScopeHas, flag, o, name);
+            emit(d->scope->kind == Scope::With ? OP_WithHas : OP_ScopeHas, flag, o, name);
             size_t next = jump(OP_JmpF, flag);
             emit(OP_SetElem, o, name, src);
             done.push_back(jump(OP_Jmp));
