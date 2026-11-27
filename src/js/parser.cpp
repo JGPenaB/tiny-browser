@@ -647,7 +647,9 @@ public:
                 v->captured = true;
                 v->slot = es.vars[i].slot;
                 v->needsTdz = es.vars[i].tdz;
+                v->argIndex = es.vars[i].arg;
                 v->declEnd = 0;
+                if ((int)i == es.mappedVar) sc->fn->mappedVar = v;
                 if ((int)i == es.thisVar) sc->fn->thisVar = v;
                 if ((int)i == es.argsVar) sc->fn->argsVar = v;
                 if ((int)i == es.newTargetVar) sc->fn->newTargetVar = v;
@@ -892,12 +894,12 @@ private:
         Node* target = mk(N::Ident);
         target->str = name;
         target->var = v;
-        Node* asg = mk(N::Assign);
-        asg->op = P_Assign;
-        asg->a = target;
-        asg->b = value;
-        Node* st = mk(N::ExprStmt);
-        st->a = asg;
+        Node* st = mk(N::VarDecl);  // let %default = value: the statement initialises the binding
+        st->op = VK_LET;
+        Node* decl = mk(N::Declarator);
+        decl->a = target;
+        decl->b = value;
+        st->list.push_back(decl);
         addExport(k.default_, name, -1, nullptr, line);
         return st;
     }
@@ -1201,7 +1203,9 @@ private:
         sc->fn->selfVar = nullptr;
     }
     bool declSpecial = false;  // the function declaration being declared is a generator or async
+    Variable* varShadow = nullptr;  // set by declare: the catch parameter a `var` of the same name writes to
     Variable* declare(JSString* name, uint8_t kind) {
+        varShadow = nullptr;
         hideSelf(kind == VK_VAR ? fnScope(scope) : scope, name);
         if (scope->varScope && (kind == VK_LET || kind == VK_CONST || kind == VK_CLASS)) {  // 15.2.1: not a parameter's name
             Variable* pv = scope->parent->find(name);
@@ -1211,6 +1215,17 @@ private:
             Scope* fs = fnScope(scope);
             if (evalScope && fs == evalScope && !fs->fn->strict) {
                 // sloppy direct eval: var and function declarations belong to the code that called eval
+                {
+                    bool inner = false;
+                    for (Scope* sc : ast.evalScopes) {
+                        if (inner) {
+                            Variable* v = sc->find(name);
+                            if (v && (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS || (v->kind == VK_FUNC && sc->kind == Scope::Block)))
+                                fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+                        }
+                        if (sc == evalVarScope) inner = true;
+                    }
+                }
                 if (Variable* v = evalVarScope->find(name); v && v->kind != VK_FUNCNAME) {
                     // EvalDeclarationInstantiation (19.2.1.3) step 3: no var over a lexical binding on the way out; for
                     // eval in a default value that includes the parameters and the arguments object
@@ -1238,6 +1253,7 @@ private:
                     Variable* v = sc->find(name);
                     if (v && (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS || v->kind == VK_FUNC))
                         fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+                    if (v && v->kind == VK_CATCH && !varShadow) varShadow = v;
                     sc->varNames.push_back(name);
                 }
             if (Variable* v = fs->find(name)) {
@@ -1396,6 +1412,7 @@ private:
             JSString* w = t.str;
             if (w == k.var_ || w == k.const_) {
                 Node* d = varDecl(w == k.var_ ? VK_VAR : VK_CONST, true);
+                requireInitializers(d);
                 semi();
                 return d;
             }
@@ -1404,6 +1421,7 @@ private:
                 if ((nx.type == Tok::Ident && nx.str != k.in_ && nx.str != k.instanceof_) ||
                     (nx.type == Tok::Punct && (nx.p == P_LBrack || nx.p == P_LBrace))) {
                     Node* d = varDecl(VK_LET, true);
+                    requireInitializers(d);
                     semi();
                     return d;
                 }
@@ -1554,6 +1572,13 @@ private:
         return b;
     }
 
+    void requireInitializers(Node* d) {
+        for (Node* decl : d->list) {
+            if (decl->b) continue;
+            if (d->op == VK_CONST) fail("Missing initializer in const declaration");
+            if (decl->a->type != N::Ident) fail("Missing initializer in destructuring declaration");
+        }
+    }
     Node* varDecl(uint8_t kind, bool in) {
         Node* d = mk(N::VarDecl);
         d->op = kind;
@@ -1579,6 +1604,7 @@ private:
         if (fn->strict) return nullptr;
         Scope* fs = fnScope(scope);
         if (scope == fs) return nullptr;
+        if (name == k.arguments_ && fs->kind != Scope::Global && fs->fn && !fs->fn->isArrow && !fs->fn->isEvalBody) return nullptr;  // the arguments object keeps its name
         for (Scope* sc = scope->parent; sc && sc != fs; sc = sc->parent) {
             Variable* v = sc->find(name);
             if (v && (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS || v->kind == VK_FUNC)) return nullptr;
@@ -1623,6 +1649,7 @@ private:
         Node* n = mk(N::Ident);
         n->str = t.str;
         n->var = declare(t.str, kind);
+        if (kind == VK_VAR && varShadow) n->var = varShadow;
         bound(n, kind);
         advance();
         return n;
@@ -1698,6 +1725,7 @@ private:
                         Node* id = mk(N::Ident);
                         id->str = name;
                         id->var = declare(name, kind);
+                        if (kind == VK_VAR && varShadow) id->var = varShadow;
                         bound(id, kind);
                         pr->flags |= NF_SHORTHAND;
                         if (eatP(P_Assign)) {
@@ -1785,12 +1813,16 @@ private:
             }
             n->a = init;
             n->b = n->type == N::ForOf ? assign() : expression();
+            if (isDecl && init->op != VK_VAR)
+                for (Variable* v : sc->vars)
+                    if (v->kind == VK_LET || v->kind == VK_CONST) v->declEnd = prevEnd;
             expectP(P_RParen);
             n->d = loopBody();
             close(sc);
             return n;
         }
         finishDecl(mark);
+        if (init && isDecl) requireInitializers(init);
         if (init && !isDecl) {
             Node* es = mk(N::ExprStmt);
             es->a = init;
@@ -1817,6 +1849,9 @@ private:
             if (eatP(P_LParen)) {
                 size_t mark = declaredNow.size();
                 n->b = bindingTarget(VK_CATCH);
+                if (n->b->type != N::Ident)
+                    for (Variable* v : sc->vars)
+                        if (v->kind == VK_CATCH) v->kind = VK_LET;
                 finishDecl(mark);
                 expectP(P_RParen);
             }
@@ -2365,7 +2400,9 @@ private:
             Node* n = mk(N::Assign);
             n->op = t.p;
             if (n->op == P_Assign) left = toPattern(left);
-            else if (left->type != N::Ident && left->type != N::Member && left->type != N::Index) fail("Invalid assignment target");
+            else if (left->type != N::Ident && left->type != N::Member && left->type != N::Index &&
+                     !(left->type == N::Call && !fn->strict && n->op != P_AndAndEq && n->op != P_OrOrEq && n->op != P_QQEq))
+                fail("Invalid assignment target");
             else if (left->type == N::Ident && fn->strict && isEvalOrArguments(left->str)) fail("Unexpected eval or arguments in strict mode");
             n->a = left;
             advance();
@@ -2455,7 +2492,8 @@ private:
                 n->flags = NF_PREFIX;
                 advance();
                 n->a = unary();
-                if (n->a->type != N::Ident && n->a->type != N::Member && n->a->type != N::Index) fail("Invalid update target");
+                if (n->a->type != N::Ident && n->a->type != N::Member && n->a->type != N::Index && !(n->a->type == N::Call && !fn->strict))
+                    fail("Invalid update target");
                 if (n->a->type == N::Ident && fn->strict && isEvalOrArguments(n->a->str)) fail("Unexpected eval or arguments in strict mode");
                 return n;
             }
@@ -2483,7 +2521,7 @@ private:
         }
         Node* e = lhs();
         if (!t.nl && (isP(P_Inc) || isP(P_Dec))) {
-            if (e->type != N::Ident && e->type != N::Member && e->type != N::Index) fail("Invalid update target");
+            if (e->type != N::Ident && e->type != N::Member && e->type != N::Index && !(e->type == N::Call && !fn->strict)) fail("Invalid update target");
             if (e->type == N::Ident && fn->strict && isEvalOrArguments(e->str)) fail("Unexpected eval or arguments in strict mode");
             Node* n = mk(N::Update);
             n->op = t.p;
@@ -2906,6 +2944,9 @@ private:
             case N::ArrayPat:
             case N::ObjectPat:
             case N::Hole: return n;
+            case N::Call:
+                if (!nested && !fn->strict) return n;
+                break;
             case N::Array:
                 n->type = N::ArrayPat;
                 for (Node*& e : n->list) {

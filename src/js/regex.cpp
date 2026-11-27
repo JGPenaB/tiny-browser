@@ -616,6 +616,11 @@ struct Parser {
             ++i;
             return '-';
         }
+        // B.1.2 ClassControlLetter: inside a class \c may also be followed by a digit or an underscore
+        if (c == 'c' && !fl.unicode && i + 1 < src.size() && (isDigit(src[i + 1]) || src[i + 1] == '_')) {
+            i += 2;
+            return src[i - 1] & 31;
+        }
         return charEscape();
     }
     RxNode* charClass() {

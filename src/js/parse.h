@@ -45,6 +45,7 @@ struct Variable {
     bool annexB = false;              // a `var` that exists only because a block-level function shares its name
     bool special = false;             // VK_FUNC declared by a generator or async function: a block may not declare it twice
     Variable* initFrom = nullptr;     // a body-level `var` that starts with the value of the parameter of the same name
+    int argIndex = -1;                // a parameter tied to arguments[argIndex] (a mapped arguments object, 10.4.4)
     Variable* importNs = nullptr;     // VK_IMPORT: the variable holding the source module's namespace
     JSString* importName = nullptr;  // VK_IMPORT: the export it stands for (null: the namespace itself)
 };
@@ -110,6 +111,7 @@ struct FunctionInfo {
     Variable* ctorVar = nullptr;  // the running function itself, for a super() call made from an arrow function or eval
     Variable* evalVars = nullptr;  // sloppy function with a direct eval: holds the object of variables eval creates
     Scope* bodyScope = nullptr;    // the separate scope of the body, when the parameters hold expressions
+    Variable* mappedVar = nullptr; // hidden: the mapped arguments object, so that assignments to parameters can reach it
     uint32_t srcStart = 0, srcEnd = 0, line = 0;
     int length = 0;
     FunctionInfo* parent = nullptr;

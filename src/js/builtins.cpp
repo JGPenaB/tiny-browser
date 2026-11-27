@@ -864,7 +864,7 @@ JSFN(errorCtor) {
     Value nm = vm.get(V(e), vm.a.name);
     std::u16string head = nm.isString() ? nm.asString()->s : std::u16string(u"Error");
     if (!msg.empty()) head += u": " + msg;
-    e->add(PropKey::of(vm.a.stack), vm.strv(head + vm.captureStack()), PF_W | PF_C);
+    e->add(PropKey::of(vm.symErrorStack), vm.strv(head + vm.captureStack()), PF_W);
     return V(e);
 }
 JSFN(errorToString) {
@@ -876,6 +876,30 @@ JSFN(errorToString) {
     if (name.empty()) return vm.strv(msg);
     if (msg.empty()) return vm.strv(name);
     return vm.strv(name + u": " + msg);
+}
+// Error.prototype.stack (the error stack accessor proposal, 20.5.3.1): the trace is kept with the error object itself
+JSFN(errorStackGet) {
+    Vm& vm = ci.vm;
+    if (!ci.thisv.isObject()) vm.throwError(Err::TypeError, "Error.prototype.stack getter called on a non-object");
+    JSObject* e = ci.thisv.asObject();
+    if (e->cls != Cls::Error) return Value::undef();
+    Prop* st = e->find(PropKey::of(vm.symErrorStack));
+    return st ? st->val : V(vm.a.empty);
+}
+JSFN(errorStackSet) {
+    Vm& vm = ci.vm;
+    if (!ci.thisv.isObject()) vm.throwError(Err::TypeError, "Error.prototype.stack setter called on a non-object");
+    if (!ci.arg(0).isString()) vm.throwError(Err::TypeError, "The stack must be a string");
+    // SetterThatIgnoresPrototypeProperties (27.1.4.1): the value lands in an own property of the receiver
+    JSObject* o = ci.thisv.asObject();
+    PropKey k = PropKey::of(vm.a.stack);
+    if (o == vm.errorProtos[0]) vm.throwError(Err::TypeError, "Cannot assign to the stack property of Error.prototype");
+    PropDesc d;
+    if (!vm.getOwnDesc(o, k, d)) {
+        if (!vm.defineElement(o, k, ci.arg(0), PF_ALL)) vm.throwError(Err::TypeError, "Cannot define property stack: the object is not extensible");
+    } else if (!vm.set(ci.thisv, k, ci.arg(0)))
+        vm.throwError(Err::TypeError, "Cannot assign to read only property 'stack'");
+    return Value::undef();
 }
 JSFN(errorCaptureStackTrace) {
     Vm& vm = ci.vm;
@@ -1412,6 +1436,8 @@ void Vm::setupGlobals() {
     symSplit = sym("Symbol.split");
     symDispose = sym("Symbol.dispose");
     symAsyncDispose = sym("Symbol.asyncDispose");
+    symErrorStack = sym("stack");
+    symErrorStack->isPrivate = true;
 
     {
         JSArray* ap = alloc<JSArray>();
@@ -1515,6 +1541,7 @@ void Vm::setupGlobals() {
         def(proto, "message", V(a.empty));
     }
     defFn(errorProto, "toString", errorToString, 0);
+    defGetter(errorProto, "stack", errorStackGet, errorStackSet);
     defFn(errorC, "captureStackTrace", errorCaptureStackTrace, 1);
     def(errorC, "stackTraceLimit", Value::i32(10), PF_ALL);
 

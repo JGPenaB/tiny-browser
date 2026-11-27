@@ -24,10 +24,16 @@ uint8_t elementFlags(JSObject* o) {
 // Puts a data property where it belongs. Array elements with the default attributes live in the dense store;
 // anything else is an ordinary property, which switches the array to its slower, fully general form.
 void storeData(Vm& vm, JSObject* o, PropKey k, Value v, uint8_t flags) {
+    if (k.isIndex() && (o == vm.arrayProto || o == vm.objectProto)) vm.protoIndexProps = true;
+    if (Value* slot = vm.mappedArg(o, k)) {
+        *slot = v;
+        if (!(flags & PF_W)) vm.unmapArg(o, k);
+    }
     if (isArrayLike(o) && k.isIndex()) {
         JSArray* arr = (JSArray*)o;
         uint32_t i = k.asIndex();
         size_t size = arr->elems.size();
+        if (i >= size) vm.pinArgumentsLength(o);
         bool dense = flags == PF_ALL && elementFlags(o) == PF_ALL && (i < size || i - size <= kSparseGap);
         if (dense) {
             if (o->oflags & OF_SLOWIDX) o->remove(k);
@@ -48,6 +54,7 @@ void storeData(Vm& vm, JSObject* o, PropKey k, Value v, uint8_t flags) {
 }
 
 void storeAccessor(Vm& vm, JSObject* o, PropKey k, Value getter, Value setter, uint8_t flags) {
+    vm.unmapArg(o, k);
     if (isArrayLike(o) && k.isIndex()) {
         JSArray* arr = (JSArray*)o;
         uint32_t i = k.asIndex();
@@ -323,6 +330,7 @@ bool Vm::setIntegrity(JSObject* o, bool frozen) {
     o->oflags |= OF_NOEXT;
     if (o->cls == Cls::TypedArray && typedLength((JSTypedArray*)o) > 0 && !((JSTypedArray*)o)->buffer->immutable)  // an element cannot be made non-configurable
         throwError(Err::TypeError, frozen ? "Cannot freeze array buffer views with elements" : "Cannot seal array buffer views with elements");
+    if (frozen && o->cls == Cls::Arguments) ((JSArguments*)o)->mapCtx = nullptr;  // read-only elements are no longer tied to parameters
     if (isArrayLike(o)) o->oflags |= frozen ? (OF_FROZEN | OF_SEALED) : OF_SEALED;  // covers the dense elements
     else if (frozen) o->oflags |= OF_FROZEN;
     auto fix = [&] {  // private members are not properties: freezing leaves them alone

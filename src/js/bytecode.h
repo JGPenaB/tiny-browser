@@ -87,6 +87,10 @@ enum Op : uint16_t {
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
     OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2
     OP_DefGlobalFuncD,  // like OP_DefGlobalFunc, from eval code: the property can be deleted
+    OP_ThrowBadTarget,   // ReferenceError: the target of an assignment was a call (B.3.6)
+    OP_SetCtxTdz,        // like OP_SetCtx, for a let, const or class: ReferenceError while the binding is uninitialised; the next word's bx = name
+    OP_CheckGlobalDecl,  // may the global name consts[bx] be declared? a: 0 let/const/class, 1 var, 2 function (16.1.7 steps 3 to 10)
+    OP_SyncArg,       // a parameter was assigned: a = value, b/c = depth and slot of the hidden arguments variable; the next word's bx = index
     OP_GetTemplate,   // a = the strings object already made for template site bx, or undefined
     OP_SetTemplate,   // GetTemplateObject: a = strings array, b = raw array, c = site; both are frozen and kept
     OP_DelGlobal,     // a = delete of the global name consts[bx]: false for a binding that cannot be removed

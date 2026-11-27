@@ -44,7 +44,13 @@ public:
         FunctionInfo* info = ast.top;
         Fn fn;
         begin(fn, info);
+        fn.p->isTop = true;
         Scope* sc = info->scope;
+        for (Variable* v : sc->vars) {
+            if (!v->isGlobal || v->annexB) continue;
+            bool lex = v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS;
+            if (lex || v->kind == VK_VAR || v->kind == VK_FUNC) emitX(OP_CheckGlobalDecl, lex ? 0 : v->kind == VK_VAR ? 1 : 2, kstr(v->name));
+        }
         for (Variable* v : sc->vars) {
             if (!v->isGlobal) continue;
             if (v->kind == VK_VAR) emitX(OP_DeclGlobalVar, 0, kstr(v->name));
@@ -74,6 +80,7 @@ private:
     Fn* f = nullptr;
     std::vector<Scope*> chain;  // scopes that own a runtime context, innermost last
     int evalObjReg = -1;        // eval code: the register holding the caller's object of eval-made variables
+    bool bindingParams = false; // the arguments are being put into the parameters: nothing to copy back yet
     uint32_t curLine = 1;
 
     [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, curLine}; }
@@ -161,6 +168,7 @@ private:
         fn.p->isMethod = info->isMethod;
         fn.p->namesValue = info->namesValue;
         fn.p->simpleParams = info->simpleParams;
+        fn.p->isTop = info->isEvalBody || info == ast.moduleFn;
         fn.p->source = ast.src;
         fn.p->srcStart = info->srcStart;
         fn.p->srcEnd = info->srcEnd;
@@ -178,8 +186,12 @@ private:
     void prologuePseudo(FunctionInfo* info) {
         if (info->argsVar) {
             int t = newReg();
+            if (info->mappedVar && !info->isEvalBody) {
+                for (Node* p : info->params) f->p->argSlots.push_back(p->var->argIndex == (int)f->p->argSlots.size() ? p->var->slot : -1);
+            }
             emit(OP_CreateArgs, t);
             storeVar(info->argsVar, info->argsVar->name, t, true);
+            if (info->mappedVar && !info->isEvalBody) storeVar(info->mappedVar, info->mappedVar->name, t, true);
             f->nextReg--;
             f->p->needsArgs = true;
         }
@@ -214,6 +226,24 @@ private:
         fn.p->nparams = (uint16_t)np;
         fn.nextReg = fn.maxReg = 2 + np;
         for (Variable* v : sc->vars) v->reg = -1;
+        if (info->argsVar && !info->strict && info->simpleParams && !info->isArrow && np > 0 && !info->isEvalBody && info != ast.moduleFn) {
+            // CreateMappedArgumentsObject (10.4.4.7): arguments[i] and the i-th parameter share a value, so the
+            // parameters are kept in the context, where the arguments object can reach them after the call too
+            for (int i = 0; i < np; ++i) {  // with a repeated name the last parameter is the one that is tied
+                info->params[i]->var->captured = true;
+                info->params[i]->var->argIndex = i;
+            }
+            if (!info->mappedVar) {
+                Variable& hv = ast.vars.emplace_back();
+                hv.name = vm.atom("%mapped");
+                hv.kind = VK_PSEUDO;
+                hv.scope = sc;
+                hv.captured = true;
+                hv.declEnd = 0;
+                sc->vars.push_back(&hv);
+                info->mappedVar = &hv;
+            }
+        }
         for (int i = 0; i < np; ++i) {
             Node* p = info->params[i];
             Node* target = p->type == N::AssignPat ? p->a : p;
@@ -245,6 +275,7 @@ private:
                     emit(OP_LoadEmpty, v->reg);
             }
         }
+        bindingParams = true;
         for (int i = 0; i < np; ++i) {
             Node* p = info->params[i];
             int reg = argReg[i];
@@ -266,6 +297,7 @@ private:
             } else
                 bindTarget(target, reg, true);
         }
+        bindingParams = false;
         if (info->isGenerator) {
             // The arguments are bound when the generator is called; the body waits for the first next().
             int t = newReg();
@@ -274,6 +306,8 @@ private:
             f->nextReg--;
         }
         if (info->isEvalBody) {
+            for (Variable* v : ast.evalGlobals)  // EvalDeclarationInstantiation (19.2.1.3): nothing is declared if one name cannot be
+                if (!v->annexB && (v->kind == VK_VAR || v->kind == VK_FUNC)) emitX(OP_CheckGlobalDecl, v->kind == VK_VAR ? 1 : 2, kstr(v->name));
             for (Variable* v : ast.evalGlobals)
                 if (v->kind == VK_VAR) emitX(OP_DeclGlobalVar, 1, kstr(v->name));
             if (ast.evalDynTarget) {
@@ -426,6 +460,13 @@ private:
             emitX(OP_ThrowConst, 0, kstr(v->name));
             return;
         }
+        bool tdzWrite = !init && v->needsTdz && (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS);
+        if (tdzWrite && v->kind == VK_CONST) {
+            int t = newReg();
+            if (v->captured) emit(OP_GetCtx, t, depthOf(v), v->slot);
+            emitX(OP_CheckTDZ, v->captured ? t : v->reg, kstr(v->name));
+            f->nextReg--;
+        }
         if (!init && v->kind == VK_CONST) {
             emitX(OP_ThrowConst, 0, kstr(v->name));
             return;
@@ -435,8 +476,20 @@ private:
             return;
         }
         if (!init && v->kind == VK_PRIVATE) return;
-        if (v->captured) emit(OP_SetCtx, src, depthOf(v), v->slot);
-        else if (v->reg != src) emit(OP_Move, v->reg, src);
+        if (tdzWrite && v->captured) {
+            emit(OP_SetCtxTdz, src, depthOf(v), v->slot);
+            emitX(OP_Nop, 0, kstr(v->name));
+        } else if (v->captured) {
+            emit(OP_SetCtx, src, depthOf(v), v->slot);
+        } else {
+            if (tdzWrite) emitX(OP_CheckTDZ, v->reg, kstr(v->name));
+            if (v->reg != src) emit(OP_Move, v->reg, src);
+        }
+        if (v->argIndex >= 0 && !bindingParams && v->scope->fn && v->scope->fn->mappedVar) {  // keep arguments[i] in step
+            Variable* mv = v->scope->fn->mappedVar;
+            emit(OP_SyncArg, src, depthOf(mv), mv->slot);
+            emitX(OP_Nop, 0, (uint32_t)v->argIndex);
+        }
     }
 
     static bool assignsVar(Node* n, Variable* v) {
@@ -1202,7 +1255,8 @@ private:
                 if (owner && v == sc->fn->ctorVar) es.ctorVar = (int)es.vars.size();
                 if (es.isFunction && v == sc->fn->evalVars) es.evalVars = (int)es.vars.size();
                 if (es.isWith && v == sc->withVar) es.withVar = (int)es.vars.size();
-                es.vars.push_back({v->name, (uint16_t)v->slot, v->kind, v->needsTdz});
+                if (es.isFunction && v == sc->fn->mappedVar) es.mappedVar = (int)es.vars.size();
+                es.vars.push_back({v->name, (uint16_t)v->slot, v->kind, v->needsTdz, (int16_t)v->argIndex});
             }
             site.scopes.push_back(std::move(es));
         }
@@ -1214,6 +1268,14 @@ private:
         Op op = n->op == P_Inc ? OP_Inc : OP_Dec;
         bool prefix = (n->flags & NF_PREFIX) || discard;
         Node* t = n->a;
+        if (t->type == N::Call) {
+            if (dst < 0) dst = newReg();
+            int mark = f->nextReg;
+            expr(t);
+            emit(OP_ThrowBadTarget);
+            f->nextReg = mark;
+            return dst;
+        }
         if (t->type == N::Ident && t->var && !t->var->captured && !t->var->isGlobal && t->var->kind != VK_CONST && !(t->flags & NF_DYN)) {
             int r = t->var->reg;
             if (prefix) {
@@ -1274,11 +1336,19 @@ private:
 
     int assign(Node* n, int dst) {
         Node* t = n->a;
+        if (t->type == N::Call) {
+            if (dst < 0) dst = newReg();
+            int mark = f->nextReg;
+            expr(t);
+            emit(OP_ThrowBadTarget);
+            f->nextReg = mark;
+            return dst;
+        }
         if (n->op == P_Assign) {
             if (t->type == N::Ident) {
                 Variable* v = t->var;
                 if (v && !v->captured && !v->isGlobal && v->kind != VK_CONST && v->kind != VK_FUNCNAME && v->kind != VK_PRIVATE &&
-                    !(t->flags & NF_DYN) && directOk(n->b) && !mentions(n->b, v)) {
+                    !(v->needsTdz && (v->kind == VK_LET || v->kind == VK_CLASS)) && !(t->flags & NF_DYN) && directOk(n->b) && !mentions(n->b, v)) {
                     expr(n->b, v->reg);
                     if (dst < 0 || dst == v->reg) return v->reg;
                     emit(OP_Move, dst, v->reg);
@@ -1594,6 +1664,10 @@ private:
         int mark = f->nextReg;
         switch (t->type) {
             case N::Ident: storeIdent(t, src, init); break;
+            case N::Call:
+                expr(t);
+                emit(OP_ThrowBadTarget);
+                break;
             case N::Member: {
                 int o = expr(t->a);
                 setProp(o, t->str, src);
@@ -1938,7 +2012,7 @@ private:
             case N::VarDecl: varDecl(n); break;
             case N::Function:
                 // Annex B.3.3: reaching a block-level function declaration copies it to the function-level var
-                if (n->var && n->var2 && (n->var2->kind == VK_VAR || n->var2->kind == VK_FUNC)) {
+                if (n->var && n->var2) {
                     int r = newReg();
                     if (n->var->captured) emit(OP_GetCtx, r, depthOf(n->var), n->var->slot);
                     else emit(OP_Move, r, n->var->reg);
@@ -2001,7 +2075,8 @@ private:
             }
             case N::For: {
                 ScopeMark sm = enterScope(n->scope);
-                if (n->a) stmt(n->a);
+                if (n->a) quiet(n->a);
+                if (n->a && n->scope->hasCtx) emit(OP_CloneCtx);
                 pushLoop(true);
                 size_t top = here();
                 size_t out = SIZE_MAX;

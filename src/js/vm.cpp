@@ -194,6 +194,10 @@ void JSArray::trace(Gc& g) {
     JSObject::trace(g);
     for (Value v : elems) g.mark(v);
 }
+void JSArguments::trace(Gc& g) {
+    JSArray::trace(g);
+    g.mark(mapCtx);
+}
 void JSPrimitive::trace(Gc& g) {
     JSObject::trace(g);
     g.mark(prim);
@@ -425,8 +429,9 @@ JSNative* Vm::defFn(JSObject* o, const char* name, NativeFn fn, int length, uint
     return n;
 }
 void Vm::defGetter(JSObject* o, const char* name, NativeFn getter, NativeFn setter) {
-    defineAccessor(o, PropKey::of(atom(name)), Value::cell(newNative(getter, name, 0)),
-                   setter ? Value::cell(newNative(setter, name, 1)) : Value::undef(), PF_C);
+    std::string get = std::string("get ") + name, set = std::string("set ") + name;  // SetFunctionName with a prefix (10.2.9)
+    defineAccessor(o, PropKey::of(atom(name)), Value::cell(newNative(getter, get.c_str(), 0)),
+                   setter ? Value::cell(newNative(setter, set.c_str(), 1)) : Value::undef(), PF_C);
 }
 
 void Vm::markRoots(Gc& g) {
@@ -482,6 +487,7 @@ void Vm::markRoots(Gc& g) {
     g.mark(asyncIteratorProto);
     g.mark(asyncGeneratorProto);
     g.mark(asyncFromSyncProto);
+    g.mark(symErrorStack);
     g.mark(generatorFunctionProto);
     g.mark(asyncGeneratorFunctionProto);
     g.mark(asyncFunctionProto);
@@ -510,7 +516,7 @@ static const char* kErrNames[] = {"Error", "TypeError", "RangeError", "SyntaxErr
 JSObject* Vm::newError(Err type, const std::u16string& msg) {
     JSObject* e = newObject(errorProtos[(int)type] ? errorProtos[(int)type] : objectProto, Cls::Error);
     e->add(PropKey::of(a.message), strv(msg), PF_W | PF_C);
-    e->add(PropKey::of(a.stack), strv(ascii16(kErrNames[(int)type]) + u": " + msg + captureStack()), PF_W | PF_C);
+    e->add(PropKey::of(symErrorStack), strv(ascii16(kErrNames[(int)type]) + u": " + msg + captureStack()), PF_W);
     return e;
 }
 void Vm::throwValue(Value v) {
@@ -622,7 +628,7 @@ double Vm::toInteger(Value v) {
     if (v.isInt()) return v.asInt();
     double d = toNumber(v);
     if (d != d) return 0;
-    return std::trunc(d);
+    return std::trunc(d) + 0.0;  // ToIntegerOrInfinity (7.1.5) gives a mathematical value: there is no negative zero
 }
 
 JSString* Vm::numberToString(double d, int radix) {
@@ -1010,7 +1016,16 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
             // a sloppy function of the old kind has its own caller and arguments, which shadow the throwing accessors
             if ((k.cell() == vm.a.arguments || k.cell() == vm.callerAtom) && !f->code->isStrict && !f->code->isArrow && !f->code->isMethod &&
                 !f->code->isGenerator && !f->code->isAsync && !f->code->isClassCtor) {
-                out = {k, Value::null(), 0};
+                Value by = Value::null();
+                if (k.cell() == vm.callerAtom) {  // the old `caller`: the sloppy function that made the current call of this one
+                    for (size_t n = vm.frames.size(); n-- > 1;) {
+                        if (vm.frames[n].fn != f) continue;
+                        const Frame& from = vm.frames[n - 1];
+                        if (!vm.frames[n].entry && from.fn && !from.code->isStrict && !from.code->isTop) by = Value::cell(from.fn);
+                        break;
+                    }
+                }
+                out = {k, by, 0};
                 return true;
             }
             if (k.cell() == vm.a.length && !(o->oflags & OF_NO_LENGTH)) {
@@ -1135,6 +1150,24 @@ Value Vm::get(Value target, PropKey k) {
     return getObj(protoOf(target), k, target);
 }
 
+// The length of an arguments object is an ordinary property (10.4.4.6): once elements are added past the end it
+// can no longer be read off the element store, so it is written down first.
+Value* Vm::mappedArg(JSObject* o, PropKey k) {
+    if (o->cls != Cls::Arguments || !k.isIndex()) return nullptr;
+    JSArguments* ao = (JSArguments*)o;
+    uint32_t i = k.asIndex();
+    if (!ao->mapCtx || i >= ao->mapSlots.size() || ao->mapSlots[i] < 0) return nullptr;
+    return &ao->mapCtx->slots[ao->mapSlots[i]];
+}
+void Vm::unmapArg(JSObject* o, PropKey k) {
+    if (mappedArg(o, k)) ((JSArguments*)o)->mapSlots[k.asIndex()] = -1;
+}
+void Vm::pinArgumentsLength(JSObject* o) {
+    if (o->cls != Cls::Arguments || (o->oflags & OF_NO_LENGTH)) return;
+    PropKey k = PropKey::of(a.length);
+    if (!o->find(k)) o->add(k, Value::num((double)((JSArray*)o)->elems.size()), PF_W | PF_C);
+}
+
 bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
     if (o->cls == Cls::Proxy) return proxySet(o, k, v, receiver);
     if (o->cls == Cls::Host && !k.isSymbol()) {
@@ -1158,6 +1191,8 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
         if (k.isIndex()) {
             uint32_t i = k.asIndex();
             size_t size = arr->elems.size();
+            if (self && o->cls == Cls::Arguments)
+                if (Value* slot = mappedArg(o, k)) *slot = v;
             if (i < size && !arr->elems[i].isEmpty()) {  // an existing plain element
                 if (o->oflags & OF_FROZEN) return false;
                 if (self) {
@@ -1167,6 +1202,7 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
             } else if (self && !(o->oflags & (OF_SLOWIDX | OF_NOEXT | OF_LENRO)) && !protoIndexProps &&
                        (arr->proto == arrayProto || (o->cls == Cls::Arguments && arr->proto == objectProto)) && (i < size || i - size <= (1u << 22))) {
                 // a hole or a slot past the end, and nothing on the prototypes that could intercept the write
+                if (i >= size) pinArgumentsLength(o);
                 if (i >= size) arr->elems.resize((size_t)i + 1, Value::empty());
                 arr->elems[i] = v;
                 return true;
@@ -1365,6 +1401,14 @@ bool Vm::has(JSObject* o, PropKey k) {
 }
 bool Vm::del(JSObject* o, PropKey k) {
     if (o->cls == Cls::Proxy) return proxyDelete(o, k);
+    if (mappedArg(o, k)) {  // an arguments element lets go of its parameter once it is deleted (10.4.4.5)
+        JSArguments* ao = (JSArguments*)o;
+        int32_t slot = ao->mapSlots[k.asIndex()];
+        ao->mapSlots[k.asIndex()] = -1;
+        bool ok = del(o, k);
+        if (!ok) ao->mapSlots[k.asIndex()] = slot;
+        return ok;
+    }
     if (o->cls == Cls::Host && !k.isSymbol()) {
         JSHost* h = (JSHost*)o;
         if (h->hooks && h->hooks->del && h->hooks->del(*this, o, k)) return true;
@@ -1397,7 +1441,7 @@ bool Vm::del(JSObject* o, PropKey k) {
     }
     if (!(p->flags & PF_C) || (o->oflags & OF_FROZEN)) return false;
     o->remove(k);
-    if ((o->cls == Cls::Function || o->cls == Cls::Native) && !k.isIndex() && !k.isSymbol()) {  // the built-in one must not come back
+    if ((o->cls == Cls::Function || o->cls == Cls::Native || o->cls == Cls::Arguments) && !k.isIndex() && !k.isSymbol()) {  // the built-in one must not come back
         if (k.cell() == a.name) o->oflags |= OF_NO_NAME;
         if (k.cell() == a.length) o->oflags |= OF_NO_LENGTH;
     }
@@ -2480,6 +2524,21 @@ Value Vm::runFrames(size_t base) {
                         }
                         break;
                     }
+                    case OP_CheckGlobalDecl: {
+                        PropKey k = KEYK(i.bx);
+                        fr->pc = pc;
+                        if (globalLex->find(k)) throwError(Err::SyntaxError, "Identifier '%s' has already been declared", keyName(*this, k).c_str());
+                        Prop* p = global->find(k);
+                        if (i.a == 0) {  // HasRestrictedGlobalProperty: a let may not hide a property that cannot be removed
+                            if (p && !(p->flags & PF_C)) throwError(Err::SyntaxError, "Identifier '%s' has already been declared", keyName(*this, k).c_str());
+                        } else if (i.a == 1) {  // CanDeclareGlobalVar
+                            if (!p && (global->oflags & OF_NOEXT)) throwError(Err::TypeError, "Cannot declare global variable '%s': the global object is not extensible", keyName(*this, k).c_str());
+                        } else {  // CanDeclareGlobalFunction
+                            bool can = p ? (p->flags & PF_C) || (!(p->flags & PF_ACC) && (p->flags & PF_W) && (p->flags & PF_E)) : !(global->oflags & OF_NOEXT);
+                            if (!can) throwError(Err::TypeError, "Cannot declare global function '%s'", keyName(*this, k).c_str());
+                        }
+                        break;
+                    }
                     case OP_DeclGlobalVar: {  // a: declared by eval, which makes the property configurable
                         PropKey k = KEYK(i.bx);
                         if (!global->find(k)) {  // CanDeclareGlobalVar (9.1.1.4.15), CreateGlobalVarBinding
@@ -2532,6 +2591,20 @@ Value Vm::runFrames(size_t base) {
                         c->slots[i.c] = R(i.a);
                         break;
                     }
+                    case OP_SetCtxTdz: {
+                        uint32_t name = (pc++)->bx;
+                        Context* c = fr->ctx;
+                        for (int d = i.b; d > 0; --d) c = c->parent;
+                        if (c->slots[i.c].isEmpty()) {
+                            fr->pc = pc;
+                            throwError(Err::ReferenceError, "Cannot access '%s' before initialization", utf16to8(K[name].asString()->s).c_str());
+                        }
+                        c->slots[i.c] = R(i.a);
+                        break;
+                    }
+                    case OP_ThrowBadTarget:
+                        fr->pc = pc;
+                        throwError(Err::ReferenceError, "Invalid left-hand side in assignment");
                     case OP_PushCtx: {
                         Context* c = alloc<Context>();
                         c->parent = fr->ctx;
@@ -2657,6 +2730,20 @@ Value Vm::runFrames(size_t base) {
                         if (!set(o, k, R(i.c)) && fr->code->isStrict) {
                             fr->pc = pc;
                             failedSet(o, k);
+                        }
+                        break;
+                    }
+                    case OP_SyncArg: {
+                        uint32_t idx = (pc++)->bx;
+                        Context* c = fr->ctx;
+                        for (int d = i.b; d > 0; --d) c = c->parent;
+                        Value av = c->slots[i.c];
+                        if (av.isObject() && av.asObject()->cls == Cls::Arguments) {
+                            JSArguments* ao = (JSArguments*)av.asObject();
+                            if (ao->mapCtx && idx < ao->mapSlots.size() && ao->mapSlots[idx] >= 0) {
+                                if (idx < ao->elems.size() && !ao->elems[idx].isEmpty()) ao->elems[idx] = R(i.a);
+                                else if (Prop* p = ao->find(PropKey::index(idx)); p && !(p->flags & PF_ACC)) p->val = R(i.a);
+                            }
                         }
                         break;
                     }
@@ -3169,6 +3256,7 @@ Value Vm::runFrames(size_t base) {
                         fr->pc = pc;
                         if (i.op == OP_IterClose || (i.op == OP_IterCloseAbrupt && R(i.b) == Value::cell(genReturnSignal))) {
                             Value ret = get(itv, a.return_);
+                            if (!ret.isNullish() && !isCallable(ret)) throwError(Err::TypeError, "The iterator's return property is not a function");
                             if (isCallable(ret) && !call(ret, itv, nullptr, 0).isObject()) throwError(Err::TypeError, "Iterator result is not an object");
                         } else {
                             Value keep = pending;  // an exception is on its way: whatever return() does is ignored
@@ -3288,10 +3376,14 @@ Value Vm::runFrames(size_t base) {
                     }
                     case OP_CreateArgs: {
                         JSArray* arr = fr->args ? fr->args : newArray();
-                        JSArray* copy = newArray();
+                        JSArguments* copy = alloc<JSArguments>();
                         copy->elems = arr->elems;
-                        copy->cls = Cls::Arguments;
                         copy->proto = objectProto;
+                        if (!fr->code->argSlots.empty()) {  // CreateMappedArgumentsObject (10.4.4.7)
+                            const std::vector<int32_t>& slots = fr->code->argSlots;
+                            copy->mapCtx = fr->ctx;
+                            copy->mapSlots.assign(slots.begin(), slots.begin() + std::min(slots.size(), copy->elems.size()));
+                        }
                         copy->add(PropKey::of(symIterator), getObj(arrayProto, PropKey::of(symIterator), Value::cell(arrayProto)), PF_W | PF_C);
                         if (fr->code->isStrict || !fr->code->simpleParams) {  // CreateUnmappedArgumentsObject (10.4.4.6)
                             Accessor* acc = alloc<Accessor>();
@@ -3505,7 +3597,7 @@ Value Vm::runFrames(size_t base) {
             // Find a handler in the frames this invocation owns; otherwise let the C++ caller see the exception.
             if (freshError && pending.isObject() && pending.asObject() == freshError) {
                 frames.back().pc = pc;
-                if (Prop* st = freshError->find(PropKey::of(a.stack)); st && st->val.isString()) {
+                if (Prop* st = freshError->find(PropKey::of(symErrorStack)); st && st->val.isString()) {
                     std::u16string head = st->val.asString()->s;
                     size_t nl = head.find(u'\n');
                     if (nl != std::u16string::npos) head.resize(nl);

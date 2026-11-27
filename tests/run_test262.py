@@ -17,7 +17,7 @@ exe = os.path.abspath(os.environ.get("TB_EXE") or os.path.join(root, "build", "R
 HOST = r"""
 var $262 = {
   global: globalThis,
-  evalScript: function (code) { return (0, eval)(code); },
+  evalScript: function (code) { return __evalScript(code); },
   gc: function () {},
   detachArrayBuffer: function (b) { if (!b.detached) b.transfer(); return null; },
   createRealm: function () { throw new Test262Error('createRealm is not supported'); },

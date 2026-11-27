@@ -69,6 +69,9 @@ static bool readFile(const std::wstring& path, std::string& bytes) {
     return true;
 }
 
+static Value evalScriptFn(CallInfo& ci) {  // __evalScript(code): runs the text as a script of its own (ScriptEvaluation, 16.1.6)
+    return ci.vm.eval(ci.vm.toStr16(ci.arg(0)), "<script>");
+}
 static Value canBlockFn(CallInfo& ci) {  // __canBlock(flag): may Atomics.wait put this thread to sleep?
     ci.vm.canBlock = ci.vm.toBool(ci.arg(0));
     return Value::undef();
@@ -101,6 +104,7 @@ static bool runOne(const std::string& bytes, const std::string& name, HANDLE out
     vm.def(vm.global, "print", vm.get(vm.get(V(vm.global), "console"), "log"));
     vm.defFn(vm.global, "__readFile", readFileFn, 1);
     vm.defFn(vm.global, "__canBlock", canBlockFn, 1);
+    vm.defFn(vm.global, "__evalScript", evalScriptFn, 1);
     double started = tick();
     if (limitMs > 0) vm.deadlineTick = GetTickCount64() + (ULONGLONG)limitMs;
     vm.canBlock = true;

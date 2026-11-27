@@ -190,6 +190,15 @@ struct JSArray : JSObject {
     JSArray() { cls = Cls::Array; }
     void trace(Gc&) override;
 };
+// An arguments object. In a sloppy function with plain parameters its first elements are tied to the parameters
+// (10.4.4): the parameters live in a context, and each tied element knows its slot there. The element store always
+// holds the current value; writes on either side are copied to the other while the tie lasts.
+struct JSArguments : JSArray {
+    Context* mapCtx = nullptr;
+    std::vector<int32_t> mapSlots;  // per element: the parameter's slot in mapCtx, or -1 once untied
+    JSArguments() { cls = Cls::Arguments; }
+    void trace(Gc&) override;
+};
 inline uint32_t arrayLen(const JSArray* a) {
     uint32_t n = (uint32_t)a->elems.size();
     return (a->oflags & OF_SLOWIDX) && a->slowLen > n ? a->slowLen : n;
@@ -246,11 +255,13 @@ struct EvalScope {
         uint16_t slot;
         uint8_t kind;  // VK_*
         bool tdz;
+        int16_t arg = -1;  // a parameter tied to this element of a mapped arguments object
     };
     std::vector<Var> vars;
     bool isFunction = false, isArrow = false, isClass = false, isGlobal = false, isWith = false;
     bool isMethod = false, isFieldInit = false, isClassCtor = false, isDerived = false;  // of a function scope: what eval code may use
     bool isVarScope = false;  // a function body kept apart from its parameters: eval's `var`s belong here
+    int mappedVar = -1;       // position in vars of the hidden variable holding a mapped arguments object
     int thisVar = -1, argsVar = -1, newTargetVar = -1;  // positions in vars, for `this`, `arguments` and new.target
     int ctorVar = -1;                                    // the running function, for super() from eval code
     int withVar = -1, evalVars = -1;                    // the object of a `with`; the object holding eval-made vars
@@ -275,6 +286,8 @@ struct FuncProto : Cell {
     bool isArrow = false, isStrict = false, needsArgs = false, isGenerator = false, isAsync = false, isClassCtor = false,
          isDerived = false, isMethod = false;
     bool simpleParams = true;  // plain identifiers only: no defaults, patterns or rest
+    bool isTop = false;        // a script, a module or eval code rather than a function someone wrote
+    std::vector<int32_t> argSlots;  // mapped arguments: the context slot of the parameter behind each index, or -1
     bool namesValue = false;  // a field initialiser whose value is an anonymous function: it is named after the field's computed key
     std::shared_ptr<const std::u16string> source;
     uint32_t srcStart = 0, srcEnd = 0;
@@ -633,6 +646,9 @@ public:
     bool setIntegrity(JSObject* o, bool frozen);
     bool testIntegrity(JSObject* o, bool frozen);
     bool protoIndexProps = false;  // Array.prototype or Object.prototype has gained an index-named property
+    void pinArgumentsLength(JSObject* o);
+    Value* mappedArg(JSObject* o, PropKey k);  // the parameter an arguments element is still tied to, or null
+    void unmapArg(JSObject* o, PropKey k);
     void set(Value target, const char* name, Value v) { set(target, PropKey::of(atom(name)), v); }
     bool getOwn(JSObject* o, PropKey k, Prop& out);  // virtual properties included (array elements, length...)
     bool defineOwn(JSObject* o, PropKey k, Value v, uint8_t flags);
@@ -721,6 +737,7 @@ public:
     Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
     Symbol *symUnscopables = nullptr, *symIsConcatSpreadable = nullptr;
+    Symbol* symErrorStack = nullptr;  // hidden key: the stack trace an Error object was made with (read by Error.prototype.stack)
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
            *symToStringTag = nullptr, *symSpecies = nullptr, *symMatch = nullptr, *symMatchAll = nullptr, *symReplace = nullptr,
            *symSearch = nullptr, *symSplit = nullptr, *symDispose = nullptr, *symAsyncDispose = nullptr;

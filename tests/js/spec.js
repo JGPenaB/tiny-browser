@@ -182,4 +182,41 @@ test("Iterator.concat, zip, zipKeyed, chunks, windows, includes, join (27.1.3)",
   const z = Iterator.zip([it, it]); z.next(); z.return(); eq(closed, 2);
   throws(() => [1].values().take(Number.MAX_SAFE_INTEGER + 1), RangeError);
 });
+test("mapped arguments objects (10.4.4)", function () {
+  eq((function (a, b) { a = 5; return arguments[0] + "," + arguments[1]; })(1, 2), "5,2");
+  eq((function (a, b) { arguments[1] = 9; return a + "," + b; })(1, 2), "1,9");
+  eq((function (a) { arguments[1] = 9; return a + "," + arguments.length; })(1), "1,1");
+  eq((function (a, b) { b = 7; return arguments[1] + "," + arguments.length; })(1), "undefined,1");
+  eq((function (a) { "use strict"; a = 5; return arguments[0]; })(1), 1);
+  eq((function (a) { delete arguments[0]; a = 5; return arguments[0]; })(1), undefined);
+  eq((function (a) { Object.defineProperty(arguments, "0", { writable: false }); a = 5; return arguments[0]; })(1), 1);
+  eq((function (a) { Object.defineProperty(arguments, "0", { value: 8 }); return a; })(1), 8);
+  eq((function (a) { (function () { a = 6; })(); return arguments[0]; })(1), 6);
+  eq((function (a) { eval("a = 4"); return arguments[0]; })(1), 4);
+  eq((function (a) { a++; a += 2; return arguments[0]; })(1), 4);
+  eq((function (a, a) { a = 5; return arguments[0] + "," + arguments[1]; })(1, 2), "1,5");
+  var keep, set; (function (a) { keep = arguments; set = function (v) { a = v; }; })(1); set(3); eq(keep[0], 3);
+  eq((function (a) { a = a || "dflt"; return (function (x) { return x; }).apply(null, arguments); })(0), "dflt");
+  eq((function (a = 1) { a = 5; return arguments[0]; })(2), 2);
+  eq((function (a) { Object.freeze(arguments); a = 2; return arguments[0]; })(1), 1);
+  function inner() { return inner.caller === outer; } function outer() { return inner(); } eq([outer(), inner.caller], [true, null]);
+});
+test("declarations checked before they are made (16.1.7, 19.2.1.3, B.3)", function () {
+  try { (0, eval)("function __notMade(){} function NaN(){}"); } catch (e) { }
+  eq(typeof __notMade, "undefined");
+  throws(() => { { let x; { eval("var x;"); } } }, SyntaxError);
+  throws(() => new Function("const x;"), SyntaxError); throws(() => new Function("let [a];"), SyntaxError);
+  throws(() => { f(); let y; function f() { y = 1; } }, ReferenceError);
+  throws(() => { for (let z of [z]) { } }, ReferenceError);
+  var foo = "before"; try { throw 0; } catch (foo) { var foo = "in catch"; } eq(foo, "before");
+  throws(() => new Function("try {} catch ({ f }) { var f; }"), SyntaxError);
+  var called = false; function c() { called = true; } throws(() => { c() = 1; }, ReferenceError); eq(called, true);
+  throws(() => new Function("f() &&= 1"), SyntaxError); throws(() => new Function("'use strict'; f() = 1"), SyntaxError);
+  var probe; for (let i = 0, g = probe = () => i; i < 1; i++) { } eq(probe(), 0);
+  eq([eval("for (false; false; false);"), /[\c0]/.exec("\x10")[0]], [undefined, "\x10"]);
+  var init, after; (function (f) { eval("init = f; { function f() { } } after = f;"); })(123); eq([init, typeof after], [123, "function"]);
+  const e = new Error("m"); eq([Object.hasOwn(e, "stack"), typeof e.stack, typeof Object.getOwnPropertyDescriptor(Error.prototype, "stack").get], [false, "string", "function"]);
+  e.stack = "s"; eq([Object.hasOwn(e, "stack"), e.stack], [true, "s"]);
+  Array.prototype[1] = "p"; var holes = [0]; holes.length = 2; eq(holes.join(), "0,p"); delete Array.prototype[1];
+});
 done();
