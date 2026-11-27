@@ -196,6 +196,11 @@
   dsd.shadowRoot.appendChild(document.createElement('hr')); dsd.appendChild(document.createElement('hr'));
   Promise.resolve().then(function () { eq('observers do not see into shadow trees', watched.join(), 'dsd'); mo.disconnect(); });
 
+  var textNode = document.createTextNode('t'), fragNode = document.createDocumentFragment();
+  eq('only nodes with children have the ParentNode members', [typeof textNode.querySelectorAll, typeof textNode.children, typeof textNode.append, typeof textNode.remove, typeof textNode.nextElementSibling,
+    typeof fragNode.querySelector, typeof fragNode.getElementById, typeof fragNode.getElementsByTagName, typeof document.body.getElementById, typeof document.body.append, typeof document.children].join(),
+    'undefined,undefined,undefined,function,object,function,function,undefined,undefined,function,object');
+
   window.addEventListener('load', function () {
     setTimeout(function () {
       document.title = 'Components test: ' + pass + ' passed, ' + fail + ' failed';

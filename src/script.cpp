@@ -3028,6 +3028,27 @@ void ScriptHost::Impl::setup() {
         vm.def(G, s.name, V(h), PF_ALL);
     }
 
+    // What only nodes with children have (DOM 4.2.6 ParentNode, and the lookups of documents and elements) was
+    // registered on Node.prototype above. Text and comment nodes must not have it: pages tell the kinds of node
+    // apart by asking for querySelectorAll.
+    struct {
+        const char* name;
+        bool onElement, onDocument, onFragment;
+    } parentOnly[] = {{"querySelector", true, true, true},       {"querySelectorAll", true, true, true},     {"children", true, true, true},
+                      {"childElementCount", true, true, true},   {"firstElementChild", true, true, true},    {"lastElementChild", true, true, true},
+                      {"append", true, true, true},              {"prepend", true, true, true},              {"replaceChildren", true, true, true},
+                      {"getElementById", false, true, true},     {"getElementsByTagName", true, true, false}, {"getElementsByClassName", true, true, false}};
+    for (auto& m : parentOnly) {
+        PropKey key = PropKey::of(vm.atom(m.name));
+        PropDesc d;
+        if (!vm.getOwnDesc(nodeProto, key, d)) continue;
+        if (m.onElement) vm.defineOwnDesc(elementProto, key, d);
+        if (m.onDocument) vm.defineOwnDesc(documentProto, key, d);
+        if (m.onFragment) vm.defineOwnDesc(fragmentProto, key, d);
+        vm.del(nodeProto, key);
+    }
+    vm.def(vm.get(V(G), "PerformanceObserver").asObject(), "supportedEntryTypes", V(vm.newArray()), PF_E);
+
     net->wake = client.threadWake();
     vm.defFn(G, "__net", netStart, 6);
     vm.defFn(G, "__netSync", netSyncFn, 5);
