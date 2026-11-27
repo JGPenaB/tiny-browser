@@ -178,14 +178,14 @@ JSFN(agentSleepFn) {  // (milliseconds)
 JSFN(agentNowFn) { return Value::num(tick()); }
 }  // namespace
 
-static bool readFile(const std::wstring& path, std::string& bytes) {
+static bool readFile(const std::wstring& path, std::string& bytes, bool text = true) {  // text: a leading byte order mark is dropped
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
     char buf[65536];
     DWORD n = 0;
     while (ReadFile(f, buf, sizeof buf, &n, nullptr) && n) bytes.append(buf, n);
     CloseHandle(f);
-    if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF) bytes.erase(0, 3);
+    if (text && bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF) bytes.erase(0, 3);
     return true;
 }
 
@@ -207,6 +207,16 @@ static Value readFileFn(CallInfo& ci) {  // __readFile(path): the text of a file
     if (!readFile(std::wstring(wide.begin(), wide.end()), bytes)) ci.vm.throwError(Err::TypeError, "Cannot read %s", utf16to8(wide).c_str());
     return ci.vm.strv(utf8to16(bytes));
 }
+static Value readFileBytesFn(CallInfo& ci) {  // __readFileBytes(path): the bytes of a file, as an ArrayBuffer
+    Vm& vm = ci.vm;
+    std::u16string wide = vm.toStr16(ci.arg(0));
+    std::string bytes;
+    if (!readFile(std::wstring(wide.begin(), wide.end()), bytes, false)) vm.throwError(Err::TypeError, "Cannot read %s", utf16to8(wide).c_str());
+    JSArrayBuffer* b = vm.alloc<JSArrayBuffer>();
+    b->proto = vm.arrayBufferProto;
+    b->bytes.assign(bytes.begin(), bytes.end());
+    return V(b);
+}
 static Value createRealmFn(CallInfo& ci);
 // What the shell adds to the global object of the running realm.
 static void defineShellGlobals(Vm& vm) {
@@ -216,6 +226,7 @@ static void defineShellGlobals(Vm& vm) {
     vm.defFn(vm.global, "clearInterval", clearTimerFn, 1);
     vm.def(vm.global, "print", vm.get(vm.get(V(vm.global), "console"), "log"));
     vm.defFn(vm.global, "__readFile", readFileFn, 1);
+    vm.defFn(vm.global, "__readFileBytes", readFileBytesFn, 1);
     vm.defFn(vm.global, "__canBlock", canBlockFn, 1);
     vm.defFn(vm.global, "__evalScript", evalScriptFn, 1);
     vm.defFn(vm.global, "__htmldda", htmlDdaFn, 0);

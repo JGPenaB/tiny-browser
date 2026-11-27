@@ -44,7 +44,9 @@ __modules.host.resolve = function (specifier, referrer) {
   specifier.split('/').forEach(function (p) { if (p === '..') parts.pop(); else if (p !== '.' && p !== '') parts.push(p); });
   return parts.join('/');
 };
-__modules.host.fetch = function (url) { return new Promise(function (resolve) { resolve(__readFile(url)); }); };
+__modules.host.fetch = function (url, type) {
+  return new Promise(function (resolve) { resolve(type === 'bytes' ? __readFileBytes(url) : __readFile(url)); });
+};
 """
 HOST = "var __hostSource = " + json.dumps(HOST) + ";" + HOST
 

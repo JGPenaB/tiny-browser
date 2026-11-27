@@ -278,7 +278,8 @@ JSFN(moduleSetImport) {
 const char kModuleLoader[] = R"JS((function (compile, bind, init, run, setImport) {
 'use strict';
 var G = globalThis, $Promise = G.Promise, $Map = G.Map, $Set = G.Set, $TypeError = G.TypeError, $SyntaxError = G.SyntaxError, $Object = G.Object,
-    min = G.Math.min, parseJSON = G.JSON.parse;
+    min = G.Math.min, parseJSON = G.JSON.parse, $ArrayBuffer = G.ArrayBuffer, $Uint8Array = G.Uint8Array, apply = G.Reflect.apply,
+    toImmutable = $ArrayBuffer.prototype.transferToImmutable;
 // A module request is a specifier with its import attributes (only `type` is known here): both go into its key.
 function requestKey(specifier, type) { return type === undefined ? specifier : specifier + '\u0000' + type; }
 var fetching = new $Map();  // the module map: URL -> promise of its record
@@ -360,9 +361,13 @@ function fetchRecord(url, type) {
     p = new $Promise(function (resolve) { resolve(host.fetch(url, type)); }).then(function (r) {
       var source = typeof r === 'string' ? r : r.source, base = typeof r === 'string' ? url : r.url || url;
       if (type === undefined) return new Record(url, source, base);
-      // A synthetic module (16.2.1.8): its one export, default, is the parsed JSON or the text itself
-      if (type !== 'json' && type !== 'text') throw new $TypeError("Module type '" + type + "' is not supported");
-      var value = type === 'json' ? parseJSON(source) : source;
+      // A synthetic module (16.2.1.8): its one export, default, is the parsed JSON, the text itself, or (the
+      // import-bytes proposal) the file's bytes, which the host hands over as an ArrayBuffer
+      var value;
+      if (type === 'json') value = parseJSON(source);
+      else if (type === 'text') value = source;
+      else if (type === 'bytes' && r instanceof $ArrayBuffer) value = new $Uint8Array(apply(toImmutable, r, []));
+      else throw new $TypeError("Module type '" + type + "' is not supported");
       var record = new Record(key, 'export default import.meta.value;', base);
       record.meta = { value: value };
       return record;

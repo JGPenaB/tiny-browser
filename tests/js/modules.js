@@ -7,7 +7,8 @@ __modules.host.resolve = function (spec, referrer) {
   if (spec.startsWith("mem:")) return spec;
   throw new TypeError("Cannot resolve '" + spec + "' from " + referrer);
 };
-__modules.host.fetch = url => (url in files ? Promise.resolve(files[url]) : Promise.reject(new TypeError("not found: " + url)));
+__modules.host.fetch = (url, type) => (url in files ? Promise.resolve(type === "bytes" ? new TextEncoder().encode(files[url]).buffer : files[url])
+  : Promise.reject(new TypeError("not found: " + url)));
 function mod(name, src) { files["mem:/" + name] = src; }
 async function load(name) { const r = await __modules.load("mem:/" + name); await __modules.run(r); return __modules.namespace(r); }
 async function rejects(promise, type, msg) {
@@ -155,6 +156,10 @@ function strictSet(o, k, v) { "use strict"; o[k] = v; }
   __modules.host.resolve = (spec, referrer) => (referrers.push(referrer), plainResolve(spec, referrer));
   const EV = await load("ev.js"); __modules.host.resolve = plainResolve;
   eq([EV.viaEval === A, EV.viaFn === A, referrers], [true, true, ["mem:/ev.js", "mem:/ev.js"]]);
+  // importing bytes: a Uint8Array over an immutable ArrayBuffer
+  mod("usebytes.js", `import raw from './notes.bin' with { type: 'bytes' }; export { raw };`); mod("notes.bin", "AZ");
+  const raw = (await load("usebytes.js")).raw;
+  eq([raw instanceof Uint8Array, [...raw], raw.buffer.immutable, (await import("mem:/notes.bin", { with: { type: "bytes" } })).default === raw], [true, [65, 90], true, true]);
   const viaScript = await import("mem:/a.js");
   ok(viaScript === A, "import() from a classic script");
   const p = import("mem:/a.js"); ok(p instanceof Promise);
