@@ -230,7 +230,14 @@ struct ScriptHost::Impl {
         auto n = std::make_unique<Node>();
         n->type = Node::T::Element;
         n->name = lower(tag);
+        if (n->name == "template") n->content = fragment();
         return adopt(std::move(n));
+    }
+    static std::unique_ptr<Node> fragment() {
+        auto f = std::make_unique<Node>();
+        f->type = Node::T::Element;
+        f->name = "#document-fragment";
+        return f;
     }
     Node* newText(const std::string& text, Node::T type = Node::T::Text) {
         auto n = std::make_unique<Node>();
@@ -499,6 +506,7 @@ struct ScriptHost::Impl {
         else if (el->name == "select") pre += "<select>", path = {"select"};
         else if (el->name == "ul" || el->name == "ol") pre += "<ul>", path = {"ul"};
         std::unique_ptr<Document> d = parse_html(pre + html, doc.url);
+        if (el->content) el = el->content.get();  // a template: the markup becomes its contents
         Node* ctx = d->body;
         for (const char* name : path) {
             Node* next = nullptr;
@@ -549,6 +557,7 @@ struct ScriptHost::Impl {
         n->attrs = src->attrs;
         n->classes = src->classes;
         Node* raw = adopt(std::move(n));
+        if (src->content) raw->content = deep ? take(clone(src->content.get(), true)) : fragment();
         if (deep)
             for (auto& k : src->kids) {
                 Node* c = clone(k.get(), true);
@@ -879,7 +888,7 @@ void serialize(const Node* n, std::string& out) {
                 out += ">";
                 if (isVoid(n->name)) return;
             }
-            for (auto& k : n->kids) serialize(k.get(), out);
+            for (auto& k : (n->content ? n->content.get() : n)->kids) serialize(k.get(), out);  // a template: its contents
             if (!frag) out += "</" + n->name + ">";
         }
     }
@@ -1224,9 +1233,11 @@ JSFN(reflectSet) {
 }
 JSFN(innerHTMLGet) {
     std::string out;
-    for (auto& k : thisNode(ci)->kids) serialize(k.get(), out);
+    const Node* n = thisNode(ci);
+    for (auto& k : (n->content ? n->content.get() : n)->kids) serialize(k.get(), out);
     return val8(ci.vm, out);
 }
+JSFN(templateContent) { return I(ci.vm).wrap(thisElem(ci)->content.get()); }  // HTMLTemplateElement.prototype.content
 JSFN(innerHTMLSet) {
     I(ci.vm).setInner(thisElem(ci), ci.arg(0).isNull() ? "" : str8(ci.vm, ci.arg(0)));
     return Value::undef();
@@ -2592,6 +2603,7 @@ void ScriptHost::Impl::setup() {
         {"HTMLOptGroupElement", {"optgroup"}}, {"HTMLMenuElement", {"menu"}}, {"HTMLUnknownElement", {}},
     };
     for (auto& pl : plain) iface(pl.name, elementProto, pl.tags, {});
+    getter(tagProtos["template"], "content", templateContent);
     JSObject* svg = iface("SVGElement", elementProto, {"svg", "g", "path", "circle", "rect", "line", "polyline", "polygon", "ellipse", "text", "tspan", "use", "defs", "symbol", "clippath", "lineargradient", "radialgradient", "stop", "mask", "pattern", "image", "foreignobject"}, {});
     for (const char* n : {"SVGSVGElement", "SVGGraphicsElement", "SVGPathElement"}) {
         JSNative* c = vm.newNative(illegalCtor, n, 0);

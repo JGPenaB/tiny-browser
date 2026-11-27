@@ -252,6 +252,11 @@ private:
 
     // ---------------- tree builder ----------------
     Node* cur() { return st_.empty() ? (d_.html ? d_.html : d_.root.get()) : st_.back(); }
+    // Where the next node goes: into the current element, or into the contents of a template (HTML 13.2.6.1)
+    Node* place() {
+        Node* c = cur();
+        return c->content ? c->content.get() : c;
+    }
 
     static std::unique_ptr<Node> mk(std::string_view name) {
         auto n = std::make_unique<Node>();
@@ -315,8 +320,9 @@ private:
     void insert(Tok& t) {
         auto e = mk(t.name);
         e->attrs = std::move(t.attrs);
-        Node* raw = cur()->append(std::move(e));
+        Node* raw = place()->append(std::move(e));
         const std::string& n = raw->name;
+        if (n == "template" && foreign_ == 0) raw->content = mk("#document-fragment");
         bool selfClose = isVoid(n) || (t.selfClosing && (foreign_ > 0 || n == "svg" || n == "math"));
         if (selfClose) return;
         if (st_.size() < kMaxDepth) {
@@ -341,7 +347,7 @@ private:
                 auto n = std::make_unique<Node>();
                 n->type = Node::T::Comment;
                 n->text = std::move(t.data);
-                cur()->append(std::move(n));
+                place()->append(std::move(n));
                 return;
             }
             case Tok::Text: text(t.data); return;
@@ -365,8 +371,8 @@ private:
                 if (!isws(ch)) allws = false;
             if (allws) return;
             ensureBody();
-            c = cur();
         }
+        c = place();
         if (!c->kids.empty() && c->kids.back()->type == Node::T::Text) {
             c->kids.back()->text += data;
         } else {
@@ -495,13 +501,24 @@ private:
     }
 };
 
+// Ids, classes and child positions for every node, and the document's title, base URL and size. The contents of
+// templates are prepared the same way, though they are no part of the document.
 void finalize(Document& d) {
     std::vector<Node*> stack{d.root.get()};
+    std::vector<Node*> templates;  // contents still to walk, after the document itself
     size_t count = 0;
-    while (!stack.empty()) {
+    bool inDocument = true;
+    for (;;) {
+        if (stack.empty()) {
+            if (templates.empty()) break;
+            stack.push_back(templates.back());
+            templates.pop_back();
+            inDocument = false;
+        }
         Node* n = stack.back();
         stack.pop_back();
-        ++count;
+        if (inDocument) ++count;
+        if (n->content) templates.push_back(n->content.get());
         if (n->type == Node::T::Element) {
             if (auto v = n->attr("id")) n->id = *v;
             if (auto c = n->attr("class")) {
@@ -515,7 +532,7 @@ void finalize(Document& d) {
                     i = j;
                 }
             }
-            if (d.title.empty() && n->name == "title") {
+            if (inDocument && d.title.empty() && n->name == "title") {
                 std::string t = text_content(n), out;
                 bool sp = false;
                 for (char ch : t) {
@@ -529,7 +546,7 @@ void finalize(Document& d) {
                 }
                 d.title = out;
             }
-            if (n->name == "base" && d.baseUrl.empty())
+            if (inDocument && n->name == "base" && d.baseUrl.empty())
                 if (auto h = n->attr("href")) d.baseUrl = resolve_url(d.url, *h);
         }
         uint32_t ec = 0, idx = 0;

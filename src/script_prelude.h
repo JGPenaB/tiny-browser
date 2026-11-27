@@ -360,7 +360,8 @@ Document.prototype.elementFromPoint = function () { return document.body; };
 Document.prototype.elementsFromPoint = function () { return [document.body]; };
 Document.prototype.execCommand = function () { return false; };
 Document.prototype.queryCommandSupported = function () { return false; };
-Document.prototype.adoptNode = Document.prototype.importNode = function (n, deep) { return deep === undefined ? n : n.cloneNode(deep); };
+Document.prototype.adoptNode = function (n) { return n; };
+Document.prototype.importNode = function (n, deep) { return n.cloneNode(!!deep); };
 function inertDocument(title) {
   var html = document.createElement('html'), head = document.createElement('head'), body = document.createElement('body');
   html.appendChild(head); html.appendChild(body);
@@ -436,19 +437,6 @@ HTMLImageElement.prototype.decode = function () { return Promise.resolve(); };
 function sheetOf() { return { cssRules: [], rules: [], disabled: false, ownerNode: this, insertRule: function () { return 0; }, deleteRule: function () {}, addRule: function () {}, removeRule: function () {} }; }
 prop(HTMLStyleElement, 'sheet', sheetOf); prop(HTMLLinkElement, 'sheet', sheetOf);
 prop(HTMLLinkElement, 'relList', function () { var el = this; return { contains: function (t) { return (' ' + el.rel + ' ').indexOf(' ' + t + ' ') >= 0; }, supports: function () { return false; }, add: function (t) { el.rel = (el.rel + ' ' + t).trim(); } }; });
-var innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
-function templateContent(t) {
-  var f = t.__content;
-  if (!f) { f = document.createDocumentFragment(); Object.defineProperty(t, '__content', { value: f }); }
-  while (t.firstChild) f.appendChild(t.firstChild);
-  return f;
-}
-prop(HTMLTemplateElement, 'content', function () { return templateContent(this); });
-Object.defineProperty(HTMLTemplateElement.prototype, 'innerHTML', {
-  get: function () { var d = document.createElement('div'); d.appendChild(templateContent(this).cloneNode(true)); return innerDesc.get.call(d); },
-  set: function (v) { var f = templateContent(this); while (f.firstChild) f.removeChild(f.firstChild); innerDesc.set.call(this, v); templateContent(this); },
-  configurable: true, enumerable: true
-});
 var E = Element.prototype;
 var attrsDesc = Object.getOwnPropertyDescriptor(E, 'attributes');
 Object.defineProperty(E, 'attributes', { get: function () {

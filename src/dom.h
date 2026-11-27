@@ -16,6 +16,9 @@ struct Node {
     std::vector<std::string> classes;
     Node* parent = nullptr;
     std::vector<std::unique_ptr<Node>> kids;
+    // A template element's contents (HTML 4.12.3): a document fragment of their own, which is not part of the
+    // page. What is written between <template> and </template> goes here, not among the element's children.
+    std::unique_ptr<Node> content;
     std::unique_ptr<Style> style;  // computed style (elements only)
     uint32_t elemIndex = 0, elemCount = 1;
     // Border box from the last layout (document coordinates), used by devtools.

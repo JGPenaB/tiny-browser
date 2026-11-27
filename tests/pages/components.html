@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Components test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; }
+  .card { border: 1px solid #c8ccd4; border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Templates, custom elements, shadow DOM</h1>
+<template id="tpl"><title>not the page title</title><p class="row" id="in-template">row <b>bold</b></p><tr><td>cell</td></tr><template id="inner"><i>deep</i></template></template>
+<div class="card" id="results"><b>Results</b></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log((ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : ''));
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+
+  // ---- template contents are a fragment of their own, not part of the page (HTML 4.12.3)
+  var tpl = document.getElementById('tpl');
+  eq('template: no children', tpl.childNodes.length + ':' + tpl.children.length, '0:0');
+  eq('template: content is a fragment', tpl.content.nodeType + ':' + tpl.content.childNodes.length + ':' + (tpl.content === tpl.content), '11:4:true');
+  eq('template: contents are not in the document', String(document.getElementById('in-template')) + document.querySelectorAll('.row').length + document.title, 'null0Components test');
+  eq('template: found through content', tpl.content.querySelector('.row b').textContent + tpl.content.getElementById('in-template').className, 'boldrow');
+  eq('template: table row kept', tpl.content.children[2].tagName + tpl.content.querySelector('td').textContent, 'TRcell');
+  eq('template: nested', tpl.content.querySelector('#inner').content.firstChild.outerHTML, '<i>deep</i>');
+  eq('template: innerHTML reads the contents', tpl.innerHTML.indexOf('<p class="row" id="in-template">row <b>bold</b></p>') > 0, true);
+  var copy = tpl.cloneNode(true), shallow = tpl.cloneNode(false);
+  eq('template: deep clone copies contents', copy.content.childNodes.length + ':' + (copy.content !== tpl.content) + ':' + copy.content.querySelector('#inner').content.childNodes.length, '4:true:1');
+  eq('template: shallow clone has empty contents', shallow.content.childNodes.length, 0);
+  var made = document.createElement('template');
+  made.innerHTML = '<span>a</span><span>b</span>';
+  eq('template: innerHTML writes the contents', made.childNodes.length + ':' + made.content.childNodes.length + ':' + made.innerHTML, '0:2:<span>a</span><span>b</span>');
+  var stamp = document.importNode(made.content, true);
+  var host = document.createElement('div');
+  host.appendChild(stamp);
+  eq('template: stamping a copy', host.innerHTML + made.content.childNodes.length, '<span>a</span><span>b</span>2');
+  host.appendChild(made.content);
+  eq('template: moving the contents', host.children.length + ':' + made.content.childNodes.length, '4:0');
+  made.appendChild(document.createElement('u'));
+  eq('template: children are not contents', made.childNodes.length + ':' + made.content.childNodes.length + ':' + made.outerHTML, '1:0:<template></template>');
+
+  window.addEventListener('load', function () {
+    setTimeout(function () {
+      document.title = 'Components test: ' + pass + ' passed, ' + fail + ' failed';
+      console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+    }, 80);
+  });
+</script>
+</body>
+</html>
