@@ -23,7 +23,9 @@ struct ImageRes {
 
 // One entry of the display list produced by layout and consumed by the GPU painter.
 struct DItem {
-    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip };
+    // PushTransform holds a transform for everything up to its PopTransform: a b c d in bw[0..3], e f in w h, and
+    // the transform origin in x y (document coordinates), so x' = origin + M (x - origin) + (e, f).
+    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform };
     K k = K::Rect;
     int16_t layer = 0;  // paint layer: 0 = normal flow, >0 positioned (z-index + 1), <0 behind
     float x = 0, y = 0, w = 0, h = 0;

@@ -19,6 +19,19 @@ struct Len {
 
 using VarMap = std::unordered_map<std::string, std::string>;
 
+// One function of a transform list (CSS Transforms 1, section 7.1). Translations keep their lengths, because a
+// percentage is of the element's own border box and that is known only after layout; the rest are numbers
+// (angles in radians). 3D functions are kept as their 2D part (translate3d, scale3d, rotateZ); the others are
+// dropped, so translateZ(0) changes nothing.
+struct TransformFn {
+    enum K : uint8_t { Matrix, Translate, Scale, Rotate, Skew } k = Matrix;
+    float v[6] = {1, 0, 0, 1, 0, 0};
+    Len tx, ty;
+};
+using TransformList = std::vector<TransformFn>;
+// The transform of a box of the given size as a 2D matrix a b c d e f: x' = a x + c y + e, y' = b x + d y + f.
+void transform_matrix(const TransformList& list, float width, float height, float out[6]);
+
 struct Style {
     Display display = Display::Inline;
     Color color{0, 0, 0, 1};
@@ -44,6 +57,8 @@ struct Style {
     uint8_t borderStyle[4] = {0, 0, 0, 0};
     Color borderColor[4] = {{0, 0, 0, -1}, {0, 0, 0, -1}, {0, 0, 0, -1}, {0, 0, 0, -1}};
     std::shared_ptr<const VarMap> vars;
+    std::shared_ptr<const TransformList> transform;              // null for `none`
+    Len transformOrigin[2] = {{Len::Pct, 50}, {Len::Pct, 50}};  // from the border box's top left corner
 
     // Positioning
     uint8_t position = 0;  // 0 static, 1 relative, 2 absolute, 3 fixed, 4 sticky

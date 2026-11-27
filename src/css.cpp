@@ -166,6 +166,110 @@ bool parse_calc(std::string_view inner, float fs, Len& out) {
     return true;
 }
 
+// <angle> (CSS Values 4, 7.1) in radians; a plain 0 is allowed where the grammar says <zero>.
+bool parse_angle(std::string_view t, double& rad) {  // double: cos(90deg) must come out as 6e-17, not 4e-8
+    float v;
+    std::string_view u;
+    if (!parse_num(t, v, u)) return false;
+    const double pi = 3.14159265358979323846;
+    if (u == "deg") rad = v * pi / 180;
+    else if (u == "rad") rad = v;
+    else if (u == "grad") rad = v * pi / 200;
+    else if (u == "turn") rad = v * 2 * pi;
+    else if (u.empty() && v == 0) rad = 0;
+    else return false;
+    return true;
+}
+
+// <transform-list> (CSS Transforms 1, section 7; CSS Transforms 2 for the 3D functions). False when any function
+// is malformed, which makes the whole declaration invalid.
+bool parse_transform(std::string_view lv, float fs, TransformList& out) {
+    size_t i = 0;
+    while (i < lv.size()) {
+        while (i < lv.size() && isws(lv[i])) ++i;
+        if (i >= lv.size()) break;
+        size_t open = lv.find('(', i), close = lv.find(')', i);
+        if (open == npos || close == npos || close < open) return false;
+        std::string name(trim(lv.substr(i, open - i)));
+        std::vector<std::string> args;
+        for (auto a : split_top(lv.substr(open + 1, close - open - 1), ',')) args.emplace_back(trim(a));
+        i = close + 1;
+        auto number = [&](size_t k, float& v) {
+            std::string_view u;
+            return k < args.size() && parse_num(args[k], v, u) && u.empty();
+        };
+        auto length = [&](size_t k, Len& l) { return k < args.size() && parse_len(args[k], fs, l, false) && (l.u == Len::Px || l.u == Len::Pct); };
+        TransformFn f;
+        size_t n = args.size();
+        if (name == "matrix") {
+            if (n != 6) return false;
+            for (size_t k = 0; k < 6; ++k)
+                if (!number(k, f.v[k])) return false;
+        } else if (name == "translate" || name == "translatex" || name == "translatey" || name == "translate3d") {
+            f.k = TransformFn::Translate;
+            f.tx = f.ty = {Len::Px, 0};
+            if (name == "translatey") {
+                if (n != 1 || !length(0, f.ty)) return false;
+            } else if (!length(0, f.tx) || (name == "translatex" && n != 1) || (name == "translate" && (n > 2 || (n == 2 && !length(1, f.ty)))) ||
+                       (name == "translate3d" && (n != 3 || !length(1, f.ty)))) {
+                return false;
+            }
+        } else if (name == "scale" || name == "scalex" || name == "scaley" || name == "scale3d") {
+            f.k = TransformFn::Scale;
+            float sx = 1, sy = 1;
+            if (name == "scaley") {
+                if (n != 1 || !number(0, sy)) return false;
+            } else {
+                if (!number(0, sx)) return false;
+                sy = name == "scalex" ? 1 : sx;
+                if ((name == "scalex" && n != 1) || (name == "scale" && n > 2) || (name == "scale3d" && n != 3)) return false;
+                if (n >= 2 && name != "scalex" && !number(1, sy)) return false;
+            }
+            f.v[0] = sx;
+            f.v[3] = sy;
+        } else if (name == "rotate" || name == "rotatez") {
+            double a;
+            if (n != 1 || !parse_angle(args[0], a)) return false;
+            f.k = TransformFn::Rotate;
+            f.v[0] = (float)std::cos(a), f.v[1] = (float)std::sin(a), f.v[2] = (float)-std::sin(a), f.v[3] = (float)std::cos(a);
+        } else if (name == "skew" || name == "skewx" || name == "skewy") {
+            double ax = 0, ay = 0;
+            if (name == "skewy") {
+                if (n != 1 || !parse_angle(args[0], ay)) return false;
+            } else if (n < 1 || n > (name == "skew" ? 2u : 1u) || !parse_angle(args[0], ax) || (n == 2 && !parse_angle(args[1], ay))) {
+                return false;
+            }
+            f.k = TransformFn::Skew;
+            f.v[1] = (float)std::tan(ay);
+            f.v[2] = (float)std::tan(ax);
+        } else if (name == "translatez" || name == "scalez" || name == "rotatex" || name == "rotatey" || name == "rotate3d" ||
+                   name == "perspective" || name == "matrix3d") {
+            continue;  // no 2D part that this engine draws
+        } else {
+            return false;
+        }
+        out.push_back(f);
+    }
+    return true;
+}
+
+}  // namespace
+
+void transform_matrix(const TransformList& list, float width, float height, float out[6]) {
+    float m[6] = {1, 0, 0, 1, 0, 0};
+    for (const TransformFn& f : list) {
+        float n[6];
+        std::copy(f.v, f.v + 6, n);
+        if (f.k == TransformFn::Translate) n[4] = f.tx.resolve(width), n[5] = f.ty.resolve(height);
+        float r[6] = {m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3],
+                      m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]};
+        std::copy(r, r + 6, m);
+    }
+    std::copy(m, m + 6, out);
+}
+
+namespace {
+
 bool parse_len(std::string_view sv, float fs, Len& out, bool allowAuto) {
     std::string s = lower(trim(sv));
     if (s.empty()) return false;
@@ -1095,6 +1199,8 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
     else if (p == "min-height") d.minHeight = s.minHeight;
     else if (p == "max-height") d.maxHeight = s.maxHeight;
     else if (p == "position") d.position = s.position;
+    else if (p == "transform") d.transform = s.transform;
+    else if (p == "transform-origin") std::copy(s.transformOrigin, s.transformOrigin + 2, d.transformOrigin);
     else if (p == "top" || p == "right" || p == "bottom" || p == "left" || p == "inset") std::copy(s.inset, s.inset + 4, d.inset);
     else if (p == "z-index") {
         d.zIndex = s.zIndex;
@@ -1519,6 +1625,24 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
         if (prop == "overflow" || o > s.overflow || o == 0) s.overflow = o;
     } else if (prop == "float") {
         s.floatSide = (lv == "left" || lv == "inline-start") ? 1 : (lv == "right" || lv == "inline-end") ? 2 : 0;
+    } else if (prop == "transform") {
+        TransformList list;
+        if (lv == "none") s.transform.reset();
+        else if (parse_transform(lv, fs, list)) s.transform = std::make_shared<const TransformList>(std::move(list));
+    } else if (prop == "transform-origin") {
+        // <length-percentage> or keywords, x first unless the keywords say otherwise (CSS Transforms 1, section 6)
+        Len x{Len::Pct, 50}, y{Len::Pct, 50};
+        bool ok = !T.empty() && T.size() <= 3, xSet = false, ySet = false;
+        for (size_t k = 0; ok && k < T.size() && k < 2; ++k) {
+            const std::string& t = T[k];
+            Len l;
+            if (t == "left" || t == "right") (xSet ? ok = false : (x = {Len::Pct, t == "left" ? 0.f : 100.f}, xSet = true));
+            else if (t == "top" || t == "bottom") (ySet ? ok = false : (y = {Len::Pct, t == "top" ? 0.f : 100.f}, ySet = true));
+            else if (t == "center") (k == 0 && !xSet ? xSet = true : ySet = true);
+            else if (parse_len(t, fs, l, false) && (l.u == Len::Px || l.u == Len::Pct)) (k == 0 ? (x = l, xSet = true) : (y = l, ySet = true));
+            else ok = false;
+        }
+        if (ok) s.transformOrigin[0] = x, s.transformOrigin[1] = y;
     } else if (prop == "opacity") {
         float v;
         std::string_view u;

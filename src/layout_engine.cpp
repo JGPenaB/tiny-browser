@@ -215,6 +215,13 @@ void flow(Ctx& c, Box& box, Node* e, Box* cb);
 Box* addAbs(Ctx& c, Node* n, Box* cb) {
     auto a = buildBox(c, n, cb);
     a->fixed = n->style->position == 3;
+    // A transformed ancestor holds fixed boxes too (CSS Transforms 1, section 2): they are then placed like
+    // absolutely positioned ones, inside it.
+    for (Box* k = cb; a->fixed && k; k = k->cb)
+        if (k->st && k->st->transform) {
+            a->fixed = false;
+            cb = k;
+        }
     if (a->fixed) c.out.fixed = true;
     a->oof = true;
     Box* raw = a.get();
@@ -313,7 +320,8 @@ std::unique_ptr<Box> buildBox(Ctx& c, Node* e, Box* cb) {
     auto b = mk(k, e);
     b->cb = cb;
     if (!c.root) c.root = b.get();
-    Box* inner = (e->style->position != 0 || c.root == b.get()) ? b.get() : cb;
+    // a positioned or transformed box holds its absolutely positioned descendants
+    Box* inner = (e->style->position != 0 || e->style->transform || c.root == b.get()) ? b.get() : cb;
     if (repl) {
         // A block-level or flex-item replaced element: wrap the element itself in an anonymous line box.
         b->replaced = true;
@@ -1617,6 +1625,30 @@ void layoutAbs(Ctx& c, Box& cbBox, Box& A) {
     if (!s->hidden && A.x + A.w > 0 && A.x < c.in.vw && A.w > 0 && A.h > 0 && !A.fixed) c.maxBottom = std::max(c.maxBottom, A.y + A.h);
 }
 
+// The transform of a box that has just been laid out (CSS Transforms 1). A translation moves everything the box
+// painted, as relative positioning does, so element boxes and hit testing follow it. Any other transform is left to
+// the painter through the PushTransform item; element boxes then keep their untransformed place.
+void applyTransform(Ctx& c, Box& b, size_t pushIdx, const Mark& m0) {
+    const Style& s = *b.st;
+    float m[6];
+    transform_matrix(*s.transform, b.w, b.h, m);
+    bool translation = m[0] == 1 && m[1] == 0 && m[2] == 0 && m[3] == 1;
+    if (translation) {
+        shift(c, m0, mark(c), m[4], m[5]);
+    } else {
+        float x = b.node && b.node->hasBox ? b.node->bx : b.x, y = b.node && b.node->hasBox ? b.node->by : b.y;
+        DItem& d = c.out.items[pushIdx];
+        d.x = x + s.transformOrigin[0].resolve(b.w);
+        d.y = y + s.transformOrigin[1].resolve(b.h);
+        std::copy(m, m + 4, d.bw);
+        d.w = m[4];
+        d.h = m[5];
+    }
+    DItem pop;
+    pop.k = DItem::K::PopTransform;
+    push(c, std::move(pop));
+}
+
 void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     edges(b, cw);
     const Style* s = b.st;
@@ -1625,9 +1657,18 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     bool own = s && b.kind != BK::Anon && b.kind != BK::Marker;
     Mark m0 = mark(c);
     int savedLayer = c.layer;
-    if (own && s->position != 0 && &b != c.root) {
-        int L = s->zAuto ? 1 : (s->zIndex >= 0 ? s->zIndex + 1 : s->zIndex);
+    // A transformed box is painted like a positioned one with z-index auto (CSS Transforms 1, section 2).
+    bool transformed = own && s->transform && &b != c.root;
+    if (own && (s->position != 0 || transformed) && &b != c.root) {
+        int L = s->position == 0 || s->zAuto ? 1 : (s->zIndex >= 0 ? s->zIndex + 1 : s->zIndex);
         c.layer = L < 0 ? L : std::max(c.layer, L);
+    }
+    size_t transformIdx = SIZE_MAX;
+    if (transformed) {
+        DItem d;
+        d.k = DItem::K::PushTransform;
+        d.bw[0] = d.bw[3] = 1;  // the identity, which a translation keeps: it moves the items themselves instead
+        transformIdx = push(c, std::move(d));
     }
     float hpb = hpbOf(b), vpb = vpbOf(b);
     bool normal = own && b.kind != BK::Cell && !b.oof;
@@ -1814,6 +1855,7 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         float dy = s->inset[0].u == Len::Px ? s->inset[0].v : s->inset[2].u == Len::Px ? -s->inset[2].v : 0;
         shift(c, m0, mark(c), dx, dy);
     }
+    if (transformIdx != SIZE_MAX) applyTransform(c, b, transformIdx, m0);
     c.layer = savedLayer;
 }
 
@@ -1827,11 +1869,13 @@ void sortRange(std::vector<DItem>& src, size_t a, size_t e, std::vector<DItem>& 
     bool mixed = false;
     for (size_t i = a; i < e;) {
         size_t j = i + 1;
-        if (src[i].k == DItem::K::PushClip) {
+        auto opens = [&](size_t at) { return src[at].k == DItem::K::PushClip || src[at].k == DItem::K::PushTransform; };
+        auto closes = [&](size_t at) { return src[at].k == DItem::K::PopClip || src[at].k == DItem::K::PopTransform; };
+        if (opens(i)) {  // a clip or a transform and what it holds stay together, sorted inside
             int depth = 0;
             for (j = i; j < e; ++j) {
-                if (src[j].k == DItem::K::PushClip) ++depth;
-                else if (src[j].k == DItem::K::PopClip && --depth == 0) break;
+                if (opens(j)) ++depth;
+                else if (closes(j) && --depth == 0) break;
             }
             j = j < e ? j + 1 : e;
         }
@@ -1841,10 +1885,11 @@ void sortRange(std::vector<DItem>& src, size_t a, size_t e, std::vector<DItem>& 
     }
     if (mixed) std::stable_sort(units.begin(), units.end(), [](const U& x, const U& y) { return x.layer < y.layer; });
     for (auto& u : units) {
-        if (u.e - u.a < 2 || src[u.a].k != DItem::K::PushClip) {
+        bool group = src[u.a].k == DItem::K::PushClip || src[u.a].k == DItem::K::PushTransform;
+        if (u.e - u.a < 2 || !group) {
             for (size_t i = u.a; i < u.e; ++i) dst.push_back(std::move(src[i]));
         } else {
-            bool closed = src[u.e - 1].k == DItem::K::PopClip;
+            bool closed = src[u.e - 1].k == DItem::K::PopClip || src[u.e - 1].k == DItem::K::PopTransform;
             dst.push_back(std::move(src[u.a]));
             sortRange(src, u.a + 1, closed ? u.e - 1 : u.e, dst);
             if (closed) dst.push_back(std::move(src[u.e - 1]));

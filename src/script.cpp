@@ -2026,12 +2026,20 @@ const Node* boxParent(const Node* n) {
 // Layout records an element's border box and nothing more, so width and height are the only used values there are.
 // Margins, paddings and insets report their computed value instead: right for a length in px, while a percentage or
 // `auto` reads as it was written, not in px.
+// A <number> as CSSOM 6.7.2 serializes it: in decimal, rounded to six places, with no exponent and no trailing zeros.
+std::string cssNumber(double v) {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%.7g", v);  // values come from floats: drop the digits a float does not have first
+    v = strtod(buf, nullptr);
+    snprintf(buf, sizeof buf, "%.6f", v);
+    std::string out = buf;
+    out.erase(out.find_last_not_of('0') + 1);
+    if (out.back() == '.') out.pop_back();
+    return out == "-0" ? "0" : out;
+}
 std::string resolvedValue(const Node* n, const Style& s, const std::string& name) {
     char buf[64];
-    auto number = [&](float v, const char* unit) {
-        snprintf(buf, sizeof buf, "%g%s", v, unit);
-        return std::string(buf);
-    };
+    auto number = [&](float v, const char* unit) { return cssNumber(v) + unit; };
     // `keyword` is the name this property gives to Len::Auto or Len::None
     auto length = [&](const Len& l, const char* keyword) -> std::string {
         if (l.u == Len::Px) return number(l.v, "px");
@@ -2103,6 +2111,14 @@ std::string resolvedValue(const Node* n, const Style& s, const std::string& name
         return s.underline && s.strike ? "underline line-through" : s.underline ? "underline" : s.strike ? "line-through" : "none";
     if (name == "flex-direction") return oneOf(s.flexDir, {"row", "row-reverse", "column", "column-reverse"});
     if (name == "flex-wrap") return s.flexWrap ? "wrap" : "nowrap";
+    if (name == "transform") {  // CSS Transforms 1, section 9: the matrix of the used value
+        if (!s.transform) return "none";
+        float m[6];
+        transform_matrix(*s.transform, n->hasBox ? n->bw : 0, n->hasBox ? n->bh : 0, m);
+        std::string out = "matrix(";
+        for (int i = 0; i < 6; ++i) out += cssNumber(m[i]) + (i < 5 ? ", " : ")");
+        return out;
+    }
     if (name == "flex-grow") return number(s.flexGrow, "");
     if (name == "flex-shrink") return number(s.flexShrink, "");
     return styleValue(n, name);

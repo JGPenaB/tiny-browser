@@ -61,6 +61,17 @@
   <img id="noSource" style="display: inline-block; width: 100%; height: 100%"></div></div>
 <p><img id="emptyAlt" alt="" style="width: 40px"> <img id="altText" alt="described"></p>
 
+<!-- CSS Transforms 1: a translation moves what the box paints and its box, by lengths or percentages of its own
+     size; layout around it does not change. A transformed box holds absolutely and fixed positioned descendants. -->
+<div id="frame" style="position: relative; width: 200px; height: 100px; overflow: hidden">
+  <div id="centred" style="position: absolute; top: 50%; left: 0; width: 100%; height: 100%; transform: translateY(-50%)"></div>
+</div>
+<div id="moved" style="width: 40px; height: 20px; transform: translate(10px, 5px) translateX(50%)"></div>
+<div id="afterMoved" style="height: 10px"></div>
+<div id="turned" style="width: 40px; height: 20px; transform: rotate(90deg); transform-origin: 0 0"></div>
+<div id="holder" style="transform: translateZ(0); margin-left: 30px; height: 10px"><div id="pinnedInside" style="position: fixed; top: 0; left: 0; width: 5px; height: 5px"></div></div>
+<div id="badTransform" style="width: 10px; height: 10px; transform: translate(5px) spin(3)"></div>
+
 <!-- CSS Positioned Layout 3: a fixed box is held by the viewport and stays there when the page scrolls -->
 <div id="pinned" style="position: fixed; top: 10px; right: 0; width: 20px; height: 20px; background: #c5221f"></div>
 
@@ -105,6 +116,15 @@
   var sizeOf = function (id) { var r = $(id).getBoundingClientRect(); return px(r.width) + 'x' + px(r.height); };
   eq('an img without a picture takes the size it is given', [sizeOf('noSource'), sizeOf('emptyAlt')].join(), '120x60,40x0');
   eq('an img with alternative text and no picture is that text', $('altText').getBoundingClientRect().width > 30, true);
+
+  var placeOf = function (id) { var r = $(id).getBoundingClientRect(); return px(r.left) + ',' + px(r.top); };
+  var relative = function (id, to) { var a = $(id).getBoundingClientRect(), b = $(to).getBoundingClientRect(); return px(a.left - b.left) + ',' + px(a.top - b.top); };
+  eq('translateY(-50%) centres a box', relative('centred', 'frame'), '0,0');
+  eq('translations add up, a percentage is of the box itself', [relative('moved', 'afterMoved'), relative('afterMoved', 'frame')].join(' '), '30,-15 0,120');
+  eq('the resolved value of transform is a matrix', [getComputedStyle($('moved')).transform, getComputedStyle($('turned')).transform, getComputedStyle($('afterMoved')).transform].join(' | '),
+    'matrix(1, 0, 0, 1, 30, 5) | matrix(0, 1, -1, 0, 0, 0) | none');
+  eq('a transformed box holds fixed descendants', relative('pinnedInside', 'holder'), '0,0');
+  eq('an invalid transform is ignored', getComputedStyle($('badTransform')).transform, 'none');
 
   // ---- scrolling inside a box
   var scroller = $('scroller');

@@ -8,7 +8,24 @@ static inline D2D1_COLOR_F cf(const Color& c) { return D2D1::ColorF(c.r, c.g, c.
 void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo, std::vector<ImageRes>& imgs,
                  float y0, float y1, uint64_t gen, WidgetPainter* wp) {
     int clipDepth = 0;
+    std::vector<D2D1_MATRIX_3X2_F> outer;  // the transforms in force around each open PushTransform
     for (auto& it : lo.items) {
+        if (it.k == DItem::K::PushTransform) {
+            D2D1_MATRIX_3X2_F now;
+            rt->GetTransform(&now);
+            outer.push_back(now);
+            D2D1::Matrix3x2F m(it.bw[0], it.bw[1], it.bw[2], it.bw[3], it.w, it.h);
+            D2D1::Matrix3x2F local = D2D1::Matrix3x2F::Translation(-it.x, -it.y) * m * D2D1::Matrix3x2F::Translation(it.x, it.y);
+            rt->SetTransform(local * *D2D1::Matrix3x2F::ReinterpretBaseType(&now));
+            continue;
+        }
+        if (it.k == DItem::K::PopTransform) {
+            if (!outer.empty()) {
+                rt->SetTransform(outer.back());
+                outer.pop_back();
+            }
+            continue;
+        }
         if (it.k == DItem::K::PushClip) {
             rt->PushAxisAlignedClip(D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h), D2D1_ANTIALIAS_MODE_ALIASED);
             ++clipDepth;
@@ -21,7 +38,7 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
             }
             continue;
         }
-        if (it.y > y1 || it.y + it.h < y0) continue;
+        if (outer.empty() && (it.y > y1 || it.y + it.h < y0)) continue;  // inside a transform, positions say little
         switch (it.k) {
             case DItem::K::Box: {
                 D2D1_RECT_F r = D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h);
@@ -99,6 +116,7 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
         }
     }
     while (clipDepth-- > 0) rt->PopAxisAlignedClip();
+    if (!outer.empty()) rt->SetTransform(outer.front());
 }
 
 }  // namespace tb
