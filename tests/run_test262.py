@@ -19,6 +19,7 @@ var $262 = {
   global: globalThis,
   evalScript: function (code) { return __evalScript(code); },
   gc: function () {},
+  IsHTMLDDA: __htmldda(),
   detachArrayBuffer: function (b) { if (!b.detached) b.transfer(); return null; },
   createRealm: function () { throw new Test262Error('createRealm is not supported'); },
   agent: { start: function () { throw new Test262Error('agents are not supported'); } }

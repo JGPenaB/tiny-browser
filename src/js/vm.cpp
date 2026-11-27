@@ -567,7 +567,7 @@ bool Vm::toBool(Value v) {
     if (v.isNullish() || v.isEmpty()) return false;
     if (v.isString()) return ((JSString*)v.asCell())->length() != 0;
     if (v.isBigInt()) return !v.asBigInt()->d.empty();
-    return true;
+    return !isHtmlDda(v);
 }
 
 double Vm::stringToNumber(const std::u16string& s) {
@@ -745,7 +745,10 @@ Value Vm::toPrimitive(Value v, int hint) {
         if (r.isObject()) throwError(Err::TypeError, "Cannot convert object to primitive value");
         return r;
     }
-    if (hint == 0 && o->cls == Cls::Date) hint = 2;
+    return ordinaryToPrimitive(v, hint);
+}
+Value Vm::ordinaryToPrimitive(Value v, int hint) {
+    JSObject* o = v.asObject();
     JSString* order[2] = {hint == 2 ? a.toString : a.valueOf, hint == 2 ? a.valueOf : a.toString};
     for (JSString* m : order) {
         Value f = getObj(o, PropKey::of(m), v);
@@ -805,6 +808,7 @@ JSString* Vm::typeOf(Value v) {
     if (v.isString()) return a.string;
     if (v.isSymbol()) return a.symbol;
     if (v.isBigInt()) return atom("bigint");
+    if (isHtmlDda(v)) return a.undefined;
     return isCallable(v) ? a.function : a.object;
 }
 bool Vm::isCallable(Value v) {
@@ -855,7 +859,7 @@ bool Vm::looseEquals(Value x, Value y) {
     for (;;) {
         if (x.isNumber() && y.isNumber()) return x.number() == y.number();
         if (x.isString() && y.isString()) return x.asString()->s == y.asString()->s;
-        if (x.isNullish() || y.isNullish()) return x.isNullish() && y.isNullish();
+        if (x.isNullish() || y.isNullish()) return (x.isNullish() || isHtmlDda(x)) && (y.isNullish() || isHtmlDda(y));
         if (x.isObject() && y.isObject()) return x.b == y.b;
         if (x.isBool() && y.isBool()) return x.b == y.b;
         if (x.isSymbol() && y.isSymbol()) return x.b == y.b;
@@ -1025,7 +1029,7 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
                         break;
                     }
                 }
-                out = {k, by, 0};
+                out = {k, by, PF_C};  // configurable: its value is allowed to differ from one look to the next
                 return true;
             }
             if (k.cell() == vm.a.length && !(o->oflags & OF_NO_LENGTH)) {
@@ -1484,11 +1488,11 @@ void Vm::ownKeys(JSObject* o, std::vector<PropKey>& out, bool strings, bool symb
         if (out.size() > mark && out.size() - firstIndex > 1)  // index keys come first, in ascending order
             std::sort(out.begin() + firstIndex, out.end(), [](PropKey x, PropKey y) { return x.asIndex() < y.asIndex(); });
         if (!onlyEnumerable && (o->cls == Cls::Array || o->cls == Cls::String)) out.push_back(PropKey::of(a.length));
-        bool fn = !onlyEnumerable && (o->cls == Cls::Function || o->cls == Cls::Native);
+        bool fn = o->cls == Cls::Function || o->cls == Cls::Native;
         if (fn)  // a function's length, name and prototype come first, in the order they are created
             for (JSString* n : {a.length, a.name, a.arguments, callerAtom, a.prototype}) {
                 Prop tmp{};
-                if (getOwn(o, PropKey::of(n), tmp)) out.push_back(PropKey::of(n));
+                if (getOwn(o, PropKey::of(n), tmp) && (!onlyEnumerable || (tmp.flags & PF_E))) out.push_back(PropKey::of(n));
             }
         for (auto& p : o->props) {
             if (!p.key.isString() || (onlyEnumerable && !(p.flags & PF_E))) continue;
@@ -1872,7 +1876,8 @@ bool Vm::iterStep(JSIter* it, Value& out) {
 }
 
 bool Vm::iterate(Value iterable, const std::function<bool(Value)>& each) {
-    if (iterable.isObject() && (iterable.asObject()->cls == Cls::Array || iterable.asObject()->cls == Cls::Arguments)) {
+    if (iterable.isObject() && iterable.asObject()->cls == Cls::Array && iterable.asObject()->proto == arrayProto &&
+        !(iterable.asObject()->oflags & OF_SLOWIDX) && !iterable.asObject()->find(PropKey::of(symIterator)) && !protoIndexProps && plainArrayIteration()) {
         JSArray* arr = (JSArray*)iterable.asObject();
         for (size_t i = 0; i < arr->elems.size(); ++i) {
             Value v = arr->elems[i];
@@ -1903,7 +1908,21 @@ bool Vm::iterate(Value iterable, const std::function<bool(Value)>& each) {
         Value r = call(next, itv, nullptr, 0);
         if (!r.isObject()) throwError(Err::TypeError, "Iterator result is not an object");
         if (toBool(get(r, a.done))) return true;
-        if (!each(get(r, a.value))) {
+        Value item = get(r, a.value);
+        bool more;
+        try {
+            more = each(item);
+        } catch (JSThrow&) {  // IteratorClose with a throw completion: return() is called, the first error stays
+            Value keep = pending;
+            try {
+                Value ret = get(itv, a.return_);
+                if (isCallable(ret)) call(ret, itv, nullptr, 0);
+            } catch (JSThrow&) {
+            }
+            pending = keep;
+            throw;
+        }
+        if (!more) {
             Value ret = get(itv, a.return_);
             if (isCallable(ret)) call(ret, itv, nullptr, 0);
             return false;

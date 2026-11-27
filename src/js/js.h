@@ -91,7 +91,8 @@ struct Value {
 enum class CK : uint8_t { String, Symbol, Object, Context, Code, Accessor, BigInt };
 enum class Cls : uint8_t {
     Object, Array, Arguments, Function, Native, Bound, Error, Boolean, Number, String, SymbolObj, Date, RegExp,
-    Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host, ArrayBuffer, TypedArray, DataView, Proxy, BigInt
+    Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host, ArrayBuffer, TypedArray, DataView, Proxy, BigInt,
+    RawJSON  // made by JSON.rawJSON: JSON.stringify writes its text as it is
 };
 
 struct Cell {
@@ -323,6 +324,7 @@ struct JSNative : JSObject {
     JSString* name = nullptr;
     int length = 0;
     Value data, data2;
+    bool htmlDda = false;  // [[IsHTMLDDA]] (B.3.6): document.all and its like, which pass for undefined in typeof, == and conditions
     JSNative() { cls = Cls::Native; }
     void trace(Gc&) override;
 };
@@ -592,6 +594,7 @@ public:
     const std::u16string& toStr16(Value v) { return toString(v)->s; }
     JSObject* toObject(Value v);
     Value toPrimitive(Value v, int hint);  // 0 default, 1 number, 2 string
+    Value ordinaryToPrimitive(Value v, int hint);  // 7.1.1.1: hint 1 number first, 2 string first
     PropKey toKey(Value v);
     Value keyToValue(PropKey k);
     JSString* typeOf(Value v);
@@ -647,6 +650,7 @@ public:
     bool testIntegrity(JSObject* o, bool frozen);
     bool protoIndexProps = false;  // Array.prototype or Object.prototype has gained an index-named property
     void pinArgumentsLength(JSObject* o);
+    static bool isHtmlDda(Value v) { return v.isObject() && v.asObject()->cls == Cls::Native && ((JSNative*)v.asObject())->htmlDda; }
     Value* mappedArg(JSObject* o, PropKey k);  // the parameter an arguments element is still tied to, or null
     void unmapArg(JSObject* o, PropKey k);
     void set(Value target, const char* name, Value v) { set(target, PropKey::of(atom(name)), v); }

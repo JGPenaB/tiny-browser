@@ -321,13 +321,13 @@ JSFN(strSplit) {
     if (patternMethod(ci, sep, vm.symSplit, ci.arg(1), 2, viaSymbol)) return viaSymbol;
     JSString* s = thisStr(ci, "split");
     uint32_t limit = ci.arg(1).isUndef() ? 0xFFFFFFFFu : vm.toUint32(ci.arg(1));
+    std::u16string d = vm.toStr16(sep);  // 22.1.3.23 step 6: before the limit is looked at
     JSArray* out = vm.newArray();
     if (limit == 0) return V(out);
     if (sep.isUndef()) {
         out->elems.push_back(V(s));
         return V(out);
     }
-    std::u16string d = vm.toStr16(sep);
     const std::u16string& str = s->s;
     if (d.empty()) {
         for (size_t i = 0; i < str.size() && out->elems.size() < limit; ++i) out->elems.push_back(vm.strv(std::u16string(1, str[i])));
@@ -406,7 +406,10 @@ static Value replaceImpl(CallInfo& ci, bool all) {
     Vm& vm = ci.vm;
     requireCoercible(ci, all ? "replaceAll" : "replace");
     Value pat = ci.arg(0), rep = ci.arg(1), viaSymbol;
-    if (isRegExp(pat) && regexpIsPristine(vm, pat)) return regexpReplace(vm, pat, thisStr(ci, "replace"), rep, all);
+    if (isRegExp(pat) && regexpIsPristine(vm, pat)) {
+        if (all) requireGlobal(vm, pat, "replaceAll");
+        return regexpReplace(vm, pat, thisStr(ci, "replace"), rep, all);
+    }
     if (pat.isObject()) {
         if (all) requireGlobal(vm, pat, "replaceAll");
         if (patternMethod(ci, pat, vm.symReplace, rep, 2, viaSymbol)) return viaSymbol;
@@ -478,8 +481,22 @@ JSFN(strSearch) {
 JSFN(strLocaleCompare) {
     JSString* s = thisStr(ci, "localeCompare");
     JSString* o = ci.vm.toString(ci.arg(0));
-    int r = CompareStringEx(LOCALE_NAME_USER_DEFAULT, 0, (LPCWSTR)s->s.data(), (int)s->s.size(), (LPCWSTR)o->s.data(), (int)o->s.size(), nullptr, nullptr, 0);
-    if (r == 0) return Value::i32(s->s < o->s ? -1 : s->s > o->s ? 1 : 0);
+    auto nfc = [](const std::u16string& in) {  // canonically equivalent strings compare equal (22.1.3.12)
+        bool ascii = true;
+        for (char16_t c : in) ascii = ascii && c < 128;
+        if (ascii || in.empty()) return in;
+        int guess = NormalizeString(NormalizationC, (LPCWSTR)in.data(), (int)in.size(), nullptr, 0);
+        if (guess <= 0) return in;
+        std::u16string out((size_t)guess, u'\0');
+        int n = NormalizeString(NormalizationC, (LPCWSTR)in.data(), (int)in.size(), (LPWSTR)out.data(), guess);
+        if (n <= 0) return in;
+        out.resize((size_t)n);
+        return out;
+    };
+    std::u16string x = nfc(s->s), y = nfc(o->s);
+    if (x == y) return Value::i32(0);
+    int r = CompareStringEx(LOCALE_NAME_USER_DEFAULT, 0, (LPCWSTR)x.data(), (int)x.size(), (LPCWSTR)y.data(), (int)y.size(), nullptr, nullptr, 0);
+    if (r == 0 || r == 2) return Value::i32(x < y ? -1 : 1);
     return Value::i32(r - 2);
 }
 JSFN(strNormalize) {  // 22.1.3.15, with the operating system's normalization tables
@@ -579,11 +596,20 @@ void setupString(Vm& vm) {
 }
 
 // ---------------------------------------------------------------------------- JSON
+// What JSON.parse made of one value of the text: the value, where it stood, and the same for what it contains
+// (the JSON Parse Record of the JSON.parse source text access proposal).
+struct JsonRecord {
+    Value value;
+    size_t start = 0, end = 0;
+    std::vector<JsonRecord> elements;
+    std::vector<std::pair<PropKey, JsonRecord>> entries;
+};
 struct JsonParser {
     Vm& vm;
     const std::u16string& s;
     size_t i = 0;
     int depth = 0;
+    std::vector<Value>* keep = nullptr;  // every recorded value, so that none is collected while its record is in use
     [[noreturn]] void fail() {
         if (i >= s.size()) vm.throwError(Err::SyntaxError, "Unexpected end of JSON input");
         vm.throwError(Err::SyntaxError, "Unexpected token '%s' in JSON at position %d", utf16to8(s.substr(i, 1)).c_str(), (int)i);
@@ -679,12 +705,23 @@ struct JsonParser {
         for (size_t k = st; k < i; ++k) t += (char)s[k];
         return Value::num(strtod(t.c_str(), nullptr));
     }
-    Value value() {
+    Value value(JsonRecord* rec = nullptr) {
         ws();
         if (i >= s.size()) fail();
+        size_t st = i;
+        Value v = scan(rec);
+        if (rec) {
+            rec->value = v;
+            rec->start = st;
+            rec->end = i;
+            if (keep) keep->push_back(v);
+        }
+        return v;
+    }
+    Value scan(JsonRecord* rec) {
         char16_t c = s[i];
-        if (c == '{') return object();
-        if (c == '[') return array();
+        if (c == '{') return object(rec);
+        if (c == '[') return array(rec);
         if (c == '"') return vm.strv(string());
         if (c == '-' || (c >= '0' && c <= '9')) return number();
         if (lit(u"true")) return Value::boolean(true);
@@ -692,7 +729,7 @@ struct JsonParser {
         if (lit(u"null")) return Value::null();
         fail();
     }
-    Value array() {
+    Value array(JsonRecord* rec) {
         if (++depth > 1200) vm.throwError(Err::RangeError, "JSON nesting is too deep");
         ++i;
         JSArray* a = vm.newArray();
@@ -701,7 +738,12 @@ struct JsonParser {
             ++i;
         } else {
             for (;;) {
-                a->elems.push_back(value());
+                JsonRecord* child = nullptr;
+                if (rec) {
+                    rec->elements.emplace_back();
+                    child = &rec->elements.back();
+                }
+                a->elems.push_back(value(child));
                 ws();
                 if (i < s.size() && s[i] == ',') {
                     ++i;
@@ -717,7 +759,7 @@ struct JsonParser {
         --depth;
         return V(a);
     }
-    Value object() {
+    Value object(JsonRecord* rec) {
         if (++depth > 1200) vm.throwError(Err::RangeError, "JSON nesting is too deep");
         ++i;
         JSObject* o = vm.newObject();
@@ -732,8 +774,19 @@ struct JsonParser {
                 ws();
                 if (i >= s.size() || s[i] != ':') fail();
                 ++i;
-                Value v = value();
-                vm.defineOwn(o, vm.toKey(V(vm.atom(std::u16string_view(key)))), v, PF_ALL);
+                PropKey pk = vm.toKey(V(vm.atom(std::u16string_view(key))));
+                JsonRecord* child = nullptr;
+                if (rec) {  // the last of several entries with one name is the one that counts
+                    for (auto& e : rec->entries)
+                        if (e.first == pk) child = &e.second;
+                    if (child) *child = JsonRecord{};
+                    else {
+                        rec->entries.emplace_back(pk, JsonRecord{});
+                        child = &rec->entries.back().second;
+                    }
+                }
+                Value v = value(child);
+                vm.defineOwn(o, pk, v, PF_ALL);
                 ws();
                 if (i < s.size() && s[i] == ',') {
                     ++i;
@@ -751,35 +804,86 @@ struct JsonParser {
     }
 };
 
-static Value internalize(Vm& vm, Value holder, PropKey key, Value reviver) {
+static Value internalize(Vm& vm, Value holder, PropKey key, Value reviver, const JsonRecord* rec, const std::u16string& text) {
     Value val = vm.get(holder, key);
+    JSObject* context = vm.newObject();
+    Value contextValue = V(context);
+    if (rec && !vm.sameValue(rec->value, val)) rec = nullptr;  // something changed it since it was parsed
+    if (rec && !val.isObject()) context->add(PropKey::of(vm.atom("source")), vm.strv(text.substr(rec->start, rec->end - rec->start)), PF_ALL);
     if (val.isObject()) {
         JSObject* o = val.asObject();
-        std::vector<PropKey> keys;
-        vm.ownKeys(o, keys, true, false, true);
-        for (PropKey k : keys) {
-            Value nv = internalize(vm, val, k, reviver);
-            if (nv.isUndef()) vm.del(o, k);
-            else vm.defineOwn(o, k, nv, PF_ALL);
+        if (vm.isArray(val)) {
+            uint32_t len = vm.lengthOf(val);
+            for (uint32_t n = 0; n < len; ++n) {
+                PropKey k = PropKey::index(n);
+                Value nv = internalize(vm, val, k, reviver, rec && n < rec->elements.size() ? &rec->elements[n] : nullptr, text);
+                if (nv.isUndef()) vm.del(o, k);
+                else vm.defineElement(o, k, nv, PF_ALL);
+            }
+        } else {
+            std::vector<PropKey> all, keys;
+            vm.ownKeys(o, all, true, false, false);
+            for (PropKey k : all) {
+                Prop own{};
+                if (vm.getOwn(o, k, own) && (own.flags & PF_E)) keys.push_back(k);
+            }
+            for (PropKey k : keys) {
+                const JsonRecord* entry = nullptr;
+                if (rec)
+                    for (auto& e : rec->entries)
+                        if (e.first == k) entry = &e.second;
+                Value nv = internalize(vm, val, k, reviver, entry, text);
+                if (nv.isUndef()) vm.del(o, k);
+                else vm.defineElement(o, k, nv, PF_ALL);
+            }
         }
     }
-    Value args[2] = {vm.keyToValue(key), val};
-    return vm.call(reviver, holder, args, 2);
+    Value args[3] = {vm.keyToValue(key), val, contextValue};
+    return vm.call(reviver, holder, args, 3);
 }
 JSFN(jsonParse) {
     Vm& vm = ci.vm;
     JSString* text = vm.toString(ci.arg(0));
+    Value textValue = V(text);
     JsonParser p{vm, text->s};
-    Value v = p.value();
+    if (!vm.isCallable(ci.arg(1))) {
+        Value v = p.value();
+        p.ws();
+        if (p.i < text->s.size()) p.fail();
+        return v;
+    }
+    std::vector<Value> keep;
+    RootScope rs(vm, keep);
+    keep.push_back(textValue);
+    p.keep = &keep;
+    JsonRecord root;
+    Value v = p.value(&root);
     p.ws();
     if (p.i < text->s.size()) p.fail();
-    if (vm.isCallable(ci.arg(1))) {
-        JSObject* holder = vm.newObject();
-        holder->add(PropKey::of(vm.a.empty), v, PF_ALL);
-        return internalize(vm, V(holder), PropKey::of(vm.a.empty), ci.arg(1));
-    }
-    return v;
+    JSObject* holder = vm.newObject();
+    Value holderValue = V(holder);
+    holder->add(PropKey::of(vm.a.empty), v, PF_ALL);
+    return internalize(vm, holderValue, PropKey::of(vm.a.empty), ci.arg(1), &root, text->s);
 }
+// JSON.rawJSON and JSON.isRawJSON (the JSON.parse source text access proposal)
+JSFN(jsonRawJSON) {
+    Vm& vm = ci.vm;
+    JSString* text = vm.toString(ci.arg(0));
+    Value textValue = V(text);
+    const std::u16string& s = text->s;
+    auto blank = [](char16_t c) { return c == 9 || c == 10 || c == 13 || c == 32; };
+    if (s.empty() || blank(s.front()) || blank(s.back())) vm.throwError(Err::SyntaxError, "Invalid value for JSON.rawJSON");
+    if (s.front() == '{' || s.front() == '[') vm.throwError(Err::SyntaxError, "JSON.rawJSON cannot hold an object or an array");
+    JsonParser p{vm, s};
+    p.value();
+    if (p.i < s.size()) p.fail();
+    JSObject* o = vm.newObject(nullptr, Cls::RawJSON);
+    Value keep = V(o);
+    o->add(PropKey::of(vm.atom("rawJSON")), textValue, PF_ALL);
+    vm.setIntegrity(o, true);
+    return keep;
+}
+JSFN(jsonIsRawJSON) { return Value::boolean(ci.arg(0).isObject() && ci.arg(0).asObject()->cls == Cls::RawJSON); }
 
 struct JsonWriter {
     Vm& vm;
@@ -828,6 +932,10 @@ struct JsonWriter {
         }
         if (v.isObject()) {
             JSObject* o = v.asObject();
+            if (o->cls == Cls::RawJSON) {
+                out += vm.toStr16(vm.get(v, "rawJSON"));
+                return true;
+            }
             if (o->cls == Cls::Number) v = Value::num(vm.toNumber(v));
             else if (o->cls == Cls::String) v = V(vm.toString(v));
             else if (o->cls == Cls::Boolean || o->cls == Cls::BigInt) v = ((JSPrimitive*)o)->prim;
@@ -908,15 +1016,19 @@ JSFN(jsonStringify) {
     Value rep = ci.arg(1), space = ci.arg(2);
     if (vm.isCallable(rep)) {
         w.replacer = rep;
-    } else if (vm.isArray(rep)) {
+    } else if (rep.isObject() && vm.isArray(rep)) {
         w.hasList = true;
-        for (Value e : ((JSArray*)rep.asObject())->elems) {
-            if (!e.isString() && !e.isNumber()) continue;
+        uint32_t len = vm.lengthOf(rep);
+        for (uint32_t n = 0; n < len; ++n) {
+            Value e = vm.get(rep, PropKey::index(n));
+            bool wrapped = e.isObject() && (e.asObject()->cls == Cls::Number || e.asObject()->cls == Cls::String);
+            if (!e.isString() && !e.isNumber() && !wrapped) continue;
             PropKey k = vm.toKey(V(vm.toString(e)));
             if (std::find(w.list.begin(), w.list.end(), k) == w.list.end()) w.list.push_back(k);
         }
     }
-    if (space.isObject() && (space.asObject()->cls == Cls::Number || space.asObject()->cls == Cls::String)) space = ((JSPrimitive*)space.asObject())->prim;
+    if (space.isObject() && space.asObject()->cls == Cls::Number) space = Value::num(vm.toNumber(space));
+    else if (space.isObject() && space.asObject()->cls == Cls::String) space = V(vm.toString(space));
     if (space.isNumber()) w.gap.assign((size_t)std::min(10.0, std::max(0.0, std::trunc(space.number()))), u' ');
     else if (space.isString()) w.gap = space.asString()->s.substr(0, 10);
     JSObject* holder = vm.newObject();
@@ -929,6 +1041,8 @@ void setupJSON(Vm& vm) {
     vm.def(vm.global, "JSON", V(json));
     vm.defFn(json, "parse", jsonParse, 2);
     vm.defFn(json, "stringify", jsonStringify, 3);
+    vm.defFn(json, "rawJSON", jsonRawJSON, 1);
+    vm.defFn(json, "isRawJSON", jsonIsRawJSON, 1);
     vm.defineOwn(json, PropKey::of(vm.symToStringTag), vm.strv("JSON"), PF_C);
 }
 
@@ -1096,7 +1210,7 @@ static std::string formatDate(double t, int kind) {  // 0 toString, 1 date, 2 ti
     if (kind == 3 || kind == 4) {
         DateParts p = partsOf(t);
         if (kind == 4) {
-            snprintf(buf, sizeof buf, "%s, %02d %s %04d %02d:%02d:%02d GMT", kDayNames[p.wday], p.day, kMonthNames[p.month], (int)p.year, p.hour, p.min, p.sec);
+            snprintf(buf, sizeof buf, "%s, %02d %s %s%04d %02d:%02d:%02d GMT", kDayNames[p.wday], p.day, kMonthNames[p.month], p.year < 0 ? "-" : "", (int)std::fabs(p.year), p.hour, p.min, p.sec);
         } else if (p.year >= 0 && p.year <= 9999) {
             snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", (int)p.year, p.month + 1, p.day, p.hour, p.min, p.sec, p.ms);
         } else {
@@ -1111,13 +1225,14 @@ static std::string formatDate(double t, int kind) {  // 0 toString, 1 date, 2 ti
     snprintf(zone, sizeof zone, "GMT%c%02d%02d", off < 0 ? '-' : '+', om / 60, om % 60);
     int h12 = p.hour % 12 == 0 ? 12 : p.hour % 12;
     switch (kind) {
-        case 1: snprintf(buf, sizeof buf, "%s %s %02d %04d", kDayNames[p.wday], kMonthNames[p.month], p.day, (int)p.year); break;
+        case 1: snprintf(buf, sizeof buf, "%s %s %02d %s%04d", kDayNames[p.wday], kMonthNames[p.month], p.day, p.year < 0 ? "-" : "", (int)std::fabs(p.year)); break;
         case 2: snprintf(buf, sizeof buf, "%02d:%02d:%02d %s", p.hour, p.min, p.sec, zone); break;
         case 5: snprintf(buf, sizeof buf, "%d/%d/%d", p.month + 1, p.day, (int)p.year); break;
         case 6: snprintf(buf, sizeof buf, "%d:%02d:%02d %s", h12, p.min, p.sec, p.hour < 12 ? "AM" : "PM"); break;
         case 7: snprintf(buf, sizeof buf, "%d/%d/%d, %d:%02d:%02d %s", p.month + 1, p.day, (int)p.year, h12, p.min, p.sec, p.hour < 12 ? "AM" : "PM"); break;
         default:
-            snprintf(buf, sizeof buf, "%s %s %02d %04d %02d:%02d:%02d %s", kDayNames[p.wday], kMonthNames[p.month], p.day, (int)p.year, p.hour, p.min, p.sec, zone);
+            snprintf(buf, sizeof buf, "%s %s %02d %s%04d %02d:%02d:%02d %s", kDayNames[p.wday], kMonthNames[p.month], p.day, p.year < 0 ? "-" : "", (int)std::fabs(p.year), p.hour,
+                     p.min, p.sec, zone);
     }
     return buf;
 }
@@ -1147,6 +1262,7 @@ static double parseDate(const std::u16string& in) {
         double frac = 0, zone = 0;
         bool hasTime = false, hasZone = false;
         if (digits(sign ? 6 : 4, y)) {
+            if (sign < 0 && y == 0) return NAN;  // -000000 is not a year (21.4.1.32)
             bool ok = true;
             if (*p == '-') {
                 ++p;
@@ -1360,11 +1476,12 @@ JSFN(dateSet) {
     double args[4] = {NAN, NAN, NAN, NAN};
     int given = std::min(ci.argc, maxArgs[field]);
     for (int i = 0; i < given; ++i) args[i] = vm.toNumber(ci.args[i]);
-    if (std::isnan(t)) {
+    bool fromNaN = std::isnan(t);  // only a year can be given to an invalid date: it then starts from +0, taken as it is
+    if (fromNaN) {
         if (field != 0) return Value::dbl(NAN);
         t = 0;
     }
-    DateParts p = partsOf(utc ? t : t + localOffset(t));
+    DateParts p = partsOf(utc || fromNaN ? t : t + localOffset(t));
     double f[7] = {p.year, (double)p.month, (double)p.day, (double)p.hour, (double)p.min, (double)p.sec, (double)p.ms};
     for (int i = 0; i < given; ++i) f[field + i] = args[i];
     if (given == 0) f[field] = NAN;
@@ -1372,6 +1489,28 @@ JSFN(dateSet) {
     if (!utc) nt = localToUtc(nt);
     d->prim = Value::num(timeClip(nt));
     return d->prim;
+}
+JSFN(dateSetYear) {  // B.2.3.2
+    Vm& vm = ci.vm;
+    JSPrimitive* d = thisDate(ci);
+    double t = d->prim.number(), y = vm.toNumber(ci.arg(0));
+    if (std::isnan(y)) {
+        d->prim = Value::dbl(NAN);
+        return d->prim;
+    }
+    double year = std::trunc(y);
+    if (year >= 0 && year <= 99) year += 1900;
+    DateParts p = partsOf(std::isnan(t) ? 0 : t + localOffset(t));
+    d->prim = Value::num(timeClip(localToUtc(makeTime(year, p.month, p.day, p.hour, p.min, p.sec, p.ms))));
+    return d->prim;
+}
+JSFN(dateToPrimitive) {  // 21.4.4.45
+    Vm& vm = ci.vm;
+    if (!ci.thisv.isObject()) vm.throwError(Err::TypeError, "Date.prototype[Symbol.toPrimitive] called on a non-object");
+    Value hint = ci.arg(0);
+    bool string = hint.isString() && (hint.asString()->s == u"string" || hint.asString()->s == u"default");
+    if (!string && !(hint.isString() && hint.asString()->s == u"number")) vm.throwError(Err::TypeError, "Invalid hint: %s", utf16to8(vm.inspect(hint, 0)).c_str());
+    return vm.ordinaryToPrimitive(ci.thisv, string ? 2 : 1);
 }
 JSFN(dateFormat) {
     Vm& vm = ci.vm;
@@ -1413,9 +1552,12 @@ void setupDate(Vm& vm) {
     struct {
         const char* name;
         int kind;
-    } formats[] = {{"toString", 0}, {"toDateString", 1}, {"toTimeString", 2}, {"toISOString", 3}, {"toUTCString", 4}, {"toGMTString", 4},
+    } formats[] = {{"toString", 0}, {"toDateString", 1}, {"toTimeString", 2}, {"toISOString", 3}, {"toUTCString", 4},
                    {"toLocaleDateString", 5}, {"toLocaleTimeString", 6}, {"toLocaleString", 7}};
     for (auto& f : formats) vm.defFn(proto, f.name, dateFormat, 0)->data = Value::i32(f.kind);
+    vm.def(proto, "toGMTString", vm.get(V(proto), vm.atom("toUTCString")));  // B.2.3.3: the same function object
+    vm.defFn(proto, "setYear", dateSetYear, 1);
+    vm.defineOwn(proto, PropKey::of(vm.symToPrimitive), V(vm.newNative(dateToPrimitive, "[Symbol.toPrimitive]", 1)), PF_C);
     vm.defFn(proto, "toJSON", dateToJSON, 1);
 }
 

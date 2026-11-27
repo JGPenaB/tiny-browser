@@ -327,7 +327,7 @@ bool Vm::setIntegrity(JSObject* o, bool frozen) {
         }
         return true;
     }
-    o->oflags |= OF_NOEXT;
+    if (!preventExtensions(o)) return false;
     if (o->cls == Cls::TypedArray && typedLength((JSTypedArray*)o) > 0 && !((JSTypedArray*)o)->buffer->immutable)  // an element cannot be made non-configurable
         throwError(Err::TypeError, frozen ? "Cannot freeze array buffer views with elements" : "Cannot seal array buffer views with elements");
     if (frozen && o->cls == Cls::Arguments) ((JSArguments*)o)->mapCtx = nullptr;  // read-only elements are no longer tied to parameters

@@ -82,6 +82,10 @@ bool Vm::isExtensible(JSObject* o) {
 
 bool Vm::preventExtensions(JSObject* o) {
     if (o->cls != Cls::Proxy) {
+        if (o->cls == Cls::TypedArray) {
+            JSTypedArray* t = (JSTypedArray*)o;
+            if (t->tracking || (t->buffer && t->buffer->maxLen >= 0 && !t->buffer->shared)) return false;
+        }
         o->oflags |= OF_NOEXT;
         return true;
     }

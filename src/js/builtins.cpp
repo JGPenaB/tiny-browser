@@ -50,13 +50,16 @@ JSFN(objectCtor) {
     return V(vm.toObject(v));
 }
 
-static Value objectEnumerate(CallInfo& ci, int mode) {
+static Value objectEnumerate(CallInfo& ci, int mode) {  // EnumerableOwnProperties (7.3.23)
     Vm& vm = ci.vm;
     JSObject* o = vm.toObject(ci.arg(0));
     std::vector<PropKey> keys;
-    vm.ownKeys(o, keys, true, false, true);
+    vm.ownKeys(o, keys, true, false, false);
     JSArray* out = vm.newArray();
+    Value keep = V(out);
     for (PropKey k : keys) {
+        Prop own{};  // each key is looked at when its turn comes: an earlier getter may have removed or hidden it
+        if (!vm.getOwn(o, k, own) || !(own.flags & PF_E)) continue;
         if (mode == 0) {
             out->elems.push_back(vm.keyToValue(k));
             continue;
@@ -85,8 +88,13 @@ JSFN(objectAssign) {
         if (src.isNullish()) continue;
         JSObject* so = vm.toObject(src);
         std::vector<PropKey> keys;
-        vm.ownKeys(so, keys, true, true, true);
-        for (PropKey k : keys) vm.setObj(target, k, vm.getObj(so, k, V(so)), V(target));
+        vm.ownKeys(so, keys, true, true, false);
+        for (PropKey k : keys) {  // 20.1.2.1 step 3.a.iii: the descriptor, then Get, then Set (which must succeed)
+            Prop own{};
+            if (!vm.getOwn(so, k, own) || !(own.flags & PF_E)) continue;
+            Value v = vm.getObj(so, k, V(so));
+            if (!vm.setObj(target, k, v, V(target))) vm.failedSet(V(target), k);
+        }
     }
     return V(target);
 }
@@ -201,15 +209,24 @@ JSFN(objectIsFrozen) { return Value::boolean(!ci.arg(0).isObject() || ci.vm.test
 JSFN(objectIsSealed) { return Value::boolean(!ci.arg(0).isObject() || ci.vm.testIntegrity(ci.arg(0).asObject(), false)); }
 JSFN(objectFromEntries) {
     Vm& vm = ci.vm;
+    if (ci.arg(0).isNullish()) vm.throwError(Err::TypeError, "Object.fromEntries requires an iterable");
     JSObject* o = vm.newObject();
-    vm.iterate(ci.arg(0), [&](Value e) {
-        vm.defineOwn(o, vm.toKey(vm.get(e, PropKey::index(0))), vm.get(e, PropKey::index(1)), PF_ALL);
+    Value keep = V(o);
+    vm.iterate(ci.arg(0), [&](Value e) {  // AddEntriesFromIterable (24.1.1.2)
+        if (!e.isObject()) vm.throwError(Err::TypeError, "Iterator value %s is not an entry object", utf16to8(vm.inspect(e, 0)).c_str());
+        Value k = vm.get(e, PropKey::index(0));
+        Value v = vm.get(e, PropKey::index(1));
+        vm.defineOwn(o, vm.toKey(k), v, PF_ALL);
         return true;
     });
-    return V(o);
+    return keep;
 }
 JSFN(objectIs) { return Value::boolean(ci.vm.sameValue(ci.arg(0), ci.arg(1))); }
-JSFN(objectHasOwn) { return Value::boolean(ci.vm.hasOwn(ci.vm.toObject(ci.arg(0)), ci.vm.toKey(ci.arg(1)))); }
+JSFN(objectHasOwn) {
+    JSObject* o = ci.vm.toObject(ci.arg(0));
+    PropKey k = ci.vm.toKey(ci.arg(1));
+    return Value::boolean(ci.vm.hasOwn(o, k));
+}
 
 JSFN(objProtoHasOwnProperty) {
     PropKey k = ci.vm.toKey(ci.arg(0));
@@ -217,9 +234,10 @@ JSFN(objProtoHasOwnProperty) {
 }
 JSFN(objProtoIsPrototypeOf) {
     Value v = ci.arg(0);
-    if (!v.isObject() || !ci.thisv.isObject()) return Value::boolean(false);
+    if (!v.isObject()) return Value::boolean(false);
+    JSObject* self = ci.vm.toObject(ci.thisv);
     for (JSObject* p = ci.vm.getProto(v.asObject()); p; p = ci.vm.getProto(p))
-        if (p == ci.thisv.asObject()) return Value::boolean(true);
+        if (p == self) return Value::boolean(true);
     return Value::boolean(false);
 }
 JSFN(objProtoPropertyIsEnumerable) {
@@ -232,9 +250,12 @@ Value objectProtoToString(CallInfo& ci) {
     if (ci.thisv.isUndef()) return vm.strv("[object Undefined]");
     if (ci.thisv.isNull()) return vm.strv("[object Null]");
     JSObject* o = vm.toObject(ci.thisv);
+    bool isArr = vm.isArray(V(o));
     Value tag = vm.getObj(o, PropKey::of(vm.symToStringTag), ci.thisv);
     if (tag.isString()) return vm.strv(u"[object " + tag.asString()->s + u"]");
     const char* n = "Object";
+    if (isArr) return vm.strv("[object Array]");
+    if (o->cls == Cls::Proxy) return vm.strv(vm.isCallable(V(o)) ? "[object Function]" : "[object Object]");
     switch (o->cls) {
         case Cls::Array: n = "Array"; break;
         case Cls::Arguments: n = "Arguments"; break;
@@ -259,6 +280,7 @@ JSFN(objProtoGetProto) {
     return p ? V(p) : Value::null();
 }
 JSFN(objProtoSetProto) {
+    if (ci.thisv.isNullish()) ci.vm.throwError(Err::TypeError, "Object.prototype.__proto__ called on null or undefined");
     if (ci.arg(0).isObject() || ci.arg(0).isNull()) setProto(ci.vm, ci.thisv, ci.arg(0));
     return Value::undef();
 }
@@ -1003,34 +1025,78 @@ static std::string fixExponent(const std::string& s) {  // C prints e+01, JavaSc
     int ex = atoi(s.c_str() + e + 1);
     return s.substr(0, e) + "e" + (ex >= 0 ? "+" : "-") + std::to_string(std::abs(ex));
 }
+// The decimal digits of a positive finite double, exactly: x = 0.d1d2d3... * 10^point, without trailing zeros.
+static std::string exactDecimal(double x, int& point) {
+    char buf[1200];
+    snprintf(buf, sizeof buf, "%.800e", x);
+    std::string s = buf;
+    size_t e = s.find('e');
+    std::string digits = s.substr(0, 1) + s.substr(2, e - 2);
+    while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
+    point = atoi(s.c_str() + e + 1) + 1;
+    return digits;
+}
+// Keeps `count` digits. Of two equally near results the larger one is taken, as the algorithms ask.
+static void roundDigits(std::string& digits, int& point, int count) {
+    if ((int)digits.size() <= count) {
+        digits.append((size_t)count - digits.size(), '0');
+        return;
+    }
+    bool up = digits[(size_t)count] >= '5';
+    digits.resize((size_t)count);
+    if (!up) return;
+    int i = count - 1;
+    while (i >= 0 && digits[(size_t)i] == '9') digits[(size_t)i--] = '0';
+    if (i >= 0) {
+        ++digits[(size_t)i];
+    } else {
+        digits.insert(digits.begin(), '1');
+        digits.pop_back();
+        ++point;
+    }
+}
+static std::string exponentText(const std::string& digits, int e) {
+    std::string out = digits.substr(0, 1);
+    if (digits.size() > 1) out += "." + digits.substr(1);
+    return out + (e >= 0 ? "e+" : "e-") + std::to_string(std::abs(e));
+}
 JSFN(numberToPrecision) {
     Vm& vm = ci.vm;
     double d = thisNumber(ci);
-    if (ci.arg(0).isUndef() || !std::isfinite(d)) return V(vm.numberToString(d));
+    if (ci.arg(0).isUndef()) return V(vm.numberToString(d));
     double pd = vm.toInteger(ci.arg(0));
+    if (!std::isfinite(d)) return V(vm.numberToString(d));
     if (pd < 1 || pd > 100) vm.throwError(Err::RangeError, "toPrecision() argument must be between 1 and 100");
-    int p = (int)pd;
-    char buf[512];
-    snprintf(buf, sizeof buf, "%.*e", p - 1, d);
-    std::string s = buf;
-    int e = atoi(s.c_str() + s.find('e') + 1);
-    if (e < -6 || e >= p) return vm.strv(fixExponent(s));
-    snprintf(buf, sizeof buf, "%.*f", std::max(0, p - 1 - e), d);
-    return vm.strv(buf);
+    int p = (int)pd, point = 1;
+    std::string sign = d < 0 ? "-" : "", digits;
+    if (d == 0) digits.assign((size_t)p, '0');
+    else {
+        digits = exactDecimal(std::fabs(d), point);
+        roundDigits(digits, point, p);
+    }
+    int e = point - 1;
+    if (e < -6 || e >= p) return vm.strv(sign + exponentText(digits, e));
+    if (e == p - 1) return vm.strv(sign + digits);
+    if (e >= 0) return vm.strv(sign + digits.substr(0, (size_t)e + 1) + "." + digits.substr((size_t)e + 1));
+    return vm.strv(sign + "0." + std::string((size_t)(-(e + 1)), '0') + digits);
 }
 JSFN(numberToExponential) {
     Vm& vm = ci.vm;
     double d = thisNumber(ci);
+    double fd = vm.toInteger(ci.arg(0));
     if (!std::isfinite(d)) return V(vm.numberToString(d));
+    if (fd < 0 || fd > 100) vm.throwError(Err::RangeError, "toExponential() argument must be between 0 and 100");
+    std::string sign = d < 0 ? "-" : "";
+    if (d == 0) return vm.strv(exponentText(std::string((size_t)fd + 1, '0'), 0));
     char buf[512];
-    if (ci.arg(0).isUndef()) {
+    if (ci.arg(0).isUndef()) {  // as many digits as the number needs
         auto r = std::to_chars(buf, buf + sizeof buf, d, std::chars_format::scientific);
         return vm.strv(fixExponent(std::string(buf, r.ptr)));
     }
-    double fd = vm.toInteger(ci.arg(0));
-    if (fd < 0 || fd > 100) vm.throwError(Err::RangeError, "toExponential() argument must be between 0 and 100");
-    snprintf(buf, sizeof buf, "%.*e", (int)fd, d);
-    return vm.strv(fixExponent(buf));
+    int point = 1;
+    std::string digits = exactDecimal(std::fabs(d), point);
+    roundDigits(digits, point, (int)fd + 1);
+    return vm.strv(sign + exponentText(digits, point - 1));
 }
 JSFN(numberToLocaleString) {
     Vm& vm = ci.vm;
@@ -1155,14 +1221,19 @@ MATH1(asinh, std::asinh(x))
 MATH1(acosh, std::acosh(x))
 MATH1(atanh, std::atanh(x))
 MATH1(fround, (double)(float)x)
-JSFN(math_round) {
+JSFN(math_round) {  // 21.3.2.28: halves go up, and what rounds to zero from below keeps its sign
     double x = ci.vm.toNumber(ci.arg(0));
-    if (!std::isfinite(x)) return Value::dbl(x);
+    if (!std::isfinite(x) || x == std::floor(x)) return Value::num(x);
+    if (x < 0 && x >= -0.5) return Value::dbl(-0.0);
     double r = std::floor(x);
     if (x - r >= 0.5) r += 1;
     return Value::num(r);
 }
-JSFN(math_pow) { return Value::num(std::pow(ci.vm.toNumber(ci.arg(0)), ci.vm.toNumber(ci.arg(1)))); }
+JSFN(math_pow) {  // Number::exponentiate (6.1.6.1.3)
+    double base = ci.vm.toNumber(ci.arg(0)), e = ci.vm.toNumber(ci.arg(1));
+    if (e != e || (std::isinf(e) && std::fabs(base) == 1)) return Value::dbl(NAN);
+    return Value::num(std::pow(base, e));
+}
 JSFN(math_atan2) { return Value::num(std::atan2(ci.vm.toNumber(ci.arg(0)), ci.vm.toNumber(ci.arg(1)))); }
 JSFN(math_imul) { return Value::i32((int32_t)((uint32_t)ci.vm.toInt32(ci.arg(0)) * (uint32_t)ci.vm.toInt32(ci.arg(1)))); }
 JSFN(math_clz32) {
@@ -1171,13 +1242,101 @@ JSFN(math_clz32) {
     while (n < 32 && !(x & (0x80000000u >> n))) ++n;
     return Value::i32(n);
 }
-JSFN(math_hypot) {
-    double s = 0;
-    for (int i = 0; i < ci.argc; ++i) {
-        double x = ci.vm.toNumber(ci.args[i]);
-        s += x * x;
+JSFN(math_hypot) {  // 21.3.2.18: every argument is converted first; an infinity wins over NaN
+    std::vector<double> xs;
+    for (int i = 0; i < ci.argc; ++i) xs.push_back(ci.vm.toNumber(ci.args[i]));
+    bool nan = false;
+    double big = 0;
+    for (double x : xs) {
+        if (std::isinf(x)) return Value::dbl(INFINITY);
+        if (x != x) nan = true;
+        big = std::max(big, std::fabs(x));
     }
-    return Value::num(std::sqrt(s));
+    if (nan) return Value::dbl(NAN);
+    if (big == 0) return Value::i32(0);
+    double s = 0;
+    for (double x : xs) s += (x / big) * (x / big);
+    return Value::num(big * std::sqrt(s));
+}
+// Math.sumPrecise (the Math.sumPrecise proposal): the exact sum of the numbers, rounded once. The running sum is kept
+// as a list of non-overlapping partials (Shewchuk), with a separate count of how many times 2^1024 overflowed.
+JSFN(math_sumPrecise) {
+    Vm& vm = ci.vm;
+    if (ci.arg(0).isNullish()) vm.throwError(Err::TypeError, "Math.sumPrecise requires an iterable");
+    std::vector<double> partials;
+    double overflow = 0, count = 0;
+    int state = 0;  // 0 minus zero, 1 finite, 2 +Infinity, 3 -Infinity, 4 NaN
+    const double two1023 = 8.98846567431158e307;
+    auto twoSum = [](double x, double y, double& hi, double& lo) {  // needs |x| >= |y|
+        hi = x + y;
+        lo = y - (hi - x);
+    };
+    vm.iterate(ci.arg(0), [&](Value v) {
+        if (++count >= 9007199254740992.0) vm.throwError(Err::RangeError, "Math.sumPrecise: too many values");
+        if (!v.isNumber()) vm.throwError(Err::TypeError, "Math.sumPrecise: %s is not a number", utf16to8(vm.inspect(v, 0)).c_str());
+        double x = v.number();
+        if (state == 4) return true;
+        if (x != x) state = 4;
+        else if (x == INFINITY) state = state == 3 ? 4 : 2;
+        else if (x == -INFINITY) state = state == 2 ? 4 : 3;
+        else if (!(x == 0 && std::signbit(x)) && state <= 1) {
+            state = 1;
+            size_t used = 0;
+            for (size_t i = 0; i < partials.size(); ++i) {
+                double p = partials[i], hi, lo;
+                if (std::fabs(x) < std::fabs(p)) std::swap(x, p);
+                twoSum(x, p, hi, lo);
+                if (std::isinf(hi)) {
+                    double sign = hi > 0 ? 1 : -1;
+                    overflow += sign;
+                    x = (x - sign * two1023) - sign * two1023;
+                    if (std::fabs(x) < std::fabs(p)) std::swap(x, p);
+                    twoSum(x, p, hi, lo);
+                }
+                if (lo != 0) partials[used++] = lo;
+                x = hi;
+            }
+            partials.resize(used);
+            if (x != 0) partials.push_back(x);
+        }
+        return true;
+    });
+    if (state == 4) return Value::dbl(NAN);
+    if (state == 2) return Value::dbl(INFINITY);
+    if (state == 3) return Value::dbl(-INFINITY);
+    if (state == 0) return Value::dbl(-0.0);
+    const double maxDouble = 1.7976931348623157e308, maxUlp = 1.99584030953472e292;
+    int n = (int)partials.size() - 1;
+    double hi = 0, lo = 0;
+    if (overflow != 0) {
+        double next = n >= 0 ? partials[(size_t)n] : 0;
+        --n;
+        if (std::fabs(overflow) > 1 || (overflow > 0 && next > 0) || (overflow < 0 && next < 0)) return Value::dbl(overflow > 0 ? INFINITY : -INFINITY);
+        twoSum(overflow * two1023, next / 2, hi, lo);  // at half scale, so that it cannot overflow
+        lo *= 2;
+        if (std::isinf(2 * hi)) {
+            if (hi > 0) return Value::dbl(hi == two1023 && lo == -(maxUlp / 2) && n >= 0 && partials[(size_t)n] < 0 ? maxDouble : INFINITY);
+            return Value::dbl(hi == -two1023 && lo == maxUlp / 2 && n >= 0 && partials[(size_t)n] > 0 ? -maxDouble : -INFINITY);
+        }
+        if (lo != 0) {
+            if ((size_t)(n + 1) < partials.size()) partials[(size_t)(n + 1)] = lo;
+            else partials.push_back(lo);
+            ++n;
+            lo = 0;
+        }
+        hi *= 2;
+    }
+    while (n >= 0) {
+        double x = hi, y = partials[(size_t)n--];
+        twoSum(x, y, hi, lo);
+        if (lo != 0) break;
+    }
+    // a remainder of exactly half a unit in the last place: the next partial says which way to round
+    if (n >= 0 && ((lo < 0 && partials[(size_t)n] < 0) || (lo > 0 && partials[(size_t)n] > 0))) {
+        double y = lo * 2, x = hi + y;
+        if (y == x - hi) hi = x;
+    }
+    return Value::num(hi);
 }
 static Value minMax(CallInfo& ci, bool isMax) {
     double r = isMax ? -INFINITY : INFINITY;
@@ -1215,6 +1374,8 @@ static JSObject* needObject(Vm& vm, Value v, const char* what) {
 JSFN(reflectApply) {
     std::vector<Value> args;
     RootScope rs(ci.vm, args);
+    if (!ci.vm.isCallable(ci.arg(0))) ci.vm.throwError(Err::TypeError, "Reflect.apply: the target is not a function");
+    if (!ci.arg(2).isObject()) ci.vm.throwError(Err::TypeError, "CreateListFromArrayLike called on non-object");
     spreadArgs(ci.vm, ci.arg(2), args);
     return ci.vm.call(ci.arg(0), ci.arg(1), args.data(), (int)args.size());
 }
@@ -1223,6 +1384,7 @@ JSFN(reflectConstruct) {
     RootScope rs(ci.vm, args);
     if (!ci.vm.isConstructor(ci.arg(0))) ci.vm.throwError(Err::TypeError, "Reflect.construct: the target is not a constructor");
     if (ci.argc > 2 && !ci.vm.isConstructor(ci.args[2])) ci.vm.throwError(Err::TypeError, "Reflect.construct: newTarget is not a constructor");
+    if (!ci.arg(1).isObject()) ci.vm.throwError(Err::TypeError, "CreateListFromArrayLike called on non-object");
     spreadArgs(ci.vm, ci.arg(1), args);
     return ci.vm.construct(ci.arg(0), args.data(), (int)args.size(), ci.argc > 2 ? ci.args[2] : ci.arg(0));
 }
@@ -1323,39 +1485,80 @@ JSFN(consoleNoop) { return Value::undef(); }
 
 // ---------------------------------------------------------------------------- URI coding and other globals
 static Value uriEncode(CallInfo& ci, const char* keep) {
-    std::string in = utf16to8(ci.vm.toStr16(ci.arg(0)));
+    Vm& vm = ci.vm;
+    std::u16string in = vm.toStr16(ci.arg(0));
     std::string out;
-    for (unsigned char c : in) {
-        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c < 128 && strchr(keep, c) && c)) {
+    for (size_t i = 0; i < in.size(); ++i) {
+        char16_t c = in[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c && c < 128 && strchr(keep, (char)c))) {
             out += (char)c;
-        } else {
-            char b[4];
-            snprintf(b, sizeof b, "%%%02X", c);
-            out += b;
+            continue;
+        }
+        uint32_t cp = c;
+        if (c >= 0xDC00 && c <= 0xDFFF) vm.throwError(Err::URIError, "URI malformed");
+        if (c >= 0xD800 && c <= 0xDBFF) {
+            if (i + 1 >= in.size() || in[i + 1] < 0xDC00 || in[i + 1] > 0xDFFF) vm.throwError(Err::URIError, "URI malformed");
+            cp = 0x10000 + (((uint32_t)c - 0xD800) << 10) + (in[++i] - 0xDC00);
+        }
+        unsigned char bytes[4];
+        int n = 0;
+        if (cp < 0x80) bytes[n++] = (unsigned char)cp;
+        else if (cp < 0x800) bytes[n++] = (unsigned char)(0xC0 | (cp >> 6)), bytes[n++] = (unsigned char)(0x80 | (cp & 63));
+        else if (cp < 0x10000)
+            bytes[n++] = (unsigned char)(0xE0 | (cp >> 12)), bytes[n++] = (unsigned char)(0x80 | ((cp >> 6) & 63)), bytes[n++] = (unsigned char)(0x80 | (cp & 63));
+        else
+            bytes[n++] = (unsigned char)(0xF0 | (cp >> 18)), bytes[n++] = (unsigned char)(0x80 | ((cp >> 12) & 63)),
+            bytes[n++] = (unsigned char)(0x80 | ((cp >> 6) & 63)), bytes[n++] = (unsigned char)(0x80 | (cp & 63));
+        for (int b = 0; b < n; ++b) {
+            char hex[4];
+            snprintf(hex, sizeof hex, "%%%02X", bytes[b]);
+            out += hex;
         }
     }
-    return ci.vm.strv(out);
+    return vm.strv(out);
 }
 static Value uriDecode(CallInfo& ci, const char* keepEscaped) {
     Vm& vm = ci.vm;
-    std::string in = utf16to8(vm.toStr16(ci.arg(0)));
-    std::string out;
-    for (size_t i = 0; i < in.size(); ++i) {
-        if (in[i] != '%') {
-            out += in[i];
+    std::u16string in = vm.toStr16(ci.arg(0)), out;
+    auto byteAt = [&](size_t k) -> int {  // the value of %XX at k, or -1
+        if (k + 2 >= in.size()) return -1;
+        if (in[k] != '%') return -1;
+        int hi = digitValue(in[k + 1]), lo = digitValue(in[k + 2]);
+        return hi > 15 || lo > 15 ? -1 : hi * 16 + lo;
+    };
+    for (size_t k = 0; k < in.size(); ++k) {
+        if (in[k] != '%') {
+            out += in[k];
             continue;
         }
-        int hi = i + 2 < in.size() ? digitValue((char16_t)(unsigned char)in[i + 1]) : 99, lo = i + 2 < in.size() ? digitValue((char16_t)(unsigned char)in[i + 2]) : 99;
-        if (hi > 15 || lo > 15) vm.throwError(Err::URIError, "URI malformed");
-        char c = (char)(hi * 16 + lo);
-        if ((unsigned char)c < 128 && c && strchr(keepEscaped, c)) out += in.substr(i, 3);
-        else out += c;
-        i += 2;
+        if (k + 2 >= in.size()) vm.throwError(Err::URIError, "URI malformed");
+        int b = byteAt(k);
+        if (b < 0) vm.throwError(Err::URIError, "URI malformed");
+        if (b < 0x80) {
+            if (b && strchr(keepEscaped, (char)b)) out.append(in, k, 3);
+            else out += (char16_t)b;
+            k += 2;
+            continue;
+        }
+        int n = (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : (b & 0xF8) == 0xF0 ? 4 : 0;
+        if (!n || k + 3 * (size_t)n > in.size()) vm.throwError(Err::URIError, "URI malformed");
+        uint32_t cp = (uint32_t)b & (n == 2 ? 0x1F : n == 3 ? 0x0F : 0x07);
+        for (int j = 1; j < n; ++j) {
+            int c = byteAt(k + 3 * (size_t)j);
+            if (c < 0 || (c & 0xC0) != 0x80) vm.throwError(Err::URIError, "URI malformed");
+            cp = (cp << 6) | ((uint32_t)c & 0x3F);
+        }
+        static const uint32_t least[] = {0, 0, 0x80, 0x800, 0x10000};
+        if (cp < least[n] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) vm.throwError(Err::URIError, "URI malformed");
+        if (cp < 0x10000) out += (char16_t)cp;
+        else {
+            cp -= 0x10000;
+            out += (char16_t)(0xD800 + (cp >> 10));
+            out += (char16_t)(0xDC00 + (cp & 0x3FF));
+        }
+        k += 3 * (size_t)n - 1;
     }
-    // reject byte sequences that are not UTF-8
-    if (!out.empty() && MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, out.data(), (int)out.size(), nullptr, 0) == 0)
-        vm.throwError(Err::URIError, "URI malformed");
-    return vm.strv(utf8to16(out));
+    return vm.strv(out);
 }
 JSFN(globalEncodeURIComponent) { return uriEncode(ci, "-_.!~*'()"); }
 JSFN(globalEncodeURI) { return uriEncode(ci, "-_.!~*'();/?:@&=+$,#"); }
@@ -1366,7 +1569,7 @@ JSFN(globalEscape) {
     std::string out;
     for (char16_t c : s) {
         char b[8];
-        if (c < 128 && (isalnum(c) || strchr("@*_+-./", (char)c))) out += (char)c;
+        if (c && c < 128 && (isalnum(c) || strchr("@*_+-./", (char)c))) out += (char)c;
         else if (c < 256) snprintf(b, sizeof b, "%%%02X", c), out += b;
         else snprintf(b, sizeof b, "%%u%04X", c), out += b;
     }
@@ -1629,10 +1832,12 @@ void Vm::setupGlobals() {
     def(math, "SQRT2", Value::dbl(1.4142135623730951), 0);
     def(math, "SQRT1_2", Value::dbl(0.7071067811865476), 0);
     defineOwn(math, PropKey::of(symToStringTag), strv("Math"), PF_C);
+    defFn(math, "sumPrecise", math_sumPrecise, 1);
 
     // Reflect
     JSObject* reflect = newObject();
     def(global, "Reflect", V(reflect));
+    defineOwn(reflect, PropKey::of(symToStringTag), strv("Reflect"), PF_C);
     defFn(reflect, "apply", reflectApply, 3);
     defFn(reflect, "construct", reflectConstruct, 2);
     defFn(reflect, "defineProperty", reflectDefineProperty, 3);

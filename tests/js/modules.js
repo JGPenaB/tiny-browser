@@ -96,9 +96,9 @@ function strictSet(o, k, v) { "use strict"; o[k] = v; }
     export const callOne = one(); export function readOne() { return late; }`);
   const C1 = await load("cy1.js"), C2 = await load("cy2.js");
   eq([C1.result, C1.tdz(), C2.early, C2.callOne], ["one+two", "late", "ReferenceError", "one"]);
-  mod("self.js", `import * as me from './self.js'; export const keys = Object.keys(me); export let ok; try { me.keys2; ok = 'no tdz'; } catch (e) { ok = e.constructor.name; } export const keys2 = 1;`);
+  mod("self.js", `import * as me from './self.js'; export let viaKeys; try { Object.keys(me); viaKeys = 'no tdz'; } catch (e) { viaKeys = e.constructor.name; } export const keys = Reflect.ownKeys(me).filter(k => typeof k === 'string'); export let ok; try { me.keys2; ok = 'no tdz'; } catch (e) { ok = e.constructor.name; } export const keys2 = 1;`);
   const S = await load("self.js");
-  eq([S.keys, S.ok], [["keys", "keys2", "ok"], "ReferenceError"]);
+  eq([S.keys, S.ok, S.viaKeys], [["keys", "keys2", "ok", "viaKeys"], "ReferenceError", "ReferenceError"]);
   mod("star1.js", `export * from './star2.js'; export const s1 = 1;`);
   mod("star2.js", `export * from './star1.js'; export const s2 = 2;`);
   eq(Object.keys(await load("star1.js")), ["s1", "s2"]);
