@@ -49,6 +49,8 @@ struct NetShared {
 struct ObserveTarget {
     Node* node;
     bool childList, attributes, characterData, subtree;
+    bool filtered = false;            // attributeFilter was given: only these attributes are reported
+    std::vector<std::string> filter;
 };
 struct Observer {  // a MutationObserver
     Value object, callback;
@@ -433,8 +435,9 @@ struct ScriptHost::Impl {
         for (auto& ob : observers) {
             bool hit = false;
             for (auto& t : ob->targets) {
-                bool wants = type[0] == 'c' && type[1] == 'h' ? t.childList : type[0] == 'a' ? t.attributes : t.characterData;
+                bool wants = !strcmp(type, "childList") ? t.childList : !strcmp(type, "attributes") ? t.attributes : t.characterData;
                 if (!wants) continue;
+                if (attrName && t.filtered && std::find(t.filter.begin(), t.filter.end(), *attrName) == t.filter.end()) continue;
                 if (t.node == target) hit = true;
                 else if (t.subtree && !target->isShadowRoot())
                     for (Node* a = target->parent; a && !hit; a = a->parent) {
@@ -2379,7 +2382,13 @@ JSFN(mutationObserve) {
     ObserveTarget t{n, false, false, false, false};
     if (o.isObject()) {
         t.childList = vm.toBool(vm.get(o, "childList"));
-        t.attributes = vm.toBool(vm.get(o, "attributes")) || !vm.get(o, "attributeFilter").isUndef() || vm.toBool(vm.get(o, "attributeOldValue"));
+        Value filter = vm.get(o, "attributeFilter");
+        t.attributes = vm.toBool(vm.get(o, "attributes")) || !filter.isUndef() || vm.toBool(vm.get(o, "attributeOldValue"));
+        if (filter.isObject()) {
+            t.filtered = true;
+            uint32_t count = vm.lengthOf(filter);
+            for (uint32_t i = 0; i < count; ++i) t.filter.push_back(str8(vm, vm.get(filter, PropKey::index(i))));
+        }
         t.characterData = vm.toBool(vm.get(o, "characterData")) || vm.toBool(vm.get(o, "characterDataOldValue"));
         t.subtree = vm.toBool(vm.get(o, "subtree"));
     }

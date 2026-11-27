@@ -196,6 +196,11 @@
   dsd.shadowRoot.appendChild(document.createElement('hr')); dsd.appendChild(document.createElement('hr'));
   Promise.resolve().then(function () { eq('observers do not see into shadow trees', watched.join(), 'dsd'); mo.disconnect(); });
 
+  var kinds = [], mo2 = new MutationObserver(function (records) { records.forEach(function (r) { kinds.push(r.type + ':' + (r.attributeName || r.target.nodeName)); }); });
+  var probe = document.createElement('div'), probeText = probe.appendChild(document.createTextNode('a'));
+  mo2.observe(probe, { subtree: true, childList: true, attributeFilter: ['title'] });
+  probeText.data = 'b'; probe.id = 'unwatched'; probe.title = 'watched'; probe.appendChild(document.createElement('hr'));
+  Promise.resolve().then(function () { eq('observers get only what they asked for', kinds.join(), 'attributes:title,childList:DIV'); mo2.disconnect(); });
   var textNode = document.createTextNode('t'), fragNode = document.createDocumentFragment();
   eq('only nodes with children have the ParentNode members', [typeof textNode.querySelectorAll, typeof textNode.children, typeof textNode.append, typeof textNode.remove, typeof textNode.nextElementSibling,
     typeof fragNode.querySelector, typeof fragNode.getElementById, typeof fragNode.getElementsByTagName, typeof document.body.getElementById, typeof document.body.append, typeof document.children].join(),
