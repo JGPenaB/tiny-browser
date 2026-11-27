@@ -1477,38 +1477,104 @@ static JSMap* thisMap(CallInfo& ci) {
     if (!ci.thisv.isObject() || ci.thisv.asObject()->cls != cls) ci.vm.throwError(Err::TypeError, "Method called on incompatible receiver");
     return (JSMap*)ci.thisv.asObject();
 }
+// CanBeHeldWeakly (9.14): objects, and symbols that are not in the global symbol registry
 static void weakCheck(Vm& vm, Cls cls, Value key) {
-    if ((cls == Cls::WeakMap || cls == Cls::WeakSet) && !key.isObject() && !key.isSymbol()) vm.throwError(Err::TypeError, "Invalid value used as weak collection key");
+    if (cls != Cls::WeakMap && cls != Cls::WeakSet) return;
+    bool ok = key.isObject();
+    if (key.isSymbol()) {
+        ok = true;
+        for (auto& kv : vm.symbolRegistry)
+            if (kv.second == key.asCell()) ok = false;
+    }
+    if (!ok) vm.throwError(Err::TypeError, "Invalid value used as weak collection key");
 }
+JSFN(mapSet);
+JSFN(setAdd);
+// Map, Set, WeakMap, WeakSet ( iterable ) (24.1.1.1 and friends): entries go in through the object's own set or add
+// method, and the iterator is closed when one of them cannot be added.
 JSFN(collectionCtor) {
     Vm& vm = ci.vm;
     Cls cls = (Cls)ci.callee->data.asInt();
-    if (!ci.isConstruct()) vm.throwError(Err::TypeError, "Constructor requires 'new'");
+    bool keyed = cls == Cls::Map || cls == Cls::WeakMap;
+    if (!ci.isConstruct()) vm.throwError(Err::TypeError, "Constructor %s requires 'new'", ci.callee->name ? utf16to8(ci.callee->name->s).c_str() : "");
     JSMap* m = vm.alloc<JSMap>();
     m->cls = cls;
     m->proto = vm.protoFromNewTarget(ci.newTarget, ci.callee->data2.asObject());
-    Value src = ci.arg(0);
-    if (!src.isNullish()) {
-        bool keyed = cls == Cls::Map || cls == Cls::WeakMap;
-        vm.iterate(src, [&](Value e) {
-            if (keyed) {
-                if (!e.isObject()) vm.throwError(Err::TypeError, "Iterator value %s is not an entry object", utf16to8(vm.inspect(e, 0)).c_str());
-                Value k = vm.get(e, PropKey::index(0));
-                weakCheck(vm, cls, k);
-                mapPut(m, k, vm.get(e, PropKey::index(1)));
-            } else {
+    Value src = ci.arg(0), self = V(m);
+    if (src.isNullish()) return self;
+    Value adder = vm.get(self, keyed ? "set" : "add");
+    if (!vm.isCallable(adder)) vm.throwError(Err::TypeError, "The %s method is not a function", keyed ? "set" : "add");
+    bool builtin = adder.asObject()->cls == Cls::Native && ((JSNative*)adder.asObject())->fn == (keyed ? mapSet : setAdd);
+    auto addOne = [&](Value e) {
+        if (!keyed) {
+            if (builtin) {
                 weakCheck(vm, cls, e);
                 mapPut(m, e, e);
-            }
-            return true;
-        });
+            } else
+                vm.call(adder, self, &e, 1);
+            return;
+        }
+        if (!e.isObject()) vm.throwError(Err::TypeError, "Iterator value %s is not an entry object", utf16to8(vm.inspect(e, 0)).c_str());
+        Value kv[2];
+        kv[0] = vm.get(e, PropKey::index(0));
+        kv[1] = vm.get(e, PropKey::index(1));
+        if (builtin) {
+            weakCheck(vm, cls, kv[0]);
+            mapPut(m, kv[0], kv[1]);
+        } else
+            vm.call(adder, self, kv, 2);
+    };
+    if (src.isObject() && src.asObject()->cls == Cls::Array && !(src.asObject()->oflags & OF_SLOWIDX) && vm.plainArrayIteration()) {
+        JSArray* arr = (JSArray*)src.asObject();
+        for (size_t i = 0; i < arr->elems.size(); ++i) {
+            Value e = arr->elems[i];
+            addOne(e.isEmpty() ? Value::undef() : e);
+        }
+        return self;
     }
-    return V(m);
+    Value method = vm.get(src, PropKey::of(vm.symIterator));
+    if (!vm.isCallable(method)) vm.throwError(Err::TypeError, "%s is not iterable", utf16to8(vm.inspect(src, 0)).c_str());
+    Value itv = vm.call(method, src, nullptr, 0);
+    if (!itv.isObject()) vm.throwError(Err::TypeError, "Result of the Symbol.iterator method is not an object");
+    Value next = vm.get(itv, vm.a.next);
+    for (;;) {
+        Value r = vm.call(next, itv, nullptr, 0);
+        if (!r.isObject()) vm.throwError(Err::TypeError, "Iterator result is not an object");
+        if (vm.toBool(vm.get(r, vm.a.done))) break;
+        Value e = vm.get(r, vm.a.value);
+        try {
+            addOne(e);
+        } catch (JSThrow&) {  // IteratorClose with a throw completion: the first error is the one reported
+            Value error = vm.pending;
+            vm.pending = Value::undef();
+            try {
+                Value ret = vm.get(itv, vm.a.return_);
+                if (!ret.isNullish()) vm.call(ret, itv, nullptr, 0);
+            } catch (JSThrow&) {
+                vm.pending = Value::undef();
+            }
+            vm.throwValue(error);
+        }
+    }
+    return self;
 }
 JSFN(mapGet) {
     JSMap* m = thisMap(ci);
     auto it = m->lookup.find(normKey(ci.arg(0)));
     return it == m->lookup.end() ? Value::undef() : m->entries[it->second].second;
+}
+JSFN(mapGetOrInsert) {  // Map and WeakMap getOrInsert and getOrInsertComputed (data2: 1 computed)
+    Vm& vm = ci.vm;
+    JSMap* m = thisMap(ci);
+    bool computed = ci.callee->data2.asInt() == 1;
+    Value key = normKey(ci.arg(0)), value = ci.arg(1);
+    if (computed && !vm.isCallable(value)) vm.throwError(Err::TypeError, "The callback is not a function");
+    weakCheck(vm, m->cls, key);
+    auto it = m->lookup.find(key);
+    if (it != m->lookup.end()) return m->entries[it->second].second;
+    if (computed) value = vm.call(value, Value::undef(), &key, 1);  // the callback may have changed the map
+    mapPut(m, key, value);
+    return value;
 }
 JSFN(mapSet) {
     JSMap* m = thisMap(ci);
@@ -1563,23 +1629,6 @@ JSFN(mapIterate) {
     return V(ci.vm.newIter(m->cls == Cls::Map ? Cls::MapIter : Cls::SetIter, ci.thisv, (uint8_t)ci.callee->data2.asInt()));
 }
 
-JSFN(weakRefCtor) {
-    Vm& vm = ci.vm;
-    if (!ci.isConstruct() || !ci.arg(0).isObject()) vm.throwError(Err::TypeError, "WeakRef: target must be an object");
-    JSObject* o = vm.newObject(vm.protoFromNewTarget(ci.newTarget, ci.callee->data2.asObject()));
-    o->add(PropKey::of(ci.callee->data.asCell()), ci.arg(0), 0);
-    return V(o);
-}
-JSFN(weakRefDeref) {
-    if (!ci.thisv.isObject()) return Value::undef();
-    Prop* p = ci.thisv.asObject()->find(PropKey::of(ci.callee->data.asCell()));
-    return p ? p->val : Value::undef();
-}
-JSFN(finalizationRegistryCtor) {
-    return V(ci.vm.newObject(ci.vm.protoFromNewTarget(ci.newTarget, ci.callee->data2.asObject())));
-}
-JSFN(noop) { return Value::undef(); }
-
 void Vm::setupCollections() {
     Vm& vm = *this;
     // iterator prototypes
@@ -1624,6 +1673,8 @@ void Vm::setupCollections() {
         if (keyed) {
             method("get", mapGet, 1);
             method("set", mapSet, 2);
+            method("getOrInsert", mapGetOrInsert, 2)->data2 = Value::i32(0);
+            method("getOrInsertComputed", mapGetOrInsert, 2)->data2 = Value::i32(1);
         } else
             method("add", setAdd, 1);
         method("has", mapHas, 1);
@@ -1632,32 +1683,20 @@ void Vm::setupCollections() {
         if (weak) continue;
         method("clear", mapClear, 0);
         method("forEach", mapForEach, 1);
-        JSNative* size = newNative(mapSize, "size", 0);
+        defineAccessor(c, PropKey::of(symSpecies), V(newNative(promiseSpecies, "get [Symbol.species]", 0)), Value::undef(), PF_C);
+        JSNative* size = newNative(mapSize, "get size", 0);
         size->data = tag;
         defineAccessor(proto, PropKey::of(atom("size")), V(size), Value::undef(), PF_C);
         JSNative* entries = method("entries", mapIterate, 0);
         entries->data2 = Value::i32(2);
         JSNative* values = method("values", mapIterate, 0);
         values->data2 = Value::i32(0);
-        JSNative* keys = method("keys", mapIterate, 0);
-        keys->data2 = Value::i32(keyed ? 1 : 0);
+        if (keyed) method("keys", mapIterate, 0)->data2 = Value::i32(1);
+        else def(proto, "keys", V(values));  // Set.prototype.keys is the values function itself
         defineOwn(proto, PropKey::of(symIterator), V(keyed ? entries : values), PF_W | PF_C);
     }
 
-    // WeakRef and FinalizationRegistry keep their targets alive for now (no weak semantics yet)
-    {
-        Symbol* slot = newSymbol(str("WeakRefTarget"));
-        JSObject* proto = newObject();
-        JSNative* c = makeCtor(vm, "WeakRef", weakRefCtor, 1, proto);
-        c->data = V(slot);
-        c->data2 = V(proto);
-        defFn(proto, "deref", weakRefDeref, 0)->data = V(slot);
-        JSObject* frProto = newObject();
-        JSNative* fr = makeCtor(vm, "FinalizationRegistry", finalizationRegistryCtor, 1, frProto);
-        fr->data2 = V(frProto);
-        defFn(frProto, "register", noop, 2);
-        defFn(frProto, "unregister", noop, 1);
-    }
+    // WeakRef and FinalizationRegistry are written in JavaScript (builtins_js.h).
 }
 
 }  // namespace tb::js

@@ -719,6 +719,269 @@ install(RegExp, {
 install(Error, { isError(arg) { return natives.isError(arg); } });
 )JS"
 R"JS(
+// ---- Explicit resource management: SuppressedError, DisposableStack, AsyncDisposableStack
+var symDispose = $Symbol.dispose, symAsyncDispose = $Symbol.asyncDispose, $Error = Error, construct = Reflect.construct;
+var sameValue = $Object.is;
+function hidden(target, key, value) { defineProperty(target, key, { value: value, writable: true, enumerable: false, configurable: true }); }
+function fixedPrototype(ctor, proto) {
+  defineProperty(ctor, 'prototype', { value: proto, writable: false, enumerable: false, configurable: false });
+  hidden(proto, 'constructor', ctor);
+}
+function protoFor(newTarget, fallback) {  // GetPrototypeFromConstructor
+  var proto = newTarget.prototype;
+  return isObject(proto) ? proto : fallback;
+}
+var SuppressedError = function SuppressedError(error, suppressed, message) {
+  var proto = new.target === undefined ? SuppressedErrorProto : protoFor(new.target, SuppressedErrorProto);
+  var O = construct($Error, [], SuppressedError);
+  if (proto !== SuppressedErrorProto) $Object.setPrototypeOf(O, proto);
+  if (message !== undefined) hidden(O, 'message', natives.toString(message));
+  hidden(O, 'error', error);
+  hidden(O, 'suppressed', suppressed);
+  return O;
+};
+$Object.setPrototypeOf(SuppressedError, $Error);
+var SuppressedErrorProto = create($Error.prototype);
+fixedPrototype(SuppressedError, SuppressedErrorProto);
+hidden(SuppressedErrorProto, 'message', '');
+hidden(SuppressedErrorProto, 'name', 'SuppressedError');
+hidden(globalThis, 'SuppressedError', SuppressedError);
+
+function getMethod(V, key) {
+  var m = V[key];
+  if (m === undefined || m === null) return undefined;
+  if (typeof m !== 'function') throw new $TypeError('The dispose method is not a function');
+  return m;
+}
+// CreateDisposableResource: { value, method, async, fallback }; fallback: a sync dispose method used by an async stack
+function createResource(V, async) {
+  if (V === undefined || V === null) return { value: undefined, method: undefined, async: async, fallback: false };
+  if (!isObject(V)) throw new $TypeError('Only an object, null or undefined can be used as a resource');
+  var method, fallback = false;
+  if (async) {
+    method = getMethod(V, symAsyncDispose);
+    if (method === undefined) {
+      method = getMethod(V, symDispose);
+      fallback = true;
+    }
+  } else {
+    method = getMethod(V, symDispose);
+  }
+  if (method === undefined) throw new $TypeError('The resource has no dispose method');
+  return { value: V, method: method, async: async, fallback: fallback };
+}
+function suppress(completion, error) {  // a later failure wraps the earlier one
+  if (!completion.threw) return { threw: true, value: error };
+  var wrapped = construct($Error, [], SuppressedError);
+  hidden(wrapped, 'error', error);
+  hidden(wrapped, 'suppressed', completion.value);
+  return { threw: true, value: wrapped };
+}
+function disposeResources(list, completion) {  // DisposeResources for sync resources only
+  for (var i = list.length - 1; i >= 0; i--) {
+    var r = list[i];
+    try { apply(r.method, r.value, []); } catch (e) { completion = suppress(completion, e); }
+  }
+  return completion;
+}
+function makeStack(async) {
+  var states = new $WeakMap(), name = async ? 'AsyncDisposableStack' : 'DisposableStack';
+  function state(stack) {
+    var s = isObject(stack) ? wmGet(states, stack) : undefined;
+    if (s === undefined) throw new $TypeError('The receiver is not ' + (async ? 'an ' : 'a ') + name);
+    return s;
+  }
+  function open(stack) {
+    var s = state(stack);
+    if (s.disposed) throw new ReferenceError('The ' + name + ' has already been disposed');
+    return s;
+  }
+  var proto = {}, Stack;
+  if (async) {
+    Stack = function AsyncDisposableStack() {
+      if (new.target === undefined) throw new $TypeError("Constructor AsyncDisposableStack requires 'new'");
+      var stack = create(protoFor(new.target, proto));
+      wmSet(states, stack, { disposed: false, list: [] });
+      return stack;
+    };
+  } else {
+    Stack = function DisposableStack() {
+      if (new.target === undefined) throw new $TypeError("Constructor DisposableStack requires 'new'");
+      var stack = create(protoFor(new.target, proto));
+      wmSet(states, stack, { disposed: false, list: [] });
+      return stack;
+    };
+  }
+  fixedPrototype(Stack, proto);
+  install(proto, {
+    adopt(value, onDispose) {
+      var s = open(this);
+      if (typeof onDispose !== 'function') throw new $TypeError('The second argument must be a function');
+      data(s.list, s.list.length, { value: undefined, method: () => onDispose(value), async: async, fallback: false });
+      return value;
+    },
+    defer(onDispose) {
+      var s = open(this);
+      if (typeof onDispose !== 'function') throw new $TypeError('The argument must be a function');
+      data(s.list, s.list.length, { value: undefined, method: onDispose, async: async, fallback: false });
+    },
+    get disposed() { return state(this).disposed; },
+    move() {
+      var s = open(this), moved = create(proto);
+      wmSet(states, moved, { disposed: false, list: s.list });
+      s.list = [];
+      s.disposed = true;
+      return moved;
+    },
+    use(value) {
+      var s = open(this);
+      if (!async && (value === undefined || value === null)) return value;
+      data(s.list, s.list.length, createResource(value, async));
+      return value;
+    }
+  });
+  if (async) {
+    var run = async function (stack) {  // DisposeResources, with its awaits; settles in the turn the last step finishes
+      var s = state(stack);
+      if (s.disposed) return undefined;
+      s.disposed = true;
+      var list = s.list, completion = { threw: false, value: undefined }, needsAwait = false, hasAwaited = false;
+      s.list = [];
+      for (var i = list.length - 1; i >= 0; i--) {
+        var r = list[i];
+        if (r.method === undefined) {
+          needsAwait = true;
+          continue;
+        }
+        try {
+          if (r.fallback) {  // a sync dispose method: its result is not awaited, and a failure arrives a turn later
+            var failed = false, failure;
+            try { apply(r.method, r.value, []); } catch (e) { failed = true; failure = e; }
+            hasAwaited = true;
+            await undefined;
+            if (failed) throw failure;
+          } else {
+            var result = apply(r.method, r.value, []);
+            hasAwaited = true;
+            await result;
+          }
+        } catch (e) {
+          completion = suppress(completion, e);
+        }
+      }
+      if (needsAwait && !hasAwaited) await undefined;
+      if (completion.threw) throw completion.value;
+      return undefined;
+    };
+    install(proto, { disposeAsync() { return run(this); } });
+    hidden(proto, symAsyncDispose, proto.disposeAsync);
+  } else {
+    install(proto, {
+      dispose() {
+        var s = state(this);
+        if (s.disposed) return undefined;
+        s.disposed = true;
+        var list = s.list;
+        s.list = [];
+        var completion = disposeResources(list, { threw: false, value: undefined });
+        if (completion.threw) throw completion.value;
+        return undefined;
+      }
+    });
+    hidden(proto, symDispose, proto.dispose);
+  }
+  defineProperty(proto, symToStringTag, { value: name, writable: false, enumerable: false, configurable: true });
+  hidden(globalThis, name, Stack);
+}
+makeStack(false);
+makeStack(true);
+install(IteratorProto, {
+  [symDispose]() {
+    var ret = getMethod(this, 'return');
+    if (ret !== undefined) apply(ret, this, []);
+  }
+});
+install(getPrototypeOf(getPrototypeOf((async function* () {}).prototype)), {
+  [symAsyncDispose]() {
+    var O = this, cap = natives.newPromiseCapability($Promise);
+    try {
+      var ret = getMethod(O, 'return');
+      if (ret === undefined) {
+        (0, cap.resolve)(undefined);
+      } else {
+        var wrapper = natives.promiseResolve($Promise, apply(ret, O, []));
+        natives.promiseThen(wrapper, (0, (value) => undefined), undefined, cap.resolve, cap.reject);
+      }
+    } catch (e) {
+      (0, cap.reject)(e);
+    }
+    return cap.promise;
+  }
+});
+)JS"
+R"JS(
+// ---- WeakRef and FinalizationRegistry (26.1, 26.2). Targets are held strongly for now, which the spec allows:
+// an implementation never has to collect anything, so cleanup callbacks simply never run.
+var keyFor = $Symbol.keyFor;
+function canBeHeldWeakly(v) { return isObject(v) || (typeof v === 'symbol' && keyFor(v) === undefined); }
+var weakRefTargets = new $WeakMap(), registries = new $WeakMap();
+var WeakRefProto = {}, RegistryProto = {};
+var WeakRef = function WeakRef(target) {
+  if (new.target === undefined) throw new $TypeError("Constructor WeakRef requires 'new'");
+  if (!canBeHeldWeakly(target)) throw new $TypeError('WeakRef: the target must be an object or a non-registered symbol');
+  var ref = create(protoFor(new.target, WeakRefProto));
+  wmSet(weakRefTargets, ref, { target: target });
+  return ref;
+};
+fixedPrototype(WeakRef, WeakRefProto);
+install(WeakRefProto, {
+  deref() {
+    var s = isObject(this) ? wmGet(weakRefTargets, this) : undefined;
+    if (s === undefined) throw new $TypeError('The receiver is not a WeakRef');
+    return s.target;
+  }
+});
+defineProperty(WeakRefProto, symToStringTag, { value: 'WeakRef', writable: false, enumerable: false, configurable: true });
+hidden(globalThis, 'WeakRef', WeakRef);
+var FinalizationRegistry = function FinalizationRegistry(cleanupCallback) {
+  if (new.target === undefined) throw new $TypeError("Constructor FinalizationRegistry requires 'new'");
+  if (typeof cleanupCallback !== 'function') throw new $TypeError('The cleanup callback must be a function');
+  var registry = create(protoFor(new.target, RegistryProto));
+  wmSet(registries, registry, { cells: [] });
+  return registry;
+};
+fixedPrototype(FinalizationRegistry, RegistryProto);
+function registryState(registry) {
+  var s = isObject(registry) ? wmGet(registries, registry) : undefined;
+  if (s === undefined) throw new $TypeError('The receiver is not a FinalizationRegistry');
+  return s;
+}
+install(RegistryProto, {
+  register(target, heldValue) {
+    var s = registryState(this), unregisterToken = arguments[2];
+    if (!canBeHeldWeakly(target)) throw new $TypeError('The target must be an object or a non-registered symbol');
+    if (sameValue(target, heldValue)) throw new $TypeError('The held value must not be the target');
+    if (!canBeHeldWeakly(unregisterToken)) {
+      if (unregisterToken !== undefined) throw new $TypeError('The unregister token must be an object or a non-registered symbol');
+    } else {
+      data(s.cells, s.cells.length, unregisterToken);
+    }
+  },
+  unregister(unregisterToken) {
+    var s = registryState(this);
+    if (!canBeHeldWeakly(unregisterToken)) throw new $TypeError('The unregister token must be an object or a non-registered symbol');
+    var kept = [], removed = false;
+    for (var i = 0; i < s.cells.length; i++) {
+      if (s.cells[i] === unregisterToken) removed = true;
+      else data(kept, kept.length, s.cells[i]);
+    }
+    s.cells = kept;
+    return removed;
+  }
+});
+defineProperty(RegistryProto, symToStringTag, { value: 'FinalizationRegistry', writable: false, enumerable: false, configurable: true });
+hidden(globalThis, 'FinalizationRegistry', FinalizationRegistry);
+
 // ---- String.prototype: the HTML methods of Annex B (B.2.2)
 function createHTML(string, tag, attribute, value) {
   if (string === undefined || string === null) throw new $TypeError('String.prototype method called on null or undefined');
@@ -748,7 +1011,7 @@ install($String.prototype, {
 
 // ---- RegExp.prototype: the methods behind String's match, matchAll, replace, search and split (22.2.6)
 var $RegExp = RegExp, RegExpProto = $RegExp.prototype, builtinExec = natives.regexpBuiltinExec, toStr = natives.toString,
-    toInt = natives.toInteger, toLength = natives.toLength, sameValue = $Object.is, strIndexOf = uncurry($String.prototype.indexOf);
+    toInt = natives.toInteger, toLength = natives.toLength, strIndexOf = uncurry($String.prototype.indexOf);
 var symMatch = $Symbol.match, symMatchAll = $Symbol.matchAll, symReplace = $Symbol.replace, symSearch = $Symbol.search, symSplit = $Symbol.split;
 function regExpExec(R, S) {  // RegExpExec (22.2.7.1)
   var exec = R.exec;

@@ -1497,7 +1497,8 @@ void Vm::setupGlobals() {
     defFn(symbolProto, "toString", symbolToString, 0);
     defFn(symbolProto, "valueOf", symbolValueOf, 0);
     defGetter(symbolProto, "description", symbolDescription);
-    defSym(vm, symbolProto, symToPrimitive, symbolValueOf, "[Symbol.toPrimitive]", 1);
+    defineOwn(symbolProto, PropKey::of(symToPrimitive), V(newNative(symbolValueOf, "[Symbol.toPrimitive]", 1)), PF_C);
+    defineOwn(symbolProto, PropKey::of(symToStringTag), strv("Symbol"), PF_C);
 
     // Boolean
     makeCtor(vm, "Boolean", booleanCtor, 1, booleanProto);

@@ -24,6 +24,10 @@ JSFN(toLength) {
 JSFN(toStringNative) { return V(ci.vm.toString(ci.arg(0))); }
 JSFN(toIntegerNative) { return Value::num(ci.vm.toInteger(ci.arg(0)) + 0.0); }
 JSFN(regexpExecNative) { return regexpBuiltinExec(ci.vm, ci.arg(0), ci.vm.toString(ci.arg(1))); }
+JSFN(promiseThenNative) {  // PerformPromiseThen(promise, onFulfilled, onRejected, capability's resolve and reject)
+    ci.vm.promiseThenWith((JSPromise*)ci.arg(0).asObject(), ci.arg(1), ci.arg(2), ci.arg(3), ci.arg(4));
+    return Value::undef();
+}
 JSFN(isPromise) { return Value::boolean(ci.arg(0).isObject() && ci.arg(0).asObject()->cls == Cls::Promise); }
 JSFN(newPromiseCapability) {
     Vm& vm = ci.vm;
@@ -64,6 +68,7 @@ void setupJsBuiltins(Vm& vm) {
     vm.defFn(natives, "toInteger", toIntegerNative, 1);
     vm.defFn(natives, "regexpBuiltinExec", regexpExecNative, 2);
     vm.defFn(natives, "isPromise", isPromise, 1);
+    vm.defFn(natives, "promiseThen", promiseThenNative, 5);
     vm.defFn(natives, "newPromiseCapability", newPromiseCapability, 1);
     vm.defFn(natives, "promiseResolve", promiseResolve, 2);
     vm.defFn(natives, "speciesConstructor", speciesConstructor, 2);

@@ -1366,6 +1366,10 @@ bool Vm::del(JSObject* o, PropKey k) {
     }
     if (!(p->flags & PF_C) || (o->oflags & OF_FROZEN)) return false;
     o->remove(k);
+    if ((o->cls == Cls::Function || o->cls == Cls::Native) && !k.isIndex() && !k.isSymbol()) {  // the built-in one must not come back
+        if (k.cell() == a.name) o->oflags |= OF_NO_NAME;
+        if (k.cell() == a.length) o->oflags |= OF_NO_LENGTH;
+    }
     return true;
 }
 
