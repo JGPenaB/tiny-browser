@@ -63,9 +63,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    `::before`/`::after`, `:hover`, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
-   engine, ES modules (`import`, `export`, `import()`, top-level await, cycles), devtools Console. Missing behavior is filled
-   in from the ECMAScript specification (ECMA-262). Still open: `for await` and async generators, strict-mode errors on
-   failed assignments, direct `eval` with local scope, class static blocks, Proxy, BigInt, Intl, a test262 run.
+   engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
+   devtools Console. Behavior follows the ECMAScript specification (ECMA-262) and is checked against the test262
+   conformance suite: see "Conformance" below. Still open: Temporal, `using` declarations, Intl.
 4. **Milestone 4 - DOM + Web APIs (in progress; required by Google results, YouTube and Reddit):** done so far: DOM
    bindings and events, classic and module scripts (import maps, `defer`, `nomodule`), timers + event loop, `fetch`/XHR with
    CORS, storage, cookies, MutationObserver. Still open: custom elements and shadow DOM (Reddit), styles and images added
@@ -75,6 +75,27 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 5. **Milestone 5 - performance, security, graphics:** GPU layer compositor, off-thread layout, HTTP cache, process isolation,
    CSP and sandboxed frames, media playback, WebGL (own GLSL-to-HLSL translator), 3D page view (page layers as a movable
    parallax), save as PDF.
+
+## Conformance
+
+`python tests/run_test262.py [path filter ...] [--jobs N] [--save name]` runs the ECMAScript conformance suite (test262,
+cloned into the git-ignored `third_party/test262`; the script's header has the command) and writes the failures to
+`out/test262-<name>.txt`. Ninth full run, 2026-11-27: 43,208 of 48,803 tests pass (88.5%). Without the 4,616 Temporal
+tests, which is the one large piece of the language not written yet, that is 97.8%.
+
+What the engine covers: the whole core language with its early errors (classes with private members and static
+blocks, generators and async generators, destructuring, modules, direct and indirect `eval`, `with`, Annex B),
+Proxy and Reflect, BigInt, typed arrays with resizable and shared buffers, Atomics, RegExp (named groups, lookbehind,
+Unicode properties, the `v` flag with set operations), Promise combinators, iterator helpers (including `concat`, `zip`,
+`chunks`, `windows`), Set methods, `Array.fromAsync`, `Error.prototype.stack`, `JSON.rawJSON`, `Math.sumPrecise`,
+DisposableStack, mapped `arguments` objects.
+
+What still fails, largest first: Temporal (4,616), `import defer` and source-phase imports (about 250, both proposals),
+`using` and `await using` declarations (about 120), Atomics tests that need worker agents (112), tests that need a
+second realm (about 190) or ShadowRealm (64), proper tail calls (35), decorators (20), emoji sequence properties in
+regular expressions (13), lookbehind capture order (6).
+
+## Engine speed
 
 JavaScript engine speed, after the spec-compliance work and without a JIT: hidden classes (shapes) with inline caches,
 lazy function parsing plus an on-disk bytecode cache, computed-goto style dispatch. Values are already NaN-boxed. Later
