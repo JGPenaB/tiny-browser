@@ -87,6 +87,26 @@ static Value readFileFn(CallInfo& ci) {  // __readFile(path): the text of a file
     if (!readFile(std::wstring(wide.begin(), wide.end()), bytes)) ci.vm.throwError(Err::TypeError, "Cannot read %s", utf16to8(wide).c_str());
     return ci.vm.strv(utf8to16(bytes));
 }
+static Value createRealmFn(CallInfo& ci);
+// What the shell adds to the global object of the running realm.
+static void defineShellGlobals(Vm& vm) {
+    vm.defFn(vm.global, "setTimeout", setTimeoutFn, 2);
+    vm.defFn(vm.global, "setInterval", setIntervalFn, 2);
+    vm.defFn(vm.global, "clearTimeout", clearTimerFn, 1);
+    vm.defFn(vm.global, "clearInterval", clearTimerFn, 1);
+    vm.def(vm.global, "print", vm.get(vm.get(V(vm.global), "console"), "log"));
+    vm.defFn(vm.global, "__readFile", readFileFn, 1);
+    vm.defFn(vm.global, "__canBlock", canBlockFn, 1);
+    vm.defFn(vm.global, "__evalScript", evalScriptFn, 1);
+    vm.defFn(vm.global, "__htmldda", htmlDdaFn, 0);
+    vm.defFn(vm.global, "__createRealm", createRealmFn, 0);
+}
+static Value createRealmFn(CallInfo& ci) {  // __createRealm(): the global object of a new realm, as test262's $262.createRealm needs
+    Vm& vm = ci.vm;
+    RealmScope scope(vm, vm.createRealm());
+    defineShellGlobals(vm);
+    return V(vm.global);
+}
 
 // Runs one script in a fresh engine, with its timers, writing console output to `out`. limitMs > 0 stops a
 // script that runs too long. Returns true when it failed with an uncaught error.
@@ -102,15 +122,7 @@ static bool runOne(const std::string& bytes, const std::string& name, HANDLE out
         if (level == 3 && text.rfind(u"Uncaught", 0) == 0 && text.rfind(u"Uncaught (in promise)", 0) != 0) r.failed = true;
         r.write(text);
     };
-    vm.defFn(vm.global, "setTimeout", setTimeoutFn, 2);
-    vm.defFn(vm.global, "setInterval", setIntervalFn, 2);
-    vm.defFn(vm.global, "clearTimeout", clearTimerFn, 1);
-    vm.defFn(vm.global, "clearInterval", clearTimerFn, 1);
-    vm.def(vm.global, "print", vm.get(vm.get(V(vm.global), "console"), "log"));
-    vm.defFn(vm.global, "__readFile", readFileFn, 1);
-    vm.defFn(vm.global, "__canBlock", canBlockFn, 1);
-    vm.defFn(vm.global, "__evalScript", evalScriptFn, 1);
-    vm.defFn(vm.global, "__htmldda", htmlDdaFn, 0);
+    defineShellGlobals(vm);
     double started = tick();
     if (limitMs > 0) vm.deadlineTick = GetTickCount64() + (ULONGLONG)limitMs;
     vm.canBlock = true;

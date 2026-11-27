@@ -41,6 +41,16 @@ JSFN(newPromiseCapability) {
 }
 JSFN(promiseResolve) { return ci.vm.promiseResolveWith(ci.arg(0), ci.arg(1)); }
 JSFN(speciesConstructor) { return ci.vm.speciesConstructor(ci.arg(0).asObject(), ci.arg(1)); }
+JSFN(iteratorCtor) {  // 27.1.3.1.1 Iterator(): only a subclass may be constructed
+    Vm& vm = ci.vm;
+    if (!ci.isConstruct() || ci.newTarget == V(ci.callee)) vm.throwError(Err::TypeError, "Iterator is an abstract class and cannot be constructed directly");
+    return V(vm.newObject(vm.protoFromNewTarget(ci.newTarget, vm.iteratorProto)));
+}
+JSFN(protoFor) { return V(ci.vm.protoFromNewTarget(ci.arg(0), ci.arg(1).asObject())); }  // GetPrototypeFromConstructor (10.1.14)
+JSFN(intrinsicProto) {  // a prototype made in JavaScript joins the realm's list of them
+    ci.vm.intrinsicProtos.push_back(ci.arg(0).asObject());
+    return Value::undef();
+}
 JSFN(arrayCreate) {
     Vm& vm = ci.vm;
     double n = vm.toNumber(ci.arg(0));
@@ -74,6 +84,10 @@ void setupJsBuiltins(Vm& vm) {
     vm.defFn(natives, "newPromiseCapability", newPromiseCapability, 1);
     vm.defFn(natives, "promiseResolve", promiseResolve, 2);
     vm.defFn(natives, "speciesConstructor", speciesConstructor, 2);
+    vm.defFn(natives, "protoFor", protoFor, 2);
+    vm.defFn(natives, "Iterator", iteratorCtor, 0)->oflags |= OF_CTOR;
+    vm.intrinsicProtos.push_back(vm.iteratorProto);
+    vm.defFn(natives, "intrinsicProto", intrinsicProto, 1);
     auto src = std::make_shared<const std::u16string>(utf8to16(kBuiltinsJs));
     FuncProto* p = compileScript(vm, src, kBuiltinFile, false, nullptr);
     JSFunction* outer = vm.makeClosure(p, nullptr, nullptr);

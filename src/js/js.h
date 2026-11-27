@@ -102,6 +102,7 @@ struct Cell {
     uint8_t mark = 0;
     Cls cls = Cls::Object;
     uint8_t oflags = 0;
+    uint16_t realm = 0;  // of a function or a RegExp: the realm it was made in, its [[Realm]]. Kept here because the space is free.
 };
 
 // A string is either flat (text in `s`) or a rope: the lazy concatenation of two other strings, which is what
@@ -293,6 +294,9 @@ struct FuncProto : Cell {
     std::shared_ptr<const std::u16string> source;
     uint32_t srcStart = 0, srcEnd = 0;
     std::string file;
+    // Made from a string by eval or Function(): `file` is then that of the code that asked for it, which is what an
+    // import() inside resolves against (9.4.1 GetActiveScriptOrModule). Stack traces show such code as "<eval>".
+    bool isDynamic = false;
     FuncProto() { kind = CK::Code; }
     void trace(Gc&) override;
 };
@@ -523,6 +527,7 @@ struct Frame {
     uint16_t ctxDepth;
     bool entry;      // entered from C++: runFrames() returns when this frame finishes
     bool construct;
+    uint16_t callerRealm;  // of a constructor's frame: the realm that was running when it was called
 };
 
 struct Job {
@@ -537,7 +542,48 @@ struct Atoms {
         *raw, *toJSON, *join, *source, *flags, *global, *status, *reason;
 };
 
-class Vm {
+// What one realm owns (ECMA-262 9.3): its global object and its intrinsics. Vm derives from this, so the engine
+// reads them as plain members (vm.objectProto): they are always those of the realm that is running. The fields
+// of the other realms wait in Vm::realms, and Vm::enterRealm exchanges them.
+struct RealmFields {
+    JSObject* global = nullptr;
+    JSObject *objectProto = nullptr, *functionProto = nullptr, *arrayProto = nullptr, *stringProto = nullptr, *numberProto = nullptr,
+             *booleanProto = nullptr, *symbolProto = nullptr, *bigintProto = nullptr, *errorProto = nullptr, *iteratorProto = nullptr, *arrayIterProto = nullptr,
+             *mapProto = nullptr, *setProto = nullptr, *weakMapProto = nullptr, *weakSetProto = nullptr, *promiseProto = nullptr,
+             *generatorProto = nullptr, *dateProto = nullptr, *regexpProto = nullptr, *mapIterProto = nullptr, *setIterProto = nullptr,
+             *stringIterProto = nullptr, *globalLex = nullptr;
+    JSObject* errorProtos[7] = {};
+    JSObject* typedProtos[12] = {};
+    Value typedCtors[12];
+    JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr, *sharedBufferProto = nullptr;
+    Value arrayBufferCtor, sharedBufferCtor;
+    JSObject *asyncIteratorProto = nullptr, *asyncGeneratorProto = nullptr, *asyncFromSyncProto = nullptr;
+    // %GeneratorFunction.prototype%, %AsyncGeneratorFunction.prototype%, %AsyncFunction.prototype% (27.3.3, 27.4.3, 27.7.3)
+    JSObject *generatorFunctionProto = nullptr, *asyncGeneratorFunctionProto = nullptr, *asyncFunctionProto = nullptr;
+    Value throwTypeError;  // %ThrowTypeError% (10.2.4.1): behind Function.prototype.caller and a strict arguments.callee
+    Value arrayCtorValue, arraySpeciesGetter;  // the built-in Array and the getter of Array[Symbol.species]
+    Value arrayValuesFn, arrayIterNextFn;  // the original Array.prototype.values and array iterator next
+    Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
+    Value importHook;  // called for import(): (specifier, options, file of the calling code)
+    struct PropWatch {  // one property of RegExp.prototype as the engine made it (regexp.cpp)
+        PropKey key;
+        uint64_t value;
+        uint8_t flags;
+    };
+    std::vector<PropWatch> regexpWatch;
+    // The legacy static properties of RegExp ($1, lastMatch, ...): the subject and offsets of the last match, or
+    // not valid after a match by a RegExp subclass.
+    Value regexpLastInput;
+    std::vector<int> regexpLastCaps;
+    bool regexpLegacyValid = true;
+    Value regexpCtor, promiseCtor;
+    Value suppressedErrorCtor;  // %SuppressedError%, for the errors `using` declarations collect
+    // The prototypes built-in constructors fall back to (10.1.14 GetPrototypeFromConstructor). Every realm lists
+    // them in the same order, which is how the one that stands for another realm's is found.
+    std::vector<JSObject*> intrinsicProtos;
+};
+
+class Vm : public RealmFields {
 public:
     Vm();
     ~Vm();
@@ -549,8 +595,15 @@ public:
     std::u16string describeError(Value err);
     std::u16string inspect(Value v, int depth = 2, bool quoteStrings = true);
     std::function<void(int level, const std::u16string& text)> onConsole;  // level: 0 log, 1 info, 2 warn, 3 error
-    JSObject* global = nullptr;
     Value pending;  // the value being thrown
+
+    // ---- realms: the engine starts with realm 0, and a function always runs in the realm it was made in
+    std::vector<std::unique_ptr<RealmFields>> realms;  // realms[i]: the fields of realm i while it is not the running one
+    uint16_t currentRealm = 0;
+    uint16_t createRealm();          // a new global object with its own intrinsics (9.3.1); returns the realm's number
+    void enterRealm(uint16_t id);    // makes realm `id` the running one
+    RealmFields& fieldsOf(uint16_t id) { return id == currentRealm ? *this : *realms[id]; }
+    uint16_t functionRealm(JSObject* fn);  // GetFunctionRealm (7.3.24)
 
     // ---- allocation
     Gc gc{*this};
@@ -648,11 +701,10 @@ public:
     Value fromPropDesc(const PropDesc& d);
     bool setIntegrity(JSObject* o, bool frozen);
     bool testIntegrity(JSObject* o, bool frozen);
-    bool protoIndexProps = false;  // Array.prototype or Object.prototype has gained an index-named property
+    bool protoIndexProps = false;  // some realm's Array.prototype or Object.prototype has gained an index-named property
     void pinArgumentsLength(JSObject* o);
     static constexpr uint8_t kModuleHostKind = 200;  // JSHost::hostKind of a module namespace object
     static bool isHtmlDda(Value v) { return v.isObject() && v.asObject()->cls == Cls::Native && ((JSNative*)v.asObject())->htmlDda; }
-    Value suppressedErrorCtor;  // %SuppressedError%, for the errors `using` declarations collect
     Value* mappedArg(JSObject* o, PropKey k);  // the parameter an arguments element is still tied to, or null
     void unmapArg(JSObject* o, PropKey k);
     void set(Value target, const char* name, Value v) { set(target, PropKey::of(atom(name)), v); }
@@ -680,7 +732,9 @@ public:
     Value call(Value fn, Value thisv, Value a0) { return call(fn, thisv, &a0, 1); }
     Value invoke(Value target, const char* method, const Value* args = nullptr, int argc = 0);
     // kind: 0 function, 1 generator, 2 async function, 3 async generator
-    Value compileFunction(const std::u16string& params, const std::u16string& body, const std::string& file, int kind = 0, Value newTarget = Value::undef());
+    Value compileFunction(const std::u16string& params, const std::u16string& body, const std::string& file, int kind = 0, Value newTarget = Value::undef(),
+                          bool dynamic = false);
+    std::string activeFile(const char* otherwise) const;  // the file of the script that is running, or `otherwise`
 
     // ---- iteration helpers for natives
     bool iterate(Value iterable, const std::function<bool(Value)>& each);  // false from the callback stops early
@@ -712,16 +766,6 @@ public:
 
     // ---- well-known objects
     Atoms a;
-    JSObject *objectProto = nullptr, *functionProto = nullptr, *arrayProto = nullptr, *stringProto = nullptr, *numberProto = nullptr,
-             *booleanProto = nullptr, *symbolProto = nullptr, *bigintProto = nullptr, *errorProto = nullptr, *iteratorProto = nullptr, *arrayIterProto = nullptr,
-             *mapProto = nullptr, *setProto = nullptr, *weakMapProto = nullptr, *weakSetProto = nullptr, *promiseProto = nullptr,
-             *generatorProto = nullptr, *dateProto = nullptr, *regexpProto = nullptr, *mapIterProto = nullptr, *setIterProto = nullptr,
-             *stringIterProto = nullptr, *globalLex = nullptr;
-    JSObject* errorProtos[7] = {};
-    JSObject* typedProtos[12] = {};
-    Value typedCtors[12];
-    JSObject *arrayBufferProto = nullptr, *dataViewProto = nullptr, *sharedBufferProto = nullptr;
-    Value arrayBufferCtor, sharedBufferCtor;
     bool canBlock = false;  // may Atomics.wait put this thread to sleep?
     struct AsyncWaiter {  // an Atomics.waitAsync call that has not been answered yet
         JSArrayBuffer* buffer;
@@ -731,34 +775,15 @@ public:
     };
     std::vector<AsyncWaiter> asyncWaiters;
     uint32_t nextWaiterId = 1;
-    JSObject *asyncIteratorProto = nullptr, *asyncGeneratorProto = nullptr, *asyncFromSyncProto = nullptr;
-    // %GeneratorFunction.prototype%, %AsyncGeneratorFunction.prototype%, %AsyncFunction.prototype% (27.3.3, 27.4.3, 27.7.3)
-    JSObject *generatorFunctionProto = nullptr, *asyncGeneratorFunctionProto = nullptr, *asyncFunctionProto = nullptr;
     JSString* callerAtom = nullptr;
-    Value throwTypeError;  // %ThrowTypeError% (10.2.4.1): behind Function.prototype.caller and a strict arguments.callee
     JSObject* genReturnSignal = nullptr;  // thrown inside a generator to make it return through its finally blocks
-    Value arrayCtorValue, arraySpeciesGetter;  // the built-in Array and the getter of Array[Symbol.species]
     std::vector<JSObject*> joinStack;     // arrays whose join() is running, to stop self-reference
-    Value arrayValuesFn, arrayIterNextFn;  // the original Array.prototype.values and array iterator next
-    Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
-    Value importHook;  // called for import(): (specifier, options, file of the calling code)
+    // The well-known symbols, shared by every realm (6.1.5.1)
     Symbol *symUnscopables = nullptr, *symIsConcatSpreadable = nullptr;
     Symbol* symErrorStack = nullptr;  // hidden key: the stack trace an Error object was made with (read by Error.prototype.stack)
     Symbol *symIterator = nullptr, *symAsyncIterator = nullptr, *symHasInstance = nullptr, *symToPrimitive = nullptr,
            *symToStringTag = nullptr, *symSpecies = nullptr, *symMatch = nullptr, *symMatchAll = nullptr, *symReplace = nullptr,
            *symSearch = nullptr, *symSplit = nullptr, *symDispose = nullptr, *symAsyncDispose = nullptr;
-    struct PropWatch {  // one property of RegExp.prototype as the engine made it (regexp.cpp)
-        PropKey key;
-        uint64_t value;
-        uint8_t flags;
-    };
-    std::vector<PropWatch> regexpWatch;
-    // The legacy static properties of RegExp ($1, lastMatch, ...): the subject and offsets of the last match, or
-    // not valid after a match by a RegExp subclass.
-    Value regexpLastInput;
-    std::vector<int> regexpLastCaps;
-    bool regexpLegacyValid = true;
-    Value regexpCtor, promiseCtor;
     std::unordered_map<std::u16string, Symbol*> symbolRegistry;
 
     // ---- interpreter internals
@@ -780,6 +805,7 @@ public:
     std::u16string captureStack();
     void markRoots(Gc& g);
     void runJob(const Job& j);
+    void initRealm();  // builds the running realm's global object and intrinsics
 
     std::vector<Value> stack;
     std::vector<Frame> frames;
@@ -800,6 +826,18 @@ public:
     std::unordered_map<std::u16string_view, JSString*> atomTable;
     void setupGlobals();
     void setupCollections();
+};
+
+// RAII: the code in its scope runs in the given realm.
+struct RealmScope {
+    Vm& vm;
+    uint16_t from;
+    RealmScope(Vm& v, uint16_t realm) : vm(v), from(v.currentRealm) {
+        if (realm != from) vm.enterRealm(realm);
+    }
+    ~RealmScope() {
+        if (vm.currentRealm != from) vm.enterRealm(from);
+    }
 };
 
 // RAII: keeps the values of a std::vector alive across calls that may collect garbage.
@@ -831,8 +869,9 @@ struct ModuleInfo {
 FuncProto* compileScript(Vm& vm, std::shared_ptr<const std::u16string> src, const std::string& file, bool functionBody,
                          const std::u16string* params, ModuleInfo* module = nullptr);
 void moduleInit(Vm& vm, Value ns, Context* ctx);
-FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const EvalSite& site);
-FuncProto* compileDynamicFunction(Vm& vm, std::shared_ptr<const std::u16string> src, const std::u16string& params, int kind, const std::string& file);
+FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const EvalSite& site, const std::string& callerFile);
+FuncProto* compileDynamicFunction(Vm& vm, std::shared_ptr<const std::u16string> src, const std::u16string& params, int kind, const std::string& file,
+                                  bool dynamic);
 
 std::u16string utf8to16(std::string_view s);
 std::string utf16to8(std::u16string_view s);

@@ -1666,7 +1666,8 @@ JSFN(collectionCtor) {
         } else
             vm.call(adder, self, kv, 2);
     };
-    if (src.isObject() && src.asObject()->cls == Cls::Array && !(src.asObject()->oflags & OF_SLOWIDX) && vm.plainArrayIteration()) {
+    if (src.isObject() && src.asObject()->cls == Cls::Array && src.asObject()->proto == vm.arrayProto && !(src.asObject()->oflags & OF_SLOWIDX) &&
+        vm.plainArrayIteration()) {
         JSArray* arr = (JSArray*)src.asObject();
         for (size_t i = 0; i < arr->elems.size(); ++i) {
             Value e = arr->elems[i];

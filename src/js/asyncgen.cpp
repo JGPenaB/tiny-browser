@@ -374,7 +374,7 @@ void Vm::delegateResult(Value* regs, Value& value, bool& done) {
 }
 
 void setupAsyncIteration(Vm& vm) {
-    vm.genReturnSignal = vm.newObject(nullptr);
+    if (!vm.genReturnSignal) vm.genReturnSignal = vm.newObject(nullptr);
     // %AsyncIteratorPrototype%
     vm.asyncIteratorProto = vm.newObject();
     JSNative* self = vm.newNative(returnThis, "[Symbol.asyncIterator]", 0);

@@ -289,4 +289,59 @@ test("finally runs once, with and object environments, small rules", function ()
   const trace = []; const env = new Proxy({ p: 1 }, { has(t, k) { if (typeof k === "string") trace.push("has:" + k); return Reflect.has(t, k); }, get(t, k) { trace.push("get:" + String(k)); return t[k]; } });
   eq([new Function("env", "with (env) { return p; }")(env), trace], [1, ["has:p", "get:Symbol(Symbol.unscopables)", "has:p", "get:p"]]);
 });
+test("references are made before values are read: super, patterns, object rest; try values", function () {
+  // a super reference keeps the base it was made with while the key is converted (13.3.7.1)
+  const p1 = { p: 1 }, p2 = { p: -1 };
+  const obj = { __proto__: p1, add() { return super[key] += 1; }, inc() { return super[key]++; },
+    spread() { [super.q, super["r"]] = [7, 8]; for (super.s of [9]); return [this.q, this.r, this.s]; },
+    late() { super.z = (Object.setPrototypeOf(obj, { set z(v) { throw new Error("the new prototype was used"); } }), 5); return this.z; } };
+  const key = { toString() { Object.setPrototypeOf(obj, p2); return "p"; } };
+  eq(obj.add(), 2); Object.setPrototypeOf(obj, p1); delete obj.p; eq([obj.inc(), obj.p], [1, 2]);
+  eq(obj.spread(), [7, 8, 9]); eq(obj.late(), 5);
+  const none = { m() { super.x = 1; } }; Object.setPrototypeOf(none, null); throws(() => none.m(), TypeError);
+  // the target of a pattern element is found before its value is read (8.6.3)
+  const order = [], env = new Proxy({}, { has(t, k) { if (typeof k === "string") order.push("has " + k); return false; } });
+  const source = { get p() { order.push("get p"); } };
+  new Function("env", "source", "with (env) { var { p: target = 0 } = source; }")(env, source);
+  eq(order, ["has source", "has target", "get p"]);
+  // CopyDataProperties never looks at an excluded key (7.3.26)
+  const asked = [], px = new Proxy({}, { ownKeys() { return ["skip", "keep"]; }, getOwnPropertyDescriptor(t, k) { asked.push(k); } });
+  const { skip, ...rest } = px; eq([asked, Object.keys(rest)], [["keep"], []]);
+  // a finally block left by break gives the try statement its value (14.15.3)
+  eq([eval("1; do { try { 39 } finally { 42; break; } } while (false);"), eval("1; do { try { 39 } finally { break; } } while (false);")], [42, undefined]);
+  eq([eval("1; try { 2 } finally { 3 }"), eval("1; do { try { 2; break; } finally { 3 } } while (false);")], [2, 2]);
+  for (using of = null; ;) break;
+});
+test("realms: each has its own global object and intrinsics (9.3)", function () {
+  const other = __createRealm(), OF = other.Function;
+  eq([other !== globalThis, other.Object !== Object, other.Array.prototype !== Array.prototype], [true, true, true]);
+  eq([other.Symbol.iterator === Symbol.iterator, other.Symbol.for("shared") === Symbol.for("shared")], [true, true]);
+  const arr = other.eval("[1, 2, 3]");
+  eq([Object.getPrototypeOf(arr) === other.Array.prototype, arr instanceof Array, Array.isArray(arr)], [true, false, true]);
+  eq([other.eval("var madeThere = 5; this") === other, other.madeThere, typeof madeThere], [true, 5, "undefined"]);
+  // a function runs in the realm it was made in: its global, its errors, its prototypes
+  const f = new OF("return this"); eq([f() === other, Object.getPrototypeOf(f) === OF.prototype], [true, true]);
+  let caught; try { new OF("null.x")(); } catch (e) { caught = e; } eq([caught instanceof other.TypeError, caught instanceof TypeError], [true, false]);
+  eq(Object.getPrototypeOf(new OF().prototype) === other.Object.prototype, true);
+  const gen = other.eval("(function* () { yield [1]; yield this; })")();
+  eq([Object.getPrototypeOf(gen.next().value) === other.Array.prototype, gen.next().value === other], [true, true]);
+  // GetPrototypeFromConstructor (10.1.14) falls back to the intrinsic of the new target's realm
+  const C = new OF(); C.prototype = null;
+  const made = [Reflect.construct(Array, [], C), Reflect.construct(function () { }, [], C), Reflect.construct(Map, [], C), Reflect.construct(RangeError, [], C),
+    Reflect.construct(Promise, [function () { }], C), Reflect.construct(Uint8Array, [], C), Reflect.construct(WeakRef, [{}], C), Reflect.construct(Function, [], C),
+    Reflect.construct(Date, [], C), Reflect.construct(String, [], C), Reflect.construct(RegExp, [], C), Reflect.construct(DisposableStack, [], C)];
+  const names = ["Array", "Object", "Map", "RangeError", "Promise", "Uint8Array", "WeakRef", "Function", "Date", "String", "RegExp", "DisposableStack"];
+  eq(made.map((o, i) => Object.getPrototypeOf(o) === other[names[i]].prototype), names.map(() => true));
+  class Sub extends Iterator { } eq(Object.getPrototypeOf(Reflect.construct(Sub, [], C)) === other.Iterator.prototype, true);
+  function D() { } D.prototype = null; eq(Object.getPrototypeOf(Reflect.construct(other.Array, [], D)) === Array.prototype, true);
+  // ArraySpeciesCreate: the Array of another realm stands for this realm's
+  eq(Object.getPrototypeOf(Array.prototype.map.call(new other.Array(1, 2), x => x)) === Array.prototype, true);
+  // a derived constructor's bad return value is an error of the caller's realm ([[Construct]] step 12)
+  const Bad = other.eval("(class extends Object { constructor() { return null; } })"); throws(() => new Bad(), TypeError);
+  throws(() => RegExp.prototype.compile.call(new other.RegExp("")), TypeError);
+  class Mine extends other.Array { } const m = new Mine(); eq([m instanceof Mine, m instanceof other.Array, Array.isArray(m)], [true, true, true]);
+  const third = other.__createRealm(); eq([third !== other, third.eval("[]") instanceof third.Array], [true, true]);
+  for (let i = 0; i < 200000; i++) ({ a: [i] });  // collections keep every realm alive
+  eq([other.eval("[1, 2].map(function (x) { return x * 2; }).join()"), third.Object.keys({ a: 1 }).length], ["2,4", 1]);
+});
 done();

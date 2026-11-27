@@ -18,6 +18,7 @@ JSNative* makeCtor(Vm& vm, const char* name, NativeFn fn, int length, JSObject* 
     if (proto) {
         c->add(PropKey::of(vm.a.prototype), V(proto), 0);
         vm.defineOwn(proto, PropKey::of(vm.a.constructor), V(c), PF_W | PF_C);
+        vm.intrinsicProtos.push_back(proto);
     }
     vm.def(vm.global, name, V(c));
     return c;
@@ -294,7 +295,7 @@ static Value dynamicFunction(CallInfo& ci, int kind) {
         params += vm.toStr16(ci.args[i]);
     }
     if (ci.argc) body = vm.toStr16(ci.args[ci.argc - 1]);
-    return vm.compileFunction(params, body, "<Function>", kind, ci.newTarget);
+    return vm.compileFunction(params, body, vm.activeFile("<Function>"), kind, ci.newTarget, true);
 }
 JSFN(functionCtor) { return dynamicFunction(ci, 0); }
 JSFN(generatorFunctionCtor) { return dynamicFunction(ci, 1); }
@@ -311,6 +312,7 @@ void setupFunctionKinds(Vm& vm) {
         c->proto = functionCtorValue.asObject();
         c->add(PropKey::of(vm.a.prototype), V(proto), 0);
         vm.defineOwn(proto, PropKey::of(vm.a.constructor), V(c), PF_C);
+        vm.intrinsicProtos.push_back(proto);
         if (instances) {
             vm.defineOwn(proto, PropKey::of(vm.a.prototype), V(instances), PF_C);
             vm.defineOwn(instances, PropKey::of(vm.a.constructor), V(proto), PF_C);
@@ -1606,7 +1608,7 @@ JSFN(globalEval) {
     global.vars.push_back({vm.atom("this"), 0, VK_PSEUDO, false});  // `this` is the global object, kept in a context of its own
     global.thisVar = 0;
     site.scopes.push_back(global);
-    FuncProto* code = compileEval(vm, std::make_shared<const std::u16string>(ci.arg(0).asString()->s), site);
+    FuncProto* code = compileEval(vm, std::make_shared<const std::u16string>(ci.arg(0).asString()->s), site, vm.activeFile("<eval>"));
     Context* ctx = vm.alloc<Context>();
     ctx->slots.push_back(V(vm.global));
     JSFunction* fn = vm.makeClosure(code, ctx, nullptr);
@@ -1623,24 +1625,26 @@ JSFN(throwTypeErrorFn) { ci.vm.throwError(Err::TypeError, "'caller', 'callee', a
 // ---------------------------------------------------------------------------- setup
 void Vm::setupGlobals() {
     Vm& vm = *this;
-    auto sym = [&](const char* name) { return newSymbol(str(name)); };
-    symIterator = sym("Symbol.iterator");
-    symAsyncIterator = sym("Symbol.asyncIterator");
-    symUnscopables = sym("Symbol.unscopables");
-    symIsConcatSpreadable = sym("Symbol.isConcatSpreadable");
-    symHasInstance = sym("Symbol.hasInstance");
-    symToPrimitive = sym("Symbol.toPrimitive");
-    symToStringTag = sym("Symbol.toStringTag");
-    symSpecies = sym("Symbol.species");
-    symMatch = sym("Symbol.match");
-    symMatchAll = sym("Symbol.matchAll");
-    symReplace = sym("Symbol.replace");
-    symSearch = sym("Symbol.search");
-    symSplit = sym("Symbol.split");
-    symDispose = sym("Symbol.dispose");
-    symAsyncDispose = sym("Symbol.asyncDispose");
-    symErrorStack = sym("stack");
-    symErrorStack->isPrivate = true;
+    if (!symIterator) {  // made with the first realm: every realm has the same well-known symbols (6.1.5.1)
+        auto sym = [&](const char* name) { return newSymbol(str(name)); };
+        symIterator = sym("Symbol.iterator");
+        symAsyncIterator = sym("Symbol.asyncIterator");
+        symUnscopables = sym("Symbol.unscopables");
+        symIsConcatSpreadable = sym("Symbol.isConcatSpreadable");
+        symHasInstance = sym("Symbol.hasInstance");
+        symToPrimitive = sym("Symbol.toPrimitive");
+        symToStringTag = sym("Symbol.toStringTag");
+        symSpecies = sym("Symbol.species");
+        symMatch = sym("Symbol.match");
+        symMatchAll = sym("Symbol.matchAll");
+        symReplace = sym("Symbol.replace");
+        symSearch = sym("Symbol.search");
+        symSplit = sym("Symbol.split");
+        symDispose = sym("Symbol.dispose");
+        symAsyncDispose = sym("Symbol.asyncDispose");
+        symErrorStack = sym("stack");
+        symErrorStack->isPrivate = true;
+    }
 
     {
         JSArray* ap = alloc<JSArray>();

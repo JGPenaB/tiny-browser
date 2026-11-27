@@ -29,7 +29,11 @@ enum Op : uint16_t {
     OP_SetElem,     // a[b] = c
     OP_DelProp, OP_DelElem,  // a = delete b[...]
     OP_GetSuper,    // a = super[b]  (b: key register)
-    OP_SetSuper,    // super[a] = b
+    // A super reference that is written to (13.3.7.3): its base is found when the reference is made, and kept
+    // in a register with the key in the one after it.
+    OP_SuperBase,   // a = the object super properties are looked up on, or null
+    OP_GetSuperAt,  // a = r[b][r[b+1]] with `this` r[c]; r[b+1] becomes the property key
+    OP_SetSuper,    // r[a][r[a+1]] = b with `this` r[c]
     OP_DefField,    // define own data property: a[consts[b]] = c
     OP_DefElem,     // define own data property: a[b] = c
     OP_DefMethod, OP_DefMethodE,  // a[b] = function c with [[HomeObject]] a (E: enumerable)

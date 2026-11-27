@@ -149,6 +149,12 @@ function strictSet(o, k, v) { "use strict"; o[k] = v; }
   const DY = await load("dy.js");
   eq([DY.ns === A, DY.same, DY.fail, DY.meta, DY.resolved, DY.proto, DY.sameMeta, log.length], [true, true, "TypeError", "mem:/dy.js", "mem:/zzz.js", null, true, 0]);
   eq([(await DY.lazy()).default, (await DY.lazy()).default, log.join()], ["lazy value", "lazy value", "lazy"]);
+  // code made by eval or Function belongs to the script that made it: its import() resolves against that file (9.4.1)
+  mod("ev.js", `export const viaEval = await eval("import('./a.js')"), viaFn = await new Function("return import('./a.js')")();`);
+  const referrers = [], plainResolve = __modules.host.resolve;
+  __modules.host.resolve = (spec, referrer) => (referrers.push(referrer), plainResolve(spec, referrer));
+  const EV = await load("ev.js"); __modules.host.resolve = plainResolve;
+  eq([EV.viaEval === A, EV.viaFn === A, referrers], [true, true, ["mem:/ev.js", "mem:/ev.js"]]);
   const viaScript = await import("mem:/a.js");
   ok(viaScript === A, "import() from a classic script");
   const p = import("mem:/a.js"); ok(p instanceof Promise);

@@ -71,6 +71,7 @@ void initRegExp(Vm& vm, JSRegExp* r, const std::u16string& src, const std::u16st
 JSRegExp* makeRegExp(Vm& vm, const std::u16string& src, const std::u16string& flagStr, JSObject* proto) {
     JSRegExp* r = vm.alloc<JSRegExp>();
     r->proto = proto;
+    r->realm = vm.currentRealm;
     r->add(PropKey::of(vm.a.lastIndex), Value::i32(0), PF_W);
     r->source = r->flagText = vm.a.empty;
     initRegExp(vm, r, src, flagStr);
@@ -94,6 +95,7 @@ size_t advance(const JSRegExp* rx, const std::u16string& s, size_t pos) {
 
 // UpdateLegacyRegExpStaticProperties / InvalidateLegacyRegExpStaticProperties (the legacy RegExp features proposal)
 void remember(Vm& vm, const JSRegExp* rx, JSString* str, const std::vector<int>& caps) {
+    if (rx->realm != vm.currentRealm) return;  // a RegExp of another realm leaves this realm's record alone
     vm.regexpLegacyValid = rx->legacy;
     if (!rx->legacy) return;
     vm.regexpLastInput = V(str);
@@ -216,6 +218,7 @@ JSFN(regexpCtorFn) {  // 22.2.4.1
 JSFN(regexpCompile) {  // B.2.4.1
     Vm& vm = ci.vm;
     JSRegExp* rx = thisRegExp(ci);
+    if (rx->realm != vm.currentRealm) vm.throwError(Err::TypeError, "RegExp.prototype.compile cannot be used on a RegExp of another realm");
     if (!rx->legacy) vm.throwError(Err::TypeError, "RegExp.prototype.compile cannot be used on an instance of a RegExp subclass");
     Value pattern = ci.arg(0), flags = ci.arg(1);
     std::u16string src, fl;

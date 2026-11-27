@@ -339,12 +339,20 @@ Vm::Vm() {
                            "flags", "global", "status", "reason"};
     JSString** slots = &a.length;
     for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) slots[i] = atom(names[i]);
+    realms.push_back(std::make_unique<RealmFields>());
+    initRealm();
+}
+Vm::~Vm() {}
+
+// InitializeHostDefinedRealm (9.6) for the running realm, whose fields are still empty
+void Vm::initRealm() {
     objectProto = alloc<JSObject>();
     {  // Function.prototype is itself a function: it takes anything and returns undefined (20.2.3)
         JSNative* fp = alloc<JSNative>();
         fp->cls = Cls::Native;
         fp->fn = [](CallInfo&) { return Value::undef(); };
         fp->name = a.empty;
+        fp->realm = currentRealm;
         functionProto = fp;
     }
     functionProto->proto = objectProto;
@@ -364,7 +372,39 @@ Vm::Vm() {
     setupJsBuiltins(*this);
     suppressedErrorCtor = get(Value::cell(global), atom("SuppressedError"));
 }
-Vm::~Vm() {}
+
+uint16_t Vm::createRealm() {
+    if (realms.size() >= 0xFFFF) throwError(Err::RangeError, "Too many realms");
+    realms.push_back(std::make_unique<RealmFields>());
+    RealmScope scope(*this, (uint16_t)(realms.size() - 1));
+    initRealm();
+    return currentRealm;
+}
+
+// The running realm's fields go back to their place in `realms`, and those of realm `id` take theirs in the Vm.
+void Vm::enterRealm(uint16_t id) {
+    if (id == currentRealm) return;
+    RealmFields& running = *this;
+    *realms[currentRealm] = std::move(running);
+    running = std::move(*realms[id]);
+    currentRealm = id;
+}
+
+// GetFunctionRealm (7.3.24)
+uint16_t Vm::functionRealm(JSObject* o) {
+    for (;;) {
+        Value next;
+        if (o->cls == Cls::Function || o->cls == Cls::Native) return o->realm;
+        if (o->cls == Cls::Proxy) {
+            JSProxy* px = (JSProxy*)o;
+            if (!px->handler.isObject()) throwError(Err::TypeError, "Cannot find the realm of a proxy that has been revoked");
+            next = px->target;
+        } else if (o->cls == Cls::Bound)
+            next = ((JSBound*)o)->target;
+        if (!next.isObject()) return currentRealm;
+        o = next.asObject();
+    }
+}
 
 JSString* Vm::str(std::u16string s) {
     JSString* j = alloc<JSString>();
@@ -411,6 +451,7 @@ JSNative* Vm::newNative(NativeFn fn, std::string_view name, int length) {
     n->fn = fn;
     n->name = atom(name);
     n->length = length;
+    n->realm = currentRealm;
     return n;
 }
 JSIter* Vm::newIter(Cls cls, Value target, uint8_t mode) {
@@ -435,6 +476,22 @@ void Vm::defGetter(JSObject* o, const char* name, NativeFn getter, NativeFn sett
                    setter ? Value::cell(newNative(setter, set.c_str(), 1)) : Value::undef(), PF_C);
 }
 
+static void markRealm(Gc& g, RealmFields& r) {
+    for (JSObject* p : {r.global, r.globalLex, r.objectProto, r.functionProto, r.arrayProto, r.stringProto, r.numberProto, r.booleanProto, r.symbolProto,
+                        r.bigintProto, r.errorProto, r.iteratorProto, r.arrayIterProto, r.mapProto, r.setProto, r.weakMapProto, r.weakSetProto,
+                        r.promiseProto, r.generatorProto, r.dateProto, r.regexpProto, r.mapIterProto, r.setIterProto, r.stringIterProto,
+                        r.arrayBufferProto, r.dataViewProto, r.sharedBufferProto, r.asyncIteratorProto, r.asyncGeneratorProto, r.asyncFromSyncProto,
+                        r.generatorFunctionProto, r.asyncGeneratorFunctionProto, r.asyncFunctionProto})
+        g.mark(p);
+    for (JSObject* p : r.errorProtos) g.mark(p);
+    for (JSObject* p : r.typedProtos) g.mark(p);
+    for (JSObject* p : r.intrinsicProtos) g.mark(p);
+    for (Value v : r.typedCtors) g.mark(v);
+    for (Value v : {r.arrayBufferCtor, r.sharedBufferCtor, r.throwTypeError, r.arrayCtorValue, r.arraySpeciesGetter, r.arrayValuesFn, r.arrayIterNextFn,
+                    r.evalFn, r.importHook, r.regexpLastInput, r.regexpCtor, r.promiseCtor, r.suppressedErrorCtor})
+        g.mark(v);
+}
+
 void Vm::markRoots(Gc& g) {
     for (Value* p = stack.data(); p < stackTop; ++p) g.mark(*p);
     for (auto& f : frames) {
@@ -446,16 +503,12 @@ void Vm::markRoots(Gc& g) {
         g.mark(f.gen);
     }
     g.mark(pending);
-    g.mark(global);
-    g.mark(globalLex);
-    JSObject** protos = &objectProto;
-    for (int i = 0; i < 22; ++i) g.mark(protos[i]);
-    for (JSObject* p : errorProtos) g.mark(p);
-    Symbol** syms = &symIterator;
-    for (int i = 0; i < 6; ++i) g.mark(syms[i]);
-    g.mark(regexpCtor);
-    g.mark(regexpLastInput);
-    g.mark(promiseCtor);
+    markRealm(g, *this);
+    for (size_t i = 0; i < realms.size(); ++i)
+        if (i != currentRealm) markRealm(g, *realms[i]);  // the running realm's own place holds nothing meaningful
+    for (Symbol* s : {symIterator, symAsyncIterator, symHasInstance, symToPrimitive, symToStringTag, symSpecies, symMatch, symMatchAll, symReplace,
+                      symSearch, symSplit, symDispose, symAsyncDispose, symUnscopables, symIsConcatSpreadable, symErrorStack})
+        g.mark(s);
     g.mark(freshError);
     for (auto& kv : atomTable) g.mark(kv.second);
     for (auto& kv : symbolRegistry) g.mark(kv.second);
@@ -468,33 +521,11 @@ void Vm::markRoots(Gc& g) {
     for (auto* vec : rootVecs)
         for (Value v : *vec) g.mark(v);
     for (auto& tracer : rootTracers) tracer(g);
-    for (JSObject* p : typedProtos) g.mark(p);
-    for (Value v : typedCtors) g.mark(v);
-    g.mark(arrayBufferProto);
-    g.mark(sharedBufferProto);
-    g.mark(arrayBufferCtor);
-    g.mark(sharedBufferCtor);
     for (auto& w : asyncWaiters) {
         g.mark(w.buffer);
         g.mark(w.resolve);
     }
-    g.mark(dataViewProto);
-    g.mark(importHook);
-    g.mark(evalFn);
-    g.mark(arrayValuesFn);
-    g.mark(arrayCtorValue);
-    g.mark(arraySpeciesGetter);
-    g.mark(arrayIterNextFn);
-    g.mark(asyncIteratorProto);
-    g.mark(asyncGeneratorProto);
-    g.mark(asyncFromSyncProto);
-    g.mark(symErrorStack);
-    g.mark(suppressedErrorCtor);
-    g.mark(generatorFunctionProto);
-    g.mark(asyncGeneratorFunctionProto);
-    g.mark(asyncFunctionProto);
     g.mark(genReturnSignal);
-    g.mark(throwTypeError);
 }
 
 // ---------------------------------------------------------------------------- errors
@@ -508,7 +539,7 @@ std::u16string Vm::captureStack() {
         uint32_t line = at < f.code->lines.size() ? f.code->lines[at] : 0;
         s += u"\n    at ";
         s += (f.code->name && !f.code->name->s.empty()) ? f.code->name->s : std::u16string(u"<anonymous>");
-        s += u" (" + utf8to16(f.code->file) + u":" + ascii16(std::to_string(line)) + u")";
+        s += u" (" + (f.code->isDynamic ? std::u16string(u"<eval>") : utf8to16(f.code->file)) + u":" + ascii16(std::to_string(line)) + u")";
     }
     return s;
 }
@@ -966,7 +997,8 @@ Value Vm::fnProtoProp(JSFunction* f) {
     if (Prop* p = f->find(k)) return p->val;
     FuncProto* c = f->code;
     if (c->isArrow || (c->isMethod && !c->isGenerator) || (c->isAsync && !c->isGenerator)) return Value::undef();
-    JSObject* po = newObject(c->isGenerator ? (c->isAsync ? asyncGeneratorProto : generatorProto) : objectProto);
+    RealmFields& r = fieldsOf(f->realm);  // the object belongs to the function's realm, whoever asks first
+    JSObject* po = newObject(c->isGenerator ? (c->isAsync ? r.asyncGeneratorProto : r.generatorProto) : r.objectProto);
     if (!c->isGenerator) po->add(PropKey::of(a.constructor), Value::cell(f), PF_W | PF_C);
     f->add(k, Value::cell(po), PF_W);
     return Value::cell(po);
@@ -1544,27 +1576,23 @@ JSObject* Vm::protoFromNewTarget(Value newTarget, JSObject* fallback) {
     if (newTarget.isObject()) {
         Value p = get(newTarget, a.prototype);
         if (p.isObject()) return p.asObject();
-        // GetFunctionRealm (7.3.24): the default comes from the constructor's realm, and a revoked proxy has none
-        for (JSObject* o = newTarget.asObject(); o;) {
-            if (o->cls == Cls::Proxy) {
-                JSProxy* px = (JSProxy*)o;
-                if (!px->handler.isObject()) throwError(Err::TypeError, "Cannot perform 'construct' on a proxy that has been revoked");
-                o = px->target.isObject() ? px->target.asObject() : nullptr;
-            } else if (o->cls == Cls::Bound) {
-                Value t = ((JSBound*)o)->target;
-                o = t.isObject() ? t.asObject() : nullptr;
-            } else
-                break;
+        // the default comes from the constructor's realm: the intrinsic listed there at the position of `fallback` here
+        uint16_t realm = functionRealm(newTarget.asObject());
+        if (realm != currentRealm) {
+            std::vector<JSObject*>& theirs = realms[realm]->intrinsicProtos;
+            size_t at = std::find(intrinsicProtos.begin(), intrinsicProtos.end(), fallback) - intrinsicProtos.begin();
+            if (at < theirs.size()) return theirs[at];
         }
     }
     return fallback;
 }
 
+// CopyDataProperties (7.3.26)
 void Vm::copyDataProps(JSObject* dst, Value src, JSArray* excluded) {
     if (src.isNullish()) return;
     JSObject* so = toObject(src);
     std::vector<PropKey> keys;
-    ownKeys(so, keys, true, true, true);
+    ownKeys(so, keys, true, true, false);
     for (PropKey k : keys) {
         if (excluded) {
             bool skip = false;
@@ -1572,6 +1600,8 @@ void Vm::copyDataProps(JSObject* dst, Value src, JSArray* excluded) {
                 if (toKey(e) == k) skip = true;
             if (skip) continue;
         }
+        PropDesc d;  // looked up key by key: an earlier getter may have changed what is there
+        if (!getOwnDesc(so, k, d) || !d.enumerable) continue;
         defineOwn(dst, k, getObj(so, k, Value::cell(so)), PF_ALL);
     }
 }
@@ -1599,6 +1629,7 @@ JSFunction* Vm::makeClosure(FuncProto* p, Context* ctx, Frame* parent) {
     f->proto = p->isGenerator ? (p->isAsync ? asyncGeneratorFunctionProto : generatorFunctionProto) : p->isAsync ? asyncFunctionProto : functionProto;
     f->code = p;
     f->ctx = ctx;
+    f->realm = currentRealm;
     if (p->isArrow && parent && parent->fn) f->home = parent->fn->home;
     return f;
 }
@@ -1624,6 +1655,7 @@ void Vm::pushFrame(JSFunction* f, Value* base, int argc, Value newTarget, Value*
 
 Value Vm::callFunction(JSFunction* f, Value thisv, const Value* args, int argc, Value newTarget, bool construct) {
     FuncProto* p = f->code;
+    RealmScope realm(*this, f->realm);
     if (!construct) {
         if (p->isClassCtor) throwError(Err::TypeError, "Class constructor %s cannot be invoked without 'new'", p->name ? utf16to8(p->name->s).c_str() : "");
         if (p->isGenerator) return p->isAsync ? startAsyncGenerator(f, thisv, args, argc) : startGenerator(f, thisv, args, argc);
@@ -1638,6 +1670,7 @@ Value Vm::callFunction(JSFunction* f, Value thisv, const Value* args, int argc, 
     for (int i = 0; i < argc; ++i) base[2 + i] = args[i];
     stackTop = base + 2 + argc;
     pushFrame(f, base, argc, newTarget, nullptr, true, construct);
+    frames.back().callerRealm = realm.from;
     return runFrames(frames.size() - 1);
 }
 
@@ -1649,6 +1682,7 @@ Value Vm::call(Value fn, Value thisv, const Value* args, int argc) {
             case Cls::Native: {
                 DepthGuard guard(*this);
                 JSNative* n = (JSNative*)o;
+                RealmScope realm(*this, n->realm);
                 CallInfo ci{*this, thisv, (Value*)args, argc, Value::undef(), n};
                 return n->fn(ci);
             }
@@ -1748,6 +1782,7 @@ Value Vm::construct(Value fn, const Value* args, int argc, Value newTarget) {
     if (o->cls == Cls::Native) {
         DepthGuard guard(*this);
         JSNative* n = (JSNative*)o;
+        RealmScope realm(*this, n->realm);
         CallInfo ci{*this, Value::undef(), (Value*)args, argc, newTarget, n};
         return n->fn(ci);
     }
@@ -1770,10 +1805,17 @@ Value Vm::eval(std::u16string_view src, const std::string& file) {
 }
 
 // CreateDynamicFunction (20.2.1.1.1)
-Value Vm::compileFunction(const std::u16string& params, const std::u16string& body, const std::string& file, int kind, Value newTarget) {
+// GetActiveScriptOrModule (9.4.1), as a file name: the nearest running code that is not the engine's own JavaScript
+std::string Vm::activeFile(const char* otherwise) const {
+    for (size_t i = frames.size(); i-- > 0;)
+        if (frames[i].code->file != kBuiltinFile) return frames[i].code->file;
+    return otherwise;
+}
+
+Value Vm::compileFunction(const std::u16string& params, const std::u16string& body, const std::string& file, int kind, Value newTarget, bool dynamic) {
     static const char16_t* const prefix[] = {u"function", u"function*", u"async function", u"async function*"};
     auto sp = std::make_shared<const std::u16string>(std::u16string(prefix[kind]) + u" anonymous(" + params + u"\n) {\n" + body + u"\n}");
-    FuncProto* p = compileDynamicFunction(*this, sp, params, kind, file);
+    FuncProto* p = compileDynamicFunction(*this, sp, params, kind, file, dynamic);
     JSFunction* top = makeClosure(p, nullptr, nullptr);
     Value fv = callFunction(top, Value::cell(global), nullptr, 0, Value::undef(), false);
     if (newTarget.isObject() && fv.isObject()) {
@@ -1980,6 +2022,7 @@ Value Vm::startGenerator(JSFunction* f, Value thisv, const Value* args, int argc
 
 Value Vm::resumeGenerator(JSGenerator* g, Value sent, int mode, bool& done) {
     done = true;
+    RealmScope realm(*this, g->fn->realm);
     if (g->state == 2) throwError(Err::TypeError, "Generator is already running");
     if (g->state == 3) {
         if (mode == 1) throwValue(sent);
@@ -2932,13 +2975,24 @@ Value Vm::runFrames(size_t base) {
                         R(i.a) = getObj(sp, k, thisv);
                         break;
                     }
-                    case OP_SetSuper: {  // super.x = v: the lookup starts at the home object's prototype, the receiver is `this`
+                    case OP_SuperBase: {  // GetSuperBase (9.1.1.3.5): the home object's prototype as it is now
                         JSObject* home = fr->fn->home;
-                        JSObject* sp = home ? home->proto : nullptr;
+                        R(i.a) = home && home->proto ? Value::cell(home->proto) : Value::null();
+                        break;
+                    }
+                    case OP_GetSuperAt: {  // GetValue of a super reference (6.2.5.5): the key is converted once and remembered
                         fr->pc = pc;
-                        PropKey k = toKey(R(i.a));
-                        if (!sp) throwError(Err::TypeError, "Cannot set properties of null (setting '%s')", keyName(*this, k).c_str());
-                        if (!setObj(sp, k, R(i.b), R(i.c)) && fr->code->isStrict) failedSet(R(i.c), k);
+                        if (!R(i.b).isObject()) throwError(Err::TypeError, "Cannot read a property of super: the home object has no prototype");
+                        PropKey k = toKey(R(i.b + 1));
+                        R(i.b + 1) = keyToValue(k);
+                        R(i.a) = getObj(R(i.b).asObject(), k, R(i.c));
+                        break;
+                    }
+                    case OP_SetSuper: {  // PutValue of a super reference (6.2.5.6): the receiver is `this`
+                        fr->pc = pc;
+                        if (!R(i.a).isObject()) throwError(Err::TypeError, "Cannot set a property of super: the home object has no prototype");
+                        PropKey k = toKey(R(i.a + 1));
+                        if (!setObj(R(i.a).asObject(), k, R(i.b), R(i.c)) && fr->code->isStrict) failedSet(R(i.c), k);
                         break;
                     }
                     case OP_DefField: defineOwn(R(i.a).asObject(), KEYK(i.b), R(i.c), PF_ALL); break;
@@ -3204,7 +3258,7 @@ Value Vm::runFrames(size_t base) {
                         if (callee.isObject() && callee.asObject()->cls == Cls::Function && !fr->construct && !fr->gen) {
                             JSFunction* f = (JSFunction*)callee.asObject();
                             FuncProto* p = f->code;
-                            if (!p->isGenerator && !p->isAsync && !p->isClassCtor) {
+                            if (!p->isGenerator && !p->isAsync && !p->isClassCtor && f->realm == currentRealm) {
                                 fr->pc = pc;
                                 if (gc.shouldCollect()) gc.collect();
                                 if (++pollTicks == 0) pollInterrupt();
@@ -3230,14 +3284,15 @@ Value Vm::runFrames(size_t base) {
                             if (co->cls == Cls::Function) {
                                 JSFunction* f = (JSFunction*)co;
                                 FuncProto* p = f->code;
-                                if (!p->isGenerator && !p->isAsync && !p->isClassCtor) {
+                                // a function of another realm is called the long way, which changes realm around it
+                                if (!p->isGenerator && !p->isAsync && !p->isClassCtor && f->realm == currentRealm) {
                                     if (gc.shouldCollect()) gc.collect();
                                     if (++pollTicks == 0) pollInterrupt();
                                     pushFrame(f, b2, i.c, Value::undef(), regs + i.a, false, false);
                                     LOAD_FRAME();
                                     break;
                                 }
-                            } else if (co->cls == Cls::Native) {
+                            } else if (co->cls == Cls::Native && co->realm == currentRealm) {
                                 JSNative* n = (JSNative*)co;
                                 CallInfo ci{*this, b2[1], b2 + 2, i.c, Value::undef(), n};
                                 Value r = n->fn(ci);
@@ -3322,16 +3377,19 @@ Value Vm::runFrames(size_t base) {
                     case OP_RetUndef: {
                         Value rv = i.op == OP_Return ? R(i.a) : Value::undef();
                         if (fr->construct && !rv.isObject()) {
-                            // [[Construct]] (10.2.2) makes these checks once the body has finished: its own try blocks do not see the errors
+                            // [[Construct]] (10.2.2) makes these checks once the body has finished: its own try blocks do not see the
+                            // errors, and they are errors of the caller's realm, which is running again by then (step 11)
                             if (fr->code->isDerived && !rv.isUndef()) {
                                 fr->pc = pc;
                                 leaving = true;
+                                enterRealm(fr->callerRealm);
                                 throwError(Err::TypeError, "Derived constructors may only return object or undefined");
                             }
                             rv = regs[1];
                             if (rv.isEmpty()) {
                                 fr->pc = pc;
                                 leaving = true;
+                                enterRealm(fr->callerRealm);
                                 throwError(Err::ReferenceError, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
                             }
                         }
@@ -3674,7 +3732,7 @@ Value Vm::runFrames(size_t base) {
                             !(evalFn.isObject() && callee.asObject() == evalFn.asObject())) {
                             JSFunction* f = (JSFunction*)callee.asObject();
                             FuncProto* p = f->code;
-                            if (!p->isGenerator && !p->isAsync && !p->isClassCtor) {
+                            if (!p->isGenerator && !p->isAsync && !p->isClassCtor && f->realm == currentRealm) {
                                 if (gc.shouldCollect()) gc.collect();
                                 if (++pollTicks == 0) pollInterrupt();
                                 int argc = i.c;
@@ -3701,7 +3759,7 @@ Value Vm::runFrames(size_t base) {
                                 break;
                             }
                             auto src = std::make_shared<const std::u16string>(argv[0].asString()->s);
-                            FuncProto* code = compileEval(*this, src, fr->code->evalSites[site]);
+                            FuncProto* code = compileEval(*this, src, fr->code->evalSites[site], fr->code->file);
                             JSFunction* fn = makeClosure(code, fr->ctx, fr);
                             R(i.a) = callFunction(fn, Value::undef(), nullptr, 0, Value::undef(), false);
                         } else

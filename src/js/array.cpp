@@ -109,6 +109,10 @@ JSArray* arrayCreate(Vm& vm, double length) {
 JSObject* speciesCreate(Vm& vm, JSObject* original, double length) {
     if (!vm.isArray(V(original))) return arrayCreate(vm, length);
     Value c = vm.getObj(original, PropKey::of(vm.a.constructor), V(original));
+    if (vm.isConstructor(c)) {  // the Array of another realm stands for this realm's (step 4)
+        uint16_t realm = vm.functionRealm(c.asObject());
+        if (realm != vm.currentRealm && c == vm.realms[realm]->arrayCtorValue) c = Value::undef();
+    }
     if (c.isObject()) {
         if (c.asObject() == vm.arrayCtorValue.asObject()) {
             // the built-in Array with its built-in species: the common case

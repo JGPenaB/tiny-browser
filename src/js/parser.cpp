@@ -1627,7 +1627,7 @@ private:
         if (t.str == usingAtom) {
             Tok nx = peek();
             if (nx.type != Tok::Ident || nx.nl || isRes(nx.str)) return 0;
-            if (forHead && nx.str == k.of_) return 0;
+            if (forHead && nx.str == k.of_ && peek(2).p != P_Assign) return 0;
             return 1;
         }
         if (t.str == k.await_ && (fn->isAsync || fn->isStaticBlock)) {

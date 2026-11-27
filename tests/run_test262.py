@@ -8,7 +8,7 @@ The suite is not part of this repository. Get it once with:
 Filters are substrings of the test path, e.g. `language/expressions` or `built-ins/Array`. Results are printed
 per folder; the failures (with the first line of what went wrong) go to out/test262-<name>.txt.
 """
-import concurrent.futures, os, re, shutil, subprocess, sys, tempfile
+import concurrent.futures, json, os, re, shutil, subprocess, sys, tempfile
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 suite = os.path.join(root, "third_party", "test262")
@@ -21,7 +21,12 @@ var $262 = {
   gc: function () {},
   IsHTMLDDA: __htmldda(),
   detachArrayBuffer: function (b) { if (!b.detached) b.transfer(); return null; },
-  createRealm: function () { throw new Test262Error('createRealm is not supported'); },
+  createRealm: function () {  // the new realm gets a $262 of its own by running this same text there
+    var other = __createRealm();
+    other.__hostSource = __hostSource;
+    other.__evalScript(__hostSource);
+    return other.$262;
+  },
   agent: { start: function () { throw new Test262Error('agents are not supported'); } }
 };
 __modules.host.resolve = function (specifier, referrer) {
@@ -33,6 +38,7 @@ __modules.host.resolve = function (specifier, referrer) {
 };
 __modules.host.fetch = function (url) { return new Promise(function (resolve) { resolve(__readFile(url)); }); };
 """
+HOST = "var __hostSource = " + json.dumps(HOST) + ";" + HOST
 
 
 def read(path):

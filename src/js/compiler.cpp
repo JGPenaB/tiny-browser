@@ -47,7 +47,7 @@ struct ScopeMark {
 
 class Compiler {
 public:
-    Compiler(Vm& v, Ast& a, const std::string& file) : vm(v), ast(a), file_(file) {}
+    Compiler(Vm& v, Ast& a, const std::string& file, bool dynamic = false) : vm(v), ast(a), file_(file), dynamic_(dynamic) {}
 
     FuncProto* program() {
         FunctionInfo* info = ast.top;
@@ -86,6 +86,7 @@ private:
     Vm& vm;
     Ast& ast;
     std::string file_;
+    bool dynamic_ = false;  // the code comes from eval or Function(): see FuncProto::isDynamic
     Fn* f = nullptr;
     std::vector<Scope*> chain;  // scopes that own a runtime context, innermost last
     int evalObjReg = -1;        // eval code: the register holding the caller's object of eval-made variables
@@ -183,6 +184,7 @@ private:
         fn.p->srcStart = info->srcStart;
         fn.p->srcEnd = info->srcEnd;
         fn.p->file = file_;
+        fn.p->isDynamic = dynamic_;
         fn.p->length = (uint16_t)info->length;
         fn.chainBase = chain.size();
         f = &fn;
@@ -614,6 +616,16 @@ private:
             return r;
         }
         return expr(n->b);
+    }
+    // The reference `super.name` or `super[expr]` as an assignment target (13.3.7.1): the key expression runs, then
+    // the super base is taken, before the key is converted and before anything that follows. The result is the
+    // first of two registers: the base, then the key.
+    int superRef(Node* n) {
+        int base = newReg(), key = newReg();
+        if (n->type == N::Member) emitX(OP_LoadK, key, kstr(n->str));
+        else expr(n->b, key);
+        emit(OP_SuperBase, base);
+        return base;
     }
     int thisReg(Node* superNode) {
         if (superNode->var) {
@@ -1268,10 +1280,10 @@ private:
         patch(end);
         f->nextReg = mark;
     }
-    void storeResolved(Node* id, int base, int src) {
+    void storeResolved(Node* id, int base, int src, bool init = false) {
         int mark = f->nextReg;
         size_t dynamic = jump(OP_JmpNotUndef, base);
-        storeVar(id->var, id->str, src, false);
+        storeVar(id->var, id->str, src, init);
         size_t end = jump(OP_Jmp);
         patch(dynamic);
         int name = newReg();
@@ -1379,13 +1391,11 @@ private:
         int oldv = newReg(), newv = newReg();
         if ((t->type == N::Member || t->type == N::Index) && t->a->type == N::Super) {
             int th = thisReg(t->a);
-            int k = newReg();
-            if (t->type == N::Member) emitX(OP_LoadK, k, kstr(t->str));
-            else emit(OP_ToPropKey, k, expr(t->b));
-            emit(OP_GetSuper, oldv, k, th);
+            int ref = superRef(t);
+            emit(OP_GetSuperAt, oldv, ref, th);
             emit(OP_ToNumeric, oldv, oldv);
             emit(op, newv, oldv);
-            emit(OP_SetSuper, k, newv, th);
+            emit(OP_SetSuper, ref, newv, th);
         } else if (t->type == N::Ident && dynOf(t)) {
             int base = resolveDyn(t);
             loadResolved(t, base, oldv);
@@ -1470,9 +1480,9 @@ private:
             if (t->type == N::Member) {
                 if (t->a->type == N::Super) {
                     int th = thisReg(t->a);
-                    int k = superKey(t);
+                    int ref = superRef(t);
                     expr(n->b, dst);
-                    emit(OP_SetSuper, k, dst, th);
+                    emit(OP_SetSuper, ref, dst, th);
                 } else {
                     int o = operand(t->a, n->b);
                     expr(n->b, dst);
@@ -1480,10 +1490,9 @@ private:
                 }
             } else if (t->type == N::Index && t->a->type == N::Super) {
                 int th = thisReg(t->a);
-                int k = newReg();
-                expr(t->b, k);
+                int ref = superRef(t);
                 expr(n->b, dst);
-                emit(OP_SetSuper, k, dst, th);
+                emit(OP_SetSuper, ref, dst, th);
             } else if (t->type == N::Index) {
                 int o = operand(t->a, n->b);
                 int k = expr(t->b);
@@ -1514,10 +1523,8 @@ private:
         int o = -1, k = -1, dynBase = -1, superThis = -1;
         if ((t->type == N::Member || t->type == N::Index) && t->a->type == N::Super) {
             superThis = thisReg(t->a);
-            k = newReg();
-            if (t->type == N::Member) emitX(OP_LoadK, k, kstr(t->str));
-            else emit(OP_ToPropKey, k, expr(t->b));
-            emit(OP_GetSuper, cur, k, superThis);
+            k = superRef(t);
+            emit(OP_GetSuperAt, cur, k, superThis);
         } else if (t->type == N::Ident && dynOf(t)) {
             dynBase = resolveDyn(t);
             loadResolved(t, dynBase, cur);
@@ -1606,6 +1613,7 @@ private:
         p->isDerived = derived;
         p->isStrict = true;
         p->file = file_;
+        p->isDynamic = dynamic_;
         auto add = [&](Op op, int a, int b, int c) {
             Ins i;
             i.op = op;
@@ -1723,16 +1731,31 @@ private:
     // ---------------------------------------------------------------- destructuring
     // In a destructuring assignment a target that is a property access is worked out (its object and key expressions
     // run) before the value for it is fetched (13.15.5.5, 13.15.5.6).
+    // The target of one element of a pattern, when finding it can be observed: it is found before the element's
+    // value is read (8.6.2, 8.6.3, 13.15.5). That is a property reference, or a name that a `with` object or eval
+    // code may supply (o is then what resolveDyn found).
     struct Ref {
         Node* t = nullptr;
-        int o = -1, k = -1;
+        int o = -1, k = -1;  // a super reference: o is its register pair, k holds `this`
+        bool init = false, isSuper = false;
     };
     Ref prepareRef(Node* e, bool init) {
         Ref r;
-        if (init) return r;
         Node* t = e->type == N::AssignPat ? e->a : e;
-        if ((t->type != N::Member && t->type != N::Index) || t->a->type == N::Super) return r;
+        if (t->type == N::Ident && dynOf(t)) {
+            r.t = t;
+            r.init = init;
+            r.o = resolveDyn(t);
+            return r;
+        }
+        if (init || (t->type != N::Member && t->type != N::Index)) return r;
         r.t = t;
+        if (t->a->type == N::Super) {
+            r.isSuper = true;
+            r.k = thisReg(t->a);
+            r.o = superRef(t);
+            return r;
+        }
         r.o = newReg();
         expr(t->a, r.o);
         if (t->type == N::Index) {
@@ -1751,7 +1774,9 @@ private:
             expr(e->b, v);
             patch(j);
         }
-        if (r.t->type == N::Member) setProp(r.o, r.t->str, v);
+        if (r.isSuper) emit(OP_SetSuper, r.o, v, r.k);
+        else if (r.t->type == N::Ident) storeResolved(r.t, r.o, v, r.init);
+        else if (r.t->type == N::Member) setProp(r.o, r.t->str, v);
         else emit((r.t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, r.o, r.k, v);
         f->nextReg = mark;
     }
@@ -1763,14 +1788,16 @@ private:
                 expr(t);
                 emit(OP_ThrowBadTarget);
                 break;
-            case N::Member: {
-                int o = expr(t->a);
-                setProp(o, t->str, src);
-                break;
-            }
+            case N::Member:
             case N::Index: {
+                if (t->a->type == N::Super) {
+                    int th = thisReg(t->a);
+                    emit(OP_SetSuper, superRef(t), src, th);
+                    break;
+                }
                 int o = expr(t->a);
-                emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, expr(t->b), src);
+                if (t->type == N::Member) setProp(o, t->str, src);
+                else emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, expr(t->b), src);
                 break;
             }
             case N::AssignPat: {
@@ -2003,7 +2030,7 @@ private:
             int savedDepth = f->ctxDepth;
             f->ctxDepth = fin.ctxDepth;
             size_t inlineStart = here();
-            if (fin.block) quiet(fin.block);
+            if (fin.block) finallyBlock(fin.block);
             else disposeCode(fin.disposeReg, -1, fin.disposeAsync);
             f->unwound.push_back({inlineStart, here(), i});
             f->ctxDepth = savedDepth;
@@ -2173,12 +2200,12 @@ private:
         if (hasFin) {
             size_t endAll = here();
             f->fins.pop_back();
-            quiet(n->d);
+            finallyBlock(n->d);
             size_t after = jump(OP_Jmp);
             size_t handler = here();
             int e = newReg();
             emit(OP_Catch, e);
-            quiet(n->d);
+            finallyBlock(n->d);
             emit(OP_Throw, e);
             f->nextReg--;
             patch(after);
@@ -2186,7 +2213,21 @@ private:
         }
     }
 
-    // A finally block's value never becomes the value of its try statement.
+    // A finally block that runs to its end leaves the value of its try statement alone. One that is left by break
+    // or continue supplies that value: its own, or undefined when it has none (14.15.3, UpdateEmpty(F, undefined)).
+    void finallyBlock(Node* n) {
+        if (f->cptn < 0) {
+            stmt(n);
+            return;
+        }
+        int saved = newReg();
+        emit(OP_Move, saved, f->cptn);
+        emit(OP_LoadUndef, f->cptn);
+        stmt(n);
+        emit(OP_Move, f->cptn, saved);
+        f->nextReg = saved;
+    }
+    // The first part of a for statement never supplies the statement's value.
     void quiet(Node* n) {
         int saved = f->cptn;
         f->cptn = -1;
@@ -2388,12 +2429,12 @@ private:
 
 }  // namespace
 
-FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const EvalSite& site) {
+FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const EvalSite& site, const std::string& callerFile) {
     Ast ast;
     ast.src = std::move(src);
     try {
         parseEval(vm, ast, site);
-        Compiler c(vm, ast, "<eval>");
+        Compiler c(vm, ast, callerFile, true);
         return c.evalFunction();
     } catch (const SyntaxErr& e) {
         std::string m = e.msg + " (<eval>:" + std::to_string(e.line) + ")";
@@ -2402,7 +2443,8 @@ FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const 
 }
 
 // CreateDynamicFunction (20.2.1.1.1) steps 17 to 24: the parameters must be valid alone, then the text as a whole.
-FuncProto* compileDynamicFunction(Vm& vm, std::shared_ptr<const std::u16string> src, const std::u16string& params, int kind, const std::string& file) {
+FuncProto* compileDynamicFunction(Vm& vm, std::shared_ptr<const std::u16string> src, const std::u16string& params, int kind, const std::string& file,
+                                  bool dynamic) {
     try {
         {
             Ast pa;
@@ -2412,10 +2454,10 @@ FuncProto* compileDynamicFunction(Vm& vm, std::shared_ptr<const std::u16string> 
         Ast ast;
         ast.src = std::move(src);
         parseDynamicFunction(vm, ast, kind);
-        Compiler c(vm, ast, file);
+        Compiler c(vm, ast, file, dynamic);
         return c.program();
     } catch (const SyntaxErr& e) {
-        std::string m = e.msg + " (" + file + ":" + std::to_string(e.line) + ")";
+        std::string m = e.msg + " (" + (dynamic ? "<Function>" : file) + ":" + std::to_string(e.line) + ")";
         vm.throwError(Err::SyntaxError, utf8to16(m));
     }
 }

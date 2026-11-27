@@ -66,9 +66,7 @@ function closeQuietly(iterator) {  // IteratorClose after a throw completion: th
 
 // ---- Iterator, Iterator.prototype and iterator helpers
 var IteratorProto = getPrototypeOf(getPrototypeOf([][symIterator]()));
-var Iterator = function Iterator() {
-  if (new.target === undefined || new.target === Iterator) throw new $TypeError('Iterator is an abstract class and cannot be constructed directly');
-};
+var Iterator = natives.Iterator;
 defineProperty(Iterator, 'prototype', { value: IteratorProto, writable: false, enumerable: false, configurable: false });
 
 // SetterThatIgnoresPrototypeProperties (27.1.4.1.x): assigning on an iterator makes an own property
@@ -1002,11 +1000,9 @@ function hidden(target, key, value) { defineProperty(target, key, { value: value
 function fixedPrototype(ctor, proto) {
   defineProperty(ctor, 'prototype', { value: proto, writable: false, enumerable: false, configurable: false });
   hidden(proto, 'constructor', ctor);
+  natives.intrinsicProto(proto);
 }
-function protoFor(newTarget, fallback) {  // GetPrototypeFromConstructor
-  var proto = newTarget.prototype;
-  return isObject(proto) ? proto : fallback;
-}
+var protoFor = natives.protoFor;  // (newTarget, fallback): GetPrototypeFromConstructor
 var SuppressedError = function SuppressedError(error, suppressed, message) {
   var proto = new.target === undefined ? SuppressedErrorProto : protoFor(new.target, SuppressedErrorProto);
   var O = construct($Error, [], SuppressedError);
