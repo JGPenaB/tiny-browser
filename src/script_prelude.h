@@ -427,9 +427,6 @@ prop(HTMLSelectElement, 'length', function () { return this.options.length; });
 prop(HTMLSelectElement, 'selectedIndex', function () { var v = this.value, o = this.options; for (var i = 0; i < o.length; i++) if (o[i].value === v) return i; return o.length ? 0 : -1; }, function (i) { var o = this.options[i]; if (o) this.value = o.value; });
 prop(HTMLSelectElement, 'selectedOptions', function () { var i = this.selectedIndex; return i < 0 ? [] : [this.options[i]]; });
 prop(HTMLOptionElement, 'index', function () { var s = this.closest('select'); return s ? Array.prototype.indexOf.call(s.options, this) : 0; });
-prop(HTMLImageElement, 'naturalWidth', function () { return this.offsetWidth; });
-prop(HTMLImageElement, 'naturalHeight', function () { return this.offsetHeight; });
-prop(HTMLImageElement, 'complete', function () { return true; });
 prop(HTMLImageElement, 'currentSrc', function () { return this.src; });
 HTMLImageElement.prototype.decode = function () { return Promise.resolve(); };
 function sheetOf() { return { cssRules: [], rules: [], disabled: false, ownerNode: this, insertRule: function () { return 0; }, deleteRule: function () {}, addRule: function () {}, removeRule: function () {} }; }

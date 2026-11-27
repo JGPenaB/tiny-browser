@@ -426,6 +426,7 @@ struct ScriptHost::Impl {
         if (value) setAttr(n, name, *value);
         else removeAttr(n, name);
         attrChanged(n, name);
+        if (n->name == "img" && (name == "src" || name == "srcset" || name == "data-src")) client.imageSourceChanged(n);
         if (n->ceState == 1) reactions.push_back(std::move(r));
     }
 
@@ -1480,6 +1481,12 @@ JSFN(innerHTMLGet) {
     const Node* n = thisNode(ci);
     for (auto& k : (n->content ? n->content.get() : n)->kids) serialize(k.get(), out);
     return val8(ci.vm, out);
+}
+JSFN(imageInfo) {  // HTMLImageElement: data 0 naturalWidth, 1 naturalHeight, 2 complete
+    int w = 0, h = 0;
+    bool complete = I(ci.vm).client.imageSize(thisElem(ci), w, h);
+    int which = ci.callee->data.asInt();
+    return which == 2 ? Value::boolean(complete) : Value::i32(which == 0 ? w : h);
 }
 JSFN(templateContent) { return I(ci.vm).wrap(thisElem(ci)->content.get()); }  // HTMLTemplateElement.prototype.content
 JSFN(innerHTMLSet) {
@@ -2898,6 +2905,9 @@ void ScriptHost::Impl::setup() {
     };
     for (auto& pl : plain) iface(pl.name, elementProto, pl.tags, {});
     getter(tagProtos["template"], "content", templateContent);
+    getter(tagProtos["img"], "naturalWidth", imageInfo, nullptr, 0);
+    getter(tagProtos["img"], "naturalHeight", imageInfo, nullptr, 1);
+    getter(tagProtos["img"], "complete", imageInfo, nullptr, 2);
     method(tagProtos["slot"], "assignedNodes", slotAssigned, 0, 0);
     method(tagProtos["slot"], "assignedElements", slotAssigned, 0, 1);
     JSObject* svg = iface("SVGElement", elementProto, {"svg", "g", "path", "circle", "rect", "line", "polyline", "polygon", "ellipse", "text", "tspan", "use", "defs", "symbol", "clippath", "lineargradient", "radialgradient", "stop", "mask", "pattern", "image", "foreignobject"}, {});

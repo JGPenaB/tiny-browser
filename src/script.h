@@ -40,6 +40,9 @@ public:
         virtual void setFormChecked(Node* n, bool on) = 0;
         virtual void focusNode(Node* n) = 0;
         virtual Node* focusedNode() = 0;
+        virtual void imageSourceChanged(Node* img) = 0;  // a script gave an <img> another source: fetch it, then fire load or error
+        // The picture an <img> shows: its own size, 0 by 0 when it has none or failed. False while it is still loading.
+        virtual bool imageSize(Node* img, int& w, int& h) = 0;
         virtual void titleChanged() = 0;
         virtual void urlChanged(const std::string& url) = 0;
     };

@@ -656,6 +656,33 @@ FetchResult fetch(const std::string& url, const FetchOpts& o) {
     return r;
 }
 
+bool style_for_screen(const Node* n) {
+    const std::string* media = n->attr("media");
+    return !media || !contains(lower(*media), "print") || contains(lower(*media), "screen");
+}
+std::string stylesheet_href(const Node* n) {
+    const std::string* rel = n->attr("rel");
+    const std::string* href = n->attr("href");
+    if (!rel || !href || !contains(lower(*rel), "stylesheet") || contains(lower(*rel), "alternate") || !style_for_screen(n)) return {};
+    return *href;
+}
+std::string image_source(const Node* n) {
+    const std::string* src = n->attr("src");
+    std::string s = src ? *src : "";
+    // a tiny inline picture is a placeholder for one that a script would swap in: the real one is named beside it
+    bool placeholder = s.empty() || (istarts(s, "data:image/gif") && s.size() < 200) || (istarts(s, "data:image/svg") && s.size() < 300);
+    if (placeholder)
+        if (auto ds = n->attr("data-src")) s = *ds;
+    if (s.empty())
+        if (auto ss = n->attr("srcset")) {  // the first candidate of the list
+            std::string_view v = trim(*ss);
+            size_t e = 0;
+            while (e < v.size() && !isws(v[e]) && v[e] != ',') ++e;
+            s = std::string(v.substr(0, e));
+        }
+    return s;
+}
+
 bool decode_image(const std::string& bytes, ImageRes& out) {
     if (bytes.empty()) return false;
     ComPtr<IWICImagingFactory> f;
@@ -837,30 +864,12 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
         stack.pop_back();
         if (n->type == Node::T::Element) {
             if (n->name == "style") {
-                auto media = n->attr("media");
-                if (!media || !contains(lower(*media), "print") || contains(lower(*media), "screen"))
-                    cssJobs.push_back({true, text_content(n)});
+                if (style_for_screen(n)) cssJobs.push_back({true, text_content(n)});
             } else if (n->name == "link") {
-                auto rel = n->attr("rel");
-                auto href = n->attr("href");
-                auto media = n->attr("media");
-                if (rel && href && contains(lower(*rel), "stylesheet") && !contains(lower(*rel), "alternate") &&
-                    (!media || !contains(lower(*media), "print") || contains(lower(*media), "screen")))
-                    cssJobs.push_back({false, resolve_url(base, *href)});
+                std::string href = stylesheet_href(n);
+                if (!href.empty()) cssJobs.push_back({false, resolve_url(base, href)});
             } else if (n->name == "img" && imgRefs.size() < 300) {
-                const std::string* src = n->attr("src");
-                std::string s = src ? *src : "";
-                bool placeholder = s.empty() || (istarts(s, "data:image/gif") && s.size() < 200) ||
-                                   (istarts(s, "data:image/svg") && s.size() < 300);
-                if (placeholder)
-                    if (auto ds = n->attr("data-src")) s = *ds;
-                if (s.empty())
-                    if (auto ss = n->attr("srcset")) {
-                        std::string_view v = trim(*ss);
-                        size_t e = 0;
-                        while (e < v.size() && !isws(v[e]) && v[e] != ',') ++e;
-                        s = std::string(v.substr(0, e));
-                    }
+                std::string s = image_source(n);
                 if (!s.empty()) imgRefs.push_back({n, resolve_url(base, s)});
             } else if (n->name == "script" && wantScripts && scriptJobs.size() < 150) {
                 const std::string* type = n->attr("type");
@@ -955,6 +964,7 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
     for (size_t i = 0; i < nCss; ++i) {
         if (!cssJobs[i].isInline) R->net.push_back(cssNet[i]);
         R->sheets.push_back(std::move(sheets[i]));
+        R->sheetKeys.push_back((cssJobs[i].isInline ? "t:" : "u:") + cssJobs[i].text);
     }
     for (auto& e : imgNet) R->net.push_back(e);
     for (size_t k = 0; k < nScript; ++k) {

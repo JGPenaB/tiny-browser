@@ -2,7 +2,9 @@
 import html
 import json
 import os
+import struct
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -26,6 +28,14 @@ pre{background:#f0f2f5;padding:10px;border-radius:6px;white-space:pre-wrap}
 def page(title, body):
     return f"<!doctype html><html><head><meta charset=utf-8><title>{title}</title>{STYLE}</head><body>" \
            f"<header><b>Test Site</b><nav><a href='/'>Home</a><a href='/echo'>Cookies</a></nav></header><main>{body}</main></body></html>"
+
+def png(w, h, rgb=(200, 30, 30)):
+    """A PNG file of one colour."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    rows = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -87,6 +97,17 @@ class H(BaseHTTPRequestHandler):
                 self.send_raw(body, q.get("type", ["text/javascript"])[0], headers)
                 return
             self.send(body, headers=[("Set-Cookie", "visible=1; Path=/"), ("Set-Cookie", "secret=hidden; Path=/; HttpOnly")])
+        elif u.path == "/res/dot.png":  # a plain picture of the size asked for, after ?delay= milliseconds
+            if "delay" in q:
+                time.sleep(int(q["delay"][0]) / 1000)
+            data = png(int(q.get("w", ["4"])[0]), int(q.get("h", ["3"])[0]))
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif u.path == "/res/late.css":  # a style sheet with the text given in ?css=
+            self.send_raw(q.get("css", [""])[0], "text/css")
         elif u.path.startswith("/api/"):
             self.api("GET", u, "")
         else:

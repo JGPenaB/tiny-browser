@@ -1,0 +1,108 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Late resources test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; }
+  .card { border: 1px solid #c8ccd4; border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Style sheets and pictures that arrive after the page</h1>
+<p id="target" class="styled">target</p>
+<div id="pictures"></div>
+<div id="host"><template shadowrootmode="open"><img id="inside" src="/res/dot.png?w=6&amp;h=5"><style>img { border-left: 2px solid green; }</style></template></div>
+<div class="card" id="results"><b>Results</b></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log((ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : ''));
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  function once(el, timeout) {  // 'load', 'error', or 'nothing' when neither comes in time
+    return new Promise(function (resolve) {
+      el.addEventListener('load', function () { resolve('load'); });
+      el.addEventListener('error', function () { resolve('error'); });
+      setTimeout(function () { resolve('nothing'); }, timeout || 3000);
+    });
+  }
+  var target = document.getElementById('target'), pictures = document.getElementById('pictures');
+  var cs = function (el, prop) { return getComputedStyle(el)[prop]; };
+
+  async function main() {
+    // ---- style sheets
+    var style = document.createElement('style');
+    style.textContent = '.styled { font-style: italic; }';
+    document.head.appendChild(style);
+    eq('a <style> added by script applies', cs(target, 'fontStyle'), 'italic');
+    style.textContent = '.styled { font-weight: 700; }';
+    eq('its text can change', cs(target, 'fontStyle') + ':' + cs(target, 'fontWeight'), 'normal:700');
+    style.remove();
+    eq('and it can be taken out again', cs(target, 'fontWeight'), '400');
+
+    var link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = '/res/late.css?css=' + encodeURIComponent('.styled { font-style: italic; border-left: 7px solid red; }');
+    var linked = once(link);
+    document.head.appendChild(link);
+    eq('a linked sheet is not there at once', cs(target, 'fontStyle'), 'normal');
+    eq('the link fires load', await linked, 'load');
+    eq('and then its rules apply', cs(target, 'fontStyle') + ':' + cs(target, 'borderLeftWidth'), 'italic:7px');
+    link.disabled = true;
+    eq('a disabled link does not style', cs(target, 'fontStyle'), 'normal');
+    link.disabled = false;
+    eq('until it is enabled again', cs(target, 'fontStyle'), 'italic');
+    var missing = document.createElement('link');
+    missing.rel = 'stylesheet';
+    missing.href = '/nowhere.css';
+    var missed = once(missing);
+    document.head.appendChild(missing);
+    eq('a sheet that is not found fires error', await missed, 'error');
+
+    // ---- pictures
+    var img = document.createElement('img');
+    img.src = '/res/dot.png?w=40&h=30&delay=100';
+    var loaded = once(img);
+    pictures.appendChild(img);
+    eq('a picture is not complete while it loads', img.complete + ':' + img.naturalWidth, 'false:0');
+    eq('an <img> added by script fires load', await loaded, 'load');
+    eq('its own size', img.naturalWidth + 'x' + img.naturalHeight + ':' + img.complete, '40x30:true');
+    eq('and the size it is laid out with', img.offsetWidth + 'x' + img.offsetHeight, '40x30');
+
+    var again = once(img);
+    img.src = '/res/dot.png?w=10&h=20';
+    eq('a new source loads too', await again, 'load');
+    eq('with the new size', img.naturalWidth + 'x' + img.naturalHeight + ':' + img.offsetWidth, '10x20:10');
+
+    var detached = new Image();
+    var preloaded = once(detached);
+    detached.src = '/res/dot.png?w=10&h=20';
+    eq('an Image that is in no document loads', await preloaded, 'load');
+    eq('with its size', detached.naturalWidth + 'x' + detached.naturalHeight + ':' + detached.complete, '10x20:true');
+
+    var broken = new Image();
+    var failed = once(broken);
+    broken.src = '/nowhere.png';
+    eq('a picture that is not found fires error', await failed, 'error');
+    eq('and has no size', broken.naturalWidth + ':' + broken.complete, '0:true');
+
+    var inside = document.getElementById('host').shadowRoot.getElementById('inside');
+    if (!inside.complete) await once(inside);
+    eq('a picture inside a shadow tree of the markup', inside.naturalWidth + 'x' + inside.naturalHeight + ':' + inside.offsetHeight + ':' + cs(inside, 'borderLeftWidth'), '6x5:5:2px');
+    eq('a picture without a source', new Image().complete + ':' + new Image().naturalWidth, 'true:0');
+  }
+  main().catch(function (e) { log('main threw ' + (e && e.stack || e), false); }).then(function () {
+    document.title = 'Late test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

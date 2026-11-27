@@ -56,6 +56,11 @@ struct NetEntry {
     double ms = 0;
 };
 
+// What the page's own elements ask to be loaded. Both give "" when there is nothing to load.
+std::string image_source(const Node* img);        // an <img>'s picture: src, or what stands in for a placeholder; not resolved
+std::string stylesheet_href(const Node* link);    // a <link rel=stylesheet> for the screen: its href; not resolved
+bool style_for_screen(const Node* styleOrLink);   // the media attribute does not keep it from the screen
+
 // Everything a navigation produces off the UI thread: parsed DOM, parsed stylesheets, decoded images.
 struct LoadResult {
     int tabId = 0;
@@ -63,6 +68,7 @@ struct LoadResult {
     std::string url;
     std::unique_ptr<Document> doc;
     std::vector<Sheet> sheets;
+    std::vector<std::string> sheetKeys;  // for each sheet: "t:" + the text of its <style>, or "u:" + the URL it was linked from
     std::vector<ImageRes> images;
     std::unordered_map<const Node*, int> imgNode;
     std::vector<NetEntry> net;

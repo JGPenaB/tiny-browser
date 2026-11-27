@@ -7,7 +7,11 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <cstdio>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -125,13 +129,36 @@ struct FormState {
     int sel = 0;
 };
 
+// Style sheets and pictures a page asks for after it was loaded (a script added them, or they sit in a shadow
+// tree) are fetched on threads of their own. A thread leaves what it got here; the UI thread takes it from here.
+struct LateLoads {
+    struct Done {
+        std::string url;
+        bool image = false, ok = false;
+        ImageRes picture;
+        std::unique_ptr<Sheet> sheet;
+        NetEntry net;
+    };
+    std::mutex lock;
+    std::vector<Done> done;
+    std::atomic<int> inFlight{0};
+};
+
 struct Page {
     std::string url;
     std::unique_ptr<Document> doc;
-    std::vector<Sheet> sheets;
-    std::unordered_map<std::string, std::unique_ptr<Sheet>> shadowSheets;  // style sheets of shadow trees, by their text
+    // Parsed style sheets by what they are made from: "t:" + the text of a <style> (or of a sheet a script
+    // adopted), "u:" + the URL of a linked sheet. A linked sheet that is still on its way has a null entry.
+    std::unordered_map<std::string, std::unique_ptr<Sheet>> sheetCache;
     std::vector<ImageRes> images;
     std::unordered_map<const Node*, int> imgNode;
+    std::unordered_map<std::string, int> imgByUrl;  // every picture asked for: its place in `images`, -1 while on its way
+    std::shared_ptr<LateLoads> late = std::make_shared<LateLoads>();
+    std::deque<std::pair<std::string, bool>> lateQueue;           // URL, is a picture: waiting for a free fetch thread
+    std::unordered_map<std::string, std::vector<Node*>> waiting;  // the elements to tell when a late resource arrives
+    std::vector<std::pair<Node*, bool>> lateEvents;               // load (true) or error events owed to elements
+    std::function<void()> wake;                                   // any thread: asks the UI thread to look at `late`
+    int lateCount = 0;
     std::vector<NetEntry> net;
     LayoutOut lo;
     float layoutW = -1;
@@ -503,9 +530,17 @@ public:
         auto p = std::make_unique<Page>();
         p->url = r->url;
         p->doc = std::move(r->doc);
-        p->sheets = std::move(r->sheets);
+        for (size_t i = 0; i < r->sheets.size(); ++i) p->sheetCache[r->sheetKeys[i]] = std::make_unique<Sheet>(std::move(r->sheets[i]));
         p->images = std::move(r->images);
+        for (size_t i = 0; i < p->images.size(); ++i) p->imgByUrl[p->images[i].url] = (int)i;
         p->imgNode = std::move(r->imgNode);
+        {
+            HWND target = hwnd;
+            int id = t.id;
+            p->wake = [target, id] {
+                if (target) PostMessageW(target, WM_APP_SCRIPT, (WPARAM)id, 0);
+            };
+        }
         p->net = std::move(r->net);
         p->tFetch = r->tFetch;
         p->tParse = r->tParse;
@@ -617,6 +652,25 @@ public:
             app.invalidate();
         }
         Node* focusedNode() override { return &tab == app.cur() ? app.focus : nullptr; }
+        void imageSourceChanged(Node* img) override {
+            if (Page* p = page()) app.bindImage(*p, img, true);
+        }
+        bool imageSize(Node* img, int& w, int& h) override {
+            w = h = 0;
+            Page* p = page();
+            if (!p) return true;
+            std::string source = image_source(img);
+            if (source.empty()) return true;
+            auto it = p->imgByUrl.find(resolve_url(p->doc->baseUrl, source));
+            if (it == p->imgByUrl.end()) {  // nobody has asked for it yet: now someone has
+                app.bindImage(*p, img, false);
+                return false;
+            }
+            if (it->second < 0) return false;
+            w = p->images[it->second].w;
+            h = p->images[it->second].h;
+            return true;
+        }
         void titleChanged() override {
             Page* p = page();
             if (!p) return;
@@ -669,6 +723,8 @@ public:
     }
     void runScriptTimers(Tab& t) {
         t.scriptDue = -1;
+        if (!t.page) return;
+        takeLate(t);
         if (!t.page || !t.page->script) return;
         t.page->script->pump();
         afterScript(t);
@@ -676,14 +732,23 @@ public:
     // Headless mode has no message loop: serve timers here for a bounded time.
     void pumpScripts(Tab& t, double budgetMs) {
         double end = now_ms() + budgetMs;
-        while (t.page && t.page->script && now_ms() < end) {
-            bool busy = t.page->script->busy();
+        while (t.page && now_ms() < end) {
+            bool busy = (t.page->script && t.page->script->busy()) || lateBusy(*t.page);
             if (t.scriptDue < 0 && !busy) break;
             double wait = t.scriptDue < 0 ? 5 : t.scriptDue - now_ms();
             if (busy) wait = std::min(wait, 5.0);
             if (now_ms() + std::max(0.0, wait) > end) break;
             if (wait > 0) Sleep((DWORD)wait + 1);
             runScriptTimers(t);
+        }
+    }
+    // Headless: lays the page out and waits, for a bounded time, for what the layout asked to be fetched.
+    void settle(Tab& t, double budgetMs) {
+        double end = now_ms() + budgetMs;
+        for (;;) {
+            ensureLayout(t);
+            if (!t.page || !lateBusy(*t.page) || now_ms() >= end) break;
+            pumpScripts(t, std::min(300.0, end - now_ms()));
         }
     }
     // Sends a DOM event to the page's scripts. Returns false when a listener cancelled the default action.
@@ -709,35 +774,167 @@ public:
 
     float viewportW() const { return std::max(200.f, contentRect().w() - kSbW); }
 
+    Sheet* sheetFromText(Page& p, const std::string& css) {
+        auto& sheet = p.sheetCache["t:" + css];
+        if (!sheet) sheet = std::make_unique<Sheet>(parse_sheet(css));
+        return sheet.get();
+    }
+
+    // ---- style sheets and pictures that are asked for after the page was loaded
+    void requestLate(Page& p, const std::string& url, bool image) {
+        p.lateQueue.push_back({url, image});
+        startLate(p);
+    }
+    void startLate(Page& p) {
+        while (!p.lateQueue.empty() && p.late->inFlight < 6) {
+            auto [url, image] = p.lateQueue.front();
+            p.lateQueue.pop_front();
+            if (++p.lateCount > 600) {  // a page that never stops asking: the rest count as failed
+                std::lock_guard<std::mutex> g(p.late->lock);
+                p.late->done.emplace_back();
+                p.late->done.back().url = url;
+                p.late->done.back().image = image;
+                continue;
+            }
+            FetchOpts opts;
+            opts.referrer = p.url;
+            Url du = Url::parse(p.url);
+            opts.firstPartySite = du.valid && !du.host.empty() ? site_of(du.host) : std::string("local");
+            ++p.late->inFlight;
+            std::thread([late = p.late, wake = p.wake, url = url, image = image, opts] {
+                LateLoads::Done d;
+                d.url = url;
+                d.image = image;
+                FetchResult f = fetch(url, opts);
+                d.net = {url, f.contentType, f.error, f.status, f.body.size(), f.ms};
+                d.ok = f.error.empty() && f.status < 400;
+                if (d.ok && image) {
+                    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                    d.picture.url = url;
+                    d.ok = decode_image(f.body, d.picture);
+                    if (!d.ok) d.net.error = "decode failed";
+                    CoUninitialize();
+                } else if (d.ok)
+                    d.sheet = std::make_unique<Sheet>(parse_sheet(bytes_to_utf8(f.body, f.contentType)));
+                {
+                    std::lock_guard<std::mutex> g(late->lock);
+                    late->done.push_back(std::move(d));
+                }
+                --late->inFlight;
+                if (wake) wake();
+            }).detach();
+        }
+    }
+    bool lateBusy(Page& p) {
+        if (p.late->inFlight > 0 || !p.lateQueue.empty() || !p.lateEvents.empty()) return true;
+        std::lock_guard<std::mutex> g(p.late->lock);
+        return !p.late->done.empty();
+    }
+    // Puts what the fetch threads have brought into the page, and tells the elements that were waiting for it.
+    void takeLate(Tab& t) {
+        Page* p = t.page.get();
+        std::vector<LateLoads::Done> done;
+        {
+            std::lock_guard<std::mutex> g(p->late->lock);
+            done.swap(p->late->done);
+        }
+        std::vector<std::pair<Node*, bool>> events;
+        events.swap(p->lateEvents);
+        if (done.empty() && events.empty()) return;
+        for (auto& d : done) {
+            if (!d.net.url.empty()) p->net.push_back(d.net);
+            if (d.image) {
+                p->imgByUrl[d.url] = (int)p->images.size();
+                p->images.push_back(std::move(d.picture));
+            } else
+                p->sheetCache["u:" + d.url] = d.ok ? std::move(d.sheet) : std::make_unique<Sheet>();
+            auto w = p->waiting.find(d.url);
+            if (w == p->waiting.end()) continue;
+            for (Node* n : w->second) events.push_back({n, d.ok});
+            p->waiting.erase(w);
+        }
+        if (!done.empty()) {
+            p->layoutW = -1;
+            p->domDirty = true;
+        }
+        startLate(*p);
+        for (auto& [node, ok] : events) {
+            if (t.page.get() != p || !p->script) break;  // a handler navigated away
+            fireEvent(t, node, ok ? "load" : "error", false, false);
+        }
+        invalidate();
+    }
+    // An <img> shows the picture its source names now. One that has not been asked for yet is fetched; `tell`:
+    // a script set the source, so a load or error event is owed even when the picture is already here.
+    void bindImage(Page& p, Node* n, bool tell) {
+        std::string source = image_source(n);
+        if (source.empty()) {
+            p.imgNode.erase(n);
+            return;
+        }
+        std::string url = resolve_url(p.doc->baseUrl, source);
+        auto it = p.imgByUrl.find(url);
+        if (it == p.imgByUrl.end()) {
+            p.imgByUrl[url] = -1;
+            p.waiting[url].push_back(n);
+            p.imgNode.erase(n);
+            requestLate(p, url, true);
+        } else if (it->second < 0) {
+            auto& w = p.waiting[url];
+            if (std::find(w.begin(), w.end(), n) == w.end()) w.push_back(n);
+            p.imgNode.erase(n);
+        } else {
+            p.imgNode[n] = it->second;
+            if (tell) {
+                p.lateEvents.push_back({n, p.images[it->second].w > 0});
+                if (p.wake) p.wake();
+            }
+        }
+    }
+    void bindImages(Page& p) {
+        std::vector<Node*> st{p.doc->root.get()};
+        while (!st.empty()) {
+            Node* n = st.back();
+            st.pop_back();
+            if (n->is("img")) bindImage(p, n, false);
+            if (n->shadow) st.push_back(n->shadow.get());
+            for (auto& k : n->kids) st.push_back(k.get());
+        }
+    }
+
     void restyle(Page& p, float vw) {
         double t0 = now_ms();
         StyleEngine se;
         se.add(&ua_sheet(), true);
         if (p.doc->quirks) se.add(&quirks_sheet(), true);
-        for (auto& s : p.sheets) se.add(&s, false);
-        if (p.script) se.add(&scripting_sheet(), true);
-        if (g_shadowRoots) {  // each <style> inside a shadow tree styles that tree only
-            std::vector<Node*> st{p.doc->root.get()};
-            while (!st.empty()) {
-                Node* n = st.back();
-                st.pop_back();
-                if (n->is("style"))
-                    if (Node* scope = shadow_root_of(n)) {
-                        std::string css = text_content(n);
-                        auto& sheet = p.shadowSheets[css];
-                        if (!sheet) sheet = std::make_unique<Sheet>(parse_sheet(css));
-                        se.add(sheet.get(), false, scope);
+        // The page's sheets, in tree order: every <style>, and every linked sheet that has arrived, wherever it is
+        // now. One inside a shadow tree styles that tree only.
+        std::vector<Node*> st{p.doc->root.get()};
+        while (!st.empty()) {
+            Node* n = st.back();
+            st.pop_back();
+            if (n->type == Node::T::Element && (n->name == "style" || n->name == "link") && !n->attr("disabled")) {
+                Sheet* sheet = nullptr;
+                if (n->name == "style") {
+                    if (style_for_screen(n)) sheet = sheetFromText(p, text_content(n));
+                } else if (std::string href = stylesheet_href(n); !href.empty()) {
+                    std::string url = resolve_url(p.doc->baseUrl, href);
+                    auto it = p.sheetCache.find("u:" + url);
+                    if (it != p.sheetCache.end()) sheet = it->second.get();
+                    else {
+                        p.sheetCache["u:" + url] = nullptr;
+                        p.waiting[url].push_back(n);
+                        requestLate(p, url, false);
                     }
-                if (n->shadow) st.push_back(n->shadow.get());
-                for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+                }
+                if (sheet) se.add(sheet, false, shadow_root_of(n));
             }
+            if (n->shadow) st.push_back(n->shadow.get());
+            for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
         }
+        if (p.script) se.add(&scripting_sheet(), true);
         if (p.script)
-            for (auto& [scope, css] : p.script->adoptedStyles()) {
-                auto& sheet = p.shadowSheets[css];
-                if (!sheet) sheet = std::make_unique<Sheet>(parse_sheet(css));
-                se.add(sheet.get(), false, scope);
-            }
+            for (auto& [scope, css] : p.script->adoptedStyles()) se.add(sheetFromText(p, css), false, scope);
         se.compute(*p.doc, vw, contentRect().h());
         p.hasMedia = se.hasMedia();
         p.rules = se.ruleCount();
@@ -750,6 +947,7 @@ public:
         float vw = viewportW();
         if (std::fabs(p.layoutW - vw) < 0.5f) return;
         if (p.layoutW < 0 || p.hasMedia) restyle(p, vw);
+        bindImages(p);
         double t0 = now_ms();
         LayoutInput in;
         in.doc = p.doc.get();
@@ -2773,6 +2971,7 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
     followRefresh();
     if (Tab* c = app.cur()) app.pumpScripts(*c, 1500);
     app.cur()->scroll = scroll;
+    if (Tab* c = app.cur()) app.settle(*c, 4000);
     app.ensureLayout(t);
     app.clampScroll(t);
     // Scripted input.
@@ -2806,7 +3005,7 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
         if (Tab* c = app.cur()) app.pumpScripts(*c, 800);
     }
     Tab& ft = *app.cur();
-    app.ensureLayout(ft);
+    app.settle(ft, 2000);
     if (dev && devTab == 0 && ft.page) {
         for (auto& L : ft.page->devLines)
             if (L.node && L.node->name == "body") {
