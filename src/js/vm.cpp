@@ -362,6 +362,7 @@ Vm::Vm() {
     setupBigInt(*this);
     setupModules(*this);
     setupJsBuiltins(*this);
+    suppressedErrorCtor = get(Value::cell(global), atom("SuppressedError"));
 }
 Vm::~Vm() {}
 
@@ -488,6 +489,7 @@ void Vm::markRoots(Gc& g) {
     g.mark(asyncGeneratorProto);
     g.mark(asyncFromSyncProto);
     g.mark(symErrorStack);
+    g.mark(suppressedErrorCtor);
     g.mark(generatorFunctionProto);
     g.mark(asyncGeneratorFunctionProto);
     g.mark(asyncFunctionProto);
@@ -2639,6 +2641,116 @@ Value Vm::runFrames(size_t base) {
                         c->slots[i.c] = R(i.a);
                         break;
                     }
+                    case OP_AddDisposable: {  // CreateDisposableResource and GetDisposeMethod (9.5.3, 9.5.4)
+                        JSArray* list = (JSArray*)R(i.a).asCell();
+                        Value v = R(i.b), method = Value::undef();
+                        int kind = i.c;  // 0 sync, 1 async, 2 async through the sync method
+                        fr->pc = pc;
+                        if (list->elems.size() < 2) list->elems.assign(2, Value::boolean(false));  // needsAwait, hasAwaited
+                        if (v.isNullish()) {
+                            if (!kind) break;
+                            v = Value::undef();
+                        } else {
+                            if (!v.isObject()) throwError(Err::TypeError, "The value of a using declaration must be an object, null or undefined");
+                            if (kind) {
+                                method = get(v, PropKey::of(symAsyncDispose));
+                                if (method.isNullish()) {
+                                    method = get(v, PropKey::of(symDispose));
+                                    kind = 2;
+                                }
+                            } else
+                                method = get(v, PropKey::of(symDispose));
+                            if (method.isNullish() || !isCallable(method)) throwError(Err::TypeError, "The value of a using declaration has no dispose method");
+                        }
+                        list->elems.push_back(v);
+                        list->elems.push_back(method);
+                        list->elems.push_back(Value::i32(kind));
+                        break;
+                    }
+                    case OP_DisposeNext: {  // DisposeResources (9.5.6), up to the next value that has to be awaited
+                        JSArray* list = (JSArray*)R(i.b).asCell();
+                        fr->pc = pc;
+                        auto merge = [&](Value e) {
+                            Value cur = R(i.c);
+                            if (cur.isEmpty() || cur == Value::cell(genReturnSignal)) {
+                                R(i.c) = e;
+                                return;
+                            }
+                            Value args[2] = {e, cur};
+                            R(i.c) = construct(suppressedErrorCtor, args, 2, suppressedErrorCtor);
+                        };
+                        Value out = Value::empty();
+                        while (list->elems.size() >= 5) {
+                            std::vector<Value>& el = list->elems;
+                            Value value = el[el.size() - 3], method = el[el.size() - 2];
+                            int kind = el.back().asInt();
+                            bool needsAwait = el[0].isTrue(), hasAwaited = el[1].isTrue();
+                            if (kind == 0 && needsAwait && !hasAwaited) {  // step 3.d: the pending await comes before a sync resource
+                                el[0] = Value::boolean(false);
+                                out = Value::undef();
+                                break;
+                            }
+                            el.resize(el.size() - 3);
+                            if (method.isUndef()) {  // `await using x = null`
+                                list->elems[0] = Value::boolean(true);
+                                continue;
+                            }
+                            Value result;
+                            bool threw = false;
+                            try {
+                                result = call(method, value, nullptr, 0);
+                            } catch (JSThrow&) {
+                                threw = true;
+                                result = pending;
+                                pending = Value::undef();
+                            }
+                            if (kind == 2) {  // the sync method standing in for an async one: its outcome is awaited as a promise
+                                JSPromise* p = newPromise();
+                                Value keep = Value::cell(p);
+                                if (threw) rejectPromise(p, result);
+                                else resolvePromise(p, Value::undef());
+                                list->elems[1] = Value::boolean(true);
+                                out = keep;
+                                break;
+                            }
+                            if (threw) {
+                                merge(result);
+                                continue;
+                            }
+                            if (kind == 1) {
+                                list->elems[1] = Value::boolean(true);
+                                out = result;
+                                break;
+                            }
+                        }
+                        if (out.isEmpty() && list->elems.size() >= 2) {
+                            bool needsAwait = list->elems[0].isTrue(), hasAwaited = list->elems[1].isTrue();
+                            list->elems.clear();
+                            if (needsAwait && !hasAwaited) out = Value::undef();  // step 4
+                        }
+                        R(i.a) = out;
+                        break;
+                    }
+                    case OP_DisposeMerge: {
+                        Value cur = R(i.a);
+                        fr->pc = pc;
+                        if (cur.isEmpty() || cur == Value::cell(genReturnSignal)) R(i.a) = R(i.b);
+                        else {
+                            Value args[2] = {R(i.b), cur};
+                            R(i.a) = construct(suppressedErrorCtor, args, 2, suppressedErrorCtor);
+                        }
+                        break;
+                    }
+                    case OP_ThrowIfSet:
+                        if (!R(i.a).isEmpty()) {
+                            fr->pc = pc;
+                            freshError = nullptr;
+                            throwValue(R(i.a));
+                        }
+                        break;
+                    case OP_JmpEmpty:
+                        if (R(i.a).isEmpty()) pc = code + i.bx;
+                        break;
                     case OP_ThrowBadTarget:
                         fr->pc = pc;
                         throwError(Err::ReferenceError, i.a ? "Unsupported reference to 'super'" : "Invalid left-hand side in assignment");

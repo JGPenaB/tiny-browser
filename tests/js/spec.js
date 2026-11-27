@@ -237,4 +237,24 @@ test("syntax rules that were missing (13.6, 13.13, 13.3, 16.2)", function () {
   eq([new Date(0)[Symbol.toPrimitive]("number"), typeof Date.prototype.setYear, Date.prototype.toGMTString === Date.prototype.toUTCString], [0, "function", true]);
   throws(() => encodeURI("\uD800"), URIError); eq(decodeURI("%F0%9F%98%80"), "\u{1F600}");
 });
+test("using and await using declarations (14.3.1, 9.5)", function () {
+  let log = [];
+  const res = (name, fail) => ({ [Symbol.dispose]() { log.push("d:" + name); if (fail) throw new Error("fail " + name); } });
+  { using a = res("a"), b = res("b"); log.push("body"); } eq(log, ["body", "d:b", "d:a"]);
+  log = []; eq((function () { using a = res("a"); return log.length; })(), 0); eq(log, ["d:a"]);
+  log = []; try { { using a = res("a", true); throw new Error("boom"); } } catch (e) { eq([e instanceof SuppressedError, e.error.message, e.suppressed.message], [true, "fail a", "boom"]); }
+  log = []; try { { using a = res("a"), b = (() => { throw new Error("init"); })(); } } catch (e) { eq([e.message, log], ["init", ["d:a"]]); }
+  log = []; { using n = null, u = undefined; } eq(log, []);
+  throws(() => { { using x = 1; } }, TypeError); throws(() => { { using x = {}; } }, TypeError);
+  log = []; for (let i = 0; i < 2; i++) { using a = res("a" + i); if (i === 0) continue; break; } eq(log, ["d:a0", "d:a1"]);
+  log = []; for (using x of [res("x"), res("y")]) log.push("body"); eq(log, ["body", "d:x", "body", "d:y"]);
+  log = []; function* g() { using a = res("a"); yield 1; yield 2; } const it = g(); it.next(); it.return(); eq(log, ["d:a"]);
+  throws(() => { { x; using x = null; } }, ReferenceError); throws(() => { { using x = null; x = 1; } }, TypeError);
+  var using = 5; using
+    = 6; eq(using, 6);
+  for (const src of ["{ using x; }", "switch (1) { case 1: using x = null; }", "if (1) using x = null;", "for (using x in {}) ;", "{ await using x = null; }"])
+    throws(() => new Function(src), SyntaxError, src);
+  throws(() => (0, eval)("using x = null;"), SyntaxError);
+  for (let in { k: 1 }) ; eq(let, "k");
+});
 done();

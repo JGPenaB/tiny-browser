@@ -14,15 +14,18 @@ struct Loop {
     size_t finMark = 0;
 };
 struct Fin {
-    Node* block;
+    Node* block;  // the finally block, or null for a scope whose `using` resources are disposed on the way out
     int ctxDepth;
     size_t loopMark;
+    int disposeReg = -1;
+    bool disposeAsync = false;
 };
 struct Fn {
     FunctionInfo* info = nullptr;
     FuncProto* p = nullptr;
     int nextReg = 2, maxReg = 2, ctxDepth = 0;
     uint32_t templateSites = 0;  // tagged templates seen so far in this function
+    int disposeReg = -1;         // the resource list of the innermost scope with `using` declarations
     size_t chainBase = 0;
     std::vector<Loop> loops;
     std::vector<Fin> fins;
@@ -359,7 +362,12 @@ private:
             emit(OP_Yield, t, t);
             f->nextReg--;
         }
-        for (Node* s : info->body) stmt(s);
+        {
+            Scope* bodyScope = info->bodyScope ? info->bodyScope : sc;
+            if (bodyScope->usingKind) withDisposal(bodyScope->usingKind, [&] { for (Node* s : info->body) stmt(s); });
+            else
+                for (Node* s : info->body) stmt(s);
+        }
         syncThis();
         emit(OP_RetUndef);
         FuncProto* p = end(fn);
@@ -1856,6 +1864,64 @@ private:
         f->nextReg = mark;
     }
 
+    // DisposeResources (9.5.6) for the list in `list`. errIn: the register of the error the scope is being left with, or -1.
+    void disposeCode(int list, int errIn, bool isAsync) {
+        int mark = f->nextReg;
+        int err = newReg(), tmp = newReg();
+        if (errIn >= 0) emit(OP_Move, err, errIn);
+        else emit(OP_LoadEmpty, err);
+        if (!isAsync) {
+            emit(OP_DisposeNext, tmp, list, err);
+        } else {  // every `await using` resource is awaited before the next one is disposed
+            size_t top = here();
+            emit(OP_DisposeNext, tmp, list, err);
+            size_t done = jump(OP_JmpEmpty, tmp);
+            size_t tryStart = here();
+            emit(OP_Await, tmp, tmp);
+            size_t tryEnd = here();
+            size_t skip = jump(OP_Jmp);
+            size_t handler = here();
+            int e2 = newReg();
+            emit(OP_Catch, e2);
+            emit(OP_DisposeMerge, err, e2);
+            f->nextReg--;
+            patch(skip);
+            patchTo(jump(OP_Jmp), top);
+            patch(done);
+            f->p->handlers.push_back({(uint32_t)tryStart, (uint32_t)tryEnd, (uint32_t)handler, (uint16_t)f->ctxDepth, 0});
+        }
+        emit(OP_ThrowIfSet, err);
+        f->nextReg = mark;
+    }
+    // Runs `body` as the contents of a scope with `using` declarations: however it is left, its resources are disposed.
+    template <class Body>
+    void withDisposal(int usingKind, Body body) {
+        int list = newReg();
+        emit(OP_NewArray, list);
+        int depth = f->ctxDepth;
+        Fin fin{nullptr, depth, f->loops.size()};
+        fin.disposeReg = list;
+        fin.disposeAsync = usingKind == 2;
+        f->fins.push_back(fin);
+        int saved = f->disposeReg;
+        f->disposeReg = list;
+        size_t start = here();
+        body();
+        size_t end = here();
+        f->disposeReg = saved;
+        f->fins.pop_back();
+        disposeCode(list, -1, usingKind == 2);
+        size_t after = jump(OP_Jmp);
+        size_t handler = here();
+        int e = newReg();
+        emit(OP_Catch, e);
+        disposeCode(list, e, usingKind == 2);
+        emit(OP_Throw, e);
+        f->nextReg--;
+        patch(after);
+        f->p->handlers.push_back({(uint32_t)start, (uint32_t)end, (uint32_t)handler, (uint16_t)depth, 1});
+    }
+
     // Emits the code needed before a jump that leaves try/finally blocks, loops and scopes.
     void unwind(size_t finMark, int targetDepth, size_t loopFrom) {
         for (size_t i = f->loops.size(); i-- > loopFrom;)
@@ -1878,7 +1944,8 @@ private:
             chain.resize(chainLen);
             int savedDepth = f->ctxDepth;
             f->ctxDepth = fin.ctxDepth;
-            quiet(fin.block);
+            if (fin.block) quiet(fin.block);
+            else disposeCode(fin.disposeReg, -1, fin.disposeAsync);
             f->ctxDepth = savedDepth;
             chain.insert(chain.end(), savedChain.begin(), savedChain.end());
             for (auto& L : savedLoops) f->loops.push_back(std::move(L));
@@ -1918,6 +1985,15 @@ private:
             int mark = f->nextReg;
             curLine = d->line;
             Node* t = d->a;
+            if ((n->flags & NF_USING) && d->b) {
+                if (f->disposeReg < 0) fail("internal: using declaration outside a disposal scope");
+                int r = newReg();
+                expr(d->b, r);
+                emit(OP_AddDisposable, f->disposeReg, r, (n->flags & NF_AWAIT) ? 1 : 0);
+                storeIdent(t, r, true);
+                f->nextReg = mark;
+                continue;
+            }
             if (d->b) {
                 if (t->type == N::Ident) {
                     Variable* v = t->var;
@@ -1963,9 +2039,17 @@ private:
         size_t bodyStart = here();
         int depth = f->ctxDepth;
         if (n->scope->hasCtx) emit(OP_CloneCtx);
-        if (n->a->type == N::VarDecl) bindTarget(n->a->list[0]->a, v, true);
-        else bindTarget(n->a, v, false);
-        stmt(n->d);
+        if (n->a->type == N::VarDecl && (n->a->flags & NF_USING)) {
+            withDisposal((n->a->flags & NF_AWAIT) ? 2 : 1, [&] {
+                emit(OP_AddDisposable, f->disposeReg, v, (n->a->flags & NF_AWAIT) ? 1 : 0);
+                bindTarget(n->a->list[0]->a, v, true);
+                stmt(n->d);
+            });
+        } else {
+            if (n->a->type == N::VarDecl) bindTarget(n->a->list[0]->a, v, true);
+            else bindTarget(n->a, v, false);
+            stmt(n->d);
+        }
         size_t bodyEnd = here();
         patchConts();
         patchTo(jump(OP_Jmp), top);
@@ -2064,7 +2148,9 @@ private:
             case N::Block: {
                 ScopeMark sm = enterScope(n->scope);
                 hoist(n->scope);
-                for (Node* s : n->list) stmt(s);
+                if (n->scope && n->scope->usingKind) withDisposal(n->scope->usingKind, [&] { for (Node* s : n->list) stmt(s); });
+                else
+                    for (Node* s : n->list) stmt(s);
                 exitScope(sm);
                 break;
             }
@@ -2104,23 +2190,27 @@ private:
             }
             case N::For: {
                 ScopeMark sm = enterScope(n->scope);
-                if (n->a) quiet(n->a);
-                if (n->a && n->scope->hasCtx) emit(OP_CloneCtx);
-                pushLoop(true);
-                size_t top = here();
-                size_t out = SIZE_MAX;
-                if (n->b) {
-                    int m2 = f->nextReg;
-                    out = jump(OP_JmpF, expr(n->b));
-                    f->nextReg = m2;
-                }
-                stmt(n->d);
-                patchConts();
-                if (n->scope->hasCtx) emit(OP_CloneCtx);
-                if (n->c) effect(n->c);
-                patchTo(jump(OP_Jmp), top);
-                if (out != SIZE_MAX) patch(out);
-                popLoop();
+                auto loop = [&] {
+                    if (n->a) quiet(n->a);
+                    if (n->a && n->scope->hasCtx) emit(OP_CloneCtx);
+                    pushLoop(true);
+                    size_t top = here();
+                    size_t out = SIZE_MAX;
+                    if (n->b) {
+                        int m2 = f->nextReg;
+                        out = jump(OP_JmpF, expr(n->b));
+                        f->nextReg = m2;
+                    }
+                    stmt(n->d);
+                    patchConts();
+                    if (n->scope->hasCtx) emit(OP_CloneCtx);
+                    if (n->c) effect(n->c);
+                    patchTo(jump(OP_Jmp), top);
+                    if (out != SIZE_MAX) patch(out);
+                    popLoop();
+                };
+                if (n->scope->usingKind) withDisposal(n->scope->usingKind, loop);  // the whole loop is the scope of its `using` declarations
+                else loop();
                 exitScope(sm);
                 break;
             }

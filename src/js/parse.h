@@ -27,7 +27,8 @@ enum class N : uint8_t {
 
 enum : uint16_t {
     NF_COMPUTED = 1, NF_STATIC = 2, NF_SHORTHAND = 4, NF_OPTIONAL = 8, NF_PREFIX = 16, NF_DELEGATE = 32, NF_PRIVATE = 64,
-    NF_PAREN = 128, NF_EXPRBODY = 256, NF_AWAIT = 512, NF_EVAL = 1024, NF_TRAILING = 2048, NF_DYN = 4096, NF_INPARAM = 8192
+    NF_PAREN = 128, NF_EXPRBODY = 256, NF_AWAIT = 512, NF_EVAL = 1024, NF_TRAILING = 2048, NF_DYN = 4096, NF_INPARAM = 8192,
+    NF_USING = 16384  // a VarDecl written `using` (with NF_AWAIT: `await using`)
 };
 enum : uint8_t { PK_INIT, PK_GET, PK_SET, PK_METHOD, PK_SPREAD, PK_FIELD, PK_STATIC_BLOCK };
 enum : uint8_t { VK_VAR, VK_LET, VK_CONST, VK_PARAM, VK_FUNC, VK_CLASS, VK_CATCH, VK_FUNCNAME, VK_PSEUDO, VK_PRIVATE, VK_IMPORT };
@@ -78,6 +79,8 @@ struct Scope {
     bool hasEval = false;
     bool catchBody = false;            // the block of a catch clause: its names must not repeat the parameter's
     bool varScope = false;             // the body of a function whose parameters hold expressions: its `var`s live here (10.2.11 step 28)
+    uint8_t usingKind = 0;             // holds `using` declarations (1) or `await using` ones too (2): its resources are disposed when it is left
+    bool isSwitch = false;             // the case block of a switch: no `using` directly inside
     std::vector<JSString*> varNames;   // `var`s declared in nested blocks that are hoisted through this scope  // a direct eval call sits inside: every variable must stay reachable by name
     std::vector<Node*> funcDecls;              // function declarations hoisted to the top of this scope
     // filled in by the compiler

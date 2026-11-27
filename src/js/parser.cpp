@@ -1080,7 +1080,7 @@ private:
         if (t.type == Tok::Ident && !t.esc) {
             JSString* w = t.str;
             const char* lexical = "Lexical declaration cannot appear in a single-statement context";
-            if (w == k.class_ || w == k.const_) fail(lexical);
+            if (w == k.class_ || w == k.const_ || usingAhead(false)) fail(lexical);
             if (w == k.let_) {
                 Tok nx = peek();
                 if (nx.type == Tok::Punct && nx.p == P_LBrack) fail(lexical);
@@ -1124,6 +1124,7 @@ private:
         return b;
     }
     JSString* evalAtom = vm.atom("eval");
+    JSString* usingAtom = vm.atom("using");
 
     [[noreturn]] void fail(const std::string& m) { throw SyntaxErr{m, t.line}; }
     [[noreturn]] void unexpected() {
@@ -1447,6 +1448,12 @@ private:
         }
         if (t.type == Tok::Ident && !t.esc) {
             JSString* w = t.str;
+            if (int u = usingAhead(false)) {
+                Node* d = usingDecl(u == 2, true);
+                requireInitializers(d);
+                semi();
+                return d;
+            }
             if (w == k.var_ || w == k.const_) {
                 Node* d = varDecl(w == k.var_ ? VK_VAR : VK_CONST, true);
                 requireInitializers(d);
@@ -1609,6 +1616,50 @@ private:
         return b;
     }
 
+    // Is this the start of a `using` (1) or `await using` (2) declaration? (14.3.1; `using` is a name anywhere else)
+    int usingAhead(bool forHead) {
+        if (t.type != Tok::Ident || t.esc) return 0;
+        if (t.str == usingAtom) {
+            Tok nx = peek();
+            if (nx.type != Tok::Ident || nx.nl || isRes(nx.str)) return 0;
+            if (forHead && nx.str == k.of_) return 0;
+            return 1;
+        }
+        if (t.str == k.await_ && (fn->isAsync || fn->isStaticBlock)) {
+            Tok nx = peek();
+            if (nx.type != Tok::Ident || nx.str != usingAtom || nx.nl || nx.esc) return 0;
+            Tok n2 = peek(2);
+            if (n2.type != Tok::Ident || n2.nl || isRes(n2.str)) return 0;
+            return fn->isAsync ? 2 : 0;
+        }
+        return 0;
+    }
+    Node* usingDecl(bool isAwait, bool in) {
+        if (scope->kind == Scope::Global || (fn->isEvalBody && scope == fn->scope)) fail("A using declaration is not allowed at the top level of a script");
+        if (scope->isSwitch) fail("A using declaration is not allowed directly in a switch case");
+        Node* d = mk(N::VarDecl);
+        d->op = VK_CONST;
+        d->flags |= NF_USING | (isAwait ? NF_AWAIT : 0);
+        if (isAwait) {
+            advance();  // await
+            if (fn == ast.moduleFn) ast.hasTLA = true;
+        }
+        advance();  // using
+        do {
+            size_t mark = declaredNow.size();
+            Node* decl = mk(N::Declarator);
+            if (isP(P_LBrack) || isP(P_LBrace)) fail("A using declaration takes names, not patterns");
+            decl->a = bindingIdent(VK_CONST);
+            if (eatP(P_Assign)) {
+                decl->b = assign(in);
+                nameFn(decl->b, decl->a->str);
+            }
+            finishDecl(mark);
+            d->list.push_back(decl);
+        } while (eatP(P_Comma));
+        if (scope->usingKind < (isAwait ? 2 : 1)) scope->usingKind = isAwait ? 2 : 1;
+        return d;
+    }
     void requireInitializers(Node* d) {
         for (Node* decl : d->list) {
             if (decl->b) continue;
@@ -1823,7 +1874,10 @@ private:
         size_t mark = declaredNow.size();
         bool isDecl = false;
         if (isP(P_Semi)) {
-        } else if (isK(k.var_) || isK(k.const_) || (isK(k.let_) && peek().type != Tok::Punct) ||
+        } else if (int u = usingAhead(true)) {
+            init = usingDecl(u == 2, false);
+            isDecl = true;
+        } else if (isK(k.var_) || isK(k.const_) || (isK(k.let_) && peek().type != Tok::Punct && !(peek().type == Tok::Ident && peek().str == k.in_)) ||
                    (isK(k.let_) && (peek().p == P_LBrack || peek().p == P_LBrace))) {
             init = varDecl(isK(k.var_) ? VK_VAR : isK(k.let_) ? VK_LET : VK_CONST, false);
             isDecl = true;
@@ -1837,6 +1891,7 @@ private:
             advance();
             if (isDecl) {
                 finishDecl(mark);
+                if ((init->flags & NF_USING) && n->type == N::ForIn) fail("A using declaration cannot be the variable of a for-in loop");
                 if (init->list.size() != 1) fail("Invalid left-hand side in for-loop");
                 if (init->list[0]->b) {  // only `for (var x = 1 in obj)` in sloppy code may have an initializer (B.3.5)
                     bool legacy = n->type == N::ForIn && init->op == VK_VAR && !fn->strict && init->list[0]->a->type == N::Ident;
@@ -1909,6 +1964,7 @@ private:
         expectP(P_RParen);
         expectP(P_LBrace);
         Scope* sc = open(Scope::Block);
+        sc->isSwitch = true;
         n->scope = sc;
         while (!isP(P_RBrace)) {
             Node* c = mk(N::Case);

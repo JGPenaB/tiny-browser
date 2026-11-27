@@ -139,5 +139,16 @@ test("yield* forwards next, throw and return", function () {
   eq((await awaitInside().next()).value, 21);
   async function* collect() { const out = []; for await (const x of count(3)) out.push(x); yield out; }
   eq((await collect().next()).value, [1, 2, 3]);
+
+  __current = "await using";
+  let seen = [];
+  const ares = (name, fail) => ({ async [Symbol.asyncDispose]() { seen.push("a:" + name); if (fail) throw new Error("fail " + name); } });
+  const sres = name => ({ [Symbol.dispose]() { seen.push("d:" + name); } });
+  { await using a = ares("a"), b = sres("b"), c = null; seen.push("body"); } seen.push("after");
+  eq(seen, ["body", "d:b", "a:a", "after"]);
+  seen = []; try { { await using a = ares("a", true); throw new Error("boom"); } } catch (e) { eq([e instanceof SuppressedError, e.error.message, e.suppressed.message], [true, "fail a", "boom"]); }
+  seen = []; for (await using x of [ares("x"), sres("y")]) seen.push("body"); eq(seen, ["body", "a:x", "body", "d:y"]);
+  const order = []; const pending = (async function () { await using x = null; order.push("body"); })(); order.push("after call"); await pending; order.push("done");
+  eq(order, ["body", "after call", "done"]);
   done();
 })().catch(e => { console.log("FAIL main rejected: " + (e && e.stack || e)); });

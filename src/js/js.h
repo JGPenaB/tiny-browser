@@ -652,6 +652,7 @@ public:
     void pinArgumentsLength(JSObject* o);
     static constexpr uint8_t kModuleHostKind = 200;  // JSHost::hostKind of a module namespace object
     static bool isHtmlDda(Value v) { return v.isObject() && v.asObject()->cls == Cls::Native && ((JSNative*)v.asObject())->htmlDda; }
+    Value suppressedErrorCtor;  // %SuppressedError%, for the errors `using` declarations collect
     Value* mappedArg(JSObject* o, PropKey k);  // the parameter an arguments element is still tied to, or null
     void unmapArg(JSObject* o, PropKey k);
     void set(Value target, const char* name, Value v) { set(target, PropKey::of(atom(name)), v); }
