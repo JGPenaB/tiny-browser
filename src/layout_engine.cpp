@@ -118,6 +118,7 @@ struct Box {
     int ordinal = 0, span = 1;
     bool intrinsicDone = false;
     float minW = 0, maxW = 0;
+    float contentMinW = 0;  // minW as the content alone makes it, before the box's own width and limits count
     size_t paintIdx = SIZE_MAX, clipIdx = SIZE_MAX;
     float forcedW = -1, forcedH = -1;  // border-box size imposed by the parent formatting context
     float staticX = 0, staticY = 0;
@@ -834,6 +835,7 @@ void intrinsic(Ctx& c, Box& b) {
                 mx = std::max(mx, k->maxW);
             }
     }
+    b.contentMinW = mn + hpb;
     if (b.st && b.kind != BK::Anon && !b.replaced) {
         if (b.st->width.u == Len::Px) {
             float w = b.st->width.v;
@@ -1386,11 +1388,19 @@ float layoutFlex(Ctx& c, Box& b, float ix, float iy, float W, float lower, float
         else if (defW) f.base = st->width.resolve(W) + (st->borderBox ? 0 : hpb);
         else f.base = cMax;
         f.base = std::max(f.base, hpb);
-        if (st && st->minWidth.definite()) f.mn = st->minWidth.resolve(W) + (st->borderBox ? 0 : hpb);
-        else if (st && st->overflow != 0) f.mn = hpb;
-        else f.mn = (defW || defBasis) ? std::min(cMin, f.base) : cMin;
         f.mx = (st && st->maxWidth.definite()) ? st->maxWidth.resolve(W) + (st->borderBox ? 0 : hpb) : 1e9f;
-        if (f.mx < f.mn) f.mx = f.mn;
+        if (st && st->minWidth.definite()) {
+            f.mn = st->minWidth.resolve(W) + (st->borderBox ? 0 : hpb);
+            f.mx = std::max(f.mx, f.mn);
+        } else if (st && st->overflow != 0) {
+            f.mn = hpb;
+        } else {
+            // The automatic minimum (Flexbox 4.5): the width the content needs at least, capped by the item's own
+            // width when it has one and by its max-width. A flex-basis does not lower it.
+            f.mn = std::max(hpb, it->contentMinW - f.hm);
+            if (defW) f.mn = std::min(f.mn, st->width.resolve(W) + (st->borderBox ? 0 : hpb));
+            f.mn = std::min(f.mn, f.mx);
+        }
         f.hyp = std::clamp(f.base, f.mn, f.mx);
         f.mlA = st && st->margin[3].u == Len::Auto;
         f.mrA = st && st->margin[1].u == Len::Auto;
