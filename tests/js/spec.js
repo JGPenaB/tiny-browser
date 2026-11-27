@@ -272,4 +272,21 @@ test("proper tail calls in strict code (15.10)", function () {
   function Ctor(n) { if (n > 0) return new Ctor(n - 1); this.depth = 0; } eq(new Ctor(50).depth, 0);
   const o = { m(n) { return n === 0 ? this.v : this.m(n - 1); }, v: 7 }; eq(o.m(150000), 7);
 });
+test("finally runs once, with and object environments, small rules", function () {
+  let runs = 0; function f() { try { throw "t"; } catch (e) { return "c"; } finally { runs++; throw new RangeError("fin"); } }
+  throws(f, RangeError); eq(runs, 1);
+  runs = 0; function g() { try { try { return 1; } catch (e) { return "inner caught"; } } finally { runs++; } } eq([g(), runs], [1, 1]);
+  runs = 0; function h() { try { try { return 1; } catch (e) { return "wrong"; } finally { runs++; throw new RangeError("fin"); } } catch (e) { return e.constructor.name; } }
+  eq([h(), runs], ["RangeError", 1]);
+  runs = 0; function loop() { for (let i = 0; i < 3; i++) { try { if (i === 1) continue; if (i === 2) break; } finally { runs++; } } return runs; } eq(loop(), 3);
+  eq([(function ([a, b]) { }).length, (function (a, b = 1, c) { }).length, (function (a, ...r) { }).length, (({ x }, y) => { }).length], [1, 1, 1, 2]);
+  const gen = { *g() { } }; eq(Object.getPrototypeOf(gen.g.prototype) === Object.getPrototypeOf(function* () { }).prototype, true);
+  let sets = 0; const spy = new Proxy({}, { set() { sets++; return true; } }); const saved = Object.getPrototypeOf(Number.prototype);
+  Object.setPrototypeOf(Number.prototype, spy); (0).viaProxy = 1; Object.setPrototypeOf(Number.prototype, saved); eq(sets, 1);
+  yi\u0065ld: for (;;) break yield;
+  throws(() => new Function("var async; for (async of [1]) ;"), SyntaxError); new Function("for (async of => {}; false;) ;");
+  eq(new Function("o", "with (o) { var k = delete o.k; } return [o.k, typeof k].join()")({ k: 1 }), "true,undefined");
+  const trace = []; const env = new Proxy({ p: 1 }, { has(t, k) { if (typeof k === "string") trace.push("has:" + k); return Reflect.has(t, k); }, get(t, k) { trace.push("get:" + String(k)); return t[k]; } });
+  eq([new Function("env", "with (env) { return p; }")(env), trace], [1, ["has:p", "get:Symbol(Symbol.unscopables)", "has:p", "get:p"]]);
+});
 done();

@@ -965,7 +965,7 @@ Value Vm::fnProtoProp(JSFunction* f) {
     PropKey k = PropKey::of(a.prototype);
     if (Prop* p = f->find(k)) return p->val;
     FuncProto* c = f->code;
-    if (c->isArrow || c->isMethod || (c->isAsync && !c->isGenerator)) return Value::undef();
+    if (c->isArrow || (c->isMethod && !c->isGenerator) || (c->isAsync && !c->isGenerator)) return Value::undef();
     JSObject* po = newObject(c->isGenerator ? (c->isAsync ? asyncGeneratorProto : generatorProto) : objectProto);
     if (!c->isGenerator) po->add(PropKey::of(a.constructor), Value::cell(f), PF_W | PF_C);
     f->add(k, Value::cell(po), PF_W);
@@ -1299,19 +1299,9 @@ bool Vm::set(Value target, PropKey k, Value v) {
     if (target.isObject()) return setObj(target.asObject(), k, v, target);
     if (target.isNullish() || target.isEmpty())
         throwError(Err::TypeError, "Cannot set properties of %s (setting '%s')", target.isNull() ? "null" : "undefined", keyName(*this, k).c_str());
-    // primitives: only a setter on the prototype chain can take the value (ECMA-262 10.1.9.2, receiver not an object)
-    for (JSObject* cur = protoOf(target); cur; cur = cur->proto)
-        if (Prop* p = cur->find(k)) {
-            if (p->flags & PF_ACC) {
-                Accessor* acc = (Accessor*)p->val.asCell();
-                if (!acc->set.isUndef()) {
-                    call(acc->set, target, &v, 1);
-                    return true;
-                }
-            }
-            return false;
-        }
-    return false;
+    // primitives: only a setter or a proxy on the prototype chain can take the value (10.1.9.2, receiver not an object)
+    JSObject* proto = protoOf(target);
+    return proto ? setObj(proto, k, v, target) : false;
 }
 
 void Vm::failedSet(Value target, PropKey k) {

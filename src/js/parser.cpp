@@ -1446,6 +1446,10 @@ private:
             advance();
             return e;
         }
+        if (t.type == Tok::Ident && t.esc && !isRes(t.str)) {
+            Tok nx = peek();
+            if (nx.type == Tok::Punct && nx.p == P_Colon) return labelled(t.str);
+        }
         if (t.type == Tok::Ident && !t.esc) {
             JSString* w = t.str;
             if (int u = usingAhead(false)) {
@@ -1569,33 +1573,34 @@ private:
             }
             if (!isRes(w)) {
                 Tok nx = peek();
-                if (nx.type == Tok::Punct && nx.p == P_Colon) {
-                    checkName(w, false);
-                    for (auto& l : lab.names)
-                        if (l.first == w) fail("Label '" + utf16to8(w->s) + "' has already been declared");
-                    Node* n = mk(N::Labeled);
-                    n->str = w;
-                    advance();
-                    advance();
-                    // the label names a loop when the statement it leads to, past any further labels, is one
-                    Tok look = t;
-                    for (int off = 0; off < 16 && look.type == Tok::Ident && !look.esc && !isRes(look.str); off += 2) {
-                        Tok colon = peek(off + 1);
-                        if (!(colon.type == Tok::Punct && colon.p == P_Colon)) break;
-                        look = peek(off + 2);
-                    }
-                    bool loop = look.type == Tok::Ident && !look.esc && (look.str == k.for_ || look.str == k.while_ || look.str == k.do_);
-                    lab.names.push_back({w, loop});
-                    n->a = subStatement(false, true);
-                    lab.names.pop_back();
-                    return n;
-                }
+                if (nx.type == Tok::Punct && nx.p == P_Colon) return labelled(w);
             }
         }
         Node* e = mk(N::ExprStmt);
         e->a = expression();
         semi();
         return e;
+    }
+    Node* labelled(JSString* w) {  // at the label's name; the colon follows
+        checkName(w, t.esc);
+        for (auto& l : lab.names)
+            if (l.first == w) fail("Label '" + utf16to8(w->s) + "' has already been declared");
+        Node* n = mk(N::Labeled);
+        n->str = w;
+        advance();
+        advance();
+        // the label names a loop when the statement it leads to, past any further labels, is one
+        Tok look = t;
+        for (int off = 0; off < 16 && look.type == Tok::Ident && !look.esc && !isRes(look.str); off += 2) {
+            Tok colon = peek(off + 1);
+            if (!(colon.type == Tok::Punct && colon.p == P_Colon)) break;
+            look = peek(off + 2);
+        }
+        bool loop = look.type == Tok::Ident && !look.esc && (look.str == k.for_ || look.str == k.while_ || look.str == k.do_);
+        lab.names.push_back({w, loop});
+        n->a = subStatement(false, true);
+        lab.names.pop_back();
+        return n;
     }
 
     Node* block(bool newScope) {
@@ -1873,6 +1878,7 @@ private:
         Node* init = nullptr;
         size_t mark = declaredNow.size();
         bool isDecl = false;
+        bool asyncOf = isK(k.async_) && !t.esc && peek().type == Tok::Ident && peek().str == k.of_;
         if (isP(P_Semi)) {
         } else if (int u = usingAhead(true)) {
             init = usingDecl(u == 2, false);
@@ -1888,6 +1894,7 @@ private:
         if (init && (isK(k.of_) || isK(k.in_))) {
             n->type = isK(k.of_) ? N::ForOf : N::ForIn;
             if (isAwait) n->flags |= NF_AWAIT;
+            if (asyncOf && !isAwait && n->type == N::ForOf && init->type == N::Ident) fail("The left-hand side of a for-of loop may not be 'async'");
             advance();
             if (isDecl) {
                 finishDecl(mark);
@@ -2054,7 +2061,7 @@ private:
         paramsOf = outerParams;
     }
     void paramList(FunctionInfo& f) {
-        bool simple = true;
+        bool simple = true, counting = true;
         while (!isP(P_RParen)) {
             size_t mark = declaredNow.size();
             if (isP(P_Ellipsis)) {
@@ -2068,7 +2075,8 @@ private:
             } else {
                 Node* p = bindingElement(VK_PARAM);
                 if (p->type != N::Ident) simple = false, f.simpleParams = false;
-                if (simple) f.length = (int)f.params.size() + 1;
+                if (p->type == N::AssignPat) counting = false;
+                if (counting) f.length = (int)f.params.size() + 1;
                 f.params.push_back(p);
             }
             finishDecl(mark);

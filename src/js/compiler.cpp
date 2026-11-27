@@ -1,4 +1,5 @@
 // Bytecode compiler: walks the resolved AST and emits register-machine code.
+#include <algorithm>
 #include "bytecode.h"
 #include "parse.h"
 
@@ -27,6 +28,10 @@ struct Fn {
     uint32_t templateSites = 0;  // tagged templates seen so far in this function
     int disposeReg = -1;         // the resource list of the innermost scope with `using` declarations
     int tryDepth = 0;            // try blocks with a catch clause that are open: a call inside one is not a tail call
+    struct Unwound {
+        size_t start, end, index;
+    };
+    std::vector<Unwound> unwound;  // finally blocks compiled in line at a return, break or continue: where, and for which entry of fins
     size_t chainBase = 0;
     std::vector<Loop> loops;
     std::vector<Fin> fins;
@@ -1987,8 +1992,10 @@ private:
             chain.resize(chainLen);
             int savedDepth = f->ctxDepth;
             f->ctxDepth = fin.ctxDepth;
+            size_t inlineStart = here();
             if (fin.block) quiet(fin.block);
             else disposeCode(fin.disposeReg, -1, fin.disposeAsync);
+            f->unwound.push_back({inlineStart, here(), i});
             f->ctxDepth = savedDepth;
             chain.insert(chain.end(), savedChain.begin(), savedChain.end());
             for (auto& L : savedLoops) f->loops.push_back(std::move(L));
@@ -2034,6 +2041,12 @@ private:
                 expr(d->b, r);
                 emit(OP_AddDisposable, f->disposeReg, r, (n->flags & NF_AWAIT) ? 1 : 0);
                 storeIdent(t, r, true);
+                f->nextReg = mark;
+                continue;
+            }
+            if (d->b && t->type == N::Ident && dynOf(t) && n->op == VK_VAR) {
+                int base = resolveDyn(t);
+                storeResolved(t, base, expr(d->b));
                 f->nextReg = mark;
                 continue;
             }
@@ -2111,8 +2124,23 @@ private:
         exitScope(sm);
     }
 
+    // Registers a handler for [start, end), leaving out the finally blocks that were compiled in line for this try
+    // statement or the ones around it: by the time one of those runs, the statement has been left (14.15.3).
+    void protect(size_t start, size_t end, size_t target, int depth, int isFinally, size_t finDepth, bool ownsFin) {
+        std::vector<std::pair<size_t, size_t>> holes;
+        for (auto& u : f->unwound)
+            if (u.start >= start && u.end <= end && (ownsFin ? u.index <= finDepth : u.index < finDepth)) holes.push_back({u.start, u.end});
+        std::sort(holes.begin(), holes.end());
+        size_t cur = start;
+        for (auto& h : holes) {
+            if (h.first > cur) f->p->handlers.push_back({(uint32_t)cur, (uint32_t)h.first, (uint32_t)target, (uint16_t)depth, (uint16_t)isFinally});
+            cur = std::max(cur, h.second);
+        }
+        if (cur < end) f->p->handlers.push_back({(uint32_t)cur, (uint32_t)end, (uint32_t)target, (uint16_t)depth, (uint16_t)isFinally});
+    }
     void tryStmt(Node* n) {
         int depth = f->ctxDepth;
+        size_t finDepth = f->fins.size();
         bool hasFin = n->d != nullptr;
         if (hasFin) f->fins.push_back({n->d, depth, f->loops.size()});
         size_t start = here();
@@ -2130,7 +2158,7 @@ private:
             stmt(n->c);
             exitScope(sm);
             patch(after);
-            f->p->handlers.push_back({(uint32_t)start, (uint32_t)endTry, (uint32_t)handler, (uint16_t)depth, 0});
+            protect(start, endTry, handler, depth, 0, finDepth, hasFin);
         }
         if (hasFin) {
             size_t endAll = here();
@@ -2144,7 +2172,7 @@ private:
             emit(OP_Throw, e);
             f->nextReg--;
             patch(after);
-            f->p->handlers.push_back({(uint32_t)start, (uint32_t)endAll, (uint32_t)handler, (uint16_t)depth, 1});
+            protect(start, endAll, handler, depth, 1, finDepth, true);
         }
     }
 
