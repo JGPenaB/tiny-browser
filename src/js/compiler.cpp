@@ -1449,7 +1449,17 @@ private:
                     f->nextReg = mark;
                     return dst;
                 }
+                int known = -1;
+                if (!v && f->info->strict) {  // strict code: the name is resolved before the value is computed (13.15.2, 6.2.5.6)
+                    known = newReg();
+                    emitX(OP_HasGlobal, known, kstr(t->str));
+                }
                 int r = expr(n->b);
+                if (known >= 0) {
+                    size_t ok = jump(OP_JmpT, known);
+                    emitX(OP_ThrowUnresolved, 0, kstr(t->str));
+                    patch(ok);
+                }
                 storeIdent(t, r, false);
                 if (r != dst) emit(OP_Move, dst, r);
                 f->nextReg = mark;

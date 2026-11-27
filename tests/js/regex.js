@@ -101,4 +101,9 @@ test("lookbehind matches right to left (22.2.2.3)", function () {
   eq(["abcd".replace(/(?<=b)c/, "X"), "abcd".replace(/(?<!b)c/, "X"), /(?<=^ab)c/.test("abc"), /(?<=\$)\d+(\.\d*)?/.exec("cost $10.50")[0]], ["abXd", "abcd", true, "10.50"]);
   eq([/(?<=\u{1F600})x/u.test("\u{1F600}x"), /(?<=a(?=b)b)c/.test("abc"), /(?<=(?<!x)a)b/.test("ab"), "a1b2".match(/(?<=[a-z])\d/g)], [true, true, true, ["1", "2"]]);
 });
+test("case-insensitive matching by the flag in force (22.2.5.6 Canonicalize)", function () {
+  eq([/\u212a/i.test("k"), /\u212a/iu.test("k"), /\u212a/iu.test("K"), /k/iu.test("\u212a"), /[\u212a]/iu.test("k"), /\u017f/i.test("s"), /\u017f/iu.test("S")], [false, true, true, true, true, false, true]);
+  eq([/[\u0390]/ui.test("\u1fd3"), /[\u1fd3]/ui.test("\u0390"), /[\ufb05]/ui.test("\ufb06"), /\u03c2/iu.test("\u03a3"), /\u00df/iu.test("\u1e9e"), /i/iu.test("\u0130")], [true, true, true, true, true, false]);
+  eq([/(?=(abc))?a/.exec("abc").slice(), /(?:(a)|b)?c/.exec("c").slice(), /(a*)?b/.exec("b").slice()], [["a", undefined], ["c", undefined], ["b", undefined]]);
+});
 done();

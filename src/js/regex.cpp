@@ -43,6 +43,27 @@ uint32_t lowerOf(uint32_t c) {
     return (uint32_t)(uintptr_t)CharLowerW((LPWSTR)(uintptr_t)(wchar_t)c) & 0xFFFF;
 }
 
+// Characters whose simple case folding (CaseFolding.txt, status C and S) is not what lower(upper(c)) gives here.
+struct FoldPair {
+    uint32_t from, to;
+};
+const FoldPair kFoldSpecial[] = {{0xB5, 0x3BC},    {0x130, 0x130},   {0x131, 0x131},   {0x17F, 's'},     {0x345, 0x3B9},  {0x3C2, 0x3C3},
+                                 {0x3D0, 0x3B2},   {0x3D1, 0x3B8},   {0x3D5, 0x3C6},   {0x3D6, 0x3C0},   {0x3F0, 0x3BA},  {0x3F1, 0x3C1},
+                                 {0x3F4, 0x3B8},   {0x3F5, 0x3B5},   {0x1E9B, 0x1E61}, {0x1E9E, 0xDF},   {0x1FBE, 0x3B9}, {0x1FD3, 0x390},
+                                 {0x1FE3, 0x3B0},  {0x2126, 0x3C9},  {0x212A, 'k'},    {0x212B, 0xE5},   {0xFB05, 0xFB06}};
+uint32_t foldOf(uint32_t c) {
+    if (c < 128) return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    for (const FoldPair& f : kFoldSpecial)
+        if (f.from == c) return f.to;
+    return lowerOf(upperOf(c));
+}
+// The canonical form two characters share when they match under the i flag.
+uint32_t canonOf(uint32_t c, bool unicode) {
+    if (unicode) return foldOf(c);
+    uint32_t u = upperOf(c);
+    return c >= 128 && u < 128 ? c : u;  // a non-ASCII character does not become an ASCII one
+}
+
 // Unicode properties come from generated tables (unicode_data.h). A property is the number of its table.
 int findProp(const std::string& name) {
     size_t lo = 0, hi = sizeof(kUniNames) / sizeof(kUniNames[0]);
@@ -72,6 +93,7 @@ struct CharClass {
     std::vector<std::pair<int, bool>> props;  // Unicode property, negated?
     bool negate = false;
     bool icase = false;  // ignoreCase was in force where the class was written
+    bool uni = false;    // the u or v flag: case-insensitive matching goes by simple case folding
     bool ascii[128] = {};  // final answer for ASCII, filled in once the class is complete
 };
 
@@ -91,8 +113,15 @@ bool rawIn(const CharClass& cc, uint32_t cp) {
 bool classMatchSlow(const CharClass& cc, uint32_t cp, bool ignoreCase) {
     bool in = rawIn(cc, cp);
     if (!in && ignoreCase) {
-        uint32_t u = upperOf(cp), l = lowerOf(cp);
-        in = (u != cp && rawIn(cc, u)) || (l != cp && rawIn(cc, l));
+        // some character with the same canonical form is in the class: the usual candidates are the two cases of cp
+        uint32_t canon = canonOf(cp, cc.uni);
+        auto same = [&](uint32_t other) { return other != cp && canonOf(other, cc.uni) == canon && rawIn(cc, other); };
+        in = same(upperOf(cp)) || same(lowerOf(cp)) || same(canon) || same(upperOf(canon));
+        if (!in && cc.uni) {
+            static const uint32_t extra[] = {0x17F, 0x212A, 0x2126, 0x212B, 0x1E9E, 0x1FD3, 0x1FE3, 0xFB05, 0xFB06, 0x390, 0x3B0, 0xDF, 0x3C2, 0x3F4, 0x1E9B};
+            for (uint32_t other : extra)
+                if (same(other)) in = true;
+        }
     }
     return in != cc.negate;
 }
@@ -179,6 +208,7 @@ struct Parser {
     }
     RxNode* classNode(CharClass&& cc) {
         cc.icase = fl.ignoreCase;
+        cc.uni = fl.unicode;
         classes.push_back(std::move(cc));
         RxNode* n = mk(RxNode::Class);
         n->c = (uint32_t)classes.size() - 1;
@@ -995,7 +1025,7 @@ struct Compiler {
     void one(RxNode* n, uint8_t& op, uint32_t& x) {
         if (n->t == RxNode::Char) {
             op = n->icase ? I_CHAR_I : I_CHAR;
-            x = n->icase ? upperOf(n->c) : n->c;
+            x = n->icase ? canonOf(n->c, P.fl.unicode) : n->c;
         } else if (n->t == RxNode::Any) {
             op = I_ANY;
             x = n->dotAll ? 1 : 0;
@@ -1101,9 +1131,12 @@ struct Compiler {
             return;
         }
         std::vector<size_t> splits;
+        int emptyReg = wmin == 0 ? out.nregs++ : -1;
         for (uint32_t k = mn; k < mx; ++k) {
             splits.push_back(emit(I_SPLIT));
+            if (emptyReg >= 0) emit(I_LOOP_START, (uint32_t)emptyReg);
             body();
+            if (emptyReg >= 0) emit(I_LOOP_CHECK, (uint32_t)emptyReg);
         }
         for (size_t sp : splits) {
             out.code[sp].x = n->greedy ? (uint32_t)sp + 1 : here();
@@ -1156,7 +1189,7 @@ struct Matcher {
         }
         switch (op) {
             case I_CHAR: return cp == x;
-            case I_CHAR_I: return cp == x || upperOf(cp) == x;
+            case I_CHAR_I: return cp == x || canonOf(cp, uni) == x;
             case I_ANY: return x || !isLineEnd(cp);
             default: return classHit(x, cp);
         }
@@ -1167,7 +1200,7 @@ struct Matcher {
         uint32_t cp = at(pos, w);
         switch (op) {
             case I_CHAR: return cp == x;
-            case I_CHAR_I: return cp == x || upperOf(cp) == x;
+            case I_CHAR_I: return cp == x || canonOf(cp, uni) == x;
             case I_ANY: return x || !isLineEnd(cp);
             default: return classHit(x, cp);
         }
@@ -1253,7 +1286,7 @@ struct Matcher {
                         int from = back ? pos - n : pos;
                         for (int k = 0; k < n; ++k) {
                             char16_t p = s[a + k], q = s[from + k];
-                            if (p != q && !((in.flag & 1) && upperOf(p) == upperOf(q))) goto fail;
+                            if (p != q && !((in.flag & 1) && canonOf(p, uni) == canonOf(q, uni))) goto fail;
                         }
                         pos = back ? pos - n : pos + n;
                     }

@@ -87,6 +87,7 @@ enum Op : uint16_t {
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
     OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2
     OP_DefGlobalFuncD,  // like OP_DefGlobalFunc, from eval code: the property can be deleted
+    OP_HasGlobal,        // a = does the global name consts[bx] resolve right now?
     OP_WithHas,          // HasBinding of a `with` object (9.1.1.2.1): a = found, b = object, c = name; honours Symbol.unscopables
     OP_WithGet,          // GetBindingValue of an object environment (9.1.1.2.6): a = value, b = object, c = name
     OP_TailCall,         // OP_Call in tail position of strict code (15.10.3 PrepareForTailCall): a plain function takes over the frame

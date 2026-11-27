@@ -2553,6 +2553,12 @@ Value Vm::runFrames(size_t base) {
                         }
                         break;
                     }
+                    case OP_HasGlobal: {
+                        PropKey k = KEYK(i.bx);
+                        fr->pc = pc;
+                        R(i.a) = Value::boolean(globalLex->find(k) || has(global, k));
+                        break;
+                    }
                     case OP_CheckGlobalDecl: {
                         PropKey k = KEYK(i.bx);
                         fr->pc = pc;
