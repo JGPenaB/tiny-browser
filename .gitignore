@@ -13,6 +13,8 @@ CMakeUserPresets.json
 .vscode/
 *.user
 *.suo
+AGENTS.md
+CLAUDE.md
 
 # Browser profile data and anything secret (the real profile lives in %APPDATA%\TinyBrowser,
 # these patterns are a safety net for test vaults and copies made inside the repo)
