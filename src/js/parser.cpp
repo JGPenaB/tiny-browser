@@ -564,6 +564,7 @@ public:
             }
         }
         declaredNow.clear();
+        evalInParams = site.inParams;
         advance();
         FunctionInfo* f = beginFn(nullptr, 0);
         f->isArrow = true;
@@ -582,8 +583,11 @@ private:
     Scope* evalScope = nullptr;     // the eval code's own top-level scope
     Scope* evalVarScope = nullptr;  // where the caller keeps its `var`s: the nearest function, or the global scope
     // A call written as eval(...) may be a direct eval, so everything it could name has to stay in a context.
+    FunctionInfo* paramsOf = nullptr;  // the function whose parameter list is being read
+    bool evalInParams = false;         // this eval code was called from a parameter's default value
     void markEval(Node* call) {
         call->flags |= NF_EVAL;
+        if (fn == paramsOf) call->flags |= NF_INPARAM;
         for (Scope* sc = scope; sc; sc = sc->parent) sc->hasEval = true;
         FunctionInfo* owner = fn;
         while (owner->isArrow && owner->parent) owner = owner->parent;
@@ -1062,7 +1066,10 @@ private:
             if (evalScope && fs == evalScope && !fs->fn->strict) {
                 // sloppy direct eval: var and function declarations belong to the code that called eval
                 if (Variable* v = evalVarScope->find(name)) {
-                    if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)
+                    // EvalDeclarationInstantiation (19.2.1.3) step 3: no var over a lexical binding on the way out; for
+                    // eval in a default value that includes the parameters and the arguments object
+                    bool param = evalInParams && (v->kind == VK_PARAM || (v == evalVarScope->fn->argsVar && !evalVarScope->fn->isArrow));
+                    if (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS || param)
                         fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
                     return v;
                 }
@@ -1405,6 +1412,7 @@ private:
 
     // Annex B.3.3: in sloppy code a function declared in a block is also a `var` of the enclosing function (or
     // the global object), unless a let, const, class or parameter of that name stands in the way.
+    bool annexBDynamic = false;  // set by annexBVar when the var it wants lives in the caller's eval-made variables
     Variable* annexBVar(JSString* name) {
         if (fn->strict) return nullptr;
         Scope* fs = fnScope(scope);
@@ -1413,13 +1421,27 @@ private:
             Variable* v = sc->find(name);
             if (v && (v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS || v->kind == VK_FUNC)) return nullptr;
         }
-        if (evalScope && fs == evalScope) {  // eval code: the var belongs to the code that called eval
-            if (Variable* v = evalVarScope->find(name)) return v->kind == VK_VAR || v->kind == VK_FUNC ? v : nullptr;
-            if (evalVarScope->kind != Scope::Global) return nullptr;
-            Variable* v = newVar(evalVarScope, name, VK_VAR);
-            v->declEnd = 0;
-            ast.evalGlobals.push_back(v);
-            return v;
+        if (evalScope && fs == evalScope) {  // eval code (B.3.2.3): the var belongs to the code that called eval
+            bool inner = false;  // a binding of that name in a block between the call and its function blocks the copy
+            for (Scope* sc : ast.evalScopes) {
+                if (inner && sc->find(name)) return nullptr;
+                if (sc == evalVarScope) inner = true;
+            }
+            if (Variable* v = evalVarScope->find(name)) return v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS ? nullptr : v;
+            if (evalVarScope->kind == Scope::Global) {
+                Variable* v = newVar(evalVarScope, name, VK_VAR);
+                v->declEnd = 0;
+                ast.evalGlobals.push_back(v);
+                return v;
+            }
+            if (evalVarScope->fn->evalVars) {  // a new variable of the calling function, kept in its object of eval-made vars
+                bool known = false;
+                for (JSString* n : ast.evalDynVars) known = known || n == name;
+                if (!known) ast.evalDynVars.push_back(name);
+                ast.evalDynTarget = evalVarScope->fn->evalVars;
+                annexBDynamic = true;
+            }
+            return nullptr;
         }
         if (Variable* v = fs->find(name)) return v->kind == VK_VAR || (v->kind == VK_FUNC && v->scope == fs) ? v : nullptr;
         Variable* v = newVar(fs, name, VK_VAR);
@@ -1681,8 +1703,11 @@ private:
             v = declare(name, VK_FUNC);
             advance();
         }
+        annexBDynamic = false;
         Variable* outer = !isAsync && !gen && !anonymousDefault ? annexBVar(name) : nullptr;
+        bool copyToEvalVars = annexBDynamic;
         Node* n = functionRest(name, start, isAsync, gen, false);
+        if (copyToEvalVars) n->flags |= NF_DYN;
         n->fn->isDecl = true;
         n->fn->line = line;
         n->var = v;
@@ -1715,6 +1740,12 @@ private:
     }
 
     void params(FunctionInfo& f) {
+        FunctionInfo* outerParams = paramsOf;
+        paramsOf = &f;
+        paramList(f);
+        paramsOf = outerParams;
+    }
+    void paramList(FunctionInfo& f) {
         bool simple = true;
         while (!isP(P_RParen)) {
             size_t mark = declaredNow.size();
@@ -2376,6 +2407,9 @@ private:
             if (!isK(k.target_)) unexpected();
             advance();
             n->type = N::NewTarget;
+            FunctionInfo* owner = fn;
+            while (owner->isArrow && owner->parent) owner = owner->parent;
+            if (!owner->scope || owner->scope->kind != Scope::Function) fail("new.target expression is not allowed here");
             n->var = pseudo(&FunctionInfo::newTargetVar, "new.target");
             return n;
         }

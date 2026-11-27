@@ -255,6 +255,7 @@ struct EvalScope {
 struct EvalSite {
     std::vector<EvalScope> scopes;
     bool strict = false;
+    bool inParams = false;  // the call sits in a parameter's default value: its vars must not clash with the parameters
 };
 
 struct FuncProto : Cell {

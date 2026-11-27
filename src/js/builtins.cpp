@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "builtins.h"
+#include "parse.h"
 
 namespace tb::js {
 
@@ -1336,8 +1337,20 @@ JSFN(globalUnescape) {
     return ci.vm.strv(std::move(out));
 }
 JSFN(globalEval) {
+    Vm& vm = ci.vm;
     if (!ci.arg(0).isString()) return ci.arg(0);
-    return ci.vm.eval(ci.arg(0).asString()->s, "<eval>");
+    // an indirect eval: eval code that sees only the global scope (19.2.1.1 PerformEval with direct = false)
+    EvalSite site;
+    EvalScope global;
+    global.isGlobal = true;
+    global.vars.push_back({vm.atom("this"), 0, VK_PSEUDO, false});  // `this` is the global object, kept in a context of its own
+    global.thisVar = 0;
+    site.scopes.push_back(global);
+    FuncProto* code = compileEval(vm, std::make_shared<const std::u16string>(ci.arg(0).asString()->s), site);
+    Context* ctx = vm.alloc<Context>();
+    ctx->slots.push_back(V(vm.global));
+    JSFunction* fn = vm.makeClosure(code, ctx, nullptr);
+    return vm.callFunction(fn, V(vm.global), nullptr, 0, Value::undef(), false);
 }
 JSFN(globalQueueMicrotask) {
     needFn(ci.vm, ci.arg(0));

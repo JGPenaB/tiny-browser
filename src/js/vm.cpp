@@ -2415,7 +2415,13 @@ Value Vm::runFrames(size_t base) {
                     }
                     case OP_DeclGlobalVar: {  // a: declared by eval, which makes the property configurable
                         PropKey k = KEYK(i.bx);
-                        if (!global->find(k)) global->add(k, Value::undef(), (uint8_t)(PF_W | PF_E | (i.a ? PF_C : 0)));
+                        if (!global->find(k)) {  // CanDeclareGlobalVar (9.1.1.4.15), CreateGlobalVarBinding
+                            if (global->oflags & OF_NOEXT) {
+                                fr->pc = pc;
+                                throwError(Err::TypeError, "Cannot declare global variable '%s': the global object is not extensible", keyName(*this, k).c_str());
+                            }
+                            global->add(k, Value::undef(), (uint8_t)(PF_W | PF_E | (i.a ? PF_C : 0)));
+                        }
                         break;
                     }
                     case OP_DeclGlobalLet: {
@@ -2433,7 +2439,19 @@ Value Vm::runFrames(size_t base) {
                         else globalLex->add(k, R(i.a), PF_W);
                         break;
                     }
-                    case OP_DefGlobalFunc: defineOwn(global, KEYK(i.bx), R(i.a), PF_W | PF_E); break;
+                    case OP_DefGlobalFunc:
+                    case OP_DefGlobalFuncD: {  // CanDeclareGlobalFunction and CreateGlobalFunctionBinding (9.1.1.4.16, .18)
+                        PropKey k = KEYK(i.bx);
+                        Prop* p = global->find(k);
+                        bool can = p ? (p->flags & PF_C) || (!(p->flags & PF_ACC) && (p->flags & PF_W) && (p->flags & PF_E)) : !(global->oflags & OF_NOEXT);
+                        if (!can) {
+                            fr->pc = pc;
+                            throwError(Err::TypeError, "Cannot declare global function '%s'", keyName(*this, k).c_str());
+                        }
+                        if (!p || (p->flags & PF_C)) defineOwn(global, k, R(i.a), (uint8_t)(PF_W | PF_E | (i.op == OP_DefGlobalFuncD ? PF_C : 0)));
+                        else p->val = R(i.a);
+                        break;
+                    }
 
                     case OP_GetCtx: {
                         Context* c = fr->ctx;

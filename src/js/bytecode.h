@@ -86,6 +86,7 @@ enum Op : uint16_t {
     OP_ClassInit,   // run the static block b with `this` set to the class a
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
     OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2
+    OP_DefGlobalFuncD,  // like OP_DefGlobalFunc, from eval code: the property can be deleted
     OP_SetFnName,   // the anonymous function a is named after the property key b; c: 1 a getter, 2 a setter
     OP_Debugger,
     OP__Count

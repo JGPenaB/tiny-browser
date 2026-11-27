@@ -408,7 +408,7 @@ private:
         if (v->isGlobal) {
             bool lex = v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS;
             if (lex && init) emitX(OP_InitGlobalLet, src, kstr(v->name));
-            else if (v->kind == VK_FUNC && init) emitX(OP_DefGlobalFunc, src, kstr(v->name));
+            else if (v->kind == VK_FUNC && init) emitX(ast.evalFn ? OP_DefGlobalFuncD : OP_DefGlobalFunc, src, kstr(v->name));
             else emitX(OP_SetGlobal, src, kstr(v->name));
             return;
         }
@@ -999,7 +999,7 @@ private:
         else if (n->flags & NF_EVAL) {
             // eval(...) by name: if the callee turns out to be the real eval, it runs with the scopes described here
             emit(OP_DirectEval, dst, base, (int)n->list.size());
-            emitX(OP_Nop, 0, evalSite());
+            emitX(OP_Nop, 0, evalSite((n->flags & NF_INPARAM) != 0));
         } else
             emit(OP_Call, dst, base, (int)n->list.size());
         f->nextReg = mark;
@@ -1073,9 +1073,10 @@ private:
     }
 
     // Records what a direct eval at this point can see: every scope with a context, outermost first.
-    uint32_t evalSite() {
+    uint32_t evalSite(bool inParams) {
         EvalSite site;
         site.strict = f->info->strict;
+        site.inParams = inParams;
         for (Scope* sc : chain) {
             EvalScope es;
             es.isFunction = sc->kind == Scope::Function;
@@ -1715,6 +1716,12 @@ private:
                     if (n->var->captured) emit(OP_GetCtx, r, depthOf(n->var), n->var->slot);
                     else emit(OP_Move, r, n->var->reg);
                     storeVar(n->var2, n->var2->name, r, false);
+                } else if (n->var && (n->flags & NF_DYN) && evalObjReg >= 0) {  // the same, for a var that eval gave its caller
+                    int r = newReg(), name = newReg();
+                    if (n->var->captured) emit(OP_GetCtx, r, depthOf(n->var), n->var->slot);
+                    else emit(OP_Move, r, n->var->reg);
+                    emitX(OP_LoadK, name, kstr(n->var->name));
+                    emit(OP_SetElem, evalObjReg, name, r);
                 }
                 break;
             case N::Empty:
