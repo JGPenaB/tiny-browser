@@ -87,6 +87,9 @@ enum Op : uint16_t {
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
     OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2
     OP_DefGlobalFuncD,  // like OP_DefGlobalFunc, from eval code: the property can be deleted
+    OP_GetTemplate,   // a = the strings object already made for template site bx, or undefined
+    OP_SetTemplate,   // GetTemplateObject: a = strings array, b = raw array, c = site; both are frozen and kept
+    OP_DelGlobal,     // a = delete of the global name consts[bx]: false for a binding that cannot be removed
     OP_SuperCallIn,   // super(...) from an arrow or eval: a = result, b = base (constructor in b, new.target in b+1, arguments after), c = count or 0xFFFF for a spread array
     OP_BindThis,      // ReferenceError if b (the current `this`) is already set: super() ran twice
     OP_InitFields,    // run the field initialisers of class constructor a on object b

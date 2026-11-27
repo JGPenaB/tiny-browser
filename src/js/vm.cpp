@@ -208,6 +208,7 @@ void FuncProto::trace(Gc& g) {
         for (auto& sc : site.scopes)
             for (auto& v : sc.vars) g.mark(v.name);
     for (Value v : consts) g.mark(v);
+    for (Value v : templates) g.mark(v);
     for (FuncProto* p : inner) g.mark(p);
     g.mark(name);
 }
@@ -343,12 +344,16 @@ Vm::Vm() {
         functionProto = fp;
     }
     functionProto->proto = objectProto;
+    generatorFunctionProto = newObject(functionProto);
+    asyncGeneratorFunctionProto = newObject(functionProto);
+    asyncFunctionProto = newObject(functionProto);
     global = newObject(objectProto, Cls::Global);
     globalLex = alloc<JSObject>();
     setupGlobals();
     setupCollections();
     setupTypedArrays(*this);
     setupAsyncIteration(*this);
+    setupFunctionKinds(*this);
     setupProxy(*this);
     setupBigInt(*this);
     setupModules(*this);
@@ -477,6 +482,9 @@ void Vm::markRoots(Gc& g) {
     g.mark(asyncIteratorProto);
     g.mark(asyncGeneratorProto);
     g.mark(asyncFromSyncProto);
+    g.mark(generatorFunctionProto);
+    g.mark(asyncGeneratorFunctionProto);
+    g.mark(asyncFunctionProto);
     g.mark(genReturnSignal);
     g.mark(throwTypeError);
 }
@@ -1483,6 +1491,18 @@ JSObject* Vm::protoFromNewTarget(Value newTarget, JSObject* fallback) {
     if (newTarget.isObject()) {
         Value p = get(newTarget, a.prototype);
         if (p.isObject()) return p.asObject();
+        // GetFunctionRealm (7.3.24): the default comes from the constructor's realm, and a revoked proxy has none
+        for (JSObject* o = newTarget.asObject(); o;) {
+            if (o->cls == Cls::Proxy) {
+                JSProxy* px = (JSProxy*)o;
+                if (!px->handler.isObject()) throwError(Err::TypeError, "Cannot perform 'construct' on a proxy that has been revoked");
+                o = px->target.isObject() ? px->target.asObject() : nullptr;
+            } else if (o->cls == Cls::Bound) {
+                Value t = ((JSBound*)o)->target;
+                o = t.isObject() ? t.asObject() : nullptr;
+            } else
+                break;
+        }
     }
     return fallback;
 }
@@ -1523,7 +1543,7 @@ struct DepthGuard {
 
 JSFunction* Vm::makeClosure(FuncProto* p, Context* ctx, Frame* parent) {
     JSFunction* f = alloc<JSFunction>();
-    f->proto = functionProto;
+    f->proto = p->isGenerator ? (p->isAsync ? asyncGeneratorFunctionProto : generatorFunctionProto) : p->isAsync ? asyncFunctionProto : functionProto;
     f->code = p;
     f->ctx = ctx;
     if (p->isArrow && parent && parent->fn) f->home = parent->fn->home;
@@ -1696,9 +1716,19 @@ Value Vm::eval(std::u16string_view src, const std::string& file) {
     return callFunction(f, Value::cell(global), nullptr, 0, Value::undef(), false);
 }
 
-Value Vm::compileFunction(const std::u16string& params, const std::u16string& body, const std::string& file) {
-    std::u16string src = u"(function anonymous(" + params + u"\n) {\n" + body + u"\n})";
-    return eval(src, file);
+// CreateDynamicFunction (20.2.1.1.1)
+Value Vm::compileFunction(const std::u16string& params, const std::u16string& body, const std::string& file, int kind, Value newTarget) {
+    static const char16_t* const prefix[] = {u"function", u"function*", u"async function", u"async function*"};
+    auto sp = std::make_shared<const std::u16string>(std::u16string(prefix[kind]) + u" anonymous(" + params + u"\n) {\n" + body + u"\n}");
+    FuncProto* p = compileDynamicFunction(*this, sp, params, kind, file);
+    JSFunction* top = makeClosure(p, nullptr, nullptr);
+    Value fv = callFunction(top, Value::cell(global), nullptr, 0, Value::undef(), false);
+    if (newTarget.isObject() && fv.isObject()) {
+        JSObject* fallback[] = {functionProto, generatorFunctionProto, asyncFunctionProto, asyncGeneratorFunctionProto};
+        JSObject* proto = protoFromNewTarget(newTarget, fallback[kind]);
+        fv.asObject()->proto = proto;
+    }
+    return fv;
 }
 
 bool Vm::run(std::u16string_view src, const std::string& file, std::u16string* result, std::u16string* error) {
@@ -1850,8 +1880,7 @@ bool Vm::plainArrayIteration() {
 Value Vm::startGenerator(JSFunction* f, Value thisv, const Value* args, int argc) {
     FuncProto* p = f->code;
     JSGenerator* g = alloc<JSGenerator>();
-    Value pv = p->isAsync ? Value::undef() : fnProtoProp(f);
-    g->proto = pv.isObject() ? pv.asObject() : generatorProto;
+    g->proto = generatorProto;
     g->fn = f;
     g->regs.assign(p->nregs, Value::undef());
     g->regs[0] = Value::cell(f);
@@ -1872,6 +1901,10 @@ Value Vm::startGenerator(JSFunction* f, Value thisv, const Value* args, int argc
         bool done = false;
         resumeGenerator(g, Value::undef(), 0, done);
         g->atStart = !done;
+        if (!p->isAsync) {
+            Value pv = fnProtoProp(f);
+            if (pv.isObject()) g->proto = pv.asObject();
+        }
         return keep;
     }
     return Value::cell(g);
@@ -2625,6 +2658,23 @@ Value Vm::runFrames(size_t base) {
                             fr->pc = pc;
                             failedSet(o, k);
                         }
+                        break;
+                    }
+                    case OP_GetTemplate: R(i.a) = i.bx < fr->code->templates.size() ? fr->code->templates[i.bx] : Value::undef(); break;
+                    case OP_SetTemplate: {
+                        fr->pc = pc;
+                        setIntegrity(R(i.b).asObject(), true);
+                        defineOwn(R(i.a).asObject(), PropKey::of(a.raw), R(i.b), 0);
+                        setIntegrity(R(i.a).asObject(), true);
+                        std::vector<Value>& made = fr->code->templates;
+                        if (made.size() <= i.c) made.resize((size_t)i.c + 1);
+                        made[i.c] = R(i.a);
+                        break;
+                    }
+                    case OP_DelGlobal: {
+                        PropKey k = KEYK(i.bx);
+                        fr->pc = pc;
+                        R(i.a) = Value::boolean(!globalLex->find(k) && del(global, k));
                         break;
                     }
                     case OP_DelProp:

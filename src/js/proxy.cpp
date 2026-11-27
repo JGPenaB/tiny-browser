@@ -303,7 +303,6 @@ JSFN(proxyRevoke) {
     if (!pv.isObject()) return Value::undef();
     JSProxy* p = (JSProxy*)pv.asObject();
     ci.callee->data = Value::null();
-    p->target = Value::null();
     p->handler = Value::null();
     return Value::undef();
 }

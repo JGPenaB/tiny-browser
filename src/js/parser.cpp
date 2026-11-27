@@ -12,6 +12,7 @@ struct Tok {
     enum T : uint8_t { End, Ident, Num, Str, Templ, Regex, Punct, Private } type = End;
     uint8_t p = P_None;
     bool nl = false, tail = false, esc = false, oct = false, big = false;
+    bool bad = false;  // a template piece with an escape that has no meaning: fine only in a tagged template
     uint32_t pos = 0, end = 0, line = 1;
     double num = 0;
     JSString* str = nullptr;
@@ -97,8 +98,8 @@ public:
             } else if (c == '/' && pos + 1 < n && s[pos + 1] == '*') {
                 pos += 2;
                 while (pos < n && !(s[pos] == '*' && pos + 1 < n && s[pos + 1] == '/')) {
-                    if (s[pos] == '\n') {
-                        ++line;
+                    if (isLt(s[pos])) {  // a comment that spans lines counts as a line terminator (12.4)
+                        if (s[pos] == '\n' || (s[pos] == '\r' && !(pos + 1 < n && s[pos + 1] == '\n'))) ++line;
                         nl = true;
                     }
                     ++pos;
@@ -107,7 +108,7 @@ public:
                 pos += 2;
             } else if (c == '<' && s.compare(pos, 4, u"<!--") == 0) {
                 while (pos < n && !isLt(s[pos])) ++pos;
-            } else if (c == '-' && nl && s.compare(pos, 3, u"-->") == 0) {
+            } else if (c == '-' && (nl || atStart) && s.compare(pos, 3, u"-->") == 0) {
                 while (pos < n && !isLt(s[pos])) ++pos;
             } else
                 break;
@@ -128,6 +129,10 @@ public:
             case 'v': out += u'\v'; break;
             case 'x': {
                 int a = pos + 1 < n ? hexVal(s[pos]) : -1, b = pos + 1 < n ? hexVal(s[pos + 1]) : -1;
+                if ((a < 0 || b < 0) && templEsc) {
+                    badEsc = true;
+                    return;
+                }
                 if (a < 0 || b < 0) fail("Bad \\x escape");
                 out += (char16_t)(a * 16 + b);
                 pos += 2;
@@ -135,22 +140,38 @@ public:
             }
             case 'u': {
                 uint32_t cp = 0;
+                bool ok = true;
                 if (pos < n && s[pos] == '{') {
                     ++pos;
-                    while (pos < n && s[pos] != '}') {
-                        int h = hexVal(s[pos++]);
-                        if (h < 0) fail("Bad unicode escape");
-                        cp = cp * 16 + h;
+                    bool any = false;
+                    while (ok && pos < n && s[pos] != '}') {
+                        int h = hexVal(s[pos]);
+                        if (h < 0) ok = false;
+                        else {
+                            ++pos;
+                            any = true;
+                            cp = cp * 16 + h;
+                            if (cp > 0x10FFFF) ok = false;
+                        }
                     }
-                    ++pos;
+                    if (pos >= n || !any) ok = false;
+                    if (ok) ++pos;
                 } else {
-                    for (int i = 0; i < 4; ++i) {
-                        int h = pos < n ? hexVal(s[pos++]) : -1;
-                        if (h < 0) fail("Bad unicode escape");
-                        cp = cp * 16 + h;
+                    for (int i = 0; ok && i < 4; ++i) {
+                        int h = pos < n ? hexVal(s[pos]) : -1;
+                        if (h < 0) ok = false;
+                        else {
+                            ++pos;
+                            cp = cp * 16 + h;
+                        }
                     }
                 }
-                appendCp(out, cp > 0x10FFFF ? 0xFFFD : cp);
+                if (!ok && templEsc) {
+                    badEsc = true;
+                    return;
+                }
+                if (!ok) fail("Bad unicode escape");
+                appendCp(out, cp);
                 break;
             }
             case '\r':
@@ -161,6 +182,10 @@ public:
             case 0x2028:
             case 0x2029: break;
             default:
+                if (templEsc && ((c >= '1' && c <= '9') || (c == '0' && pos < n && isDigit(s[pos])))) {  // no octal escapes in templates
+                    badEsc = true;
+                    return;
+                }
                 if (c == '8' || c == '9') sawOctal = true;
                 if (c >= '0' && c <= '7') {
                     int v = c - '0';
@@ -197,8 +222,18 @@ public:
             }
             if (c == '\\') {
                 size_t st = pos++;
+                templEsc = true;
+                badEsc = false;
                 escape(cooked);
-                raw.append(s, st, pos - st);
+                templEsc = false;
+                if (badEsc) t.bad = true;
+                for (size_t i = st; i < pos; ++i) {  // the raw text of CR and CR LF is LF (12.9.6 TRV)
+                    if (s[i] == '\r') {
+                        raw += u'\n';
+                        if (i + 1 < pos && s[i + 1] == '\n') ++i;
+                    } else
+                        raw += s[i];
+                }
                 continue;
             }
             if (c == '\r') {
@@ -252,12 +287,15 @@ public:
     }
 
     bool sawOctal = false;  // the token being read used a legacy octal number or escape
+    bool templEsc = false, badEsc = false;  // reading a template's escape: a bad one is noted, not an error yet
+    bool atStart = true;                     // nothing but white space and comments so far
     bool sawBig = false;    // the number being read is a BigInt literal; its digits are in bigText
     std::u16string bigText;
     Tok next() {
         Tok t;
         sawOctal = false;
         t.nl = skipSpace();
+        atStart = false;
         t.pos = (uint32_t)pos;
         t.line = line;
         size_t n = s.size();
@@ -526,6 +564,47 @@ public:
         close(g);
     }
 
+    // CreateDynamicFunction (20.2.1.1.1): the text is exactly one function, and nothing may follow it.
+    void dynamicFunction(int kind) {
+        FunctionInfo& f = ast.fns.emplace_back();
+        ast.top = &f;
+        fn = &f;
+        Scope* g = open(Scope::Global);
+        g->fn = &f;
+        f.scope = g;
+        advance();
+        uint32_t start = t.pos;
+        if (kind & 2) advance();  // async
+        advance();                // function
+        if (kind & 1) advance();  // *
+        JSString* name = t.str;   // anonymous: the function's name, but not a binding its code can see
+        advance();
+        Node* st = mk(N::ExprStmt);
+        st->a = functionRest(name, start, (kind & 2) != 0, (kind & 1) != 0, false);
+        if (t.type != Tok::End) unexpected();
+        f.body.push_back(st);
+        f.srcEnd = (uint32_t)s.size();
+        close(g);
+    }
+    // The parameters on their own, so that text such as a comment opened in them cannot swallow the `) {` that follows.
+    void paramsOnly(int kind) {
+        FunctionInfo& f = ast.fns.emplace_back();
+        ast.top = &f;
+        fn = &f;
+        Scope* g = open(Scope::Global);
+        g->fn = &f;
+        f.scope = g;
+        advance();
+        FunctionInfo* pf = beginFn(nullptr, 0);
+        pf->isAsync = (kind & 2) != 0;
+        pf->isGenerator = (kind & 1) != 0;
+        params(*pf);
+        expectP(P_RParen);
+        if (t.type != Tok::End) unexpected();
+        endFn(pf);
+        close(g);
+    }
+
     // Direct eval (ECMA-262 19.2.1.1): the code is compiled as an arrow function placed at the call site, which
     // gives it the caller's variables, `this` and `arguments`. The caller's scopes are rebuilt from the
     // description recorded when the call was compiled.
@@ -552,8 +631,14 @@ public:
                 sc = open(Scope::Function);
                 f.scope = sc;
                 evalVarScope = sc;  // arrow functions keep their own `var`s too
-            } else if (!es.isGlobal)
+            } else if (!es.isGlobal) {
                 sc = open(es.isWith ? Scope::With : es.isClass ? Scope::Class : Scope::Block);
+                if (es.isVarScope) {
+                    sc->varScope = true;
+                    sc->fn = fn;
+                    evalVarScope = sc;
+                }
+            }
             sc->hasCtx = true;
             ast.evalScopes.push_back(sc);
             for (size_t i = 0; i < es.vars.size(); ++i) {
@@ -823,7 +908,6 @@ private:
             advance();
             bool isAsyncFn = isK(k.async_) && peek().type == Tok::Ident && peek().str == k.function_ && !peek().nl;
             if (isK(k.function_) || isAsyncFn) {  // a declaration (hoisted like any other), named or not
-                if (isAsyncFn) advance();
                 Node* d = functionDecl(isAsyncFn, true);
                 addExport(k.default_, d->var->name, -1, nullptr, line);
                 return d;
@@ -938,8 +1022,10 @@ private:
     // An identifier used as a name: a reference, a binding or a label (ECMA-262 13.1.1).
     void checkName(JSString* name, bool escaped) {
         if (escaped && isRes(name)) fail("Keyword must not contain escaped characters");
-        if (name == k.yield_ && (fn->strict || fn->isGenerator)) fail("Unexpected identifier 'yield'");
-        if (name == k.await_ && (ast.moduleFn || fn->isAsync || inStaticBlock())) fail("Unexpected reserved word 'await'");
+        bool arrowParam = fn == paramsOf && fn->isArrow && fn->parent;
+        if (name == k.yield_ && (fn->strict || fn->isGenerator || (arrowParam && fn->parent->isGenerator))) fail("Unexpected identifier 'yield'");
+        if (name == k.await_ && (ast.moduleFn || fn->isAsync || fn->isStaticBlock || (arrowParam && (fn->parent->isAsync || fn->parent->isStaticBlock))))
+            fail("Unexpected reserved word 'await'");
         if (fn->strict && isStrictRes(name)) fail("Unexpected strict mode reserved word '" + utf16to8(name->s) + "'");
     }
     bool isEvalOrArguments(JSString* a) const { return a == evalAtom || a == k.arguments_; }
@@ -1060,8 +1146,39 @@ private:
         return &sc;
     }
     Scope* fnScope(Scope* sc) {
-        while (sc->kind != Scope::Function && sc->kind != Scope::Global) sc = sc->parent;
+        while (sc->kind != Scope::Function && sc->kind != Scope::Global && !sc->varScope) sc = sc->parent;
         return sc;
+    }
+    // ContainsExpression of a parameter (8.5.2): a default value or a computed property name
+    static bool patternHasExpr(Node* n) {
+        if (!n) return false;
+        switch (n->type) {
+            case N::AssignPat: return true;
+            case N::Rest: return patternHasExpr(n->a);
+            case N::ArrayPat:
+                for (Node* e : n->list)
+                    if (patternHasExpr(e)) return true;
+                return false;
+            case N::ObjectPat:
+                for (Node* e : n->list) {
+                    if (e->type == N::Rest) continue;
+                    if ((e->flags & NF_COMPUTED) || patternHasExpr(e->b)) return true;
+                }
+                return false;
+            default: return false;
+        }
+    }
+    // FunctionDeclarationInstantiation (10.2.11) step 28: when the parameters hold expressions the body's variables get an
+    // environment of their own, so that closures made in the parameter list cannot see them.
+    Scope* openBody(FunctionInfo* f) {
+        bool any = false;
+        for (Node* p : f->params) any = any || patternHasExpr(p);
+        if (!any) return nullptr;
+        Scope* b = open(Scope::Block);
+        b->varScope = true;
+        b->fn = f;
+        f->bodyScope = b;
+        return b;
     }
     Variable* newVar(Scope* sc, JSString* name, uint8_t kind) {
         Variable& v = ast.vars.emplace_back();
@@ -1074,12 +1191,27 @@ private:
         declaredNow.push_back(&v);
         return &v;
     }
+    // The name of a function expression is bound in a scope of its own around the function (15.2.5), so a parameter
+    // or a declaration of the same name inside the function simply hides it.
+    void hideSelf(Scope* sc, JSString* name) {
+        if (sc->kind != Scope::Function || !sc->fn->selfVar || sc->fn->selfVar->name != name) return;
+        Variable* self = sc->fn->selfVar;
+        sc->vars.erase(std::remove(sc->vars.begin(), sc->vars.end(), self), sc->vars.end());
+        sc->map.clear();
+        sc->fn->selfVar = nullptr;
+    }
+    bool declSpecial = false;  // the function declaration being declared is a generator or async
     Variable* declare(JSString* name, uint8_t kind) {
-        if (kind == VK_VAR || (kind == VK_FUNC && (scope->kind == Scope::Function || scope->kind == Scope::Global))) {
+        hideSelf(kind == VK_VAR ? fnScope(scope) : scope, name);
+        if (scope->varScope && (kind == VK_LET || kind == VK_CONST || kind == VK_CLASS)) {  // 15.2.1: not a parameter's name
+            Variable* pv = scope->parent->find(name);
+            if (pv && pv->kind == VK_PARAM) fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
+        }
+        if (kind == VK_VAR || (kind == VK_FUNC && (scope->kind == Scope::Function || scope->kind == Scope::Global || scope->varScope))) {
             Scope* fs = fnScope(scope);
             if (evalScope && fs == evalScope && !fs->fn->strict) {
                 // sloppy direct eval: var and function declarations belong to the code that called eval
-                if (Variable* v = evalVarScope->find(name)) {
+                if (Variable* v = evalVarScope->find(name); v && v->kind != VK_FUNCNAME) {
                     // EvalDeclarationInstantiation (19.2.1.3) step 3: no var over a lexical binding on the way out; for
                     // eval in a default value that includes the parameters and the arguments object
                     bool param = evalInParams && (v->kind == VK_PARAM || (v == evalVarScope->fn->argsVar && !evalVarScope->fn->isArrow));
@@ -1116,6 +1248,19 @@ private:
             }
             Variable* v = newVar(fs, name, kind);
             v->declEnd = 0;
+            if (kind == VK_VAR && name == k.arguments_ && fs->kind == Scope::Function && !fs->fn->isArrow && !fs->fn->argsVar) fs->fn->argsVar = v;
+            if (fs->varScope && !(evalScope && fs == evalScope)) {
+                // a var named like a parameter is a binding of its own that starts with the parameter's value
+                Scope* ps = fs->parent;
+                Variable* pv = ps->find(name);
+                if (!pv && name == k.arguments_ && !ps->fn->isArrow) {
+                    pv = newVar(ps, name, VK_PSEUDO);
+                    pv->declEnd = 0;
+                    declaredNow.pop_back();
+                    ps->fn->argsVar = pv;
+                }
+                if (pv && (pv->kind == VK_PARAM || pv == ps->fn->argsVar)) v->initFrom = pv;
+            }
             return v;
         }
         if (Variable* v = scope->find(name)) {
@@ -1131,8 +1276,10 @@ private:
                 fn->dupParams = true;
                 return v;
             }
-            // a block may declare the same function twice in sloppy code (Annex B.3.2.4)
-            if (v->kind == VK_FUNC && kind == VK_FUNC && !fn->strict && scope->kind != Scope::Function && scope->kind != Scope::Global) return v;
+            // a block may declare the same plain function twice in sloppy code (Annex B.3.2.4)
+            if (v->kind == VK_FUNC && kind == VK_FUNC && !fn->strict && scope->kind != Scope::Function && scope->kind != Scope::Global &&
+                !scope->varScope && !v->special && !declSpecial)
+                return v;
             if (!(v->kind == VK_PSEUDO)) fail("Identifier '" + utf16to8(name->s) + "' has already been declared");
         }
         if (kind == VK_LET || kind == VK_CONST || kind == VK_CLASS || kind == VK_FUNC) {
@@ -1143,6 +1290,7 @@ private:
         Variable* v = newVar(scope, name, kind);
         // a parameter may not be read before it is bound: its default value can name only earlier parameters
         if (kind == VK_FUNC || kind == VK_CATCH || kind == VK_FUNCNAME) v->declEnd = 0;
+        if (kind == VK_FUNC) v->special = declSpecial;
         return v;
     }
     void reference(Node* ident) { scope->refs.push_back({ident, false}); }
@@ -1224,10 +1372,13 @@ private:
 
     // ---------------------------------------------------------------- statements
     void directives(FunctionInfo& f) {
+        bool octal = false;
         while (t.type == Tok::Str) {
             Tok nx = peek();
             if (!(nx.type == Tok::End || nx.nl || (nx.type == Tok::Punct && (nx.p == P_Semi || nx.p == P_RBrace)))) break;
+            if (t.oct) octal = true;
             if (t.str == k.useStrict && !t.esc && t.end - t.pos == 12) f.strict = f.hasUseStrict = true;
+            if (f.strict && octal) fail("Octal escape sequences are not allowed in strict mode");  // also in a directive before "use strict"
             f.body.push_back(statement());
         }
     }
@@ -1260,10 +1411,7 @@ private:
             if (w == k.function_) return functionDecl(false);
             if (w == k.async_) {
                 Tok nx = peek();
-                if (nx.type == Tok::Ident && nx.str == k.function_ && !nx.nl) {
-                    advance();
-                    return functionDecl(true);
-                }
+                if (nx.type == Tok::Ident && nx.str == k.function_ && !nx.nl) return functionDecl(true);
             }
             if (w == k.class_) return classNode(true);
             if (w == k.if_) return ifStmt();
@@ -1456,6 +1604,11 @@ private:
                 annexBDynamic = true;
             }
             return nullptr;
+        }
+        hideSelf(fs, name);
+        if (fs->varScope) {  // B.3.2.1: not when a parameter has that name
+            Variable* pv = fs->parent->find(name);
+            if (pv && pv->kind == VK_PARAM) return nullptr;
         }
         if (Variable* v = fs->find(name)) return v->kind == VK_VAR || (v->kind == VK_FUNC && v->scope == fs) ? v : nullptr;
         Variable* v = newVar(fs, name, VK_VAR);
@@ -1689,7 +1842,11 @@ private:
             Node* c = mk(N::Case);
             if (eatK(k.case_)) c->a = expression();
             else if (!eatK(k.default_)) unexpected();
-            else c->flags = 1;
+            else {
+                for (Node* other : n->list)
+                    if (other->flags & 1) fail("More than one default clause in switch statement");
+                c->flags = 1;
+            }
             expectP(P_Colon);
             ++lab.breakables;
             while (!isP(P_RBrace) && !isK(k.case_) && !isK(k.default_)) {
@@ -1709,7 +1866,8 @@ private:
     Node* functionDecl(bool isAsync, bool anonymousDefault = false) {
         uint32_t start = t.pos;
         uint32_t line = t.line;
-        advance();  // function
+        if (isAsync) advance();  // async
+        advance();               // function
         bool gen = eatP(P_Star);
         JSString* name;
         Variable* v;
@@ -1720,7 +1878,9 @@ private:
             if (t.type != Tok::Ident || isRes(t.str)) unexpected();
             name = t.str;
             checkBinding(name, t.esc, VK_FUNC);
+            declSpecial = isAsync || gen;
             v = declare(name, VK_FUNC);
+            declSpecial = false;
             advance();
         }
         annexBDynamic = false;
@@ -1818,7 +1978,9 @@ private:
         expectP(P_RParen);
         if (methodKind == 2 && !f->params.empty()) fail("Getter must not have any formal parameters");
         if (methodKind == 3 && (f->params.size() != 1 || f->params[0]->type == N::Rest)) fail("Setter must have exactly one formal parameter");
+        Scope* bodyScope = openBody(f);
         body(*f);
+        if (bodyScope) close(bodyScope);
         checkFunction(f);
         endFn(f);
         n->fn = f;
@@ -1836,14 +1998,19 @@ private:
             params(*f);
             expectP(P_RParen);
         } else {
+            FunctionInfo* outerParams = paramsOf;
+            paramsOf = f;
             f->params.push_back(bindingIdent(VK_PARAM));
+            paramsOf = outerParams;
             f->params.back()->var->declEnd = 0;
             f->length = 1;
         }
         if (!isP(P_Arrow) || t.nl) unexpected();
         advance();
         if (isP(P_LBrace)) {
+            Scope* bodyScope = openBody(f);
             body(*f);
+            if (bodyScope) close(bodyScope);
         } else {
             Node* r = mk(N::Return);
             r->a = assign();
@@ -1997,6 +2164,7 @@ private:
         }
         classPrivates.pop_back();
         advance();
+        n->num = (double)prevEnd;  // where the class's text ends
         close(cs);
         fn->strict = savedStrict;
         return n;
@@ -2305,6 +2473,7 @@ private:
                 return n;
             }
             if (t.str == k.await_ && fn->isAsync) {
+                if (fn == paramsOf) fail("Await expression not allowed in formal parameter");
                 if (fn == ast.moduleFn) ast.hasTLA = true;
                 Node* n = mk(N::Await);
                 advance();
@@ -2443,7 +2612,7 @@ private:
             } else if (t.type == Tok::Templ) {
                 Node* tt = mk(N::TaggedTemplate);
                 tt->a = e;
-                tt->b = templateLit();
+                tt->b = templateLit(true);
                 e = tt;
             } else
                 break;
@@ -2482,6 +2651,11 @@ private:
                 ix->b = expression();
                 expectP(P_RBrack);
                 callee = ix;
+            } else if (t.type == Tok::Templ) {  // MemberExpression TemplateLiteral: the tag call's result is what gets constructed
+                Node* tt = mk(N::TaggedTemplate);
+                tt->a = callee;
+                tt->b = templateLit(true);
+                callee = tt;
             } else
                 break;
         }
@@ -2490,10 +2664,11 @@ private:
         return n;
     }
 
-    Node* templateLit() {
+    Node* templateLit(bool tagged = false) {
         Node* n = mk(N::Template);
         for (;;) {
-            n->strs.push_back(t.str);
+            if (t.bad && !tagged) fail("Invalid escape sequence in template literal");
+            n->strs.push_back(t.bad ? nullptr : t.str);
             n->strs.push_back(t.raw);
             if (t.tail) {
                 advance();
@@ -2774,6 +2949,18 @@ private:
 void parseEval(Vm& vm, Ast& ast, const EvalSite& site) {
     Parser p(vm, ast);
     p.evalProgram(site);
+    p.finish();
+}
+
+void parseDynamicFunction(Vm& vm, Ast& ast, int kind) {
+    Parser p(vm, ast);
+    p.dynamicFunction(kind);
+    p.finish();
+}
+
+void parseParamsOnly(Vm& vm, Ast& ast, int kind) {
+    Parser p(vm, ast);
+    p.paramsOnly(kind);
     p.finish();
 }
 

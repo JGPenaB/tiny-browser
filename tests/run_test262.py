@@ -3,7 +3,8 @@
     python tests/run_test262.py [path filter ...] [--jobs N] [--save name]
 
 The suite is not part of this repository. Get it once with:
-    git clone --depth 1 https://github.com/tc39/test262.git third_party/test262
+    git clone --depth 1 -c core.autocrlf=false https://github.com/tc39/test262.git third_party/test262
+(the files must keep their own line endings: some tests are about CR and CR LF)
 Filters are substrings of the test path, e.g. `language/expressions` or `built-ins/Array`. Results are printed
 per folder; the failures (with the first line of what went wrong) go to out/test262-<name>.txt.
 """
@@ -34,7 +35,7 @@ __modules.host.fetch = function (url) { return new Promise(function (resolve) { 
 
 
 def read(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
         return f.read()
 
 
@@ -48,6 +49,7 @@ def harness(name):
 
 
 def meta(src):
+    src = src.replace("\r\n", "\n").replace("\r", "\n")
     m = re.search(r"/\*---(.*?)---\*/", src, re.S)
     info = {"includes": [], "flags": [], "negative": None, "features": []}
     if not m:
@@ -109,7 +111,7 @@ def run_chunk(tests):
                 results[rel] = (False, "runner: " + str(e))
                 continue
             f = os.path.join(tmp, "%d.js" % i)
-            with open(f, "w", encoding="utf-8", newline="\n") as out:
+            with open(f, "w", encoding="utf-8", newline="") as out:
                 out.write(body)
             todo.append((rel, f, info))
         while todo:

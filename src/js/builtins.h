@@ -15,6 +15,7 @@ inline bool isJsSpace(char16_t c) {
 
 // Creates a constructor function, links it with its prototype object and publishes it as a global.
 JSNative* makeCtor(Vm& vm, const char* name, NativeFn fn, int length, JSObject* proto);
+void setupFunctionKinds(Vm& vm);
 Value wrapPrimitive(CallInfo& ci, Value prim, Cls cls, JSObject* proto);
 void defSym(Vm& vm, JSObject* o, Symbol* sym, NativeFn fn, const char* name, int length);
 void makeResolvingFunctions(Vm& vm, JSPromise* p, Value out[2]);  // vm.cpp

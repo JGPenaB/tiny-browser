@@ -106,7 +106,8 @@ install(HelperProto, {
     if (!s.started) {  // never started: finish it and close what it wraps
       s.started = true;
       genReturn(s.gen);
-      close(s.underlying);
+      if (s.list) closeAll(s.list);
+      else close(s.underlying);
       return { value: undefined, done: true };
     }
     return genReturn(s.gen);
@@ -160,7 +161,7 @@ function* dropGen(rec, limit) {
   }
 }
 function flattenable(obj) {  // GetIteratorFlattenable(obj, reject-primitives)
-  if (!isObject(obj)) throw new $TypeError('The mapper must return an iterable or iterator object');
+  if (!isObject(obj)) throw new $TypeError('The value is not an iterable or an iterator object');
   var method = obj[symIterator], iterator;
   if (method === undefined || method === null) iterator = obj;
   else iterator = apply(method, obj, []);
@@ -197,6 +198,7 @@ function toLimit(o, limit) {
   var n;
   try { n = +limit; } catch (e) { closeQuietly(o); throw e; }
   if (n !== n) { closeQuietly(o); throw new $RangeError('The limit must be a number'); }
+  if (n !== $Infinity && n > 9007199254740991) { closeQuietly(o); throw new $RangeError('The limit is too large'); }
   n = trunc(n);
   if (n < 0) { closeQuietly(o); throw new $RangeError('The limit must not be negative'); }
   return n;
@@ -312,6 +314,280 @@ install(Iterator, {
   }
 });
 defineProperty(globalThis, 'Iterator', { value: Iterator, writable: true, enumerable: false, configurable: true });
+)JS"
+R"JS(
+// ---- Iterator.concat, zip and zipKeyed; chunks, windows, includes and join (27.1.3.2 and 27.1.3.3)
+function closeAll(recs) {  // IteratorCloseAll after a normal or return completion: the last one first, the first error wins
+  var failed = false, error;
+  for (var i = recs.length - 1; i >= 0; i--) {
+    if (failed) closeQuietly(recs[i].iterator);
+    else try { close(recs[i].iterator); } catch (e) { failed = true; error = e; }
+  }
+  if (failed) throw error;
+}
+function closeAllQuietly(recs) {  // IteratorCloseAll after a throw completion
+  for (var i = recs.length - 1; i >= 0; i--) closeQuietly(recs[i].iterator);
+}
+function removeRec(list, rec) {
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] !== rec) continue;
+    for (; i + 1 < list.length; i++) list[i] = list[i + 1];
+    list.length = i;
+    return;
+  }
+}
+function makeHelperOver(gen, recs) {  // an iterator helper with a list of underlying iterators
+  var helper = create(HelperProto);
+  wmSet(helperState, helper, { gen: gen, list: recs, started: false });
+  return helper;
+}
+function sameValueZero(a, b) { return a === b || (a !== a && b !== b); }
+function* concatGen(iterables) {
+  for (var i = 0; i < iterables.length; i++) {
+    var iterator = apply(iterables[i].open, iterables[i].iterable, []);
+    if (!isObject(iterator)) throw new $TypeError('Result of the Symbol.iterator method is not an object');
+    var rec = directRecord(iterator);
+    for (;;) {
+      var r = step(rec);
+      if (r === null) break;
+      var value = r.value, resumed = false;
+      try { yield value; resumed = true; } finally { if (!resumed) close(rec.iterator); }
+    }
+  }
+}
+function* chunksGen(rec, size) {
+  var buffer = [], n = 0;
+  for (;;) {
+    var r = step(rec);
+    if (r === null) {
+      if (n > 0) yield buffer;
+      return;
+    }
+    data(buffer, n++, r.value);
+    if (n === size) {
+      var resumed = false;
+      try { yield buffer; resumed = true; } finally { if (!resumed) close(rec.iterator); }
+      buffer = [];
+      n = 0;
+    }
+  }
+}
+function* windowsGen(rec, size, partial) {
+  var buffer = [], n = 0;
+  for (;;) {
+    var r = step(rec);
+    if (r === null) {
+      if (partial && n > 0 && n < size) yield buffer;
+      return;
+    }
+    var value = r.value, next = [], m = 0;
+    for (var i = n === size ? 1 : 0; i < n; i++) data(next, m++, buffer[i]);
+    data(next, m++, value);
+    buffer = next;
+    n = m;
+    if (n === size) {
+      var resumed = false;
+      try { yield buffer; resumed = true; } finally { if (!resumed) close(rec.iterator); }
+    }
+  }
+}
+// IteratorZip (27.1.3.4.1)
+function* zipGen(iters, open, mode, padding, finish) {
+  var count = iters.length;
+  if (count === 0) return;
+  for (;;) {
+    var results = [];
+    for (var i = 0; i < count; i++) {
+      var iter = iters[i], result;
+      if (iter === null) result = padding[i];
+      else {
+        var r;
+        try {
+          r = step(iter);
+          if (r !== null) result = r.value;
+        } catch (e) { removeRec(open, iter); closeAllQuietly(open); throw e; }
+        if (r === null) {
+          removeRec(open, iter);
+          if (mode === 'shortest') { closeAll(open); return; }
+          if (mode === 'strict') {
+            if (i !== 0) { closeAllQuietly(open); throw new $TypeError('Iterator.zip: the iterators have different lengths'); }
+            for (var k = 1; k < count; k++) {
+              var other;
+              try { other = step(iters[k]); } catch (e) { removeRec(open, iters[k]); closeAllQuietly(open); throw e; }
+              if (other !== null) { closeAllQuietly(open); throw new $TypeError('Iterator.zip: the iterators have different lengths'); }
+              removeRec(open, iters[k]);
+            }
+            return;
+          }
+          if (open.length === 0) return;
+          iters[i] = null;
+          result = padding[i];
+        }
+      }
+      data(results, i, result);
+    }
+    results = finish(results);
+    var resumed = false;
+    try { yield results; resumed = true; } finally { if (!resumed) closeAll(open); }
+  }
+}
+function zipHelper(iters, mode, padding, finish) {
+  var open = [];
+  for (var i = 0; i < iters.length; i++) data(open, i, iters[i]);
+  return makeHelperOver(zipGen(iters, open, mode, padding, finish), open);
+}
+function zipOptions(options) {  // GetOptionsObject, then the mode and padding options
+  if (options === undefined) options = create(null);
+  else if (!isObject(options)) throw new $TypeError('The options must be an object');
+  var mode = options.mode, paddingOption;
+  if (mode === undefined) mode = 'shortest';
+  else if (mode !== 'shortest' && mode !== 'longest' && mode !== 'strict') throw new $TypeError('The mode must be "shortest", "longest" or "strict"');
+  if (mode === 'longest') {
+    paddingOption = options.padding;
+    if (paddingOption !== undefined && !isObject(paddingOption)) throw new $TypeError('The padding must be an object');
+  }
+  return { mode: mode, padding: paddingOption };
+}
+function needSize(o, size) {
+  if (typeof size !== 'number' || size !== size || size === $Infinity || size === -$Infinity || trunc(size) !== size) {
+    closeQuietly(o);
+    throw new $TypeError('The size must be an integer');
+  }
+  if (size < 1 || size > 4294967295) { closeQuietly(o); throw new $RangeError('The size must be between 1 and 4294967295'); }
+}
+install(Iterator, {
+  concat() {
+    var iterables = [];
+    for (var i = 0; i < arguments.length; i++) {
+      var item = arguments[i];
+      if (!isObject(item)) throw new $TypeError('Iterator.concat requires iterable objects');
+      var method = item[symIterator];
+      if (method === undefined || method === null || typeof method !== 'function') throw new $TypeError('Iterator.concat requires iterable objects');
+      data(iterables, i, { open: method, iterable: item });
+    }
+    return makeHelperOver(concatGen(iterables), []);
+  },
+  zip(iterables) {
+    if (!isObject(iterables)) throw new $TypeError('Iterator.zip requires an iterable object');
+    var o = zipOptions(arguments.length > 1 ? arguments[1] : undefined);
+    var iters = [], padding = [], count = 0, i;
+    var input = getIterator(iterables);
+    for (;;) {
+      var r, value, iter;
+      try {
+        r = step(input);
+        if (r !== null) value = r.value;
+      } catch (e) { closeAllQuietly(iters); throw e; }
+      if (r === null) break;
+      try { iter = flattenable(value); } catch (e) { closeAllQuietly(iters); closeQuietly(input.iterator); throw e; }
+      data(iters, count++, iter);
+    }
+    if (o.mode === 'longest') {
+      if (o.padding === undefined) for (i = 0; i < count; i++) data(padding, i, undefined);
+      else {
+        var paddingIter, using = true;
+        try { paddingIter = getIterator(o.padding); } catch (e) { closeAllQuietly(iters); throw e; }
+        for (i = 0; i < count; i++) {
+          if (using) {
+            var pr, pv;
+            try {
+              pr = step(paddingIter);
+              if (pr !== null) pv = pr.value;
+            } catch (e) { closeAllQuietly(iters); throw e; }
+            if (pr === null) using = false;
+            else data(padding, i, pv);
+          }
+          if (!using) data(padding, i, undefined);
+        }
+        if (using) try { close(paddingIter.iterator); } catch (e) { closeAllQuietly(iters); throw e; }
+      }
+    }
+    return zipHelper(iters, o.mode, padding, function (results) { return results; });
+  },
+  zipKeyed(iterables) {
+    if (!isObject(iterables)) throw new $TypeError('Iterator.zipKeyed requires an object');
+    var o = zipOptions(arguments.length > 1 ? arguments[1] : undefined);
+    var iters = [], padding = [], keys = [], count = 0, i;
+    var allKeys = ownKeys(iterables);
+    for (var j = 0; j < allKeys.length; j++) {
+      var key = allKeys[j], desc, value, iter;
+      try { desc = getOwnPropertyDescriptor(iterables, key); } catch (e) { closeAllQuietly(iters); throw e; }
+      if (desc === undefined || !desc.enumerable) continue;
+      try { value = iterables[key]; } catch (e) { closeAllQuietly(iters); throw e; }
+      if (value === undefined) continue;
+      data(keys, count, key);
+      try { iter = flattenable(value); } catch (e) { closeAllQuietly(iters); throw e; }
+      data(iters, count++, iter);
+    }
+    if (o.mode === 'longest') {
+      for (i = 0; i < count; i++) {
+        var pv = undefined;
+        if (o.padding !== undefined) try { pv = o.padding[keys[i]]; } catch (e) { closeAllQuietly(iters); throw e; }
+        data(padding, i, pv);
+      }
+    }
+    return zipHelper(iters, o.mode, padding, function (results) {
+      var obj = create(null);
+      for (var i = 0; i < count; i++) data(obj, keys[i], results[i]);
+      return obj;
+    });
+  }
+});
+install(IteratorProto, {
+  chunks(chunkSize) {
+    needObject(this, 'chunks');
+    needSize(this, chunkSize);
+    var rec = directRecord(this);
+    return makeHelper(chunksGen(rec, chunkSize), rec);
+  },
+  windows(windowSize) {
+    needObject(this, 'windows');
+    var undersized = arguments.length > 1 ? arguments[1] : undefined;
+    needSize(this, windowSize);
+    if (undersized === undefined) undersized = 'only-full';
+    if (undersized !== 'only-full' && undersized !== 'allow-partial') { closeQuietly(this); throw new $TypeError('undersized must be "only-full" or "allow-partial"'); }
+    var rec = directRecord(this);
+    return makeHelper(windowsGen(rec, windowSize, undersized === 'allow-partial'), rec);
+  },
+  includes(searchElement) {
+    needObject(this, 'includes');
+    var skippedElements = arguments.length > 1 ? arguments[1] : undefined, toSkip = 0;
+    if (skippedElements !== undefined) {
+      if (typeof skippedElements !== 'number' || (skippedElements !== $Infinity && skippedElements !== -$Infinity && trunc(skippedElements) !== skippedElements)) {
+        closeQuietly(this);
+        throw new $TypeError('The number of elements to skip must be an integer or Infinity');
+      }
+      toSkip = skippedElements;
+    }
+    if (toSkip < 0 || (toSkip !== $Infinity && toSkip > 9007199254740991)) { closeQuietly(this); throw new $RangeError('The number of elements to skip is out of range'); }
+    var rec = directRecord(this);
+    for (var skipped = 0; ;) {
+      var r = step(rec);
+      if (r === null) return false;
+      var value = r.value;
+      if (skipped < toSkip) skipped++;
+      else if (sameValueZero(value, searchElement)) { close(rec.iterator); return true; }
+    }
+  },
+  join(separator) {
+    needObject(this, 'join');
+    var sep = ',', result = '', first = true;
+    if (separator !== undefined) try { sep = natives.toString(separator); } catch (e) { closeQuietly(this); throw e; }
+    var rec = directRecord(this);
+    for (;;) {
+      var r = step(rec);
+      if (r === null) return result;
+      var value = r.value;
+      if (first) first = false;
+      else result += sep;
+      if (value !== undefined && value !== null) {
+        var text;
+        try { text = natives.toString(value); } catch (e) { closeQuietly(rec.iterator); throw e; }
+        result += text;
+      }
+    }
+  }
+});
 )JS"
 R"JS(
 // ---- Object.groupBy and Map.groupBy (7.3.35 GroupBy)

@@ -43,6 +43,8 @@ struct Variable {
     Scope* scope = nullptr;
     uint32_t declEnd = 0;
     bool annexB = false;              // a `var` that exists only because a block-level function shares its name
+    bool special = false;             // VK_FUNC declared by a generator or async function: a block may not declare it twice
+    Variable* initFrom = nullptr;     // a body-level `var` that starts with the value of the parameter of the same name
     Variable* importNs = nullptr;     // VK_IMPORT: the variable holding the source module's namespace
     JSString* importName = nullptr;  // VK_IMPORT: the export it stands for (null: the namespace itself)
 };
@@ -74,6 +76,7 @@ struct Scope {
     std::vector<std::pair<Node*, bool>> refs;  // unresolved identifier references (node, crossed a function boundary)
     bool hasEval = false;
     bool catchBody = false;            // the block of a catch clause: its names must not repeat the parameter's
+    bool varScope = false;             // the body of a function whose parameters hold expressions: its `var`s live here (10.2.11 step 28)
     std::vector<JSString*> varNames;   // `var`s declared in nested blocks that are hoisted through this scope  // a direct eval call sits inside: every variable must stay reachable by name
     std::vector<Node*> funcDecls;              // function declarations hoisted to the top of this scope
     // filled in by the compiler
@@ -106,6 +109,7 @@ struct FunctionInfo {
     Variable *thisVar = nullptr, *argsVar = nullptr, *selfVar = nullptr, *newTargetVar = nullptr;
     Variable* ctorVar = nullptr;  // the running function itself, for a super() call made from an arrow function or eval
     Variable* evalVars = nullptr;  // sloppy function with a direct eval: holds the object of variables eval creates
+    Scope* bodyScope = nullptr;    // the separate scope of the body, when the parameters hold expressions
     uint32_t srcStart = 0, srcEnd = 0, line = 0;
     int length = 0;
     FunctionInfo* parent = nullptr;
@@ -157,5 +161,7 @@ struct SyntaxErr {
 // Parses a whole script, or with `asModule` an ES module.
 void parseScript(Vm& vm, Ast& ast, bool asModule, const std::u16string* params);
 void parseEval(Vm& vm, Ast& ast, const EvalSite& site);
+void parseDynamicFunction(Vm& vm, Ast& ast, int kind);  // the whole text is one function (CreateDynamicFunction)
+void parseParamsOnly(Vm& vm, Ast& ast, int kind);       // the text is a parameter list followed by `)`
 
 }  // namespace tb::js

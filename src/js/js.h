@@ -250,6 +250,7 @@ struct EvalScope {
     std::vector<Var> vars;
     bool isFunction = false, isArrow = false, isClass = false, isGlobal = false, isWith = false;
     bool isMethod = false, isFieldInit = false, isClassCtor = false, isDerived = false;  // of a function scope: what eval code may use
+    bool isVarScope = false;  // a function body kept apart from its parameters: eval's `var`s belong here
     int thisVar = -1, argsVar = -1, newTargetVar = -1;  // positions in vars, for `this`, `arguments` and new.target
     int ctorVar = -1;                                    // the running function, for super() from eval code
     int withVar = -1, evalVars = -1;                    // the object of a `with`; the object holding eval-made vars
@@ -266,6 +267,7 @@ struct FuncProto : Cell {
     std::vector<FuncProto*> inner;
     std::vector<Handler> handlers;
     std::vector<EvalSite> evalSites;  // one per direct eval call in this function
+    std::vector<Value> templates;     // the strings object of each tagged template, made the first time it runs (13.2.8.4)
     std::vector<uint32_t> lines;
     JSString* name = nullptr;
     uint16_t nparams = 0, length = 0;
@@ -655,7 +657,8 @@ public:
     Value call(Value fn, Value thisv) { return call(fn, thisv, nullptr, 0); }
     Value call(Value fn, Value thisv, Value a0) { return call(fn, thisv, &a0, 1); }
     Value invoke(Value target, const char* method, const Value* args = nullptr, int argc = 0);
-    Value compileFunction(const std::u16string& params, const std::u16string& body, const std::string& file);
+    // kind: 0 function, 1 generator, 2 async function, 3 async generator
+    Value compileFunction(const std::u16string& params, const std::u16string& body, const std::string& file, int kind = 0, Value newTarget = Value::undef());
 
     // ---- iteration helpers for natives
     bool iterate(Value iterable, const std::function<bool(Value)>& each);  // false from the callback stops early
@@ -707,6 +710,8 @@ public:
     std::vector<AsyncWaiter> asyncWaiters;
     uint32_t nextWaiterId = 1;
     JSObject *asyncIteratorProto = nullptr, *asyncGeneratorProto = nullptr, *asyncFromSyncProto = nullptr;
+    // %GeneratorFunction.prototype%, %AsyncGeneratorFunction.prototype%, %AsyncFunction.prototype% (27.3.3, 27.4.3, 27.7.3)
+    JSObject *generatorFunctionProto = nullptr, *asyncGeneratorFunctionProto = nullptr, *asyncFunctionProto = nullptr;
     JSString* callerAtom = nullptr;
     Value throwTypeError;  // %ThrowTypeError% (10.2.4.1): behind Function.prototype.caller and a strict arguments.callee
     JSObject* genReturnSignal = nullptr;  // thrown inside a generator to make it return through its finally blocks
@@ -803,6 +808,7 @@ FuncProto* compileScript(Vm& vm, std::shared_ptr<const std::u16string> src, cons
                          const std::u16string* params, ModuleInfo* module = nullptr);
 void moduleInit(Vm& vm, Value ns, Context* ctx);
 FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const EvalSite& site);
+FuncProto* compileDynamicFunction(Vm& vm, std::shared_ptr<const std::u16string> src, const std::u16string& params, int kind, const std::string& file);
 
 std::u16string utf8to16(std::string_view s);
 std::string utf16to8(std::u16string_view s);

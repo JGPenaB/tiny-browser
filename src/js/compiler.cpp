@@ -22,6 +22,7 @@ struct Fn {
     FunctionInfo* info = nullptr;
     FuncProto* p = nullptr;
     int nextReg = 2, maxReg = 2, ctxDepth = 0;
+    uint32_t templateSites = 0;  // tagged templates seen so far in this function
     size_t chainBase = 0;
     std::vector<Loop> loops;
     std::vector<Fin> fins;
@@ -291,6 +292,19 @@ private:
                 f->nextReg--;
             }
         }
+        if (Scope* body = info->bodyScope) {  // the body's own variables (10.2.11 steps 28 to 36)
+            enterScope(body);
+            for (Variable* v : body->vars) {
+                Variable* from = v->initFrom;
+                if (!from) continue;
+                int t = newReg();
+                if (from->captured) emit(OP_GetCtx, t, depthOf(from), from->slot);
+                else emit(OP_Move, t, from->reg);
+                storeVar(v, v->name, t, true);
+                f->nextReg--;
+            }
+            hoist(body);
+        }
         hoist(sc);
         if (info->isEvalBody) {  // the value of eval(...) is the value of its last expression statement
             int result = newReg();
@@ -416,7 +430,11 @@ private:
             emitX(OP_ThrowConst, 0, kstr(v->name));
             return;
         }
-        if (!init && (v->kind == VK_FUNCNAME || v->kind == VK_PRIVATE)) return;
+        if (!init && v->kind == VK_FUNCNAME) {  // the name of a function expression is an immutable binding: strict code may not write it
+            if (f->info->strict) emitX(OP_ThrowConst, 0, kstr(v->name));
+            return;
+        }
+        if (!init && v->kind == VK_PRIVATE) return;
         if (v->captured) emit(OP_SetCtx, src, depthOf(v), v->slot);
         else if (v->reg != src) emit(OP_Move, v->reg, src);
     }
@@ -637,18 +655,24 @@ private:
                 newReg();
                 calleeInto(n->a, base);
                 int strs = newReg();
-                emit(OP_NewArray, strs);
                 int raw = newReg();
-                emit(OP_NewArray, raw);
                 Node* tl = n->b;
                 int t = newReg();
+                uint32_t site = f->templateSites++;
+                if (site > 65535) fail("Too many tagged templates in one function");
+                emitX(OP_GetTemplate, strs, site);  // one strings object per site, however often it runs
+                size_t made = jump(OP_JmpNotUndef, strs);
+                emit(OP_NewArray, strs);
+                emit(OP_NewArray, raw);
                 for (size_t i = 0; i < tl->strs.size(); i += 2) {
-                    emitX(OP_LoadK, t, kstr(tl->strs[i]));
+                    if (tl->strs[i]) emitX(OP_LoadK, t, kstr(tl->strs[i]));
+                    else emit(OP_LoadUndef, t);  // an escape that means nothing: no cooked text
                     emit(OP_ArrayPush, strs, t);
                     emitX(OP_LoadK, t, kstr(tl->strs[i + 1]));
                     emit(OP_ArrayPush, raw, t);
                 }
-                setProp(strs, vm.a.raw, raw);
+                emit(OP_SetTemplate, strs, raw, (int)site);
+                patch(made);
                 f->nextReg = base + 3;  // strs is the first argument
                 for (Node* e : tl->list) {
                     int r = newReg();
@@ -711,6 +735,11 @@ private:
                             emit(OP_DelElem, dst, o, expr(t->b));
                         } else if (t->type == N::Ident && dynOf(t)) {
                             dynLoad(t, *dynOf(t), dst, 2);
+                        } else if (t->type == N::Ident && !(t->flags & NF_PRIVATE)) {
+                            // 13.5.1.2: a declared binding stays; a name left to the global object is a property of it
+                            Variable* v = t->var;
+                            if (v && (!v->isGlobal || v->kind == VK_LET || v->kind == VK_CONST || v->kind == VK_CLASS)) emit(OP_LoadFalse, dst);
+                            else emitX(OP_DelGlobal, dst, kstr(t->str));
                         } else {
                             expr(n->a);
                             emit(OP_LoadTrue, dst);
@@ -1163,6 +1192,7 @@ private:
                 es.isDerived = sc->fn->isDerived;
             }
             es.isWith = sc->kind == Scope::With;
+            es.isVarScope = sc->varScope;
             for (Variable* v : sc->vars) {
                 if (v->isGlobal || !v->captured || v->kind == VK_IMPORT) continue;
                 bool owner = es.isFunction || es.isGlobal;
@@ -1455,7 +1485,9 @@ private:
         } else
             ctor = defaultCtor(n->a != nullptr, name);
         ctor->name = name;
+        ctor->source = ast.src;
         ctor->srcStart = n->pos;
+        ctor->srcEnd = (uint32_t)n->num;
         f->p->inner.push_back(ctor);
         emitX(OP_Closure, rc, (uint32_t)f->p->inner.size() - 1);
         emit(OP_MakeClass, rc, parent < 0 ? 0xFFFF : parent, rp);
@@ -2084,6 +2116,25 @@ FuncProto* compileEval(Vm& vm, std::shared_ptr<const std::u16string> src, const 
         return c.evalFunction();
     } catch (const SyntaxErr& e) {
         std::string m = e.msg + " (<eval>:" + std::to_string(e.line) + ")";
+        vm.throwError(Err::SyntaxError, utf8to16(m));
+    }
+}
+
+// CreateDynamicFunction (20.2.1.1.1) steps 17 to 24: the parameters must be valid alone, then the text as a whole.
+FuncProto* compileDynamicFunction(Vm& vm, std::shared_ptr<const std::u16string> src, const std::u16string& params, int kind, const std::string& file) {
+    try {
+        {
+            Ast pa;
+            pa.src = std::make_shared<const std::u16string>(params + u"\n)");
+            parseParamsOnly(vm, pa, kind);
+        }
+        Ast ast;
+        ast.src = std::move(src);
+        parseDynamicFunction(vm, ast, kind);
+        Compiler c(vm, ast, file);
+        return c.program();
+    } catch (const SyntaxErr& e) {
+        std::string m = e.msg + " (" + file + ":" + std::to_string(e.line) + ")";
         vm.throwError(Err::SyntaxError, utf8to16(m));
     }
 }

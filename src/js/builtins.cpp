@@ -264,7 +264,7 @@ JSFN(objProtoSetProto) {
 }
 
 // ---------------------------------------------------------------------------- Function
-JSFN(functionCtor) {
+static Value dynamicFunction(CallInfo& ci, int kind) {
     Vm& vm = ci.vm;
     std::u16string params, body;
     for (int i = 0; i + 1 < ci.argc; ++i) {
@@ -272,7 +272,32 @@ JSFN(functionCtor) {
         params += vm.toStr16(ci.args[i]);
     }
     if (ci.argc) body = vm.toStr16(ci.args[ci.argc - 1]);
-    return vm.compileFunction(params, body, "<Function>");
+    return vm.compileFunction(params, body, "<Function>", kind, ci.newTarget);
+}
+JSFN(functionCtor) { return dynamicFunction(ci, 0); }
+JSFN(generatorFunctionCtor) { return dynamicFunction(ci, 1); }
+JSFN(asyncFunctionCtor) { return dynamicFunction(ci, 2); }
+JSFN(asyncGeneratorFunctionCtor) { return dynamicFunction(ci, 3); }
+
+// %GeneratorFunction%, %AsyncGeneratorFunction% and %AsyncFunction% (27.3, 27.4, 27.7). None is a global: each is
+// reached through the constructor property of its prototype object.
+void setupFunctionKinds(Vm& vm) {
+    Value functionCtorValue = vm.get(V(vm.global), vm.atom("Function"));
+    auto kind = [&](const char* name, NativeFn fn, JSObject* proto, JSObject* instances) {
+        JSNative* c = vm.newNative(fn, name, 1);
+        c->oflags |= OF_CTOR;
+        c->proto = functionCtorValue.asObject();
+        c->add(PropKey::of(vm.a.prototype), V(proto), 0);
+        vm.defineOwn(proto, PropKey::of(vm.a.constructor), V(c), PF_C);
+        if (instances) {
+            vm.defineOwn(proto, PropKey::of(vm.a.prototype), V(instances), PF_C);
+            vm.defineOwn(instances, PropKey::of(vm.a.constructor), V(proto), PF_C);
+        }
+        vm.defineOwn(proto, PropKey::of(vm.symToStringTag), vm.strv(name), PF_C);
+    };
+    kind("GeneratorFunction", generatorFunctionCtor, vm.generatorFunctionProto, vm.generatorProto);
+    kind("AsyncGeneratorFunction", asyncGeneratorFunctionCtor, vm.asyncGeneratorFunctionProto, vm.asyncGeneratorProto);
+    kind("AsyncFunction", asyncFunctionCtor, vm.asyncFunctionProto, nullptr);
 }
 JSFN(fnCall) { return ci.vm.call(ci.thisv, ci.arg(0), ci.argc > 1 ? ci.args + 1 : nullptr, ci.argc > 1 ? ci.argc - 1 : 0); }
 
@@ -327,7 +352,17 @@ JSFN(fnToString) {
     }
     if (!vm.isCallable(t)) vm.throwError(Err::TypeError, "Function.prototype.toString requires that 'this' be a Function");
     Value n = vm.get(t, vm.a.name);
-    return vm.strv(u"function " + (n.isString() ? n.asString()->s : std::u16string()) + u"() { [native code] }");
+    std::u16string name = n.isString() ? std::u16string(n.asString()->s) : std::u16string();
+    size_t at = name.compare(0, 4, u"get ") == 0 || name.compare(0, 4, u"set ") == 0 ? 4 : 0;
+    bool plain = true;
+    if (at < name.size() && name[at] != '[')
+        for (size_t i = at; i < name.size(); ++i) {
+            char16_t c = name[i];
+            bool part = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_' || c > 127 || (i > at && c >= '0' && c <= '9');
+            if (!part) plain = false;
+        }
+    if (!plain) name.clear();
+    return vm.strv(u"function " + name + u"() { [native code] }");
 }
 JSFN(fnHasInstance) { return Value::boolean(ci.vm.ordinaryHasInstance(ci.thisv, ci.arg(0))); }
 
