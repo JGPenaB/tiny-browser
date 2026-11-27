@@ -134,6 +134,11 @@
   eq('resolved: automatic minimum size of a flex item', resolved('flexItem', 'minWidth minHeight'), 'auto auto');
 
   // ---- events
+  var clickKind = '', noteKind = function (e) { clickKind = [e instanceof MouseEvent, e instanceof UIEvent, e instanceof KeyboardEvent, e.constructor.name].join(); };
+  box.addEventListener('click', noteKind);
+  box.click();
+  box.removeEventListener('click', noteKind);
+  eq('a click is a pointer event', clickKind, 'true,true,false,PointerEvent');
   var clicks = 0, order = [];
   var btn = document.getElementById('btn');
   btn.addEventListener('click', function (e) { clicks++; this.textContent = 'Clicked ' + clicks + ' times'; order.push('target:' + e.target.id + ':' + e.eventPhase); });

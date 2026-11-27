@@ -45,7 +45,10 @@ public:
         // The picture an <img> shows: its own size, 0 by 0 when it has none or failed. False while it is still loading.
         virtual bool imageSize(Node* img, int& w, int& h) = 0;
         virtual void titleChanged() = 0;
-        virtual void urlChanged(const std::string& url) = 0;
+        // The document's URL changed without a load (pushState, replaceState): `push` adds a session history entry.
+        virtual void urlChanged(const std::string& url, bool push) = 0;
+        virtual int historyLength() = 0;       // how many entries the tab's session history has
+        virtual void traverse(int delta) = 0;  // history.go(delta): carried out after the script returns
     };
 
     ScriptHost(Document& doc, const std::string& url, Client& client);
@@ -58,6 +61,13 @@ public:
     bool dispatch(Node* target, const std::string& type, bool bubbles = true, bool cancelable = true);
     // Runs timers that are due. The shell calls this when a wake() delay has passed.
     void pump();
+    // The tab went to another session history entry of this document, which loads nothing (HTML 7.4.6.2): the entry
+    // at `index` among the document's own entries. Fires popstate, and hashchange when the fragment changed.
+    void traversed(size_t index);
+    // The tab navigated to a fragment of this document (HTML 7.4.2.3.3): a new entry when `push`, otherwise the
+    // current one replaced. Fires popstate and hashchange.
+    void fragmentNavigated(const std::string& url, bool push);
+    bool restoresScroll() const;  // history.scrollRestoration is "auto"
     // Devtools console: evaluates in the page's global scope. Returns false and the error text on failure.
     bool eval(const std::wstring& source, std::wstring& out);
     // Style sheets that scripts made and adopted (CSSOM 6.2, adoptedStyleSheets): the text of each with the tree

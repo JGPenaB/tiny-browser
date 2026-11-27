@@ -163,7 +163,22 @@ struct ScriptHost::Impl {
     Store localStore, sessionStore;
     JSObject *nodeProto = nullptr, *elementProto = nullptr, *documentProto = nullptr, *textProto = nullptr, *eventProto = nullptr,
              *classListProto = nullptr, *styleProto = nullptr, *computedProto = nullptr, *nodeListProto = nullptr, *storageProto = nullptr;
-    Value currentScript = Value::null(), historyState = Value::null();
+    Value currentScript = Value::null();
+    // The session history entries that belong to this document (HTML 7.4.1), each with its URL and its classic
+    // history API state. The shell keeps the tab's whole history and says which of these is the current one.
+    struct SessionEntry {
+        std::string url;
+        Value state = Value::null();
+    };
+    std::vector<SessionEntry> session;
+    size_t sessionAt = 0;
+    bool manualScrollRestoration = false;
+    std::vector<std::pair<std::string, std::string>> hashChanges;  // old and new URL of hashchange events still owed
+    JSObject* historyObject = nullptr;
+    // The prototype of each event interface, by its name ("MouseEvent"). Every interface has one of its own that
+    // inherits from its parent interface's (DOM 2.2, UI Events 3, HTML 8.1.8.3).
+    std::unordered_map<std::string, JSObject*> eventProtos;
+    Value domException, cloneFn;  // the prelude's DOMException class and structuredClone
     std::string readyState = "loading";
     double startMs = now_ms();
     int nextTimer = 1, depth = 0;
@@ -727,11 +742,40 @@ struct ScriptHost::Impl {
         return false;
     }
 
+    // The document's current session history entry changed without a load (HTML 7.4.6.2, update document for
+    // history step application): popstate at once, and hashchange in a task of its own when the fragment changed.
+    void sessionEntryChanged(const std::string& oldUrl) {
+        url = session[sessionAt].url;
+        if (Url::parse(oldUrl).fragment != Url::parse(url).fragment) {
+            hashChanges.push_back({oldUrl, url});
+            client.wake(0);
+        }
+        Value ev = makeEvent("popstate", false, false);
+        ((JSHost*)ev.asObject())->slotA = session[sessionAt].state;
+        fire(nullptr, ev);
+    }
+
     // ---- events
+    // The interface of an event that the browser itself fires, from its type (UI Events 3, Pointer Events, HTML).
+    JSObject* eventProtoFor(const std::string& type) {
+        static const std::pair<const char*, const char*> kinds[] = {
+            {"click", "PointerEvent"},      {"auxclick", "PointerEvent"},   {"contextmenu", "PointerEvent"}, {"dblclick", "MouseEvent"},
+            {"mousedown", "MouseEvent"},    {"mouseup", "MouseEvent"},      {"mousemove", "MouseEvent"},     {"mouseover", "MouseEvent"},
+            {"mouseout", "MouseEvent"},     {"mouseenter", "MouseEvent"},   {"mouseleave", "MouseEvent"},    {"wheel", "WheelEvent"},
+            {"keydown", "KeyboardEvent"},   {"keyup", "KeyboardEvent"},     {"keypress", "KeyboardEvent"},   {"input", "InputEvent"},
+            {"beforeinput", "InputEvent"},  {"focus", "FocusEvent"},        {"blur", "FocusEvent"},          {"focusin", "FocusEvent"},
+            {"focusout", "FocusEvent"},     {"popstate", "PopStateEvent"},  {"hashchange", "HashChangeEvent"}, {"submit", "SubmitEvent"},
+            {"pageshow", "PageTransitionEvent"}, {"pagehide", "PageTransitionEvent"}, {"beforeunload", "BeforeUnloadEvent"},
+        };
+        for (auto& [name, kind] : kinds)
+            if (type == name)
+                if (auto it = eventProtos.find(kind); it != eventProtos.end()) return it->second;
+        return eventProto;
+    }
     Value makeEvent(const std::string& type, bool bubbles, bool cancelable) {
         JSHost* e = vm.alloc<JSHost>();
         e->hostKind = HK_Event;
-        e->proto = eventProto;
+        e->proto = eventProtoFor(type);
         vm.def(e, "type", vm.strv(utf8to16(type)), PF_ALL);
         vm.def(e, "bubbles", Value::boolean(bubbles), PF_ALL);
         vm.def(e, "cancelable", Value::boolean(cancelable), PF_ALL);
@@ -2112,7 +2156,30 @@ JSFN(eventCtor) {
     vm.def(e, "composed", Value::boolean(false), PF_ALL);
     vm.def(e, "detail", Value::null(), PF_ALL);
     if (init.isObject()) vm.copyDataProps(e, init, nullptr);
+    // PopStateEvent and HashChangeEvent keep their attributes inside the event; the prototype's getters read them.
+    auto is = [&](const char* kind) {
+        JSObject* wanted = im.eventProtos[kind];
+        for (JSObject* p = e->proto; p; p = p->proto)
+            if (p == wanted) return true;
+        return false;
+    };
+    auto take = [&](const char* name, Value fallback) {  // the member of the init dictionary, which is not left on the event
+        PropKey key = PropKey::of(vm.atom(name));
+        Value v = init.isObject() ? vm.get(init, key) : Value::undef();
+        vm.del(e, key);
+        return v.isUndef() ? fallback : v;
+    };
+    JSHost* host = (JSHost*)e;
+    if (is("PopStateEvent")) host->slotA = take("state", Value::null());
+    if (is("HashChangeEvent")) {
+        host->slotA = vm.strv(vm.toStr16(take("oldURL", V(vm.a.empty))));
+        host->slotB = vm.strv(vm.toStr16(take("newURL", V(vm.a.empty))));
+    }
     return ev;
+}
+JSFN(eventSlotGet) {  // data: 0 for the first value kept inside the event, 1 for the second
+    JSHost* e = thisHost(ci, HK_Event);
+    return ci.callee->data.asInt() == 0 ? e->slotA : e->slotB;
 }
 JSFN(eventPreventDefault) {
     JSHost* e = thisHost(ci, HK_Event);
@@ -2308,20 +2375,75 @@ JSFN(locationReload) {
     return Value::undef();
 }
 JSFN(locationToString) { return val8(ci.vm, I(ci.vm).url); }
-JSFN(historyPushState) {  // pushState / replaceState: the address changes without a load
-    Vm& vm = ci.vm;
-    Impl& im = I(vm);
-    im.historyState = ci.arg(0);
-    if (!ci.arg(2).isNullish()) {
-        std::string next = resolve_url(im.url, str8(vm, ci.arg(2)));
-        Url a = Url::parse(im.url), b = Url::parse(next);
-        if (a.origin() != b.origin()) vm.throwError(Err::Error, "SecurityError: history state URLs must stay on the same origin");
-        im.url = next;
-        im.client.urlChanged(next);
-    }
+// ---- history (HTML 7.2.5, the History interface)
+[[noreturn]] void throwDom(Impl& im, const char* name, const char* message) {
+    Value args[] = {val8(im.vm, message), val8(im.vm, name)};
+    im.vm.throwValue(im.vm.construct(im.domException, args, 2, im.domException));
+}
+JSFN(domExceptionSet) {  // __domException(class): the prelude hands over its DOMException
+    I(ci.vm).domException = ci.arg(0);
     return Value::undef();
 }
-JSFN(historyStateGet) { return I(ci.vm).historyState; }
+Impl& historyOf(CallInfo& ci) {  // the members of History work on the history object and nothing else
+    Impl& im = I(ci.vm);
+    if (!ci.thisv.isObject() || ci.thisv.asObject() != im.historyObject) ci.vm.throwError(Err::TypeError, "Illegal invocation");
+    return im;
+}
+// Whether a document at `from` can have its URL rewritten to `to` (HTML 7.2.5).
+bool canRewriteUrl(const std::string& from, const std::string& to) {
+    Url a = Url::parse(from), b = Url::parse(to);
+    if (!b.valid || a.scheme != b.scheme || a.host != b.host || a.port != b.port) return false;
+    if (b.scheme == "http" || b.scheme == "https") return true;
+    if (a.path != b.path) return false;
+    return b.scheme == "file" || a.query == b.query;
+}
+JSFN(historyPushState) {  // data: 0 pushState, 1 replaceState (the shared history push/replace state steps)
+    Vm& vm = ci.vm;
+    Impl& im = historyOf(ci);
+    bool push = ci.callee->data.asInt() == 0;
+    Value state = ci.arg(0).isUndef() ? Value::null() : vm.call(im.cloneFn, Value::undef(), ci.arg(0));
+    std::vector<Value> held{state};
+    RootScope keep(vm, held);
+    std::string next = im.url;
+    Value to = ci.arg(2);
+    if (!to.isNullish() && !str8(vm, to).empty()) {
+        next = resolve_url(im.url, str8(vm, to));
+        if (!canRewriteUrl(im.url, next)) throwDom(im, "SecurityError", "The URL of a history state must stay within the document's origin");
+    }
+    // the URL and history update steps (HTML 7.4.4): no event is fired
+    if (push) {
+        im.session.resize(im.sessionAt + 1);
+        im.session.push_back({next, state});
+        ++im.sessionAt;
+    } else {
+        im.session[im.sessionAt] = {next, state};
+    }
+    im.url = next;
+    im.client.urlChanged(next, push);
+    return Value::undef();
+}
+JSFN(historyGet) {  // data: 0 length, 1 state, 2 scrollRestoration
+    Impl& im = historyOf(ci);
+    switch (ci.callee->data.asInt()) {
+        case 0: return Value::i32(im.client.historyLength());
+        case 1: return im.session[im.sessionAt].state;
+        default: return val8(ci.vm, im.manualScrollRestoration ? "manual" : "auto");
+    }
+}
+JSFN(historySetScrollRestoration) {
+    Impl& im = historyOf(ci);
+    std::string mode = str8(ci.vm, ci.arg(0));
+    if (mode == "auto" || mode == "manual") im.manualScrollRestoration = mode == "manual";  // other values are ignored
+    return Value::undef();
+}
+JSFN(historyGo) {  // data: the delta of back() and forward(), 0 for go(delta)
+    Impl& im = historyOf(ci);
+    int delta = ci.callee->data.asInt();
+    if (delta == 0) delta = ci.vm.toInt32(ci.arg(0));
+    if (delta == 0) im.client.navigate(im.url, true);  // go(0) reloads
+    else im.client.traverse(delta);
+    return Value::undef();
+}
 
 // ---- storage
 Store& storeOf(JSObject* o) { return *(Store*)((JSHost*)o)->ptr; }
@@ -2691,7 +2813,11 @@ void ScriptHost::Impl::setup() {
             for (Value v : t.args) g.mark(v);
         }
         g.mark(currentScript);
-        g.mark(historyState);
+        for (auto& e : session) g.mark(e.state);
+        if (historyObject) g.mark(V(historyObject));
+        for (auto& ep : eventProtos) g.mark(V(ep.second));
+        g.mark(domException);
+        g.mark(cloneFn);
         g.mark(deliverFn);
         g.mark(pageScripts);
         g.mark(ceHook);
@@ -2889,13 +3015,31 @@ void ScriptHost::Impl::setup() {
     method(eventProto, "initCustomEvent", eventInit, 4);
     method(eventProto, "composedPath", eventComposedPath, 0);
     getter(eventProto, "defaultPrevented", eventDefaultPrevented);
-    for (const char* n : {"CustomEvent", "MouseEvent", "KeyboardEvent", "UIEvent", "FocusEvent", "InputEvent", "PointerEvent", "ErrorEvent", "MessageEvent", "ProgressEvent", "HashChangeEvent", "PopStateEvent", "StorageEvent", "PageTransitionEvent", "WheelEvent", "DragEvent", "CompositionEvent", "TransitionEvent", "AnimationEvent", "BeforeUnloadEvent", "PromiseRejectionEvent", "ClipboardEvent", "TouchEvent", "SubmitEvent", "ToggleEvent"}) {
-        JSNative* c = vm.newNative(eventCtor, n, 1);
-        c->oflags |= OF_CTOR;
-        c->add(PropKey::of(vm.a.prototype), V(eventProto), 0);
-        c->proto = eventC;
-        vm.def(G, n, V(c));
+    // The other event interfaces, each after the one it inherits from. Apart from the two below, their attributes
+    // are still plain properties of each event object, not getters on these prototypes.
+    struct {
+        const char* name;
+        const char* parent;
+    } eventKinds[] = {{"UIEvent", "Event"},          {"MouseEvent", "UIEvent"},        {"KeyboardEvent", "UIEvent"},   {"FocusEvent", "UIEvent"},
+                      {"InputEvent", "UIEvent"},     {"CompositionEvent", "UIEvent"},  {"TouchEvent", "UIEvent"},      {"PointerEvent", "MouseEvent"},
+                      {"WheelEvent", "MouseEvent"},  {"DragEvent", "MouseEvent"},      {"CustomEvent", "Event"},       {"ErrorEvent", "Event"},
+                      {"MessageEvent", "Event"},     {"ProgressEvent", "Event"},       {"HashChangeEvent", "Event"},   {"PopStateEvent", "Event"},
+                      {"StorageEvent", "Event"},     {"PageTransitionEvent", "Event"}, {"TransitionEvent", "Event"},   {"AnimationEvent", "Event"},
+                      {"BeforeUnloadEvent", "Event"}, {"PromiseRejectionEvent", "Event"}, {"ClipboardEvent", "Event"}, {"SubmitEvent", "Event"},
+                      {"ToggleEvent", "Event"}};
+    std::unordered_map<std::string, JSNative*> eventCtors{{"Event", eventC}};
+    eventProtos["Event"] = eventProto;
+    for (auto& kind : eventKinds) {
+        JSObject* proto = vm.newObject();
+        proto->proto = eventProtos[kind.parent];
+        JSNative* c = makeCtor(vm, kind.name, eventCtor, 1, proto);
+        c->proto = eventCtors[kind.parent];
+        eventProtos[kind.name] = proto;
+        eventCtors[kind.name] = c;
     }
+    getter(eventProtos["PopStateEvent"], "state", eventSlotGet, nullptr, 0);
+    getter(eventProtos["HashChangeEvent"], "oldURL", eventSlotGet, nullptr, 0);
+    getter(eventProtos["HashChangeEvent"], "newURL", eventSlotGet, nullptr, 1);
 
     // ---- one constructor and prototype per kind of node, so properties such as `value` or `async` exist only
     // on the elements that have them
@@ -3108,13 +3252,20 @@ void ScriptHost::Impl::setup() {
         vm.defineAccessor(o, PropKey::of(vm.atom("location")), V(g), V(s), PF_C | PF_E);
     }
 
-    JSObject* hist = vm.newObject();
-    vm.def(G, "history", V(hist), PF_ALL);
-    vm.def(hist, "length", Value::i32(1), PF_ALL);
-    method(hist, "pushState", historyPushState, 3);
-    method(hist, "replaceState", historyPushState, 3);
-    for (const char* n : {"back", "forward", "go"}) method(hist, n, noopFn, 0);
-    getter(hist, "state", historyStateGet);
+    JSObject* historyProto = vm.newObject();
+    makeCtor(vm, "History", illegalCtor, 0, historyProto);
+    historyObject = vm.newObject();
+    historyObject->proto = historyProto;
+    vm.def(G, "history", V(historyObject), PF_ALL);
+    session.push_back({url, Value::null()});
+    getter(historyProto, "length", historyGet, nullptr, 0);
+    getter(historyProto, "state", historyGet, nullptr, 1);
+    getter(historyProto, "scrollRestoration", historyGet, historySetScrollRestoration, 2);
+    method(historyProto, "pushState", historyPushState, 2, 0);
+    method(historyProto, "replaceState", historyPushState, 2, 1);
+    method(historyProto, "go", historyGo, 0, 0);
+    method(historyProto, "back", historyGo, 0, -1);
+    method(historyProto, "forward", historyGo, 0, 1);
 
     storageProto = vm.newObject();
     makeCtor(vm, "Storage", illegalCtor, 0, storageProto);
@@ -3165,8 +3316,10 @@ void ScriptHost::Impl::setup() {
     vm.defFn(G, "__ceState", ceStateFn, 2);
     vm.defFn(G, "__isConstructor", isConstructorFn, 1);
     vm.defFn(G, "__scrollTop", scrollTopFn, 2);
+    vm.defFn(G, "__domException", domExceptionSet, 1);
     try {
         vm.eval(utf8to16(kScriptPrelude), "browser:prelude");
+        cloneFn = vm.get(V(G), "structuredClone");
     } catch (JSThrow&) {
         reportError();
     }
@@ -3275,11 +3428,58 @@ bool ScriptHost::dispatch(Node* target, const std::string& type, bool bubbles, b
     }
 }
 
+void ScriptHost::traversed(size_t index) {
+    Impl& im = *impl_;
+    if (im.dead || index >= im.session.size() || index == im.sessionAt) return;
+    Entry entry(im);
+    std::string old = im.url;
+    im.sessionAt = index;
+    try {
+        im.sessionEntryChanged(old);
+    } catch (JSThrow&) {
+        im.reportError();
+    }
+}
+
+void ScriptHost::fragmentNavigated(const std::string& url, bool push) {
+    Impl& im = *impl_;
+    if (im.dead) return;
+    Entry entry(im);
+    std::string old = im.url;
+    if (push) {
+        im.session.resize(im.sessionAt + 1);
+        im.session.push_back({url, Value::null()});  // the classic history API state is never carried over
+        ++im.sessionAt;
+    } else {
+        im.session[im.sessionAt] = {url, Value::null()};
+    }
+    try {
+        im.sessionEntryChanged(old);
+    } catch (JSThrow&) {
+        im.reportError();
+    }
+}
+
+bool ScriptHost::restoresScroll() const { return !impl_->manualScrollRestoration; }
+
 void ScriptHost::pump() {
     Impl& im = *impl_;
     if (im.dead || im.depth) return;
     drainNet(im);
     if (im.loadDue) fireLoadEvents();
+    while (!im.hashChanges.empty() && !im.dead) {
+        auto [oldUrl, newUrl] = im.hashChanges.front();
+        im.hashChanges.erase(im.hashChanges.begin());
+        Entry entry(im);
+        try {
+            Value ev = im.makeEvent("hashchange", false, false);
+            ((JSHost*)ev.asObject())->slotA = val8(im.vm, oldUrl);
+            ((JSHost*)ev.asObject())->slotB = val8(im.vm, newUrl);
+            im.fire(nullptr, ev);
+        } catch (JSThrow&) {
+            im.reportError();
+        }
+    }
     for (int budget = 200; budget > 0 && !im.dead; --budget) {
         double now = now_ms();
         int best = -1;

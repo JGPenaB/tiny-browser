@@ -173,10 +173,19 @@ struct Page {
     std::unique_ptr<ScriptHost> script;               // null for pages without scripts
 };
 
+// One entry of a tab's session history (HTML 7.4.1).
+struct HistEntry {
+    std::string url;
+    int doc = 0;       // entries with the same number belong to one document: going between them loads nothing
+    float scroll = 0;  // how far the page was scrolled when the entry was left
+};
+
 struct Tab {
     int id = 0;
-    std::vector<std::string> hist;
+    std::vector<HistEntry> hist;
     int hi = -1;
+    int docCount = 0;    // documents loaded in this tab so far: the next one's number
+    int traverseBy = 0;  // history.go(delta) asked for by script; done once the script has returned
     std::unique_ptr<Page> page;
     std::wstring title = L"New Tab";
     std::wstring addr;
@@ -439,25 +448,57 @@ public:
             url = "about:passwords";
         }
         if (push) t.refreshCount = 0;
-        // Same-document fragment navigation: just scroll.
+        // Navigating to a fragment of the document that is shown (HTML 7.4.2.3.3) loads nothing: the entry is new
+        // or replaced, the page scrolls there and its scripts are told.
         if (!req && t.page && t.page->doc && url.find('#') != std::string::npos && strip_fragment(url) == strip_fragment(t.page->url)) {
-            if (push) {
-                if (t.hi + 1 < (int)t.hist.size()) t.hist.resize(t.hi + 1);
-                t.hist.push_back(url);
-                t.hi = (int)t.hist.size() - 1;
-            }
+            if (push) pushEntry(t, url, t.hi >= 0 ? t.hist[t.hi].doc : 0);
+            else if (t.hi >= 0) t.hist[t.hi].url = url;
             t.page->url = url;
             t.addr = widen(url);
             scrollToFragment(t);
             invalidate();
+            if (t.page->script) {
+                t.page->script->fragmentNavigated(url, push);
+                afterScript(t);
+            }
             return;
         }
-        if (push) {
-            if (t.hi + 1 < (int)t.hist.size()) t.hist.resize(t.hi + 1);
-            t.hist.push_back(url);
-            t.hi = (int)t.hist.size() - 1;
-        }
+        if (push) pushEntry(t, url, 0);
         startLoad(t, url, req, fromPage);
+    }
+    // A new session history entry after the current one. What lay ahead of it is gone.
+    void pushEntry(Tab& t, const std::string& url, int doc) {
+        if (t.hi >= 0) t.hist[t.hi].scroll = t.scroll;
+        if (t.hi + 1 < (int)t.hist.size()) t.hist.resize(t.hi + 1);
+        t.hist.push_back({url, doc, 0});
+        t.hi = (int)t.hist.size() - 1;
+    }
+    // Session history traversal by `delta` entries (HTML 7.4.6.1). Between two entries of the document that is shown
+    // nothing is loaded: the page's scripts are told and the page goes back to where it was scrolled. Any other
+    // entry is loaded again.
+    void traverse(Tab& t, int delta) {
+        int to = t.hi + delta;
+        if (delta == 0 || t.hi < 0 || to < 0 || to >= (int)t.hist.size()) return;
+        t.hist[t.hi].scroll = t.scroll;
+        bool sameDocument = t.page && !t.loading && t.hist[to].doc != 0 && t.hist[to].doc == t.hist[t.hi].doc;
+        t.hi = to;
+        if (!sameDocument) {
+            navigate(t, t.hist[to].url, false);
+            return;
+        }
+        int first = to;  // the document's own entries lie next to each other: its scripts count them from the first
+        while (first > 0 && t.hist[first - 1].doc == t.hist[to].doc) --first;
+        t.page->url = t.hist[to].url;
+        t.addr = widen(t.page->url);
+        if (!t.page->script || t.page->script->restoresScroll()) {
+            t.scroll = t.hist[to].scroll;
+            clampScroll(t);
+        }
+        invalidate();
+        if (t.page->script) {
+            t.page->script->traversed((size_t)(to - first));
+            afterScript(t);
+        }
     }
 
     void startLoad(Tab& t, const std::string& url, const FetchOpts* req = nullptr, bool fromPage = false) {
@@ -500,21 +541,15 @@ public:
 
     void goBack() {
         Tab* t = cur();
-        if (t && t->hi > 0) {
-            t->hi--;
-            navigate(*t, t->hist[t->hi], false);
-        }
+        if (t) traverse(*t, -1);
     }
     void goFwd() {
         Tab* t = cur();
-        if (t && t->hi + 1 < (int)t->hist.size()) {
-            t->hi++;
-            navigate(*t, t->hist[t->hi], false);
-        }
+        if (t) traverse(*t, 1);
     }
     void reload() {
         Tab* t = cur();
-        if (t && t->hi >= 0) startLoad(*t, t->hist[t->hi]);
+        if (t && t->hi >= 0) startLoad(*t, t->hist[t->hi].url);
     }
 
     void onLoaded(LoadResult* raw) {
@@ -555,13 +590,16 @@ public:
         t.navPending = false;
         t.submitForm = t.submitBy = nullptr;
         if (hwnd) KillTimer(hwnd, kScriptTimerBase + t.id);
+        // A new document: the entry it was loaded for is its first, and the entries of the document before no
+        // longer share theirs with what is shown. Numbered before any script can add entries of its own.
+        if (t.hi >= 0 && t.hi < (int)t.hist.size()) t.hist[t.hi].doc = ++t.docCount;
         startScripts(t, r->scripts);
         if (!t.page) return;
-        bool internal = t.hi >= 0 && t.hi < (int)t.hist.size() && istarts(t.hist[t.hi], "about:");
-        if (t.hi >= 0 && t.hi < (int)t.hist.size() && !internal) t.hist[t.hi] = t.page->url;
+        bool internal = t.hi >= 0 && t.hi < (int)t.hist.size() && istarts(t.hist[t.hi].url, "about:");
+        if (t.hi >= 0 && t.hi < (int)t.hist.size() && !internal) t.hist[t.hi].url = t.page->url;
         std::string title = t.page->doc->title;
         t.title = widen(title.empty() ? t.page->url : title);
-        t.addr = widen(internal ? t.hist[t.hi] : t.page->url);
+        t.addr = widen(internal ? t.hist[t.hi].url : t.page->url);
         buildDevLines(*t.page);
         autofill(*t.page);
         ensureLayout(t);
@@ -685,14 +723,17 @@ public:
             app.updateTitle();
             app.invalidate();
         }
-        void urlChanged(const std::string& url) override {
+        void urlChanged(const std::string& url, bool push) override {
             Page* p = page();
-            if (!p) return;
+            if (!p || tab.hi < 0) return;
             p->url = url;
             tab.addr = widen(url);
-            if (tab.hi >= 0 && tab.hi < (int)tab.hist.size()) tab.hist[tab.hi] = url;
+            if (push) app.pushEntry(tab, url, tab.hist[tab.hi].doc);
+            else tab.hist[tab.hi].url = url;
             app.invalidate();
         }
+        int historyLength() override { return (int)tab.hist.size(); }
+        void traverse(int delta) override { tab.traverseBy = delta; }
     };
 
     void startScripts(Tab& t, const std::vector<ScriptSource>& scripts) {
@@ -720,6 +761,10 @@ public:
             t.navPending = false;
             std::string url = t.navRequest;
             navigate(t, url, !t.navReplace, nullptr, true);
+        }
+        if (int delta = t.traverseBy) {
+            t.traverseBy = 0;
+            traverse(t, delta);
         }
         invalidate();
     }

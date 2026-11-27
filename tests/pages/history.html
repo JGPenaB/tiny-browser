@@ -1,0 +1,108 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>History test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+</style>
+</head>
+<body>
+<p>Session history (HTML Standard 7.2.5 and 7.4): served by <code>tests/server.py</code>, because a <code>file:</code> page may not change its path.</p>
+<div id="results"><b>Results</b></div>
+<div style="height: 1500px"></div>
+<p id="three">the fragment target</p>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  function thrown(fn) { try { fn(); return 'nothing'; } catch (e) { return e.name; } }
+  var where = function () { return location.search + location.hash; };
+
+  // What the page is told, in order.
+  var events = [];
+  var took = function () { var seen = events.join(' '); events = []; return seen; };
+  window.addEventListener('popstate', function (e) { events.push((e instanceof PopStateEvent ? '' : 'not a PopStateEvent ') + 'popstate:' + JSON.stringify(e.state) + ':' + where()); });
+  window.addEventListener('hashchange', function (e) { events.push((e instanceof HashChangeEvent ? '' : 'not a HashChangeEvent ') + 'hashchange:' + new URL(e.oldURL).hash + '>' + new URL(e.newURL).hash); });
+
+  // ---- the event interfaces of history
+  var popped = new PopStateEvent('popstate', { state: 5 }), hashed = new HashChangeEvent('hashchange', { oldURL: 'a', newURL: 'b' });
+  eq('PopStateEvent and HashChangeEvent keep their attributes on the prototype', [popped.state, popped.hasOwnProperty('state'), typeof Object.getOwnPropertyDescriptor(PopStateEvent.prototype, 'state').get,
+    new PopStateEvent('popstate').state, hashed.oldURL + hashed.newURL, hashed.hasOwnProperty('newURL'), new HashChangeEvent('hashchange').oldURL].join(), '5,false,function,,ab,false,');
+  eq('event interfaces inherit from their parents', [Object.getPrototypeOf(PopStateEvent.prototype) === Event.prototype, Object.getPrototypeOf(MouseEvent.prototype) === UIEvent.prototype,
+    Object.getPrototypeOf(PointerEvent) === MouseEvent, new MouseEvent('click') instanceof UIEvent, new Event('x') instanceof MouseEvent, popped instanceof HashChangeEvent, popped.constructor.name].join(), 'true,true,true,true,false,false,PopStateEvent');
+
+  // ---- the History interface
+  eq('History is an interface with its members on the prototype', [history instanceof History, typeof Object.getOwnPropertyDescriptor(History.prototype, 'state').get,
+    history.hasOwnProperty('state'), history.hasOwnProperty('pushState')].join(), 'true,function,false,false');
+  eq('its members work on the history object only', [thrown(function () { return History.prototype.state; }), thrown(function () { History.prototype.back.call({}); })].join(), 'TypeError,TypeError');
+  eq('at the start', [history.state, history.scrollRestoration, where()].join(), ',auto,');
+
+  // ---- pushState and replaceState
+  history.pushState({ n: 1 }, '', '#one');
+  // The tab may hold entries from before this page, and pushState has just dropped any that lay ahead: lengths are
+  // counted from this page's first entry.
+  var before = history.length - 2;
+  var entries = function () { return history.length - before; };
+  eq('pushState makes a new entry with the state', [where(), JSON.stringify(history.state)].join(), '#one,{"n":1}');
+  var given = { n: 2 };
+  history.replaceState(given, '', '#two');
+  eq('replaceState changes the entry and keeps a copy of the state', [entries(), where(), history.state !== given, history.state === history.state, history.state.n].join(), '2,#two,true,true,2');
+  eq('the URL must stay in the origin', thrown(function () { history.pushState(null, '', 'https://example.org/'); }), 'SecurityError');
+  history.replaceState(history.state, '');
+  eq('without a URL the address stays', where(), '#two');
+  eq('pushState and replaceState fire no event', took(), '');
+  history.scrollRestoration = 'manual';
+  var manual = history.scrollRestoration;
+  history.scrollRestoration = 'sideways';
+  eq('scrollRestoration', [manual, history.scrollRestoration].join(), 'manual,manual');
+  history.scrollRestoration = 'auto';
+
+  // ---- traversal and fragment navigation, one step after the other
+  var steps = [
+    function () {
+      history.back();
+      eq('back() is carried out later, not inside the call', where(), '#two');
+    },
+    function () {
+      eq('back: popstate with the entry\'s state, then hashchange', took(), 'popstate:null: hashchange:#two>');
+      history.forward();
+    },
+    function () {
+      eq('forward', [took(), JSON.stringify(history.state)].join(' '), 'popstate:{"n":2}:#two hashchange:>#two {"n":2}');
+      location.hash = 'three';
+    },
+    function () {
+      eq('a fragment navigation adds an entry without a state', [took(), entries(), String(history.state), scrollY > 0].join(' '), 'popstate:null:#three hashchange:#two>#three 3 null true');
+      history.pushState('four', '', '?q=1#three');
+      eq('pushState may change the query', [where(), entries(), history.state].join(' '), '?q=1#three 4 four');
+      history.back();
+    },
+    function () {
+      eq('back over a change of query alone: popstate, no hashchange', took(), 'popstate:null:#three');
+      history.go(-2);
+    },
+    function () {
+      eq('go(-2)', [took(), where(), entries()].join('|'), 'popstate:null: hashchange:#three>||4');
+      history.go(9);
+    },
+    function () {
+      eq('going past the end does nothing', [took(), where()].join('|'), '|');
+      document.title = 'History test: ' + pass + ' passed, ' + fail + ' failed';
+      console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+    }
+  ];
+  var next = function () { var step = steps.shift(); if (step) { step(); setTimeout(next, 120); } };
+  window.addEventListener('load', function () { setTimeout(next, 0); });
+</script>
+</body>
+</html>

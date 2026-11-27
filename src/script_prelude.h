@@ -14,6 +14,8 @@ delete G.SharedArrayBuffer;  // only for cross-origin isolated pages, which do n
 class DOMException extends Error {
   constructor(message, name) { super(message); this.name = name || 'Error'; this.code = 0; }
 }
+G.__domException(DOMException);  // what the engine's own DOM code throws
+delete G.__domException;
 
 // ---- event targets that are not DOM nodes (XMLHttpRequest, AbortSignal, MessagePort...)
 class EventTarget {
@@ -480,7 +482,7 @@ function named(name, instance) {
   Object.defineProperty(G, name, { value: ctor, writable: true, configurable: true });
   return ctor;
 }
-named('Navigator', navigator); named('Location', location); named('History', history); named('Screen', screen); named('Performance', performance);
+named('Navigator', navigator); named('Location', location); named('Screen', screen); named('Performance', performance);
 var windowProto = Object.create(EventTarget.prototype);
 Object.setPrototypeOf(G, windowProto);
 named('Window').prototype = windowProto;
