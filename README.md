@@ -80,8 +80,8 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 `python tests/run_test262.py [path filter ...] [--jobs N] [--save name]` runs the ECMAScript conformance suite (test262,
 cloned into the git-ignored `third_party/test262`; the script's header has the command) and writes the failures to
-`out/test262-<name>.txt`. Tenth full run, 2026-11-27: 43,451 of 48,803 tests pass (89.0%). Without the 4,616 tests
-for Temporal, a proposal that is not part of ECMA-262 yet, that is 98.3%.
+`out/test262-<name>.txt`. Eleventh full run, 2026-11-27: 43,504 of 48,803 tests pass (89.1%). Without the 4,616 tests
+for Temporal, a proposal that is not part of ECMA-262 yet, that is 98.5%.
 
 What the engine covers: the whole core language with its early errors (classes with private members and static
 blocks, generators and async generators, destructuring, modules, direct and indirect `eval`, `with`, Annex B, proper
