@@ -26,6 +26,9 @@ struct FetchOpts {
     std::vector<std::pair<std::string, std::string>> headers;  // extra request headers (script requests)
     bool wantHeaders = false;                                  // fill FetchResult::rawHeaders
     bool sendOrigin = false;                                   // send Origin even for GET (cross-origin script requests)
+    // What the request is for decides its Accept header (Fetch 4.4, step 15): servers answer by it, and some send
+    // a page instead of the picture when a picture was not asked for.
+    enum class For : uint8_t { Document, Image, Style, Other } purpose = For::Document;
 };
 
 // Synchronous fetch for http(s) (WinHTTP: TLS via SChannel, HTTP/2, gzip/deflate/brotli), file: and data: URLs.

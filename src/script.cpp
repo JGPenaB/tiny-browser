@@ -92,6 +92,7 @@ FetchResult corsFetch(const std::string& url, FetchOpts o, bool crossOrigin, con
             custom += (custom.empty() ? "" : ",") + std::string("content-type");
         if (!simpleMethod || !custom.empty()) {  // ask the server first (preflight)
             FetchOpts pf;
+            pf.purpose = FetchOpts::For::Other;
             pf.method = "OPTIONS";
             pf.referrer = o.referrer;
             pf.firstPartySite = o.firstPartySite;
@@ -550,6 +551,7 @@ struct ScriptHost::Impl {
                 return;
             }
             FetchOpts o;
+            o.purpose = FetchOpts::For::Other;
             o.referrer = url;
             o.firstPartySite = firstParty();
             startFetch(u, o, false, "", false, [this, sc, u](FetchResult& r) {
@@ -2456,7 +2458,7 @@ JSFN(docCookieSet) {
 // ---- network primitives behind fetch() and XMLHttpRequest (see script_prelude.h)
 struct NetRequest {
     std::string url, origin, error;
-    FetchOpts opts;
+    FetchOpts opts{.purpose = FetchOpts::For::Other};  // fetch() and XMLHttpRequest ask for anything unless the script says otherwise
     bool crossOrigin = false, credentials = false, binary = false;
 };
 // arguments: method, url, [[name, value]...], body, flags (1 = send credentials, 2 = binary response)

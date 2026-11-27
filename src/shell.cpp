@@ -800,6 +800,7 @@ public:
             opts.referrer = p.url;
             Url du = Url::parse(p.url);
             opts.firstPartySite = du.valid && !du.host.empty() ? site_of(du.host) : std::string("local");
+            opts.purpose = image ? FetchOpts::For::Image : FetchOpts::For::Style;
             ++p.late->inFlight;
             std::thread([late = p.late, wake = p.wake, url = url, image = image, opts] {
                 LateLoads::Done d;

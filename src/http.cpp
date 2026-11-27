@@ -532,8 +532,12 @@ Hop http_once(const Url& u, const std::string& method, const std::string& body, 
 
     bool thirdParty = !o.firstPartySite.empty() && site_of(u.host) != o.firstPartySite;
     bool crossNav = o.topLevel && !o.initiatorSite.empty() && site_of(u.host) != o.initiatorSite;
-    std::string hdrs = "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n"
-                       "Accept-Language: en-US,en;q=0.9\r\n";
+    static const char* const kAccept[] = {"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                                          "image/webp,image/apng,image/*,*/*;q=0.8", "text/css,*/*;q=0.1", "*/*"};
+    bool ownAccept = false;  // a script request that names its own
+    for (auto& extra : o.headers) ownAccept = ownAccept || lower(extra.first) == "accept";
+    std::string hdrs = "Accept-Language: en-US,en;q=0.9\r\n";
+    if (!ownAccept) hdrs += std::string("Accept: ") + kAccept[(int)o.purpose] + "\r\n";
     if (!thirdParty) {
         std::string ck = CookieJar::get().header(u, crossNav, crossNav && method != "GET");
         if (!ck.empty()) hdrs += "Cookie: " + clean_header(ck) + "\r\n";
@@ -915,6 +919,10 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
         Url du = Url::parse(R->url);
         sub.firstPartySite = du.valid && !du.host.empty() ? site_of(du.host) : std::string("local");
     }
+    FetchOpts subImage = sub, subStyle = sub, subOther = sub;
+    subImage.purpose = FetchOpts::For::Image;
+    subStyle.purpose = FetchOpts::For::Style;
+    subOther.purpose = FetchOpts::For::Other;
     size_t nCss = cssJobs.size(), nImg = imgUrls.size(), nScript = scriptJobs.size();
     std::vector<std::string> scriptCode(nScript);
     std::vector<NetEntry> scriptNet(nScript);
@@ -936,7 +944,7 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
                 scriptOk[k] = 1;
                 return;
             }
-            FetchResult f = fetch(j.text, sub);
+            FetchResult f = fetch(j.text, subOther);
             scriptNet[k] = {j.text, f.contentType.empty() ? "text/javascript" : f.contentType, f.error, f.status, f.body.size(), f.ms};
             if (f.error.empty() && f.status < 400 && f.body.size() < 12u * 1024 * 1024) {
                 scriptCode[k] = bytes_to_utf8(f.body, f.contentType);
@@ -948,12 +956,12 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
                 sheets[i] = parse_sheet(j.text);
                 return;
             }
-            FetchResult f = fetch(j.text, sub);
+            FetchResult f = fetch(j.text, subStyle);
             cssNet[i] = {j.text, f.contentType.empty() ? "text/css" : f.contentType, f.error, f.status, f.body.size(), f.ms};
             if (f.error.empty() && f.status < 400) sheets[i] = parse_sheet(bytes_to_utf8(f.body, f.contentType));
         } else {
             size_t k = i - nCss;
-            FetchResult f = fetch(imgUrls[k], sub);
+            FetchResult f = fetch(imgUrls[k], subImage);
             imgNet[k] = {imgUrls[k], f.contentType, f.error, f.status, f.body.size(), f.ms};
             images[k].url = imgUrls[k];
             if (f.error.empty() && f.status < 400) {
