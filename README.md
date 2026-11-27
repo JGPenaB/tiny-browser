@@ -68,7 +68,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    conformance suite: see "Conformance" below. Still open: Temporal, Intl.
 4. **Milestone 4 - DOM + Web APIs (in progress; required by Google results, YouTube and Reddit):** done so far: DOM
    bindings and events, classic and module scripts (import maps, `defer`, `nomodule`), timers + event loop, `fetch`/XHR with
-   CORS, storage, cookies, MutationObserver. Still open: custom elements and shadow DOM (Reddit), styles and images added
+   CORS, storage, cookies, MutationObserver, template contents, custom elements, shadow DOM (slots, scoped styles with
+   `:host` and `::slotted()`, declarative shadow roots, style sheets made by script and adopted). These are checked by
+   `tests/pages/components.html`, whose expectations were compared with a reference browser. Still open: images added
    by script, incremental restyle/relayout, per-site controls (JavaScript, cookies, images), the security baseline
    (script time and memory limits, certificate and mixed-content warnings, per-site exceptions), content blocker
    (EasyList-format lists), tab sleeping.
