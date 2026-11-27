@@ -85,4 +85,12 @@ test("flags, lastIndex and friends", function () {
   eq(["x".anchor('a"b'), "x".bold(), "x".link("u"), "x".fontsize(3), "x".sup(), "Å".normalize() === "Å", "Å".normalize("NFD").length, "x".padEnd.length], ['<a name="a&quot;b">x</a>', "<b>x</b>", '<a href="u">x</a>', '<font size="3">x</font>', "<sup>x</sup>", true, 2, 1]);
   throws(() => "x".normalize("bad"), RangeError);
 });
+test("the v flag: sets with operations and strings (22.2.1)", function () {
+  eq([/^[[a-z]--[aeiou]]+$/v.test("xyz"), /^[[a-z]--[aeiou]]+$/v.test("xay"), /^[\w&&[^\d]]+$/v.test("ab_"), /^[\w&&[^\d]]+$/v.test("a1")], [true, false, true, false]);
+  eq([/^[\p{L}&&\p{ASCII}]+$/v.test("abc"), /^[\p{L}&&\p{ASCII}]+$/v.test("aé"), /^[[0-9][a-f]]+$/v.test("09af"), /[\q{abc|d|}]/v.exec("xabc")[0]], [true, false, true, ""]);
+  eq([/^[\q{abc|ab|a}x]$/v.exec("abc")[0], /[\q{ab|abc}]/v.exec("abcd")[0], /^[\p{Emoji_Keycap_Sequence}_]+$/v.test("1️⃣_"), /^\p{Emoji_Keycap_Sequence}$/v.test("1")], ["abc", "abc", true, false]);
+  eq([/[a\-b]/v.test("-"), /[\&\&]/v.test("&"), new RegExp("[a-c]", "v").unicodeSets, /./v.flags], [true, true, true, "v"]);
+  for (const src of ["[a&&&b]", "[a--b&&c]", "[ab--c]", "[(]", "[a-]", "[^\\q{ab}]", "[\\P{Emoji_Keycap_Sequence}]", "[a||b]", "[&&a]"]) throws(() => new RegExp(src, "v"), SyntaxError, src);
+  throws(() => new RegExp("\\ ", "u"), SyntaxError); throws(() => new RegExp("\\-", "u"), SyntaxError); eq(/[\-]/u.test("-"), true);
+});
 done();

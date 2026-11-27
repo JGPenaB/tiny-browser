@@ -45,7 +45,7 @@ void initRegExp(Vm& vm, JSRegExp* r, const std::u16string& src, const std::u16st
         *slot = true;
     }
     if (unicodeSets && f.unicode) vm.throwError(Err::SyntaxError, u"Invalid flags supplied to RegExp constructor '" + flagStr + u"'");
-    if (unicodeSets) f.unicode = true;
+    if (unicodeSets) f.unicode = f.unicodeSets = true;
     std::u16string key = flagStr + u"/" + src;
     auto& cache = programCache();
     std::shared_ptr<RegexProgram> prog;

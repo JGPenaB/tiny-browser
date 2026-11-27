@@ -11,6 +11,7 @@ struct RegexProgram;
 
 struct RegexFlags {
     bool global = false, ignoreCase = false, multiline = false, dotAll = false, unicode = false, sticky = false, hasIndices = false;
+    bool unicodeSets = false;  // the v flag: unicode is set as well
 };
 
 // Returns null and fills `error` when the pattern is not valid.

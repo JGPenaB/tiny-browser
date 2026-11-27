@@ -195,6 +195,7 @@ struct Parser {
 
     void prescan() {  // back references need the number of groups before the groups are parsed
         bool inClass = false;
+        int classDepth = 0;
         for (size_t k = 0; k < src.size(); ++k) {
             char16_t c = src[k];
             if (c == '\\') {
@@ -202,10 +203,11 @@ struct Parser {
                 continue;
             }
             if (inClass) {
-                if (c == ']') inClass = false;
+                if (c == '[' && fl.unicodeSets) ++classDepth;
+                if (c == ']' && --classDepth == 0) inClass = false;
                 continue;
             }
-            if (c == '[') inClass = true;
+            if (c == '[') inClass = true, classDepth = 1;
             if (c != '(') continue;
             if (k + 1 < src.size() && src[k + 1] == '?') {
                 if (k + 3 < src.size() && src[k + 2] == '<' && src[k + 3] != '=' && src[k + 3] != '!') {
@@ -312,7 +314,7 @@ struct Parser {
             case '$': ++i; return mk(RxNode::Eol);
             case '.': ++i; return mk(RxNode::Any);
             case '(': return group();
-            case '[': return charClass();
+            case '[': return fl.unicodeSets ? setNode(nestedClass()) : charClass();
             case '\\': return atomEscape();
             case '*':
             case '+':
@@ -521,7 +523,7 @@ struct Parser {
                     --i;
                     return octal();
                 }
-                if (fl.unicode && !(c < 128 && strchr("^$\\.*+?()[]{}|/-", (char)c))) fail("Invalid escape");
+                if (fl.unicode && !(c && c < 128 && strchr("^$\\.*+?()[]{}|/", (char)c))) fail("Invalid escape");  // IdentityEscape: a SyntaxCharacter or /
                 --i;
                 return nextCp();
         }
@@ -583,6 +585,10 @@ struct Parser {
                 addEscapeClass(cc, c);
             return classNode(std::move(cc));
         }
+        if ((c == 'p' || c == 'P') && fl.unicodeSets) {
+            ++i;
+            return setNode(propertySet(c == 'P'));
+        }
         if ((c == 'p' || c == 'P') && fl.unicode) {
             ++i;
             CharClass cc;
@@ -623,6 +629,249 @@ struct Parser {
         }
         return charEscape();
     }
+    // ---- classes under the v flag (22.2.1 ClassSetExpression): nested classes, intersection (&&), subtraction (--),
+    // strings (\q{...} and properties of strings). A class is worked out to a set of code points and a set of strings.
+    struct ClassSet {
+        std::vector<std::pair<uint32_t, uint32_t>> r;  // sorted and merged
+        std::vector<std::u32string> strs;              // strings of none or several code points, each once
+    };
+    static void tidy(std::vector<std::pair<uint32_t, uint32_t>>& r) {
+        std::sort(r.begin(), r.end());
+        size_t n = 0;
+        for (auto& p : r) {
+            if (n && p.first <= r[n - 1].second + 1 && r[n - 1].second != 0xFFFFFFFFu) r[n - 1].second = std::max(r[n - 1].second, p.second);
+            else r[n++] = p;
+        }
+        r.resize(n);
+    }
+    static bool inRanges(const std::vector<std::pair<uint32_t, uint32_t>>& r, uint32_t cp) {
+        size_t lo = 0, hi = r.size();
+        while (lo < hi) {
+            size_t mid = (lo + hi) / 2;
+            if (cp < r[mid].first) hi = mid;
+            else if (cp > r[mid].second) lo = mid + 1;
+            else return true;
+        }
+        return false;
+    }
+    static void addString(ClassSet& s, const std::u32string& w) {
+        if (w.size() == 1) {
+            s.r.push_back({w[0], w[0]});
+            tidy(s.r);
+        } else if (std::find(s.strs.begin(), s.strs.end(), w) == s.strs.end())
+            s.strs.push_back(w);
+    }
+    static ClassSet unite(ClassSet a, const ClassSet& b) {
+        a.r.insert(a.r.end(), b.r.begin(), b.r.end());
+        tidy(a.r);
+        for (auto& w : b.strs) addString(a, w);
+        return a;
+    }
+    static std::vector<std::pair<uint32_t, uint32_t>> complement(const std::vector<std::pair<uint32_t, uint32_t>>& r) {
+        std::vector<std::pair<uint32_t, uint32_t>> out;
+        uint32_t next = 0;
+        for (auto& p : r) {
+            if (p.first > next) out.push_back({next, p.first - 1});
+            next = p.second + 1;
+        }
+        if (next <= 0x10FFFF) out.push_back({next, 0x10FFFF});
+        return out;
+    }
+    static ClassSet intersect(const ClassSet& a, const ClassSet& b) {
+        ClassSet out;
+        size_t x = 0, y = 0;
+        while (x < a.r.size() && y < b.r.size()) {
+            uint32_t lo = std::max(a.r[x].first, b.r[y].first), hi = std::min(a.r[x].second, b.r[y].second);
+            if (lo <= hi) out.r.push_back({lo, hi});
+            if (a.r[x].second < b.r[y].second) ++x;
+            else ++y;
+        }
+        for (auto& w : a.strs)
+            if (std::find(b.strs.begin(), b.strs.end(), w) != b.strs.end()) out.strs.push_back(w);
+        return out;
+    }
+    static ClassSet subtract(const ClassSet& a, const ClassSet& b) {
+        ClassSet nb;
+        nb.r = complement(b.r);
+        ClassSet out = intersect(a, nb);
+        for (auto& w : a.strs)
+            if (std::find(b.strs.begin(), b.strs.end(), w) == b.strs.end()) out.strs.push_back(w);
+        return out;
+    }
+    ClassSet ofClass(const CharClass& cc) {  // the ranges and properties gathered by the helpers shared with the old syntax
+        ClassSet s;
+        s.r = cc.ranges;
+        tidy(s.r);
+        for (auto& p : cc.props) {
+            const UniTable& t = kUniTables[p.first];
+            std::vector<std::pair<uint32_t, uint32_t>> r;
+            for (size_t k = 0; k < t.count; ++k) r.push_back({t.ranges[k * 2], t.ranges[k * 2 + 1]});
+            tidy(r);
+            if (p.second) r = complement(r);
+            s.r.insert(s.r.end(), r.begin(), r.end());
+            tidy(s.r);
+        }
+        return s;
+    }
+    ClassSet propertySet(bool negated) {  // \p{...} or \P{...}, just after the letter
+        size_t save = i;
+        if (more() && src[i] == '{') {
+            std::string name;
+            size_t k = i + 1;
+            while (k < src.size() && src[k] != '}') name += (char)src[k++];
+            if (k < src.size() && name == "Emoji_Keycap_Sequence") {  // a property of strings (22.2.2.9, table 68)
+                if (negated) fail("Invalid property name");
+                i = k + 1;
+                ClassSet s;
+                for (char32_t c : std::u32string(U"#*0123456789")) s.strs.push_back(std::u32string{c, 0xFE0F, 0x20E3});
+                return s;
+            }
+        }
+        i = save;
+        CharClass cc;
+        property(cc, negated);
+        return ofClass(cc);
+    }
+    static bool setSyntaxChar(char16_t c) { return c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '/' || c == '-' || c == '\\' || c == '|'; }
+    static bool doublePunct(char16_t c) { return c && std::u16string_view(u"&!#$%*+,.:;<=>?@^`~").find(c) != std::u16string_view::npos; }
+    // A ClassSetCharacter: one code point, written plainly or escaped.
+    uint32_t setCharacter() {
+        if (!more()) fail("Unterminated character class");
+        char16_t c = src[i];
+        if (c == '\\') {
+            if (i + 1 >= src.size()) fail("\\ at end of pattern");
+            char16_t e = src[i + 1];
+            if (e == 'b') {
+                i += 2;
+                return 8;
+            }
+            if (std::u16string_view(u"&-!#%,:;<=>@`~").find(e) != std::u16string_view::npos) {  // ClassSetReservedPunctuator
+                i += 2;
+                return e;
+            }
+            ++i;
+            return charEscape();
+        }
+        if (setSyntaxChar(c)) fail("Invalid character in character class");
+        if (doublePunct(c) && i + 1 < src.size() && src[i + 1] == c) fail("Invalid set operation in character class");
+        return nextCp();
+    }
+    // A ClassSetOperand. `single` tells the caller that it was one character, which may then start a range.
+    ClassSet setOperand(bool& single, uint32_t& cp) {
+        single = false;
+        if (!more()) fail("Unterminated character class");
+        char16_t c = src[i];
+        if (c == '[') return nestedClass();
+        if (c == '\\' && i + 1 < src.size()) {
+            char16_t e = src[i + 1];
+            if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
+                i += 2;
+                CharClass cc;
+                addEscapeClass(cc, e);
+                return ofClass(cc);
+            }
+            if (e == 'p' || e == 'P') {
+                i += 2;
+                return propertySet(e == 'P');
+            }
+            if (e == 'q') {  // \q{abc|d|}: a ClassStringDisjunction
+                i += 2;
+                if (!more() || src[i] != '{') fail("Invalid escape");
+                ++i;
+                ClassSet s;
+                std::u32string w;
+                for (;;) {
+                    if (!more()) fail("Unterminated character class");
+                    if (src[i] == '}' || src[i] == '|') {
+                        addString(s, w);
+                        w.clear();
+                        if (src[i++] == '}') break;
+                        continue;
+                    }
+                    w += (char32_t)setCharacter();
+                }
+                return s;
+            }
+        }
+        cp = setCharacter();
+        single = true;
+        ClassSet s;
+        s.r.push_back({cp, cp});
+        return s;
+    }
+    bool atOp(char16_t c) const { return i + 1 < src.size() && src[i] == c && src[i + 1] == c; }
+    ClassSet nestedClass() {  // at '['
+        ++i;
+        bool negate = false;
+        if (more() && src[i] == '^') {
+            negate = true;
+            ++i;
+        }
+        ClassSet result;
+        bool first = true;
+        int mode = 0;  // 0 union, 1 intersection, 2 subtraction
+        for (;;) {
+            if (!more()) fail("Unterminated character class");
+            if (src[i] == ']') {
+                ++i;
+                break;
+            }
+            if (!first && mode == 0 && (atOp('&') || atOp('-'))) fail("Invalid set operation in character class");
+            if (!first && mode != 0) {  // the operator is written between every two operands
+                if (!atOp(mode == 1 ? '&' : '-')) fail("Invalid set operation in character class");
+                i += 2;
+                if (mode == 1 && more() && src[i] == '&') fail("Invalid set operation in character class");
+            }
+            bool single = false;
+            uint32_t lo = 0;
+            ClassSet operand = setOperand(single, lo);
+            if (single && mode == 0 && more() && src[i] == '-' && !atOp('-')) {  // a ClassSetRange
+                ++i;
+                bool single2 = false;
+                uint32_t hi = 0;
+                setOperand(single2, hi);
+                if (!single2) fail("Invalid character class");
+                if (hi < lo) fail("Range out of order in character class");
+                operand.r = {{lo, hi}};
+            }
+            if (first) {
+                result = std::move(operand);
+                first = false;
+                if (atOp('&')) mode = 1;
+                else if (atOp('-')) mode = 2;
+                continue;
+            }
+            result = mode == 0 ? unite(std::move(result), operand) : mode == 1 ? intersect(result, operand) : subtract(result, operand);
+        }
+        if (negate) {
+            if (!result.strs.empty()) fail("A negated character class may not contain strings");
+            result.r = complement(result.r);
+        }
+        return result;
+    }
+    // The node for a worked-out class: the longest strings are tried first, single characters next (22.2.2.9).
+    RxNode* setNode(ClassSet s) {
+        CharClass cc;
+        cc.ranges = s.r;
+        if (s.strs.empty()) return classNode(std::move(cc));
+        std::stable_sort(s.strs.begin(), s.strs.end(), [](const std::u32string& a, const std::u32string& b) { return a.size() > b.size(); });
+        RxNode* alt = mk(RxNode::Alt);
+        bool classDone = s.r.empty();
+        for (auto& w : s.strs) {
+            if (w.empty() && !classDone) {
+                alt->kids.push_back(classNode(std::move(cc)));
+                classDone = true;
+            }
+            RxNode* seq = mk(RxNode::Seq);
+            for (char32_t c : w) seq->kids.push_back(chr((uint32_t)c));
+            alt->kids.push_back(seq);
+        }
+        if (!classDone) alt->kids.push_back(classNode(std::move(cc)));
+        RxNode* g = mk(RxNode::Group);
+        g->kids.push_back(alt->kids.size() == 1 ? alt->kids[0] : alt);
+        return g;
+    }
+
     RxNode* charClass() {
         ++i;
         CharClass cc;
@@ -1161,7 +1410,7 @@ bool regexValidate(const std::u16string& pattern, const std::u16string& flags, s
         error = "Invalid regular expression flags";
         return false;
     }
-    if (unicodeSets) f.unicode = true;
+    if (unicodeSets) f.unicode = f.unicodeSets = true;
     return regexCompile(pattern, f, error) != nullptr;
 }
 
