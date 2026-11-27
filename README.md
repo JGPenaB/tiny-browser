@@ -80,8 +80,8 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 `python tests/run_test262.py [path filter ...] [--jobs N] [--save name]` runs the ECMAScript conformance suite (test262,
 cloned into the git-ignored `third_party/test262`; the script's header has the command) and writes the failures to
-`out/test262-<name>.txt`. Eleventh full run, 2026-11-27: 43,504 of 48,803 tests pass (89.1%). Without the 4,616 tests
-for Temporal, a proposal that is not part of ECMA-262 yet, that is 98.5%.
+`out/test262-<name>.txt`. Thirteenth full run, 2026-11-27: 43,705 of 48,803 tests pass (89.6%). Without the 4,616 tests
+for Temporal, a proposal that is not part of ECMA-262 yet, that is 98.9%.
 
 What the engine covers: the whole core language with its early errors (classes with private members and static
 blocks, generators and async generators, destructuring, modules, direct and indirect `eval`, `with`, Annex B, proper
@@ -89,12 +89,13 @@ tail calls, `using` and `await using`), Proxy and Reflect, BigInt, typed arrays 
 Atomics, RegExp (named groups, lookbehind, Unicode properties, the `v` flag with set operations), Promise combinators,
 iterator helpers (including `concat`, `zip`, `chunks`, `windows`), Set methods, `Array.fromAsync`,
 `Error.prototype.stack`, `JSON.rawJSON`, `Math.sumPrecise`, DisposableStack, mapped `arguments` objects, import
-attributes with JSON modules.
+attributes with JSON modules, and several realms in one engine (each with its own global object and built-ins, which
+is what frames in a page will use).
 
-What still fails, largest first: Temporal (4,616, a proposal), `import defer` and source-phase imports (about 250, both
-proposals), tests that need a second realm (about 190), Atomics tests that need worker agents (112), ShadowRealm (64, a
-proposal), decorators (20, a proposal), emoji sequence properties in regular expressions (13, they need Unicode data
-files).
+What still fails, largest first: Temporal (4,616, a proposal), `import defer` and source-phase imports (about 260, both
+proposals), Atomics tests that need worker agents (112), ShadowRealm (64, a proposal), decorators (22, a proposal), emoji
+sequence properties in regular expressions (12, they need Unicode data files), `import` of bytes (5, a proposal). Nothing
+else fails: inside ECMA-262 itself only the agent tests and the emoji data are left.
 
 ## Engine speed
 
