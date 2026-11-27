@@ -687,6 +687,155 @@ Object.defineProperty(G, '__pageScripts', { configurable: true, value: {
 } });
 G.reportError = function (e) { reportError(e); };
 
+)JS"
+R"JS(
+// ---- custom elements (HTML 4.13). The engine says which elements are custom and notes when they enter or leave
+// the document or have an attribute changed; the registry, the upgrades and the callbacks are here.
+var ceHook = G.__ceHook, ceState = G.__ceState, isConstructor = G.__isConstructor;  // ceState(element[, state]): 0 not custom (yet), 1 custom, 2 failed
+delete G.__ceHook; delete G.__ceState; delete G.__isConstructor;
+var reflectApply = Reflect.apply, reflectConstruct = Reflect.construct, setPrototypeOf = Object.setPrototypeOf;
+var nativeCreateElement = Document.prototype.createElement;
+var definitions = new Map(), byConstructor = new Map(), definitionOf = new WeakMap(), waitingForName = new Map();
+var CONSTRUCTED = {};  // on a construction stack: the element there has been handed out already
+var defining = false;
+function validCustomName(name) {  // PotentialCustomElementName: a lowercase letter first, at least one hyphen
+  return /^[a-z][-.0-9_a-z·À-￿]*-[-.0-9_a-z·À-￿]*$/.test(name) &&
+    ['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri', 'font-face-format', 'font-face-name', 'missing-glyph'].indexOf(name) < 0;
+}
+function callbackOf(proto, name) {
+  var f = proto[name];
+  if (f !== undefined && typeof f !== 'function') throw new TypeError(name + ' must be a function');
+  return f;
+}
+// "Upgrade an element" (4.13.5): its constructor runs with the element as the one it will be given by HTMLElement
+function upgradeElement(el, def) {
+  if (ceState(el) !== 0) return;
+  definitionOf.set(el, def);
+  ceState(el, 2);  // failed, until the constructor has come back with it
+  var names = el.getAttributeNames(), values = [], connected = el.isConnected;
+  for (var i = 0; i < names.length; i++) values.push(el.getAttribute(names[i]));
+  def.stack.push(el);
+  try {
+    if (reflectConstruct(def.ctor, []) !== el) throw new TypeError("The constructor of <" + def.name + "> did not return the element being upgraded");
+  } catch (e) {
+    definitionOf.delete(el);
+    throw e;
+  } finally { def.stack.pop(); }
+  ceState(el, 1);
+  for (var i = 0; i < names.length; i++) react(2, el, names[i], null, values[i]);
+  if (connected) react(0, el);
+}
+// The [HTMLConstructor] steps (3.2.3), which every custom element's constructor reaches through super()
+function htmlConstructor(newTarget) {
+  var def = byConstructor.get(newTarget);
+  if (!def) throw new TypeError('Illegal constructor');
+  var proto = newTarget.prototype, el;
+  if (Object(proto) !== proto) proto = HTMLElement.prototype;
+  if (def.stack.length === 0) {  // new X(): the element is made here
+    el = reflectApply(nativeCreateElement, document, [def.name]);
+    setPrototypeOf(el, proto);
+    definitionOf.set(el, def);
+    ceState(el, 1);
+    return el;
+  }
+  el = def.stack[def.stack.length - 1];
+  if (el === CONSTRUCTED) throw new TypeError("The constructor of <" + def.name + "> made its element twice");
+  setPrototypeOf(el, proto);
+  def.stack[def.stack.length - 1] = CONSTRUCTED;
+  return el;
+}
+// One reaction (4.13.6). kind: 0 connected, 1 disconnected, 2 attribute changed, 3 an element that may be waiting
+// for its definition, 4 the HTMLElement constructor (el is then new.target)
+function react(kind, el, name, oldValue, newValue) {
+  if (kind === 4) return htmlConstructor(el);
+  try {
+    if (kind === 3) {
+      var waitedFor = definitions.get(el.localName);
+      if (waitedFor) upgradeElement(el, waitedFor);
+      return;
+    }
+    var def = definitionOf.get(el);
+    if (!def || ceState(el) !== 1) return;
+    if (kind === 0) { if (def.connected) reflectApply(def.connected, el, []); }
+    else if (kind === 1) { if (def.disconnected) reflectApply(def.disconnected, el, []); }
+    else if (def.attributeChanged && def.observed.has(name)) reflectApply(def.attributeChanged, el, [name, oldValue, newValue, null]);
+  } catch (e) { reportError(e); }
+}
+function CustomElementRegistry() { throw new TypeError('Illegal constructor'); }
+CustomElementRegistry.prototype = {
+  constructor: CustomElementRegistry,
+  define: function define(name, ctor, options) {
+    name = String(name);
+    if (!isConstructor(ctor)) throw new TypeError('customElements.define: the second argument must be a constructor');
+    if (!validCustomName(name)) throw new DOMException("'" + name + "' is not a valid custom element name", 'SyntaxError');
+    if (definitions.has(name)) throw new DOMException("The name '" + name + "' has already been defined", 'NotSupportedError');
+    if (byConstructor.has(ctor)) throw new DOMException('This constructor has already been used for another custom element', 'NotSupportedError');
+    if (options && options.extends !== undefined && options.extends !== null) throw new DOMException('Customized built-in elements are not supported', 'NotSupportedError');
+    if (defining) throw new DOMException('Another custom element is being defined', 'NotSupportedError');
+    var def = { name: name, ctor: ctor, stack: [], observed: new Set() };
+    defining = true;
+    try {
+      var proto = ctor.prototype;
+      if (Object(proto) !== proto) throw new TypeError("The constructor's prototype is not an object");
+      def.connected = callbackOf(proto, 'connectedCallback');
+      def.disconnected = callbackOf(proto, 'disconnectedCallback');
+      def.adopted = callbackOf(proto, 'adoptedCallback');
+      def.attributeChanged = callbackOf(proto, 'attributeChangedCallback');
+      if (def.attributeChanged) {
+        var observed = ctor.observedAttributes;
+        if (observed !== undefined) for (var a of observed) def.observed.add(String(a));
+      }
+      var disabled = ctor.disabledFeatures;
+      if (disabled !== undefined) for (var feature of disabled) if (String(feature) === 'shadow') def.noShadow = true;
+      def.formAssociated = !!ctor.formAssociated;
+    } finally { defining = false; }
+    definitions.set(name, def);
+    byConstructor.set(ctor, def);
+    ceHook(react);  // from here on the engine notes what happens to custom elements
+    var waiting = document.querySelectorAll(name);  // the elements already in the document, in document order
+    for (var i = 0; i < waiting.length; i++) react(3, waiting[i]);
+    var promised = waitingForName.get(name);
+    if (promised) { waitingForName.delete(name); promised.resolve(ctor); }
+  },
+  get: function get(name) { var def = definitions.get(String(name)); return def ? def.ctor : undefined; },
+  getName: function getName(ctor) { var def = byConstructor.get(ctor); return def ? def.name : null; },
+  whenDefined: function whenDefined(name) {
+    name = String(name);
+    if (!validCustomName(name)) return Promise.reject(new DOMException("'" + name + "' is not a valid custom element name", 'SyntaxError'));
+    var def = definitions.get(name), promised = waitingForName.get(name);
+    if (def) return Promise.resolve(def.ctor);
+    if (!promised) {
+      promised = {};
+      promised.promise = new Promise(function (resolve) { promised.resolve = resolve; });
+      waitingForName.set(name, promised);
+    }
+    return promised.promise;
+  },
+  upgrade: function upgrade(root) {
+    if (root.nodeType === 1) react(3, root);
+    var all = root.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) if (ceState(all[i]) === 0) react(3, all[i]);
+  }
+};
+Object.defineProperty(G, 'CustomElementRegistry', { value: CustomElementRegistry, writable: true, configurable: true });
+Object.defineProperty(G, 'customElements', { value: Object.create(CustomElementRegistry.prototype), configurable: true, enumerable: true });
+// document.createElement of a defined name runs the constructor at once (DOM 4.9, "create an element", synchronously)
+Document.prototype.createElement = function createElement(name) {
+  var def = definitions.size ? definitions.get(String(name).toLowerCase()) : undefined;
+  if (!def) return reflectApply(nativeCreateElement, this, [name]);
+  try {
+    var el = reflectConstruct(def.ctor, []);
+    if (!(el instanceof HTMLElement) || el.localName !== def.name) throw new TypeError("The constructor of <" + def.name + "> returned something else");
+    if (el.getAttributeNames().length || el.firstChild || el.parentNode) throw new DOMException("The constructor of <" + def.name + "> must not give its element attributes, children or a parent", 'NotSupportedError');
+    return el;
+  } catch (e) {
+    reportError(e);
+    var failed = reflectApply(nativeCreateElement, this, [name]);
+    ceState(failed, 2);
+    return failed;
+  }
+};
+
 var exported = { DOMException: DOMException, EventTarget: EventTarget, AbortController: AbortController, AbortSignal: AbortSignal, URL: URL, URLSearchParams: URLSearchParams,
   Blob: Blob, File: File, FormData: FormData, Headers: Headers, Request: Request, Response: Response, fetch: fetch, XMLHttpRequest: XMLHttpRequest,
   NodeFilter: NodeFilter, TreeWalker: TreeWalker, MessageChannel: MessageChannel, DOMParser: DOMParser, XMLSerializer: XMLSerializer, Intl: Intl };

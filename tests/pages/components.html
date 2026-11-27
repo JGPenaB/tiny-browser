@@ -7,11 +7,15 @@
   body { font-family: Segoe UI, sans-serif; margin: 16px; }
   .card { border: 1px solid #c8ccd4; border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
   .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  x-late:not(:defined) { display: none; }
 </style>
 </head>
 <body>
 <h1>Templates, custom elements, shadow DOM</h1>
-<template id="tpl"><title>not the page title</title><p class="row" id="in-template">row <b>bold</b></p><tr><td>cell</td></tr><template id="inner"><i>deep</i></template></template>
+<template id="tpl"><title>not the page title</title><p class="row" id="in-template">row <b>bold</b></p><template id="inner"><i>deep</i></template></template>
+<template id="rows"><tr><td>cell</td></tr></template>
+<x-greet id="g1" name="A">first</x-greet> <x-greet name="B">second</x-greet> <x-late>late</x-late>
+<div id="slot"></div>
 <div class="card" id="results"><b>Results</b></div>
 <script>
   var pass = 0, fail = 0;
@@ -29,14 +33,15 @@
   // ---- template contents are a fragment of their own, not part of the page (HTML 4.12.3)
   var tpl = document.getElementById('tpl');
   eq('template: no children', tpl.childNodes.length + ':' + tpl.children.length, '0:0');
-  eq('template: content is a fragment', tpl.content.nodeType + ':' + tpl.content.childNodes.length + ':' + (tpl.content === tpl.content), '11:4:true');
+  eq('template: content is a fragment', tpl.content.nodeType + ':' + tpl.content.childNodes.length + ':' + (tpl.content === tpl.content), '11:3:true');
   eq('template: contents are not in the document', String(document.getElementById('in-template')) + document.querySelectorAll('.row').length + document.title, 'null0Components test');
   eq('template: found through content', tpl.content.querySelector('.row b').textContent + tpl.content.getElementById('in-template').className, 'boldrow');
-  eq('template: table row kept', tpl.content.children[2].tagName + tpl.content.querySelector('td').textContent, 'TRcell');
+  var rows = document.getElementById('rows').content;
+  eq('template: table rows on their own', rows.firstChild.tagName + rows.querySelector('td').textContent, 'TRcell');
   eq('template: nested', tpl.content.querySelector('#inner').content.firstChild.outerHTML, '<i>deep</i>');
   eq('template: innerHTML reads the contents', tpl.innerHTML.indexOf('<p class="row" id="in-template">row <b>bold</b></p>') > 0, true);
   var copy = tpl.cloneNode(true), shallow = tpl.cloneNode(false);
-  eq('template: deep clone copies contents', copy.content.childNodes.length + ':' + (copy.content !== tpl.content) + ':' + copy.content.querySelector('#inner').content.childNodes.length, '4:true:1');
+  eq('template: deep clone copies contents', copy.content.childNodes.length + ':' + (copy.content !== tpl.content) + ':' + copy.content.querySelector('#inner').content.childNodes.length, '3:true:1');
   eq('template: shallow clone has empty contents', shallow.content.childNodes.length, 0);
   var made = document.createElement('template');
   made.innerHTML = '<span>a</span><span>b</span>';
@@ -49,6 +54,79 @@
   eq('template: moving the contents', host.children.length + ':' + made.content.childNodes.length, '4:0');
   made.appendChild(document.createElement('u'));
   eq('template: children are not contents', made.childNodes.length + ':' + made.content.childNodes.length + ':' + made.outerHTML, '1:0:<template></template>');
+
+  // ---- custom elements (HTML 4.13)
+  var trace = [];
+  class Greet extends HTMLElement {
+    static get observedAttributes() { return ['name', 'class', 'data-x', 'style', 'hidden']; }
+    constructor() { super(); this.made = true; trace.push('ctor ' + (this.getAttribute('name') || '-')); }
+    connectedCallback() { trace.push('in ' + (this.getAttribute('name') || '-')); }
+    disconnectedCallback() { trace.push('out ' + (this.getAttribute('name') || '-')); }
+    attributeChangedCallback(name, was, now, ns) { trace.push(name + ':' + was + '>' + now + (ns === null ? '' : '!')); }
+    hello() { return 'hello ' + this.getAttribute('name'); }
+  }
+  function taken() { var t = trace.join(' | '); trace.length = 0; return t; }
+  var first = document.getElementById('g1'), late = document.querySelector('x-late');
+  eq('custom: before define', (first instanceof HTMLElement) + ':' + first.matches(':defined') + ':' + typeof first.hello + ':' + String(customElements.get('x-greet')), 'true:false:undefined:undefined');
+  eq('custom: :not(:defined) styles apply', getComputedStyle(late).display, 'none');
+  var whenGreet = customElements.whenDefined('x-greet');
+  customElements.define('x-greet', Greet);
+  eq('custom: upgrades run in document order', taken(), 'ctor A | name:null>A | in A | ctor B | name:null>B | in B');
+  eq('custom: upgraded element', first.hello() + ':' + first.made + ':' + (first instanceof Greet) + ':' + first.matches(':defined') + ':' + (first.constructor === Greet), 'hello A:true:true:true:true');
+  eq('custom: registry lookups', (customElements.get('x-greet') === Greet) + ':' + customElements.getName(Greet) + ':' + String(customElements.get('x-none')) + ':' + customElements.getName(Object), 'true:x-greet:undefined:null');
+  whenGreet.then(function (c) { log('custom: whenDefined resolves with the constructor', c === Greet); });
+  customElements.whenDefined('x-greet').then(function (c) { log('custom: whenDefined after the fact', c === Greet); });
+  customElements.whenDefined('bad').then(null, function (e) { log('custom: whenDefined rejects a bad name', e.name === 'SyntaxError'); });
+  function thrown(f) { try { f(); return 'none'; } catch (e) { return e.name; } }
+  eq('custom: define refuses', [thrown(function () { customElements.define('nohyphen', class extends HTMLElement {}); }),
+    thrown(function () { customElements.define('x-greet', class extends HTMLElement {}); }), thrown(function () { customElements.define('x-again', Greet); }),
+    thrown(function () { customElements.define('x-arrow', function () {}.bind ? (() => 1) : null); }), thrown(function () { customElements.define('X-Upper', class extends HTMLElement {}); })].join(),
+    'SyntaxError,NotSupportedError,NotSupportedError,TypeError,SyntaxError');
+  eq('custom: HTMLElement alone is not constructible', thrown(function () { new HTMLElement(); }) + ':' + thrown(function () { new (class extends HTMLElement {})(); }) + ':' + thrown(function () { HTMLElement(); }), 'TypeError:TypeError:TypeError');
+  var made1 = new Greet(), made2 = document.createElement('x-greet');
+  eq('custom: new and createElement construct at once', taken() + ' / ' + made1.localName + ':' + made2.hello() + ':' + (made2 instanceof Greet) + ':' + made1.isConnected, 'ctor - | ctor - / x-greet:hello null:true:false');
+  made1.setAttribute('name', 'C'); made1.setAttribute('name', 'C2'); made1.setAttribute('other', 'x'); made1.removeAttribute('name'); made1.toggleAttribute('hidden');
+  made1.className = 'k'; made1.classList.add('m'); made1.dataset.x = '1'; delete made1.dataset.x; made1.style.color = 'red'; made1.id = 'not-watched';
+  eq('custom: attribute changes', taken(), 'name:null>C | name:C>C2 | name:C2>null | hidden:null> | class:null>k | class:k>k m | data-x:null>1 | data-x:1>null | style:null>color: red;');
+  made1.setAttribute('name', 'C'); taken();
+  var slot = document.getElementById('slot');
+  slot.appendChild(made1);
+  eq('custom: connected', taken(), 'in C');
+  document.body.appendChild(made1);
+  eq('custom: moved', taken(), 'out C | in C');
+  made1.remove(); made1.remove();
+  eq('custom: disconnected once', taken(), 'out C');
+  var frag = document.createDocumentFragment(), fa = new Greet(), fb = new Greet();
+  fa.setAttribute('name', 'F1'); fb.setAttribute('name', 'F2'); frag.append(fa, document.createElement('p'), fb); taken();
+  slot.appendChild(frag);
+  eq('custom: a fragment connects all, then calls', taken(), 'in F1 | in F2');
+  slot.innerHTML = '<x-greet name="H"><x-greet name="H2"></x-greet></x-greet>';
+  eq('custom: innerHTML in the document', taken(), 'ctor H | name:null>H | in H | ctor H2 | name:null>H2 | in H2 | out F1 | out F2');
+  var loose = document.createElement('div'), inert = document.createElement('template'), early = document.createElement('x-early');
+  loose.innerHTML = '<x-greet name="L"></x-greet>';
+  inert.innerHTML = '<x-greet name="T"></x-greet>';
+  eq('custom: innerHTML upgrades outside the document, but not in a template', taken() + ':' + typeof loose.firstChild.hello + ':' + typeof inert.content.firstChild.hello, 'ctor L | name:null>L:function:undefined');
+  loose.appendChild(early);
+  customElements.define('x-early', class extends HTMLElement { constructor() { super(); trace.push('early'); } });
+  eq('custom: define leaves detached elements alone', taken() + ':' + early.matches(':defined'), ':false');
+  customElements.upgrade(loose);
+  eq('custom: upgrade() of a detached tree', taken() + ':' + early.matches(':defined'), 'early:true');
+  var cloned = slot.firstChild.cloneNode(true);
+  eq('custom: clones are upgraded', taken() + ':' + (cloned instanceof Greet) + ':' + cloned.firstChild.hello(), 'ctor H | name:null>H | ctor H2 | name:null>H2:true:hello H2');
+  slot.replaceChildren();
+  eq('custom: replaceChildren disconnects', taken(), 'out H | out H2');
+  class Inner extends HTMLElement { connectedCallback() { trace.push('inner in'); this.textContent = 'filled'; } }
+  class Outer extends HTMLElement { connectedCallback() { trace.push('outer in'); this.appendChild(document.createElement('x-inner')); trace.push('outer done'); } }
+  customElements.define('x-inner', Inner); customElements.define('x-outer', Outer);
+  slot.appendChild(document.createElement('x-outer'));
+  eq('custom: reactions inside a reaction', taken() + ':' + slot.textContent, 'outer in | inner in | outer done:filled');
+  customElements.define('x-late', class extends HTMLElement { constructor() { super(); trace.push('late'); } });
+  eq('custom: late definition', taken() + ':' + late.matches(':defined') + ':' + getComputedStyle(late).display, 'late:true:inline');
+  var order = [];
+  class Counted extends HTMLElement { static get observedAttributes() { order.push('observed'); return []; } }
+  var watching = new Proxy(Counted, { get: function (t, k, r) { if (typeof k === 'string') order.push(k); return Reflect.get(t, k, r); } });
+  customElements.define('x-counted', watching);
+  eq('custom: what define reads from the constructor', order.join(), 'prototype,disabledFeatures,formAssociated');
 
   window.addEventListener('load', function () {
     setTimeout(function () {

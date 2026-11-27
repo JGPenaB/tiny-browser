@@ -24,6 +24,7 @@ struct Node {
     // Border box from the last layout (document coordinates), used by devtools.
     float bx = 0, by = 0, bw = 0, bh = 0;
     bool hasBox = false;
+    uint8_t ceState = 0;  // custom element state (HTML 4.13.3): 0 not custom, or not yet; 1 custom; 2 its constructor failed
 
     Node();
     ~Node();

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -141,6 +142,11 @@ int scriptKind(const Node* n) {
 }
 }  // namespace
 
+namespace {
+void setAttr(Node* n, const std::string& name, const std::string& value);  // the element's own bookkeeping, defined below
+void removeAttr(Node* n, const std::string& name);
+}  // namespace
+
 struct ScriptHost::Impl {
     Document& doc;
     std::string url;
@@ -174,6 +180,17 @@ struct ScriptHost::Impl {
     std::vector<ScriptSource> deferred;  // scripts that wait for the document to be parsed
     bool loadPending = false;           // deferred scripts are still running; the load events come after them
     bool loadDue = false;               // they are done: fire the load events on the next pump
+    // Custom elements (HTML 4.13). The registry and the callbacks are in the prelude. This side knows which
+    // elements are custom (Node::ceState), notes what happens to them while the DOM changes, and hands the notes
+    // to the prelude once the operation that caused them is over ([CEReactions], 4.13.6).
+    struct Reaction {
+        Node* node;
+        int kind;  // 0 connected, 1 disconnected, 2 attribute changed, 3 an element that may be waiting for its definition
+        std::string name, oldValue, newValue;
+        bool hadOld = false, hasNew = false;
+    };
+    std::deque<Reaction> reactions;
+    Value ceHook;  // the prelude's function that carries a reaction out; set when the first element is defined
 
     Impl(Document& d, const std::string& u, Client& c) : doc(d), url(u), client(c) {}
 
@@ -276,8 +293,10 @@ struct ScriptHost::Impl {
             if (child->parent == parent) return;
             before = nullptr;
         }
+        bool wasConnected = connected(child);
         std::unique_ptr<Node> u = take(child);
         if (!u) return;
+        if (wasConnected) noteTree(child, false);
         u->parent = parent;
         size_t pos = parent->kids.size();
         if (before)
@@ -294,17 +313,21 @@ struct ScriptHost::Impl {
             std::vector<Node*> scripts;
             collectScripts(child, scripts);
             for (Node* sc : scripts) startScript(sc);
+            noteTree(child, true);
         }
     }
     void remove(Node* n) {
         Node* parent = n->parent;
         if (!parent) return;
+        bool wasConnected = connected(n);
         std::unique_ptr<Node> u = take(n);
         if (u) orphans[n] = std::move(u);
         changed();
         record("childList", parent, nullptr, n, nullptr);
+        if (wasConnected) noteTree(n, false);
     }
     void clearChildren(Node* el) {
+        bool wasConnected = connected(el);
         std::vector<Node*> gone;
         for (auto& k : el->kids) {
             Node* raw = k.get();
@@ -313,7 +336,10 @@ struct ScriptHost::Impl {
             orphans[raw] = std::move(k);
         }
         el->kids.clear();
-        for (Node* g : gone) record("childList", el, nullptr, g, nullptr);
+        for (Node* g : gone) {
+            record("childList", el, nullptr, g, nullptr);
+            if (wasConnected) noteTree(g, false);
+        }
     }
     static bool connected(const Node* n) {
         while (n->parent) n = n->parent;
@@ -324,6 +350,74 @@ struct ScriptHost::Impl {
         if (n->name == "script") out.push_back(n);
         else
             for (auto& k : n->kids) collectScripts(k.get(), out);
+    }
+
+    // ---- custom element reactions
+    static bool maybeCustom(const Node* n) { return n->type == Node::T::Element && n->name.find('-') != std::string::npos; }
+    template <class F>
+    static void eachElementOf(Node* root, F&& fn) {  // the elements below root, in tree order
+        std::vector<Node*> st;
+        for (auto it = root->kids.rbegin(); it != root->kids.rend(); ++it) st.push_back(it->get());
+        while (!st.empty()) {
+            Node* n = st.back();
+            st.pop_back();
+            if (n->type != Node::T::Element) continue;
+            fn(n);
+            for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+        }
+    }
+    // A subtree has entered or left the document: its custom elements hear of it, and on the way in those that
+    // may be waiting for a definition are looked at.
+    void noteTree(Node* root, bool entering) {
+        if (!ceHook.isObject()) return;
+        std::vector<Node*> st{root};
+        while (!st.empty()) {
+            Node* n = st.back();
+            st.pop_back();
+            if (n->type != Node::T::Element) continue;
+            if (n->ceState == 1) reactions.push_back({n, entering ? 0 : 1});
+            else if (entering && n->ceState == 0 && maybeCustom(n)) reactions.push_back({n, 3});
+            for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+        }
+    }
+    // Elements are served in the order they were first noted, and each gets everything noted for it at once:
+    // that is how the standard's element queue with a reaction queue per element comes out (4.13.6).
+    void flushReactions() {
+        while (!reactions.empty() && !dead) {
+            Node* n = reactions.front().node;
+            for (;;) {
+                auto it = std::find_if(reactions.begin(), reactions.end(), [n](const Reaction& x) { return x.node == n; });
+                if (it == reactions.end() || dead) break;
+                Reaction r = std::move(*it);
+                reactions.erase(it);
+                carryOut(r);
+            }
+        }
+    }
+    void carryOut(const Reaction& r) {
+        std::vector<Value> args{Value::i32(r.kind), wrap(r.node)};
+        RootScope keep(vm, args);
+        args.push_back(val8(r.name));
+        args.push_back(r.hadOld ? val8(r.oldValue) : Value::null());
+        args.push_back(r.hasNew ? val8(r.newValue) : Value::null());
+        try {
+            vm.call(ceHook, Value::undef(), args.data(), (int)args.size());
+        } catch (JSThrow&) {
+            reportError();
+        }
+    }
+    Value val8(const std::string& s) { return vm.strv(utf8to16(s)); }
+    // Every change of an attribute made by a script goes through here. value: null removes the attribute.
+    void changeAttribute(Node* n, const std::string& name, const std::string* value) {
+        const std::string* now = n->attr(name);
+        if (!now && !value) return;
+        Reaction r{n, 2, name};
+        if (now) r.hadOld = true, r.oldValue = *now;
+        if (value) r.hasNew = true, r.newValue = *value;
+        if (value) setAttr(n, name, *value);
+        else removeAttr(n, name);
+        attrChanged(n, name);
+        if (n->ceState == 1) reactions.push_back(std::move(r));
     }
 
     // ---- MutationObserver
@@ -506,7 +600,8 @@ struct ScriptHost::Impl {
         else if (el->name == "select") pre += "<select>", path = {"select"};
         else if (el->name == "ul" || el->name == "ol") pre += "<ul>", path = {"ul"};
         std::unique_ptr<Document> d = parse_html(pre + html, doc.url);
-        if (el->content) el = el->content.get();  // a template: the markup becomes its contents
+        bool inert = el->content != nullptr;
+        if (inert) el = el->content.get();  // a template: the markup becomes its contents, which belong to no page
         Node* ctx = d->body;
         for (const char* name : path) {
             Node* next = nullptr;
@@ -518,6 +613,12 @@ struct ScriptHost::Impl {
                     }
             ctx = next;
         }
+        // elements made from markup are upgraded once the operation is over, wherever they end up: they are noted
+        // as they are made, before anything is taken out (HTML 13.2.6.1, an element for a token of a fragment)
+        if (ctx && ceHook.isObject() && !inert)
+            eachElementOf(ctx, [&](Node* e) {
+                if (maybeCustom(e)) reactions.push_back({e, 3});
+            });
         clearChildren(el);
         if (ctx) {
             for (auto& k : ctx->kids) {
@@ -531,7 +632,11 @@ struct ScriptHost::Impl {
         }
         reindex(el);
         changed();
-        for (auto& k : el->kids) record("childList", el, k.get(), nullptr, nullptr);
+        bool isConnected = connected(el);
+        for (auto& k : el->kids) {
+            record("childList", el, k.get(), nullptr, nullptr);
+            if (isConnected) noteTree(k.get(), true);
+        }
     }
     void setText(Node* n, const std::string& text) {
         if (n->type == Node::T::Text || n->type == Node::T::Comment) {
@@ -557,6 +662,7 @@ struct ScriptHost::Impl {
         n->attrs = src->attrs;
         n->classes = src->classes;
         Node* raw = adopt(std::move(n));
+        if (ceHook.isObject() && maybeCustom(raw)) reactions.push_back({raw, 3});
         if (src->content) raw->content = deep ? take(clone(src->content.get(), true)) : fragment();
         if (deep)
             for (auto& k : src->kids) {
@@ -809,6 +915,45 @@ void removeAttr(Node* n, const std::string& name) {
         }
     if (name == "id") n->id.clear();
     if (name == "class") n->classes.clear();
+}
+
+// A DOM operation after which the reactions of custom elements run ([CEReactions], HTML 4.13.6)
+template <NativeFn fn>
+Value ce(CallInfo& ci) {
+    Impl& im = I(ci.vm);
+    if (!im.ceHook.isObject()) return fn(ci);
+    std::vector<Value> keep(1);
+    RootScope roots(ci.vm, keep);
+    try {
+        keep[0] = fn(ci);
+    } catch (JSThrow&) {
+        keep[0] = ci.vm.pending;
+        im.flushReactions();
+        ci.vm.pending = keep[0];
+        throw;
+    }
+    im.flushReactions();
+    return keep[0];
+}
+JSFN(ceHookSet) {  // __ceHook(fn): the prelude's function for reactions; from now on they are noted
+    I(ci.vm).ceHook = ci.arg(0);
+    return Value::undef();
+}
+JSFN(isConstructorFn) { return Value::boolean(ci.vm.isConstructor(ci.arg(0))); }  // __isConstructor(value)
+JSFN(ceStateFn) {  // __ceState(element[, state]): reads or sets the custom element state
+    Node* n = toNode(ci.arg(0));
+    if (!n) return Value::i32(0);
+    if (ci.argc > 1) {
+        n->ceState = (uint8_t)ci.vm.toInt32(ci.args[1]);
+        I(ci.vm).changed();  // :defined may match differently now
+    }
+    return Value::i32(n->ceState);
+}
+JSFN(htmlElementCtor) {  // [HTMLConstructor] (HTML 3.2.3): only a custom element's constructor gets through
+    Impl& im = I(ci.vm);
+    if (!ci.isConstruct() || ci.newTarget == V(ci.callee) || !im.ceHook.isObject()) ci.vm.throwError(Err::TypeError, "Illegal constructor");
+    Value args[2] = {Value::i32(4), ci.newTarget};
+    return ci.vm.call(im.ceHook, Value::undef(), args, 2);
 }
 
 template <class F>
@@ -1168,16 +1313,12 @@ JSFN(getAttribute) {
 }
 JSFN(setAttribute) {
     Node* n = thisElem(ci);
-    std::string name = lower(str8(ci.vm, ci.arg(0)));
-    setAttr(n, name, str8(ci.vm, ci.arg(1)));
-    I(ci.vm).attrChanged(n, name);
+    std::string value = str8(ci.vm, ci.arg(1));
+    I(ci.vm).changeAttribute(n, lower(str8(ci.vm, ci.arg(0))), &value);
     return Value::undef();
 }
 JSFN(removeAttribute) {
-    Node* n = thisElem(ci);
-    std::string name = lower(str8(ci.vm, ci.arg(0)));
-    removeAttr(n, name);
-    I(ci.vm).attrChanged(n, name);
+    I(ci.vm).changeAttribute(thisElem(ci), lower(str8(ci.vm, ci.arg(0))), nullptr);
     return Value::undef();
 }
 JSFN(hasAttribute) { return Value::boolean(thisElem(ci)->attr(lower(str8(ci.vm, ci.arg(0)))) != nullptr); }
@@ -1185,9 +1326,8 @@ JSFN(toggleAttribute) {
     Node* n = thisElem(ci);
     std::string name = lower(str8(ci.vm, ci.arg(0)));
     bool on = ci.argc > 1 ? ci.vm.toBool(ci.args[1]) : !n->attr(name);
-    if (on) setAttr(n, name, n->attr(name) ? *n->attr(name) : "");
-    else removeAttr(n, name);
-    I(ci.vm).changed();
+    std::string empty;
+    if (on != (n->attr(name) != nullptr)) I(ci.vm).changeAttribute(n, name, on ? &empty : nullptr);
     return Value::boolean(on);
 }
 JSFN(getAttributeNames) {
@@ -1223,12 +1363,9 @@ JSFN(reflectSet) {
     Vm& vm = ci.vm;
     Node* n = thisElem(ci);
     std::string attr = utf16to8(ci.callee->data.asString()->s);
-    if (ci.callee->data2.asInt() == 1) {
-        if (vm.toBool(ci.arg(0))) setAttr(n, attr, "");
-        else removeAttr(n, attr);
-    } else
-        setAttr(n, attr, str8(vm, ci.arg(0)));
-    I(vm).attrChanged(n, attr);
+    std::string value;
+    if (ci.callee->data2.asInt() != 1) value = str8(vm, ci.arg(0));
+    I(vm).changeAttribute(n, attr, ci.callee->data2.asInt() != 1 || vm.toBool(ci.arg(0)) ? &value : nullptr);
     return Value::undef();
 }
 JSFN(innerHTMLGet) {
@@ -1422,7 +1559,10 @@ JSFN(valueSet) {
     Node* n = thisElem(ci);
     const std::u16string& s = vm.toStr16(ci.arg(0));
     if (isControl(n) && isConnected(n)) I(vm).client.setFormValue(n, std::wstring(s.begin(), s.end()));
-    else setAttr(n, "value", utf16to8(s));
+    else {
+        std::string value = utf16to8(s);
+        I(vm).changeAttribute(n, "value", &value);
+    }
     I(vm).changed();
     return Value::undef();
 }
@@ -1435,8 +1575,10 @@ JSFN(checkedSet) {
     Node* n = thisElem(ci);
     bool on = ci.vm.toBool(ci.arg(0));
     if (n->name == "input" && isConnected(n)) I(ci.vm).client.setFormChecked(n, on);
-    else if (on) setAttr(n, "checked", "");
-    else removeAttr(n, "checked");
+    else {
+        std::string empty;
+        I(ci.vm).changeAttribute(n, "checked", on ? &empty : nullptr);
+    }
     I(ci.vm).changed();
     return Value::undef();
 }
@@ -1504,8 +1646,8 @@ JSFN(classListOp) {  // data: 0 add, 1 remove, 2 toggle, 3 contains, 4 replace
             if (op == 1) drop(c);
         }
     }
-    setAttr(n, "class", joinClasses(n));
-    I(vm).attrChanged(n, "class");
+    std::string value = joinClasses(n);
+    I(vm).changeAttribute(n, "class", &value);
     return result;
 }
 JSFN(classListLength) { return Value::num((double)((Node*)thisHost(ci, HK_ClassList)->ptr)->classes.size()); }
@@ -1550,8 +1692,7 @@ void setStyleProp(Impl& im, Node* n, const std::string& name, const std::string&
     std::string out;
     for (auto& d : decls) out += d.prop + ": " + d.val + (d.important ? " !important" : "") + "; ";
     if (!out.empty()) out.pop_back();
-    setAttr(n, "style", out);
-    im.attrChanged(n, "style");
+    im.changeAttribute(n, "style", &out);
 }
 bool ownsKey(JSObject* o, PropKey k) { return !k.isString() || (o->proto && o->proto->find(k)); }
 bool styleHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
@@ -1576,8 +1717,8 @@ JSFN(styleGet) {
     return V(h);
 }
 JSFN(styleSet) {  // el.style = "color: red"
-    setAttr(thisElem(ci), "style", str8(ci.vm, ci.arg(0)));
-    I(ci.vm).changed();
+    std::string value = str8(ci.vm, ci.arg(0));
+    I(ci.vm).changeAttribute(thisElem(ci), "style", &value);
     return Value::undef();
 }
 JSFN(styleSetProperty) {
@@ -1598,8 +1739,8 @@ JSFN(styleCssTextGet) {
     return st ? val8(ci.vm, *st) : V(ci.vm.a.empty);
 }
 JSFN(styleCssTextSet) {
-    setAttr((Node*)thisHost(ci, HK_Style)->ptr, "style", str8(ci.vm, ci.arg(0)));
-    I(ci.vm).changed();
+    std::string value = str8(ci.vm, ci.arg(0));
+    I(ci.vm).changeAttribute((Node*)thisHost(ci, HK_Style)->ptr, "style", &value);
     return Value::undef();
 }
 
@@ -1613,14 +1754,15 @@ bool dataHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
 }
 bool dataHookSet(Vm& vm, JSObject* o, PropKey k, Value v) {
     if (!k.isString()) return false;
-    setAttr((Node*)((JSHost*)o)->ptr, dataAttr(k), str8(vm, v));
-    I(vm).changed();
+    std::string value = str8(vm, v);
+    I(vm).changeAttribute((Node*)((JSHost*)o)->ptr, dataAttr(k), &value);
+    I(vm).flushReactions();
     return true;
 }
 bool dataHookDel(Vm& vm, JSObject* o, PropKey k) {
     if (!k.isString()) return false;
-    removeAttr((Node*)((JSHost*)o)->ptr, dataAttr(k));
-    I(vm).changed();
+    I(vm).changeAttribute((Node*)((JSHost*)o)->ptr, dataAttr(k), nullptr);
+    I(vm).flushReactions();
     return true;
 }
 void dataHookKeys(Vm& vm, JSObject* o, std::vector<PropKey>& out) {
@@ -2320,6 +2462,7 @@ void ScriptHost::Impl::setup() {
         g.mark(historyState);
         g.mark(deliverFn);
         g.mark(pageScripts);
+        g.mark(ceHook);
         g.mark(fragmentProto);
         for (auto& tp : tagProtos) g.mark(tp.second);
         g.mark(observerProto);
@@ -2361,7 +2504,7 @@ void ScriptHost::Impl::setup() {
     getter(nodeProto, "nodeType", nodeType);
     getter(nodeProto, "nodeName", nodeName);
     getter(nodeProto, "nodeValue", nodeValueGet, nodeValueSet);
-    getter(nodeProto, "textContent", textContentGet, textContentSet);
+    getter(nodeProto, "textContent", textContentGet, ce<textContentSet>);
     getter(nodeProto, "parentNode", parentNode);
     getter(nodeProto, "parentElement", parentElement);
     getter(nodeProto, "childNodes", childNodes);
@@ -2372,18 +2515,18 @@ void ScriptHost::Impl::setup() {
     getter(nodeProto, "ownerDocument", ownerDocument);
     getter(nodeProto, "isConnected", nodeIsConnected);
     getter(nodeProto, "baseURI", docUrlGet);
-    method(nodeProto, "appendChild", appendChild, 1);
-    method(nodeProto, "insertBefore", insertBefore, 2);
-    method(nodeProto, "removeChild", removeChild, 1);
-    method(nodeProto, "replaceChild", replaceChild, 2);
-    method(nodeProto, "cloneNode", cloneNode, 1);
+    method(nodeProto, "appendChild", ce<appendChild>, 1);
+    method(nodeProto, "insertBefore", ce<insertBefore>, 2);
+    method(nodeProto, "removeChild", ce<removeChild>, 1);
+    method(nodeProto, "replaceChild", ce<replaceChild>, 2);
+    method(nodeProto, "cloneNode", ce<cloneNode>, 1);
     method(nodeProto, "contains", nodeContains, 1);
     method(nodeProto, "hasChildNodes", hasChildNodes, 0);
-    method(nodeProto, "remove", nodeRemove, 0);
+    method(nodeProto, "remove", ce<nodeRemove>, 0);
     method(nodeProto, "getRootNode", getRootNode, 0);
     method(nodeProto, "compareDocumentPosition", compareDocumentPosition, 1);
     const char* many[] = {"append", "prepend", "before", "after", "replaceWith", "replaceChildren"};
-    for (int i = 0; i < 6; ++i) method(nodeProto, many[i], insertMany, 0, i);
+    for (int i = 0; i < 6; ++i) method(nodeProto, many[i], ce<insertMany>, 0, i);
     method(nodeProto, "querySelector", querySelector, 1);
     method(nodeProto, "querySelectorAll", querySelectorAll, 1);
     method(nodeProto, "getElementById", getElementById, 1);
@@ -2402,18 +2545,18 @@ void ScriptHost::Impl::setup() {
     getter(elementProto, "tagName", tagName);
     getter(elementProto, "localName", localName);
     method(elementProto, "getAttribute", getAttribute, 1);
-    method(elementProto, "setAttribute", setAttribute, 2);
-    method(elementProto, "removeAttribute", removeAttribute, 1);
+    method(elementProto, "setAttribute", ce<setAttribute>, 2);
+    method(elementProto, "removeAttribute", ce<removeAttribute>, 1);
     method(elementProto, "hasAttribute", hasAttribute, 1);
-    method(elementProto, "toggleAttribute", toggleAttribute, 1);
+    method(elementProto, "toggleAttribute", ce<toggleAttribute>, 1);
     method(elementProto, "getAttributeNames", getAttributeNames, 0);
     getter(elementProto, "attributes", attributesGet);
-    getter(elementProto, "innerHTML", innerHTMLGet, innerHTMLSet);
-    getter(elementProto, "outerHTML", outerHTMLGet, outerHTMLSet);
-    getter(elementProto, "innerText", textContentGet, textContentSet);
-    method(elementProto, "insertAdjacentHTML", insertAdjacent, 2, 0);
-    method(elementProto, "insertAdjacentElement", insertAdjacent, 2, 1);
-    method(elementProto, "insertAdjacentText", insertAdjacent, 2, 2);
+    getter(elementProto, "innerHTML", innerHTMLGet, ce<innerHTMLSet>);
+    getter(elementProto, "outerHTML", outerHTMLGet, ce<outerHTMLSet>);
+    getter(elementProto, "innerText", textContentGet, ce<textContentSet>);
+    method(elementProto, "insertAdjacentHTML", ce<insertAdjacent>, 2, 0);
+    method(elementProto, "insertAdjacentElement", ce<insertAdjacent>, 2, 1);
+    method(elementProto, "insertAdjacentText", ce<insertAdjacent>, 2, 2);
     method(elementProto, "matches", elementMatches, 1);
     method(elementProto, "webkitMatchesSelector", elementMatches, 1);
     method(elementProto, "closest", elementClosest, 1);
@@ -2432,7 +2575,7 @@ void ScriptHost::Impl::setup() {
     method(elementProto, "blur", elementBlur, 0);
     method(elementProto, "click", elementClick, 0);
     getter(elementProto, "classList", classListGet);
-    getter(elementProto, "style", styleGet, styleSet);
+    getter(elementProto, "style", styleGet, ce<styleSet>);
     getter(elementProto, "dataset", datasetGet);
     struct RP {
         const char* prop;
@@ -2442,7 +2585,7 @@ void ScriptHost::Impl::setup() {
     auto reflect = [&](JSObject* proto, std::initializer_list<RP> props) {
         for (auto& r : props) {
             JSNative* g = vm.newNative(reflectGet, r.prop, 0);
-            JSNative* s = vm.newNative(reflectSet, r.prop, 1);
+            JSNative* s = vm.newNative(ce<reflectSet>, r.prop, 1);
             g->data = s->data = V(vm.atom(r.attr));
             g->data2 = s->data2 = Value::i32(r.kind);
             vm.defineAccessor(proto, PropKey::of(vm.atom(r.prop)), V(g), V(s), PF_C | PF_E);
@@ -2454,7 +2597,7 @@ void ScriptHost::Impl::setup() {
 
     classListProto = vm.newObject();
     const char* clOps[] = {"add", "remove", "toggle", "contains", "replace"};
-    for (int i = 0; i < 5; ++i) method(classListProto, clOps[i], classListOp, 1, i);
+    for (int i = 0; i < 5; ++i) method(classListProto, clOps[i], ce<classListOp>, 1, i);
     method(classListProto, "item", classListItem, 1);
     method(classListProto, "toString", classListValue, 0);
     getter(classListProto, "length", classListLength);
@@ -2463,10 +2606,10 @@ void ScriptHost::Impl::setup() {
     vm.defineOwn(classListProto, PropKey::of(vm.symIterator), vm.get(V(vm.arrayProto), "values"), PF_W | PF_C);
 
     styleProto = vm.newObject();
-    method(styleProto, "setProperty", styleSetProperty, 2);
+    method(styleProto, "setProperty", ce<styleSetProperty>, 2);
     method(styleProto, "getPropertyValue", styleGetPropertyValue, 1);
-    method(styleProto, "removeProperty", styleRemoveProperty, 1);
-    getter(styleProto, "cssText", styleCssTextGet, styleCssTextSet);
+    method(styleProto, "removeProperty", ce<styleRemoveProperty>, 1);
+    getter(styleProto, "cssText", styleCssTextGet, ce<styleCssTextSet>);
     computedProto = vm.newObject();
     method(computedProto, "getPropertyValue", computedGetPropertyValue, 1);
 
@@ -2494,7 +2637,7 @@ void ScriptHost::Impl::setup() {
     method(documentProto, "createDocumentFragment", createDocumentFragment, 0);
     method(documentProto, "createEvent", createEvent, 1);
     method(documentProto, "getElementsByName", getElementsByName, 1);
-    method(documentProto, "write", docWrite, 1);
+    method(documentProto, "write", ce<docWrite>, 1);
     method(documentProto, "writeln", docWrite, 1);
     method(documentProto, "hasFocus", trueFn, 0);
     vm.def(documentProto, "characterSet", vm.strv("UTF-8"), PF_ALL);
@@ -2531,7 +2674,7 @@ void ScriptHost::Impl::setup() {
                  {"HTMLDocument", documentProto}, {"Text", textProto}, {"Comment", textProto}, {"CharacterData", textProto},
                  {"DocumentFragment", fragmentProto}, {"NodeList", nodeListProto}, {"HTMLCollection", nodeListProto}};
     for (auto& c : ctors) {
-        JSNative* made = makeCtor(vm, c.name, illegalCtor, 0, c.proto);
+        JSNative* made = makeCtor(vm, c.name, std::string(c.name) == "HTMLElement" ? htmlElementCtor : illegalCtor, 0, c.proto);
         if (std::string(c.name) != "Node") continue;
         for (int i = 0; i < 5; ++i) vm.def(made, consts[i], Value::i32(constVals[i]), 0);
         const char* positions[] = {"DOCUMENT_POSITION_DISCONNECTED", "DOCUMENT_POSITION_PRECEDING", "DOCUMENT_POSITION_FOLLOWING", "DOCUMENT_POSITION_CONTAINS", "DOCUMENT_POSITION_CONTAINED_BY"};
@@ -2550,9 +2693,9 @@ void ScriptHost::Impl::setup() {
         return proto;
     };
     auto control = [&](JSObject* proto, bool checkable) {
-        getter(proto, "value", valueGet, valueSet);
+        getter(proto, "value", valueGet, ce<valueSet>);
         getter(proto, "form", formGet);
-        if (checkable) getter(proto, "checked", checkedGet, checkedSet);
+        if (checkable) getter(proto, "checked", checkedGet, ce<checkedSet>);
     };
     iface("HTMLAnchorElement", elementProto, {"a"}, {{"href", "href", 2}, {"target", "target", 0}, {"rel", "rel", 0}, {"download", "download", 0}, {"hreflang", "hreflang", 0}, {"type", "type", 0}, {"referrerPolicy", "referrerpolicy", 0}, {"name", "name", 0}});
     iface("HTMLAreaElement", elementProto, {"area"}, {{"href", "href", 2}, {"target", "target", 0}, {"alt", "alt", 0}});
@@ -2747,6 +2890,9 @@ void ScriptHost::Impl::setup() {
     vm.defFn(G, "__netAbort", netAbortFn, 1);
     vm.defFn(G, "__url", urlParse, 2);
     vm.defFn(G, "__reportError", reportErrorFn, 1);
+    vm.defFn(G, "__ceHook", ceHookSet, 1);
+    vm.defFn(G, "__ceState", ceStateFn, 2);
+    vm.defFn(G, "__isConstructor", isConstructorFn, 1);
     try {
         vm.eval(utf8to16(kScriptPrelude), "browser:prelude");
     } catch (JSThrow&) {

@@ -75,7 +75,7 @@ struct AttrSel {
 };
 struct Compound;
 struct Pseudo {
-    enum K : uint8_t { FirstChild, LastChild, OnlyChild, Root, Link, Empty, NthChild, NthLastChild, FirstOfType, LastOfType, Not };
+    enum K : uint8_t { FirstChild, LastChild, OnlyChild, Root, Link, Empty, NthChild, NthLastChild, FirstOfType, LastOfType, Not, Defined };
     K k = FirstChild;
     int a = 0, b = 0;
     std::shared_ptr<Compound> inner;

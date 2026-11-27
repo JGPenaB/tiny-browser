@@ -628,7 +628,9 @@ bool parse_compound(std::string_view s, size_t& i, Compound& c, uint32_t& spec) 
                 }
                 p.k = Pseudo::Not;
                 p.inner = inner;
-            } else if (in(name, {"enabled", "visited-not", "defined", "scope", "lang", "dir", "ltr"})) {
+            } else if (name == "defined") {
+                p.k = Pseudo::Defined;
+            } else if (in(name, {"enabled", "visited-not", "scope", "lang", "dir", "ltr"})) {
                 continue;  // treated as always-true
             } else {
                 // hover, focus, active, visited, checked, is(), where(), has()... never match in M1.
@@ -918,6 +920,9 @@ bool match_compound(const Compound& c, const Node* e) {
             }
             case Pseudo::Not:
                 if (p.inner && match_compound(*p.inner, e)) return false;
+                break;
+            case Pseudo::Defined:  // every built-in element, and a custom one once it has been upgraded (HTML 4.16.4)
+                if (e->ceState != 1 && e->name.find('-') != std::string::npos) return false;
                 break;
         }
     }
