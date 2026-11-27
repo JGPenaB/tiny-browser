@@ -75,7 +75,7 @@ struct AttrSel {
 };
 struct Compound;
 struct Pseudo {
-    enum K : uint8_t { FirstChild, LastChild, OnlyChild, Root, Link, Empty, NthChild, NthLastChild, FirstOfType, LastOfType, Not, Defined };
+    enum K : uint8_t { FirstChild, LastChild, OnlyChild, Root, Link, Empty, NthChild, NthLastChild, FirstOfType, LastOfType, Not, Defined, Host, Slotted };
     K k = FirstChild;
     int a = 0, b = 0;
     std::shared_ptr<Compound> inner;
@@ -108,6 +108,9 @@ struct Sheet {
     std::vector<Rule> rules;
     std::vector<MediaQuery> media;
 };
+// Selectors of a shadow tree's style sheet are matched with that tree as their scope: nothing above its root is
+// seen, except the host through :host. Set while such a rule is matched; null for the document's own rules.
+extern const Node* g_selectorScope;
 
 Sheet parse_sheet(std::string_view css);
 std::vector<Decl> parse_decls(std::string_view body);
@@ -122,7 +125,8 @@ public:
     using FontResolver = std::wstring (*)(std::string_view familyList);
     static FontResolver fontResolver;
 
-    void add(const Sheet* s, bool ua) { sheets_.push_back({s, ua}); }
+    // scope: the shadow root whose <style> the sheet is, or null for a sheet of the document
+    void add(const Sheet* s, bool ua, const Node* scope = nullptr) { sheets_.push_back({s, ua, scope}); }
     void compute(Document& d, float vw, float vh);
     bool hasMedia() const { return hasMedia_; }
     size_t ruleCount() const { return all_.size(); }
@@ -132,12 +136,18 @@ private:
         const Rule* r;
         uint32_t order;
         bool ua;
+        const Node* scope;
+    };
+    struct Added {
+        const Sheet* sheet;
+        bool ua;
+        const Node* scope;
     };
     void build(float vw);
     void computeTree(Node* e, const Style& parent);
     void computeElem(Node* e, const Style& parent);
 
-    std::vector<std::pair<const Sheet*, bool>> sheets_;
+    std::vector<Added> sheets_;
     std::vector<IR> all_;
     std::unordered_map<std::string, std::vector<uint32_t>> byId_, byClass_, byTag_;
     std::vector<uint32_t> uni_;

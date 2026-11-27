@@ -23,6 +23,71 @@ std::string text_content(const Node* n) {
     return r;
 }
 
+int g_shadowRoots = 0;
+
+Node* shadow_root_of(const Node* n) {
+    for (Node* p = n->parent; p; p = p->parent)
+        if (p->isShadowRoot()) return p;
+    return nullptr;
+}
+// Slots are found by name (DOM 4.2.2.3 "find a slot"): the first <slot> of the shadow tree, in tree order, whose
+// name is the child's slot attribute. Text and elements without the attribute go to the slot without a name.
+static Node* find_slot(Node* in, const std::string& name) {
+    for (auto& k : in->kids) {
+        if (k->type != Node::T::Element) continue;
+        if (k->name == "slot") {
+            const std::string* own = k->attr("name");
+            if ((own ? *own : std::string()) == name) return k.get();
+        }
+        if (Node* found = find_slot(k.get(), name)) return found;
+    }
+    return nullptr;
+}
+static const std::string& slot_name_of(const Node* child) {
+    static const std::string none;
+    const std::string* a = child->type == Node::T::Element ? child->attr("slot") : nullptr;
+    return a ? *a : none;
+}
+Node* assigned_slot(const Node* n) {
+    if (!n->parent || !n->parent->shadow || n->type == Node::T::Comment) return nullptr;
+    return find_slot(n->parent->shadow.get(), slot_name_of(n));
+}
+void assigned_nodes(const Node* slot, std::vector<Node*>& out) {
+    Node* root = shadow_root_of(slot);
+    if (!root || !root->parent) return;
+    const std::string* own = slot->attr("name");
+    std::string name = own ? *own : std::string();
+    if (find_slot(root, name) != slot) return;  // an earlier slot of the same name takes them
+    for (auto& k : root->parent->kids)
+        if (k->type != Node::T::Comment && slot_name_of(k.get()) == name) out.push_back(k.get());
+}
+static void flatten_into(const Node* from, std::vector<Node*>& out, int depth) {
+    for (auto& k : from->kids) {
+        if (k->type == Node::T::Element && k->name == "slot" && depth < 16 && shadow_root_of(k.get())) {
+            size_t before = out.size();
+            assigned_nodes(k.get(), out);
+            if (out.size() == before) flatten_into(k.get(), out, depth + 1);  // nothing assigned: the slot's own content
+        } else
+            out.push_back(k.get());
+    }
+}
+FlatKids::FlatKids(const Node* n) {
+    if (g_shadowRoots == 0) {
+        plain_ = &n->kids;
+        return;
+    }
+    const Node* from = n->shadow ? n->shadow.get() : n;
+    bool hasSlot = false;
+    for (auto& k : from->kids)
+        if (k->type == Node::T::Element && k->name == "slot") hasSlot = true;
+    if (!hasSlot || !(n->shadow || shadow_root_of(from->kids[0].get()))) {
+        plain_ = &from->kids;
+        return;
+    }
+    flatten_into(from, mixed_, 0);
+    if (mixed_.empty()) plain_ = nullptr;
+}
+
 namespace {
 
 struct Ent {

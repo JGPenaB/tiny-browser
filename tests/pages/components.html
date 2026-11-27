@@ -8,6 +8,8 @@
   .card { border: 1px solid #c8ccd4; border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
   .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
   x-late:not(:defined) { display: none; }
+  .inner { color: rgb(1, 2, 3); }
+  #sh1 span { color: rgb(9, 9, 9); }
 </style>
 </head>
 <body>
@@ -16,6 +18,8 @@
 <template id="rows"><tr><td>cell</td></tr></template>
 <x-greet id="g1" name="A">first</x-greet> <x-greet name="B">second</x-greet> <x-late>late</x-late>
 <div id="slot"></div>
+<div id="sh1"><span slot="title">Slotted title</span><b>default one</b> text <i slot="none">unassigned</i></div>
+<div id="sh2">hidden light text</div>
 <div class="card" id="results"><b>Results</b></div>
 <script>
   var pass = 0, fail = 0;
@@ -127,6 +131,51 @@
   var watching = new Proxy(Counted, { get: function (t, k, r) { if (typeof k === 'string') order.push(k); return Reflect.get(t, k, r); } });
   customElements.define('x-counted', watching);
   eq('custom: what define reads from the constructor', order.join(), 'prototype,disabledFeatures,formAssociated');
+
+  // ---- shadow trees (DOM 4.8, CSS Scoping)
+  var sh1 = document.getElementById('sh1'), root = sh1.attachShadow({ mode: 'open' });
+  root.innerHTML = '<style>:host { display: block; border-left: 4px solid rgb(0, 128, 0); } .inner { font-weight: 700; } ::slotted(span) { font-style: italic; }' +
+    ' :host(.wide) .inner { font-style: italic; } #sh1 { margin-top: 99px; }</style>' +
+    '<p class="inner"><slot name="title">fallback title</slot></p><div id="body"><slot></slot></div><slot name="empty"><em id="fb">fallback</em></slot>';
+  var inner = root.querySelector('.inner'), span = sh1.querySelector('span'), bold = sh1.querySelector('b'), unassigned = sh1.querySelector('i');
+  var slots = root.querySelectorAll('slot');
+  eq('shadow: root', (sh1.shadowRoot === root) + ':' + (root.host === sh1) + ':' + root.mode + ':' + root.nodeType + ':' + String(root.parentNode) + ':' + (root instanceof ShadowRoot) + ':' + (root instanceof DocumentFragment), 'true:true:open:11:null:true:true');
+  eq('shadow: roots of nodes', (inner.getRootNode() === root) + ':' + (inner.getRootNode({ composed: true }) === document) + ':' + (span.getRootNode() === document) + ':' + inner.isConnected + ':' + (inner.parentNode === root), 'true:true:true:true:true');
+  eq('shadow: the tree is its own', String(document.querySelector('.inner')) + ':' + String(document.getElementById('body')) + ':' + root.querySelector('#body').tagName + ':' + sh1.children.length + ':' + root.children.length, 'null:null:DIV:3:4');
+  eq('shadow: slot assignment', slots[0].assignedNodes().length + ':' + slots[0].assignedElements()[0].textContent + ':' + slots[1].assignedNodes().length + ':' + slots[1].assignedElements().length + ':' +
+    (span.assignedSlot === slots[0]) + ':' + String(unassigned.assignedSlot) + ':' + slots[2].assignedNodes().length + ':' + slots[2].assignedNodes({ flatten: true }).length, '1:Slotted title:2:1:true:null:0:1');
+  var cs = function (el, prop) { return getComputedStyle(el)[prop]; };
+  eq('shadow: its styles stay inside', cs(inner, 'fontWeight') + ':' + (cs(inner, 'color') !== 'rgb(1, 2, 3)') + ':' + cs(sh1, 'marginTop'), '700:true:0px');
+  eq('shadow: :host and ::slotted', cs(sh1, 'display') + ':' + cs(sh1, 'borderLeftWidth') + ':' + cs(span, 'fontStyle') + ':' + cs(span, 'color'), 'block:4px:italic:rgb(9, 9, 9)');
+  sh1.className = 'wide';
+  eq('shadow: :host() with a selector', cs(inner, 'fontStyle'), 'italic');
+  var box = function (el) { return el.getBoundingClientRect(); };
+  eq('shadow: the flat tree is what is laid out', (box(unassigned).width === 0) + ':' + (box(bold).width > 0) + ':' + (box(root.getElementById('fb')).width > 0) + ':' + (box(span).top < box(bold).top) + ':' + (box(inner).height > 0), 'true:true:true:true:true');
+  eq('shadow: refusals', [thrown(function () { sh1.attachShadow({ mode: 'open' }); }), thrown(function () { document.createElement('a').attachShadow({ mode: 'open' }); }),
+    thrown(function () { document.createElement('div').attachShadow({}); }), thrown(function () { document.createElement('div').attachShadow(); })].join(), 'NotSupportedError,NotSupportedError,TypeError,TypeError');
+  var sh2 = document.getElementById('sh2'), closedRoot = sh2.attachShadow({ mode: 'closed' });
+  closedRoot.innerHTML = '<u>shadow only</u>';
+  eq('shadow: closed', String(sh2.shadowRoot) + ':' + closedRoot.mode + ':' + (closedRoot.firstChild.getRootNode() === closedRoot) + ':' + (box(closedRoot.firstChild).width > 0), 'null:closed:true:true');
+  function depthOf(el) { var n = 0; while (el.parentNode) { el = el.parentNode; n++; } return n; }
+  var seen = [];
+  var note = function (who) { return function (e) { seen.push(who + '=' + (e.target === inner ? 'inner' : e.target === sh1 ? 'host' : '?') + (who === 'inner' ? '/' + e.composedPath().length : '')); }; };
+  inner.addEventListener('ping', note('inner')); root.addEventListener('ping', note('root')); sh1.addEventListener('ping', note('host')); document.addEventListener('ping', note('doc'));
+  inner.dispatchEvent(new Event('ping', { bubbles: true, composed: true }));
+  seen.push('|');
+  inner.dispatchEvent(new Event('ping', { bubbles: true }));
+  eq('shadow: events are retargeted, and stay inside unless composed', seen.join(' '), 'inner=inner/' + (4 + depthOf(sh1)) + ' root=inner host=host doc=host | inner=inner/2 root=inner');
+  root.appendChild(document.createElement('x-greet')).setAttribute('name', 'S'); taken();
+  sh1.remove(); document.body.insertBefore(sh1, results);
+  eq('shadow: custom elements inside follow the host', taken(), 'out S | in S');
+  class Card extends HTMLElement { constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<style>:host { display: inline-block; }</style>[<slot></slot>]'; } }
+  customElements.define('x-card', Card);
+  var card = document.createElement('x-card');
+  card.textContent = 'card';
+  slot.appendChild(card);
+  eq('shadow: a custom element with its own tree', cs(card, 'display') + ':' + card.shadowRoot.childNodes.length + ':' + (box(card).width > 0) + ':' + card.outerHTML, 'inline-block:4:true:<x-card>card</x-card>');
+  class NoShadow extends HTMLElement { static get disabledFeatures() { return ['shadow']; } }
+  customElements.define('x-noshadow', NoShadow);
+  eq('shadow: disabledFeatures', thrown(function () { new NoShadow().attachShadow({ mode: 'open' }); }), 'NotSupportedError');
 
   window.addEventListener('load', function () {
     setTimeout(function () {

@@ -172,6 +172,7 @@ struct ScriptHost::Impl {
     std::unordered_set<Node*> startedScripts;
     std::unordered_map<std::string, JSObject*> tagProtos;  // HTMLInputElement.prototype for <input>, and so on
     JSObject* fragmentProto = nullptr;
+    JSObject* shadowProto = nullptr;  // ShadowRoot.prototype
     std::vector<std::unique_ptr<Observer>> observers;
     bool observersScheduled = false;
     Value deliverFn;
@@ -203,7 +204,7 @@ struct ScriptHost::Impl {
         h->ptr = n;
         if (n->type == Node::T::Element) {
             auto tp = tagProtos.find(n->name);
-            h->proto = tp != tagProtos.end() ? tp->second : isFragment(n) ? fragmentProto : elementProto;
+            h->proto = tp != tagProtos.end() ? tp->second : n->isShadowRoot() ? shadowProto : isFragment(n) ? fragmentProto : elementProto;
         } else
             h->proto = n->type == Node::T::Document ? documentProto : textProto;
         wrappers[n] = h;
@@ -375,9 +376,14 @@ struct ScriptHost::Impl {
             Node* n = st.back();
             st.pop_back();
             if (n->type != Node::T::Element) continue;
+            if (n->isShadowRoot()) {
+                for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+                continue;
+            }
             if (n->ceState == 1) reactions.push_back({n, entering ? 0 : 1});
             else if (entering && n->ceState == 0 && maybeCustom(n)) reactions.push_back({n, 3});
             for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+            if (n->shadow) st.push_back(n->shadow.get());  // a shadow tree enters and leaves with its host
         }
     }
     // Elements are served in the order they were first noted, and each gets everything noted for it at once:
@@ -721,6 +727,7 @@ struct ScriptHost::Impl {
         vm.def(e, "cancelable", Value::boolean(cancelable), PF_ALL);
         vm.def(e, "timeStamp", Value::num(now_ms() - startMs), PF_ALL);
         vm.def(e, "isTrusted", Value::boolean(true), PF_ALL);
+        vm.def(e, "composed", Value::boolean(true), PF_ALL);
         vm.def(e, "eventPhase", Value::i32(0), PF_ALL);
         vm.def(e, "target", Value::null(), PF_ALL);
         vm.def(e, "currentTarget", Value::null(), PF_ALL);
@@ -766,10 +773,34 @@ struct ScriptHost::Impl {
         vm.set(ev, "target", targetV);
         vm.set(ev, "srcElement", targetV);
         std::vector<Node*> path;
-        for (Node* n = target; n; n = n->parent) path.push_back(n);
+        bool composed = vm.toBool(vm.get(ev, "composed"));
+        for (Node* n = target; n; n = n->parent) {
+            path.push_back(n);
+            if (n->isShadowRoot() && !composed) break;  // the event stays inside its shadow tree
+        }
+        bool leaves = !path.empty() && !path.back()->parent && path.back()->type == Node::T::Document;
         e->flagA = e->flagB = false;
+        // What a listener on `at` (null: the window) sees as the target: the target itself, or the host of the
+        // outermost shadow tree around it that `at` is not inside of (DOM 2.5, retargeting).
+        auto seenFrom = [&](Node* at) {
+            Node* t = target;
+            while (t) {
+                Node* root = shadow_root_of(t);
+                if (!root) break;
+                bool inside = false;
+                for (Node* a = at; a && !inside; a = a->parent) inside = a == root;
+                if (inside) break;
+                t = root->parent;
+            }
+            return t;
+        };
         auto run = [&](const void* key, Value cur, int phase) {
             if (e->flagA) return;
+            if (g_shadowRoots && target) {
+                Value seen = wrap(seenFrom(key == (const void*)this ? nullptr : (Node*)key));
+                vm.set(ev, "target", seen);
+                vm.set(ev, "srcElement", seen);
+            }
             vm.set(ev, "currentTarget", cur);
             vm.set(ev, "eventPhase", Value::i32(phase));
             if (phase != 1) {
@@ -796,12 +827,12 @@ struct ScriptHost::Impl {
                 if (e->flagB) break;
             }
         };
-        if (target) run(this, window, 1);
+        if (target && leaves) run(this, window, 1);
         for (size_t i = path.size(); i-- > 1;) run(path[i], wrap(path[i]), 1);
         run(target ? (const void*)target : (const void*)this, targetV, 2);
         if (bubbles && target) {
             for (size_t i = 1; i < path.size(); ++i) run(path[i], wrap(path[i]), 3);
-            run(this, window, 3);
+            if (leaves) run(this, window, 3);
         }
         vm.set(ev, "currentTarget", Value::null());
         vm.set(ev, "eventPhase", Value::i32(0));
@@ -1047,7 +1078,7 @@ std::string upper(std::string s) {
 // ---------------------------------------------------------------------------- Node
 JSFN(nodeType) {
     Node* n = thisNode(ci);
-    int t = n->type == Node::T::Document ? 9 : n->type == Node::T::Text ? 3 : n->type == Node::T::Comment ? 8 : Impl::isFragment(n) ? 11 : 1;
+    int t = n->type == Node::T::Document ? 9 : n->type == Node::T::Text ? 3 : n->type == Node::T::Comment ? 8 : Impl::isFragment(n) || n->isShadowRoot() ? 11 : 1;
     return Value::i32(t);
 }
 JSFN(nodeName) {
@@ -1078,10 +1109,14 @@ JSFN(textContentSet) {
     I(ci.vm).setText(n, ci.arg(0).isNullish() ? "" : str8(ci.vm, ci.arg(0)));
     return Value::undef();
 }
-JSFN(parentNode) { return I(ci.vm).wrap(thisNode(ci)->parent); }
+JSFN(parentNode) {  // a shadow root has a host, not a parent
+    Node* n = thisNode(ci);
+    return I(ci.vm).wrap(n->isShadowRoot() ? nullptr : n->parent);
+}
 JSFN(parentElement) {
-    Node* p = thisNode(ci)->parent;
-    return I(ci.vm).wrap(p && p->type == Node::T::Element ? p : nullptr);
+    Node* n = thisNode(ci);
+    Node* p = n->parent;
+    return I(ci.vm).wrap(p && p->type == Node::T::Element && !n->isShadowRoot() && !p->isShadowRoot() && !Impl::isFragment(p) ? p : nullptr);
 }
 JSFN(childNodes) {
     Node* n = thisNode(ci);
@@ -1171,10 +1206,63 @@ JSFN(nodeRemove) {
     I(ci.vm).remove(thisNode(ci));
     return Value::undef();
 }
-JSFN(getRootNode) {
+JSFN(getRootNode) {  // (options): the shadow root a node is under, or with composed: true the root above all hosts
     Node* n = thisNode(ci);
-    while (n->parent) n = n->parent;
+    bool composed = ci.arg(0).isObject() && ci.vm.toBool(ci.vm.get(ci.arg(0), "composed"));
+    while (n->parent && (composed || !n->isShadowRoot())) n = n->parent;
     return I(ci.vm).wrap(n);
+}
+// ---- shadow trees (DOM 4.8)
+JSFN(attachShadow) {
+    Vm& vm = ci.vm;
+    Impl& im = I(vm);
+    Node* host = thisElem(ci);
+    static const char* allowed[] = {"article", "aside", "blockquote", "body", "div", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "main", "nav", "p", "section", "span"};
+    bool ok = Impl::maybeCustom(host);
+    for (const char* a : allowed) ok = ok || host->name == a;
+    if (!ok) vm.throwError(Err::Error, "NotSupportedError: a <%s> element cannot have a shadow root", host->name.c_str());
+    if (host->shadow) vm.throwError(Err::Error, "NotSupportedError: the element already has a shadow root");
+    std::string mode = ci.arg(0).isObject() ? str8(vm, vm.get(ci.arg(0), "mode")) : std::string();
+    if (mode != "open" && mode != "closed") vm.throwError(Err::TypeError, "attachShadow: the mode must be 'open' or 'closed'");
+    host->shadow = std::make_unique<Node>();
+    host->shadow->type = Node::T::Element;
+    host->shadow->name = "#shadow-root";
+    host->shadow->parent = host;
+    host->shadow->attrs.push_back({"mode", mode});
+    ++g_shadowRoots;
+    im.changed();
+    return im.wrap(host->shadow.get());
+}
+JSFN(shadowRootGet) {  // data: 1 = whatever the mode (for the prelude)
+    Node* shadow = thisElem(ci)->shadow.get();
+    bool open = shadow && (ci.callee->data.asInt() == 1 || *shadow->attr("mode") == "open");
+    return I(ci.vm).wrap(open ? shadow : nullptr);
+}
+Node* thisShadow(CallInfo& ci) {
+    Node* n = thisNode(ci);
+    if (!n->isShadowRoot()) illegal(ci, "a ShadowRoot");
+    return n;
+}
+JSFN(shadowHost) { return I(ci.vm).wrap(thisShadow(ci)->parent); }
+JSFN(shadowMode) { return val8(ci.vm, *thisShadow(ci)->attr("mode")); }
+JSFN(slotAssigned) {  // assignedNodes(options) and, with data 1, assignedElements(options)
+    Vm& vm = ci.vm;
+    Node* slot = thisElem(ci);
+    bool flatten = ci.arg(0).isObject() && vm.toBool(vm.get(ci.arg(0), "flatten"));
+    std::vector<Node*> found, out;
+    assigned_nodes(slot, found);
+    if (found.empty() && flatten)
+        for (Node* k : FlatKids(slot)) found.push_back(k);
+    for (Node* n : found)
+        if (ci.callee->data.asInt() != 1 || n->type == Node::T::Element) out.push_back(n);
+    JSArray* a = vm.newArray();
+    for (Node* n : out) a->elems.push_back(I(vm).wrap(n));
+    return V(a);
+}
+JSFN(assignedSlotGet) {  // null for a closed shadow tree, as its slots are not for outsiders
+    Node* slot = assigned_slot(thisNode(ci));
+    Node* root = slot ? shadow_root_of(slot) : nullptr;
+    return I(ci.vm).wrap(root && *root->attr("mode") == "open" ? slot : nullptr);
 }
 JSFN(compareDocumentPosition) {
     Node* a = thisNode(ci);
@@ -1796,10 +1884,28 @@ bool computedHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
     const Style* s = n->style.get();
     char buf[64];
     if (s) {
-        if (name == "display") val = display_name(s->display);
+        static const char* sides[] = {"top", "right", "bottom", "left"};
+        auto rgb = [&](const Color& c) {  // CSSOM 6.7.2: rgb(r, g, b), or rgba() when not opaque
+            int r = int(c.r * 255 + .5f), g = int(c.g * 255 + .5f), b = int(c.b * 255 + .5f);
+            if (c.a >= 0.999f) snprintf(buf, sizeof buf, "rgb(%d, %d, %d)", r, g, b);
+            else snprintf(buf, sizeof buf, "rgba(%d, %d, %d, %g)", r, g, b, c.a < 0 ? 0.0 : (double)c.a);
+            return std::string(buf);
+        };
+        int side = -1;
+        for (int i = 0; i < 4; ++i)
+            if (name == std::string("margin-") + sides[i] || name == std::string("padding-") + sides[i] || name == std::string("border-") + sides[i] + "-width") side = i;
+        if (side >= 0) {
+            if (name[0] == 'b') snprintf(buf, sizeof buf, "%gpx", s->borderStyle[side] ? s->border[side] : 0.f), val = buf;
+            else {
+                const Len& l = name[0] == 'm' ? s->margin[side] : s->padding[side];
+                if (l.u == Len::Px) snprintf(buf, sizeof buf, "%gpx", l.v), val = buf;
+                else val = styleValue(n, name);
+            }
+        } else if (name == "display") val = display_name(s->display);
         else if (name == "visibility") val = s->hidden ? "hidden" : "visible";
-        else if (name == "color") val = color_str(s->color);
-        else if (name == "background-color") val = color_str(s->bg);
+        else if (name == "color") val = rgb(s->color);
+        else if (name == "background-color") val = rgb(s->bg);
+        else if (name == "font-style") val = s->italic ? "italic" : "normal";
         else if (name == "opacity") val = s->opacity0 ? "0" : "1";
         else if (name == "position") val = s->position == 1 ? "relative" : s->position == 2 ? "absolute" : s->position == 3 ? "fixed" : s->position == 4 ? "sticky" : "static";
         else if (name == "font-size") snprintf(buf, sizeof buf, "%gpx", s->fontSize), val = buf;
@@ -1890,6 +1996,7 @@ JSFN(eventCtor) {
     JSObject* e = ev.asObject();
     e->proto = vm.protoFromNewTarget(ci.newTarget, im.eventProto);
     vm.def(e, "isTrusted", Value::boolean(false), PF_ALL);
+    vm.def(e, "composed", Value::boolean(false), PF_ALL);
     vm.def(e, "detail", Value::null(), PF_ALL);
     if (init.isObject()) vm.copyDataProps(e, init, nullptr);
     return ev;
@@ -1918,10 +2025,16 @@ JSFN(eventInit) {
     if (ci.argc > 3) vm.set(ci.thisv, "detail", ci.args[3]);
     return Value::undef();
 }
-JSFN(eventComposedPath) {
-    JSArray* a = ci.vm.newArray();
-    for (Node* n = toNode(ci.vm.get(ci.thisv, "target")); n; n = n->parent) a->elems.push_back(I(ci.vm).wrap(n));
-    a->elems.push_back(V(ci.vm.global));
+JSFN(eventComposedPath) {  // the nodes the event visits: all the way up when composed, else only to its shadow root
+    Vm& vm = ci.vm;
+    JSArray* a = vm.newArray();
+    bool composed = vm.toBool(vm.get(ci.thisv, "composed"));
+    Node* n = toNode(vm.get(ci.thisv, "target"));
+    for (; n; n = n->parent) {
+        a->elems.push_back(I(vm).wrap(n));
+        if (n->isShadowRoot() && !composed) return V(a);
+    }
+    a->elems.push_back(V(vm.global));
     return V(a);
 }
 JSFN(createEvent) {
@@ -2464,6 +2577,7 @@ void ScriptHost::Impl::setup() {
         g.mark(pageScripts);
         g.mark(ceHook);
         g.mark(fragmentProto);
+        g.mark(shadowProto);
         for (auto& tp : tagProtos) g.mark(tp.second);
         g.mark(observerProto);
         for (auto& n : netJs) g.mark(n.second);
@@ -2667,6 +2781,16 @@ void ScriptHost::Impl::setup() {
     // ---- one constructor and prototype per kind of node, so properties such as `value` or `async` exist only
     // on the elements that have them
     fragmentProto = vm.newObject(nodeProto);
+    shadowProto = vm.newObject(fragmentProto);
+    makeCtor(vm, "ShadowRoot", illegalCtor, 0, shadowProto);
+    getter(shadowProto, "host", shadowHost);
+    getter(shadowProto, "mode", shadowMode);
+    getter(shadowProto, "innerHTML", innerHTMLGet, ce<innerHTMLSet>);
+    method(elementProto, "attachShadow", attachShadow, 1);
+    getter(elementProto, "shadowRoot", shadowRootGet);
+    getter(elementProto, "assignedSlot", assignedSlotGet);
+    getter(textProto, "assignedSlot", assignedSlotGet);
+    vm.defFn(G, "__shadowOf", shadowRootGet, 0)->data = Value::i32(1);
     struct {
         const char* name;
         JSObject* proto;
@@ -2747,6 +2871,8 @@ void ScriptHost::Impl::setup() {
     };
     for (auto& pl : plain) iface(pl.name, elementProto, pl.tags, {});
     getter(tagProtos["template"], "content", templateContent);
+    method(tagProtos["slot"], "assignedNodes", slotAssigned, 0, 0);
+    method(tagProtos["slot"], "assignedElements", slotAssigned, 0, 1);
     JSObject* svg = iface("SVGElement", elementProto, {"svg", "g", "path", "circle", "rect", "line", "polyline", "polygon", "ellipse", "text", "tspan", "use", "defs", "symbol", "clippath", "lineargradient", "radialgradient", "stop", "mask", "pattern", "image", "foreignobject"}, {});
     for (const char* n : {"SVGSVGElement", "SVGGraphicsElement", "SVGPathElement"}) {
         JSNative* c = vm.newNative(illegalCtor, n, 0);

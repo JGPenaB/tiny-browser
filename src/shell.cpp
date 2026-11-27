@@ -129,6 +129,7 @@ struct Page {
     std::string url;
     std::unique_ptr<Document> doc;
     std::vector<Sheet> sheets;
+    std::unordered_map<std::string, std::unique_ptr<Sheet>> shadowSheets;  // style sheets of shadow trees, by their text
     std::vector<ImageRes> images;
     std::unordered_map<const Node*, int> imgNode;
     std::vector<NetEntry> net;
@@ -701,6 +702,7 @@ public:
             st.pop_back();
             if (n->type == Node::T::Element && n->hasBox && dx >= n->bx && dx < n->bx + n->bw && dy >= n->by && dy < n->by + n->bh) best = n;
             for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+            if (n->shadow) st.push_back(n->shadow.get());
         }
         return best;
     }
@@ -714,6 +716,22 @@ public:
         if (p.doc->quirks) se.add(&quirks_sheet(), true);
         for (auto& s : p.sheets) se.add(&s, false);
         if (p.script) se.add(&scripting_sheet(), true);
+        if (g_shadowRoots) {  // each <style> inside a shadow tree styles that tree only
+            std::vector<Node*> st{p.doc->root.get()};
+            while (!st.empty()) {
+                Node* n = st.back();
+                st.pop_back();
+                if (n->is("style"))
+                    if (Node* scope = shadow_root_of(n)) {
+                        std::string css = text_content(n);
+                        auto& sheet = p.shadowSheets[css];
+                        if (!sheet) sheet = std::make_unique<Sheet>(parse_sheet(css));
+                        se.add(sheet.get(), false, scope);
+                    }
+                if (n->shadow) st.push_back(n->shadow.get());
+                for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
+            }
+        }
         se.compute(*p.doc, vw, contentRect().h());
         p.hasMedia = se.hasMedia();
         p.rules = se.ruleCount();

@@ -591,6 +591,22 @@ bool parse_compound(std::string_view s, size_t& i, Compound& c, uint32_t& spec) 
                 if (i < s.size()) ++i;
             }
             any = true;
+            if (name == "host" || name == "slotted") {  // CSS Scoping 3.2 and 3.3: the host from inside, and what its slots hold
+                Pseudo hp;
+                hp.k = name == "host" ? Pseudo::Host : Pseudo::Slotted;
+                std::string_view a = trim(arg);
+                if (!a.empty()) {
+                    auto inner = std::make_shared<Compound>();
+                    size_t k = 0;
+                    uint32_t sp2 = 0;
+                    if (!parse_compound(a, k, *inner, sp2) || k != a.size()) c.never = true;
+                    hp.inner = inner;
+                } else if (hp.k == Pseudo::Slotted)
+                    c.never = true;
+                spec += 1 << 10;
+                c.pseudos.push_back(std::move(hp));
+                continue;
+            }
             if (elem || in(name, {"before", "after", "first-line", "first-letter", "selection", "placeholder", "marker",
                                   "backdrop", "file-selector-button"})) {
                 c.never = true;
@@ -829,7 +845,18 @@ bool match_nth(int a, int b, int n) {
     return d / a >= 0 && d % a == 0;
 }
 
+// What the element is to the scope of the rule being matched: 0 an element of that tree (or any element, for a
+// rule of the document), 1 the tree's host, 2 a child of the host that a slot may hold.
+int g_scopeRole = 0;
 bool match_compound(const Compound& c, const Node* e) {
+    bool isHost = g_selectorScope && e == g_selectorScope->parent;
+    bool isSlotted = g_scopeRole == 2 && g_selectorScope && e->parent == g_selectorScope->parent;
+    if (isHost || isSlotted) {  // only :host and ::slotted() reach outside the tree
+        bool reaches = false;
+        for (auto& p : c.pseudos)
+            if (p.k == (isHost ? Pseudo::Host : Pseudo::Slotted)) reaches = true;
+        if (!reaches) return false;
+    }
     if (c.never) return false;
     if (!c.tag.empty() && c.tag != e->name) return false;
     if (!c.id.empty() && c.id != e->id) return false;
@@ -921,6 +948,18 @@ bool match_compound(const Compound& c, const Node* e) {
             case Pseudo::Not:
                 if (p.inner && match_compound(*p.inner, e)) return false;
                 break;
+            case Pseudo::Host:
+            case Pseudo::Slotted: {
+                if (!g_selectorScope || (p.k == Pseudo::Host ? e != g_selectorScope->parent : e->parent != g_selectorScope->parent)) return false;
+                if (p.inner) {  // the argument is about the element as its own tree sees it
+                    const Node* scope = g_selectorScope;
+                    g_selectorScope = nullptr;
+                    bool ok = match_compound(*p.inner, e);
+                    g_selectorScope = scope;
+                    if (!ok) return false;
+                }
+                break;
+            }
             case Pseudo::Defined:  // every built-in element, and a custom one once it has been upgraded (HTML 4.16.4)
                 if (e->ceState != 1 && e->name.find('-') != std::string::npos) return false;
                 break;
@@ -929,17 +968,25 @@ bool match_compound(const Compound& c, const Node* e) {
     return true;
 }
 
+// The parent a selector sees: a tree ends at its shadow root, above which only the scope's own host shows.
+const Node* selector_parent(const Node* e) {
+    if (g_selectorScope && e == g_selectorScope->parent) return nullptr;
+    const Node* par = e->parent;
+    if (par && par->isShadowRoot()) return par == g_selectorScope ? par->parent : nullptr;
+    return par;
+}
 bool match_at(const Selector& s, int idx, const Node* e, int budget = 0) {
     if (!match_compound(s.parts[idx], e)) return false;
     if (idx == 0) return true;
     char comb = s.combs[idx - 1];
-    const Node* par = e->parent;
+    const Node* par = selector_parent(e);
     if (comb == '>') return par && par->type == Node::T::Element && match_at(s, idx - 1, par);
     if (comb == ' ') {
-        for (const Node* p = par; p && p->type == Node::T::Element; p = p->parent)
+        for (const Node* p = par; p && p->type == Node::T::Element; p = selector_parent(p))
             if (match_at(s, idx - 1, p)) return true;
         return false;
     }
+    par = e->parent;  // siblings are those of the real tree
     if (!par) return false;
     if (comb == '+') {
         const Node* prev = nullptr;
@@ -1687,6 +1734,9 @@ void hints(const Node* e, std::vector<Decl>& out) {
         }
 }
 
+}  // namespace
+const Node* g_selectorScope = nullptr;
+namespace {
 uint64_t key(int lvl, uint32_t spec, uint32_t order) {
     return (uint64_t(lvl) << 56) | (uint64_t(spec & 0x3FFFFFFF) << 24) | uint64_t(order & 0xFFFFFF);
 }
@@ -1701,14 +1751,14 @@ void StyleEngine::build(float vw) {
     uni_.clear();
     hasMedia_ = false;
     uint32_t order = 1;
-    for (auto& [sh, ua] : sheets_) {
+    for (auto& [sh, ua, scope] : sheets_) {
         for (auto& r : sh->rules) {
             ++order;
             if (r.media >= 0) {
                 hasMedia_ = true;
                 if (!media_match(sh->media[r.media], vw)) continue;
             }
-            all_.push_back({&r, order, ua});
+            all_.push_back({&r, order, ua, scope});
             uint32_t idx = (uint32_t)all_.size() - 1;
             const Compound& last = r.sel.parts.back();
             if (last.never) continue;
@@ -1741,8 +1791,10 @@ void StyleEngine::computeTree(Node* e, const Style& parent) {
         for (auto& k : e->kids) k->style.reset();
         return;
     }
-    for (auto& k : e->kids)
-        if (k->type == Node::T::Element) computeTree(k.get(), *e->style);
+    if (e->shadow)  // children no slot takes are not rendered: FlatKids leaves them out, and they keep no style
+        for (auto& k : e->kids) k->style.reset();
+    for (Node* k : FlatKids(e))
+        if (k->type == Node::T::Element) computeTree(k, *e->style);
 }
 
 void StyleEngine::computeElem(Node* e, const Style& parent) {
@@ -1765,12 +1817,25 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
     std::vector<Decl> H;
     hints(e, H);
     for (auto& d : H) L.push_back({key(1, 0, 0), &d});
+    // A sheet of a shadow tree styles the elements of that tree, its host (:host) and the host's children
+    // (::slotted()); the document's sheets style everything else. User-agent rules apply everywhere.
+    const Node* own = g_shadowRoots ? shadow_root_of(e) : nullptr;
+    const Node* asHost = e->shadow.get();
+    const Node* asSlotted = e->parent && e->parent->shadow ? e->parent->shadow.get() : nullptr;
     for (uint32_t idx : cand_) {
         const IR& ir = all_[idx];
-        if (!match_at(ir.r->sel, (int)ir.r->sel.parts.size() - 1, e)) continue;
+        int role = ir.ua || ir.scope == own ? 0 : asHost && ir.scope == asHost ? 1 : asSlotted && ir.scope == asSlotted ? 2 : -1;
+        if (role < 0) continue;
+        g_selectorScope = ir.ua ? own : ir.scope;
+        g_scopeRole = role;
+        bool hit = match_at(ir.r->sel, (int)ir.r->sel.parts.size() - 1, e);
+        g_selectorScope = nullptr;
+        g_scopeRole = 0;
+        if (!hit) continue;
         for (const Decl& d : *ir.r->decls) {
             int lvl = d.important ? (ir.ua ? 5 : 3) : (ir.ua ? 0 : 1);
-            L.push_back({key(lvl, ir.r->sel.spec, ir.order), &d});
+            // rules that reach out of a shadow tree give way to the outer tree's own rules for the element (CSS Scoping 3.4)
+            L.push_back({key(lvl, role ? 0 : ir.r->sel.spec, role ? 0 : ir.order), &d});
         }
     }
     std::vector<Decl> IL;

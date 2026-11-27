@@ -388,12 +388,10 @@ Object.defineProperty(Document.prototype, 'implementation', { get: function () {
 Object.defineProperty(Document.prototype, 'styleSheets', { get: function () { return []; }, configurable: true });
 Object.defineProperty(Document.prototype, 'fonts', { get: function () { return { ready: Promise.resolve(), status: 'loaded', check: function () { return true; }, load: function () { return Promise.resolve([]); }, addEventListener: function () {}, removeEventListener: function () {} }; }, configurable: true });
 Object.defineProperty(Document.prototype, 'scrollingElement', { get: function () { return document.documentElement; }, configurable: true });
-HTMLElement.prototype.attachShadow = undefined;
 HTMLElement.prototype.animate = function () { return { cancel: function () {}, finish: function () {}, play: function () {}, pause: function () {}, finished: Promise.resolve(), addEventListener: function () {}, removeEventListener: function () {} }; };
 HTMLElement.prototype.getAnimations = function () { return []; };
 HTMLElement.prototype.setPointerCapture = HTMLElement.prototype.releasePointerCapture = HTMLElement.prototype.scrollTo = HTMLElement.prototype.scroll = HTMLElement.prototype.scrollBy = HTMLElement.prototype.requestFullscreen = function () {};
 Object.defineProperty(HTMLElement.prototype, 'isContentEditable', { get: function () { return false; }, configurable: true });
-Object.defineProperty(HTMLElement.prototype, 'shadowRoot', { get: function () { return null; }, configurable: true });
 )JS"
 R"JS(
 function prop(ctor, name, get, set) { Object.defineProperty(ctor.prototype, name, { get: get, set: set, configurable: true, enumerable: true }); }
@@ -489,7 +487,7 @@ named('Navigator', navigator); named('Location', location); named('History', his
 var windowProto = Object.create(EventTarget.prototype);
 Object.setPrototypeOf(G, windowProto);
 named('Window').prototype = windowProto;
-['Range', 'Selection', 'NamedNodeMap', 'Attr', 'ShadowRoot', 'DocumentType', 'ProcessingInstruction', 'CDATASection', 'XMLDocument', 'MediaQueryList', 'StyleSheet', 'CSSStyleSheet',
+['Range', 'Selection', 'NamedNodeMap', 'Attr', 'DocumentType', 'ProcessingInstruction', 'CDATASection', 'XMLDocument', 'MediaQueryList', 'StyleSheet', 'CSSStyleSheet',
  'CSSRule', 'CSSRuleList', 'StyleSheetList', 'MutationRecord', 'DOMRectList', 'DataTransfer', 'FileList', 'ValidityState', 'Touch', 'TextMetrics', 'ImageData',
  'CanvasRenderingContext2D', 'MediaError', 'TimeRanges', 'HTMLAllCollection', 'DOMImplementation', 'DOMStringMap', 'NodeIterator', 'Plugin', 'MimeType', 'PluginArray', 'MimeTypeArray'].forEach(function (n) { named(n); });
 class DOMRect {
@@ -691,6 +689,8 @@ G.reportError = function (e) { reportError(e); };
 R"JS(
 // ---- custom elements (HTML 4.13). The engine says which elements are custom and notes when they enter or leave
 // the document or have an attribute changed; the registry, the upgrades and the callbacks are here.
+var shadowOf = G.__shadowOf;  // shadowOf.call(element): its shadow root, open or closed
+delete G.__shadowOf;
 var ceHook = G.__ceHook, ceState = G.__ceState, isConstructor = G.__isConstructor;  // ceState(element[, state]): 0 not custom (yet), 1 custom, 2 failed
 delete G.__ceHook; delete G.__ceState; delete G.__isConstructor;
 var reflectApply = Reflect.apply, reflectConstruct = Reflect.construct, setPrototypeOf = Object.setPrototypeOf;
@@ -761,6 +761,25 @@ function react(kind, el, name, oldValue, newValue) {
     else if (def.attributeChanged && def.observed.has(name)) reflectApply(def.attributeChanged, el, [name, oldValue, newValue, null]);
   } catch (e) { reportError(e); }
 }
+// Upgrades what was waiting for a definition, in tree order, shadow trees included (name: only elements of that name)
+function upgradeAll(root, name) {
+  var all = root.querySelectorAll('*');
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i], shadow = reflectApply(shadowOf, el, []);
+    if ((name === undefined || el.localName === name) && ceState(el) === 0) react(3, el);
+    if (shadow) upgradeAll(shadow, name);
+  }
+}
+// attachShadow: the engine's refusals become DOMExceptions, and a custom element may have opted out of shadow trees
+var nativeAttachShadow = Element.prototype.attachShadow;
+Element.prototype.attachShadow = function attachShadow(init) {
+  var def = definitionOf.get(this);
+  if (def && def.noShadow) throw new DOMException('This custom element does not take a shadow root', 'NotSupportedError');
+  try { return reflectApply(nativeAttachShadow, this, [init]); } catch (e) {
+    var named = e && !(e instanceof TypeError) && /^(\w+Error): (.*)$/.exec(e.message);
+    throw named ? new DOMException(named[2], named[1]) : e;
+  }
+};
 function CustomElementRegistry() { throw new TypeError('Illegal constructor'); }
 CustomElementRegistry.prototype = {
   constructor: CustomElementRegistry,
@@ -792,8 +811,7 @@ CustomElementRegistry.prototype = {
     definitions.set(name, def);
     byConstructor.set(ctor, def);
     ceHook(react);  // from here on the engine notes what happens to custom elements
-    var waiting = document.querySelectorAll(name);  // the elements already in the document, in document order
-    for (var i = 0; i < waiting.length; i++) react(3, waiting[i]);
+    upgradeAll(document, name);
     var promised = waitingForName.get(name);
     if (promised) { waitingForName.delete(name); promised.resolve(ctor); }
   },
@@ -813,8 +831,7 @@ CustomElementRegistry.prototype = {
   },
   upgrade: function upgrade(root) {
     if (root.nodeType === 1) react(3, root);
-    var all = root.querySelectorAll('*');
-    for (var i = 0; i < all.length; i++) if (ceState(all[i]) === 0) react(3, all[i]);
+    upgradeAll(root);
   }
 };
 Object.defineProperty(G, 'CustomElementRegistry', { value: CustomElementRegistry, writable: true, configurable: true });

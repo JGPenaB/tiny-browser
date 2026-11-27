@@ -180,12 +180,12 @@ bool replacedLike(const Node* n) {
 
 bool containsBlock(const Node* n, int depth = 0) {
     if (depth > 48) return false;
-    for (auto& k : n->kids) {
+    for (Node* k : FlatKids(n)) {
         if (k->type != Node::T::Element || !k->style) continue;
         Display d = k->style->display;
         if (d == Display::None || isAbs(k->style.get())) continue;
         if (blockLevel(d)) return true;
-        if (d == Display::Inline && containsBlock(k.get(), depth + 1)) return true;
+        if (d == Display::Inline && containsBlock(k, depth + 1)) return true;
     }
     return false;
 }
@@ -242,16 +242,14 @@ void addCell(Ctx& c, Box& row, Node* cc, Box* cb) {
 
 void collectRows(Ctx& c, Box& t, Node* n, Box* cb, int depth = 0) {
     Box* anonRow = nullptr;
-    for (auto& k : n->kids) {
-        Node* e = k.get();
+    for (Node* e : FlatKids(n)) {
         if (e->type != Node::T::Element || !e->style) continue;
         Display d = e->style->display;
         if (d == Display::None || e->name == "caption" || isAbs(e->style.get())) continue;
         if (d == Display::Row) {
             anonRow = nullptr;
             auto r = mk(BK::Row, e);
-            for (auto& ck : e->kids) {
-                Node* cc = ck.get();
+            for (Node* cc : FlatKids(e)) {
                 if (cc->type != Node::T::Element || !cc->style || cc->style->display == Display::None) continue;
                 addCell(c, *r, cc, cb);
             }
@@ -277,8 +275,7 @@ void flexKids(Ctx& c, Box& box, Node* e, Box* cb) {
         if (!run.empty() && meaningfulRun(run, false)) box.kids.push_back(anonFor(box, e, std::move(run), cb));
         run.clear();
     };
-    for (auto& k : e->kids) {
-        Node* n = k.get();
+    for (Node* n : FlatKids(e)) {
         if (n->type == Node::T::Text) {
             run.push_back(n);
             continue;
@@ -334,8 +331,7 @@ void flow(Ctx& c, Box& box, Node* e, Box* cb) {
         if (!run.empty() && meaningfulRun(run, pre)) box.kids.push_back(anonFor(box, e, std::move(run), cb));
         run.clear();
     };
-    for (auto& k : e->kids) {
-        Node* n = k.get();
+    for (Node* n : FlatKids(e)) {
         if (n->type == Node::T::Text) {
             run.push_back(n);
             continue;
@@ -652,7 +648,7 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
         b.items.push_back(std::move(gi));
     };
     gap(3);
-    for (auto& k : n->kids) walk(c, b, k.get(), s, nlink, n, nbg);
+    for (Node* k : FlatKids(n)) walk(c, b, k, s, nlink, n, nbg);
     gap(1);
 }
 
@@ -1769,6 +1765,7 @@ LayoutOut layout_document(const LayoutInput& in) {
         stack.pop_back();
         n->hasBox = false;
         for (auto& k : n->kids) stack.push_back(k.get());
+        if (n->shadow) stack.push_back(n->shadow.get());
     }
     Ctx c{in, out};
     Node* html = in.doc->html;
