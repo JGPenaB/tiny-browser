@@ -93,4 +93,12 @@ test("the v flag: sets with operations and strings (22.2.1)", function () {
   for (const src of ["[a&&&b]", "[a--b&&c]", "[ab--c]", "[(]", "[a-]", "[^\\q{ab}]", "[\\P{Emoji_Keycap_Sequence}]", "[a||b]", "[&&a]"]) throws(() => new RegExp(src, "v"), SyntaxError, src);
   throws(() => new RegExp("\\ ", "u"), SyntaxError); throws(() => new RegExp("\\-", "u"), SyntaxError); eq(/[\-]/u.test("-"), true);
 });
+test("lookbehind matches right to left (22.2.2.3)", function () {
+  eq(/(?<=(\d+)(\d+))$/.exec("1053").slice(1), ["1", "053"]);
+  eq(/(?<=([abc])\d+)x/.exec("a123x").slice(1), ["a"]);
+  eq(/(?<=\1(a))b/.exec("aab").slice(0), ["b", "a"]);
+  eq(/(?<=(?<a>\w){3})f/.exec("abcdef").groups.a, "c");
+  eq(["abcd".replace(/(?<=b)c/, "X"), "abcd".replace(/(?<!b)c/, "X"), /(?<=^ab)c/.test("abc"), /(?<=\$)\d+(\.\d*)?/.exec("cost $10.50")[0]], ["abXd", "abcd", true, "10.50"]);
+  eq([/(?<=\u{1F600})x/u.test("\u{1F600}x"), /(?<=a(?=b)b)c/.test("abc"), /(?<=(?<!x)a)b/.test("ab"), "a1b2".match(/(?<=[a-z])\d/g)], [true, true, true, ["1", "2"]]);
+});
 done();

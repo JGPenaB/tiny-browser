@@ -1005,6 +1005,7 @@ struct Compiler {
         }
     }
 
+    bool backward = false;  // inside a lookbehind: terms run in reverse order and each one reads the text leftwards
     void gen(RxNode* n) {
         switch (n->t) {
             case RxNode::Empty: break;
@@ -1014,11 +1015,14 @@ struct Compiler {
                 uint8_t op;
                 uint32_t x;
                 one(n, op, x);
-                emit(op, x);
+                emit(op, x, 0, 0, backward ? 1 : 0);
                 break;
             }
             case RxNode::Seq:
-                for (RxNode* k : n->kids) gen(k);
+                if (backward)
+                    for (size_t k = n->kids.size(); k-- > 0;) gen(n->kids[k]);
+                else
+                    for (RxNode* k : n->kids) gen(k);
                 break;
             case RxNode::Alt: {
                 std::vector<size_t> jumps;
@@ -1034,9 +1038,9 @@ struct Compiler {
                 break;
             }
             case RxNode::Group:
-                if (n->cap >= 0) emit(I_SAVE, n->cap * 2);
+                if (n->cap >= 0) emit(I_SAVE, n->cap * 2 + (backward ? 1 : 0));
                 gen(n->kids[0]);
-                if (n->cap >= 0) emit(I_SAVE, n->cap * 2 + 1);
+                if (n->cap >= 0) emit(I_SAVE, n->cap * 2 + (backward ? 0 : 1));
                 break;
             case RxNode::Bol: emit(I_BOL, n->multiline ? 1 : 0); break;
             case RxNode::Eol: emit(I_EOL, n->multiline ? 1 : 0); break;
@@ -1045,21 +1049,18 @@ struct Compiler {
             case RxNode::BackRef:
                 // by name, with several groups of that name: at most one of them took part, the others match nothing
                 if (n->caps.size() > 1) {
-                    for (int cap : n->caps) emit(I_BACKREF, (uint32_t)cap, 0, 0, n->icase ? 1 : 0);
+                    for (int cap : n->caps) emit(I_BACKREF, (uint32_t)cap, 0, 0, (uint8_t)((n->icase ? 1 : 0) | (backward ? 2 : 0)));
                 } else
-                    emit(I_BACKREF, (uint32_t)n->cap, 0, 0, n->icase ? 1 : 0);
+                    emit(I_BACKREF, (uint32_t)n->cap, 0, 0, (uint8_t)((n->icase ? 1 : 0) | (backward ? 2 : 0)));
                 break;
             case RxNode::Look: {
                 size_t at = emit(I_LOOK, 0, 0, 0, (uint8_t)((n->behind ? 1 : 0) | (n->negative ? 2 : 0)));
+                bool outer = backward;
+                backward = n->behind;
                 gen(n->kids[0]);
+                backward = outer;
                 emit(I_LOOK_END);
                 out.code[at].x = here();
-                if (n->behind) {
-                    uint64_t mn, mx;
-                    width(n->kids[0], mn, mx);
-                    out.code[at].y = (uint32_t)std::min<uint64_t>(mn, INF);
-                    out.code[at].z = (uint32_t)std::min<uint64_t>(mx, INF);
-                }
                 break;
             }
             case RxNode::Repeat: repeat(n); break;
@@ -1069,7 +1070,7 @@ struct Compiler {
         RxNode* c = n->kids[0];
         uint32_t mn = n->min, mx = n->max;
         if (mx == 0) return;
-        if (single(c)) {
+        if (single(c) && !backward) {
             uint8_t op;
             uint32_t x;
             one(c, op, x);
@@ -1143,6 +1144,23 @@ struct Matcher {
         const CharClass& cc = P.classes[idx];
         return cp < 128 ? cc.ascii[cp] : classMatchSlow(cc, cp, cc.icase);
     }
+    // The same test on the character that ends at pos, for the instructions of a lookbehind.
+    bool oneBack(uint8_t op, uint32_t x, int pos, int& w) const {
+        if (pos <= 0) return false;
+        char16_t c = s[pos - 1];
+        uint32_t cp = c;
+        w = 1;
+        if (uni && isLow(c) && pos >= 2 && isHigh(s[pos - 2])) {
+            w = 2;
+            cp = 0x10000 + ((s[pos - 2] - 0xD800) << 10) + (c - 0xDC00);
+        }
+        switch (op) {
+            case I_CHAR: return cp == x;
+            case I_CHAR_I: return cp == x || upperOf(cp) == x;
+            case I_ANY: return x || !isLineEnd(cp);
+            default: return classHit(x, cp);
+        }
+    }
     // Tests one character with a single-character matcher (the operand of I_REP, or a plain instruction).
     bool one(uint8_t op, uint32_t x, int pos, int& w) const {
         if (pos >= len) return false;
@@ -1174,8 +1192,13 @@ struct Matcher {
                 case I_CHAR_I:
                 case I_ANY:
                 case I_CLASS:
-                    if (!one(in.op, in.x, pos, w)) goto fail;
-                    pos += w;
+                    if (in.flag & 1) {
+                        if (!oneBack(in.op, in.x, pos, w)) goto fail;
+                        pos -= w;
+                    } else {
+                        if (!one(in.op, in.x, pos, w)) goto fail;
+                        pos += w;
+                    }
                     ++pc;
                     continue;
                 case I_SPLIT:
@@ -1225,12 +1248,14 @@ struct Matcher {
                     int a = caps[in.x * 2], b = caps[in.x * 2 + 1];
                     if (a >= 0 && b >= a) {
                         int n = b - a;
-                        if (pos + n > len) goto fail;
+                        bool back = (in.flag & 2) != 0;
+                        if (back ? pos - n < 0 : pos + n > len) goto fail;
+                        int from = back ? pos - n : pos;
                         for (int k = 0; k < n; ++k) {
-                            char16_t p = s[a + k], q = s[pos + k];
-                            if (p != q && !(in.flag && upperOf(p) == upperOf(q))) goto fail;
+                            char16_t p = s[a + k], q = s[from + k];
+                            if (p != q && !((in.flag & 1) && upperOf(p) == upperOf(q))) goto fail;
                         }
-                        pos += n;
+                        pos = back ? pos - n : pos + n;
                     }
                     ++pc;
                     continue;
@@ -1263,13 +1288,8 @@ struct Matcher {
                     size_t mark = stack.size();
                     bool ok = false;
                     int ignored = 0;
-                    if (!behind) {
-                        ok = run(pc + 1, pos, mark, -1, ignored);
-                    } else {  // try every start from which the body could end exactly here
-                        int hi = pos - (int)std::min<uint32_t>(in.y, 0x7FFFFFFF);
-                        int lo = in.z >= (uint32_t)pos ? 0 : pos - (int)in.z;
-                        for (int p = hi; p >= lo && !ok && !aborted; --p) ok = run(pc + 1, p, mark, pos, ignored);
-                    }
+                    (void)behind;  // the body's instructions carry the direction themselves
+                    ok = run(pc + 1, pos, mark, -1, ignored);
                     if (aborted) goto fail;
                     if (negative) {
                         if (ok) {
