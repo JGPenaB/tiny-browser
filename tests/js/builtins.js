@@ -108,4 +108,16 @@ test("Date", function () {
   eq(new Date(new Date(5)).getTime(), 5); eq(new Date(2024, 0).getDate(), 1); eq(new Date(-1).toISOString(), "1969-12-31T23:59:59.999Z"); eq(new Date(Date.UTC(1900, 0, 1)).getUTCDay(), 1);
   eq(new Date(local.toString()).getTime(), local.getTime(), "toString round trip"); eq(new Date(local.toISOString()).getTime(), local.getTime());
 });
+test("Temporal (a global built on first use)", function () {
+  ok("Temporal" in globalThis); eq(Object.keys(globalThis).indexOf("Temporal"), -1);
+  const desc = Object.getOwnPropertyDescriptor(globalThis, "Temporal");
+  eq([typeof desc.value, desc.writable, desc.enumerable, desc.configurable], ["object", true, false, true]);
+  eq(Object.prototype.toString.call(Temporal), "[object Temporal]"); eq(Object.getPrototypeOf(Temporal.PlainDate), Function.prototype);
+  eq(Temporal.PlainDate.from("2024-01-31").add({ months: 1 }).toString(), "2024-02-29");
+  eq(Temporal.PlainDateTime.from("2020-01-31T12:30").until("2021-03-01", { largestUnit: "months" }).toString(), "P12M28DT11H30M");
+  eq(Temporal.Duration.from({ hours: 25 }).round({ largestUnit: "day" }).toString(), "P1DT1H");
+  eq(Temporal.Instant.fromEpochMilliseconds(0).toString(), "1970-01-01T00:00:00Z");
+  eq(Temporal.ZonedDateTime.from("2020-01-01T10:00+01:00[+01:00]").withTimeZone("UTC").toString(), "2020-01-01T09:00:00+00:00[UTC]");
+  throws(() => Temporal.ZonedDateTime.from("2020-01-01T10:00[Europe/Paris]"), RangeError, "zones with daylight saving time are not known yet");
+});
 done();

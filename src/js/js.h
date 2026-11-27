@@ -162,7 +162,9 @@ struct PropKey {
     bool operator==(PropKey o) const { return v == o.v; }
 };
 
-enum : uint8_t { PF_W = 1, PF_E = 2, PF_C = 4, PF_ACC = 8, PF_ALL = 7 };
+// PF_LAZY: a data property whose value is made the first time it is used. It holds a native function that makes it;
+// Vm::materialize swaps the result in. Only the engine sets it, for large built-ins written in JavaScript.
+enum : uint8_t { PF_W = 1, PF_E = 2, PF_C = 4, PF_ACC = 8, PF_ALL = 7, PF_LAZY = 16 };
 // Arrays: OF_SLOWIDX some elements are kept as ordinary properties (own attributes, accessors, or far past the
 // dense part), OF_LENRO length is not writable, OF_SEALED the dense elements are not configurable.
 enum : uint8_t { OF_NOEXT = 1, OF_FROZEN = 2, OF_CTOR = 4, OF_NO_NAME = 8, OF_NO_LENGTH = 16, OF_SLOWIDX = 32, OF_LENRO = 64, OF_SEALED = 128 };  // the last two: a function whose name/length was deleted
@@ -583,6 +585,7 @@ struct RealmFields {
     Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
     Value moduleHost;  // the module loader's `host` object: the embedder's resolve and fetch functions live on it
+    Value temporalNatives;  // once Temporal is built: the object its JavaScript filled in (prelude.cpp temporalNatives)
     struct PropWatch {  // one property of RegExp.prototype as the engine made it (regexp.cpp)
         PropKey key;
         uint64_t value;
@@ -736,6 +739,10 @@ public:
     JSObject* protoOf(Value v);
     void def(JSObject* o, const char* name, Value v, uint8_t flags = PF_W | PF_C);
     JSNative* defFn(JSObject* o, const char* name, NativeFn fn, int length, uint8_t flags = PF_W | PF_C);
+    // A writable, configurable, non-enumerable data property whose value `make` returns the first time it is read.
+    void defLazy(JSObject* o, const char* name, NativeFn make);
+    // Makes the value of a lazy property now. Does nothing for any other property.
+    void materialize(JSObject* o, PropKey k);
     void defGetter(JSObject* o, const char* name, NativeFn getter, NativeFn setter = nullptr);
     uint32_t lengthOf(Value v);
     bool instanceOf(Value v, Value ctor);

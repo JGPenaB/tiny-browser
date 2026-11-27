@@ -503,7 +503,7 @@ static void markRealm(Gc& g, RealmFields& r) {
     for (JSObject* p : r.intrinsicProtos) g.mark(p);
     for (Value v : r.typedCtors) g.mark(v);
     for (Value v : {r.arrayBufferCtor, r.sharedBufferCtor, r.throwTypeError, r.arrayCtorValue, r.arraySpeciesGetter, r.arrayValuesFn, r.arrayIterNextFn,
-                    r.evalFn, r.importHook, r.moduleHost, r.regexpLastInput, r.regexpCtor, r.promiseCtor, r.suppressedErrorCtor})
+                    r.evalFn, r.importHook, r.moduleHost, r.temporalNatives, r.regexpLastInput, r.regexpCtor, r.promiseCtor, r.suppressedErrorCtor})
         g.mark(v);
 }
 
@@ -1116,6 +1116,26 @@ static bool virtualProp(Vm& vm, JSObject* o, PropKey k, Prop& out) {
     }
 }
 
+void Vm::defLazy(JSObject* o, const char* name, NativeFn make) {
+    JSNative* maker = newNative(make, name, 0);
+    o->add(PropKey::of(atom(name)), V(maker), PF_W | PF_C | PF_LAZY);
+}
+void Vm::materialize(JSObject* o, PropKey k) {
+    Prop* p = o->find(k);
+    if (!p || !(p->flags & PF_LAZY)) return;
+    Value maker = p->val;
+    p->flags &= (uint8_t)~PF_LAZY;
+    p->val = Value::undef();
+    std::vector<Value> held{maker};
+    RootScope keep(*this, held);
+    Value made;
+    {
+        RealmScope in(*this, ((JSNative*)maker.asObject())->realm);  // made in the realm the property belongs to
+        made = call(maker, Value::undef(), nullptr, 0);
+    }
+    if (Prop* q = o->find(k); q && q->val.isUndef() && !(q->flags & PF_ACC)) q->val = made;
+}
+
 bool Vm::getOwn(JSObject* o, PropKey k, Prop& out) {
     if (o->cls == Cls::Proxy) {
         PropDesc d;
@@ -1131,6 +1151,11 @@ bool Vm::getOwn(JSObject* o, PropKey k, Prop& out) {
         return true;
     }
     if (Prop* p = o->find(k)) {
+        if (p->flags & PF_LAZY) {
+            materialize(o, k);
+            p = o->find(k);
+            if (!p) return virtualProp(*this, o, k, out);
+        }
         out = *p;
         return true;
     }
@@ -1152,6 +1177,10 @@ Value Vm::getObj(JSObject* o, PropKey k, Value receiver) {
             if (!(cur->oflags & OF_SLOWIDX)) continue;
         }
         if (Prop* p = cur->find(k)) {
+            if (p->flags & PF_LAZY) {
+                materialize(cur, k);
+                if (!(p = cur->find(k))) continue;
+            }
             if (p->flags & PF_ACC) {
                 Accessor* acc = (Accessor*)p->val.asCell();
                 if (acc->get.isUndef()) return Value::undef();
@@ -1220,6 +1249,11 @@ void Vm::pinArgumentsLength(JSObject* o) {
 
 bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
     if (o->cls == Cls::Proxy) return proxySet(o, k, v, receiver);
+    // a lazy property is writable, so a write to the object itself replaces it: no need to make it first
+    if (Prop* lazy = o->find(k); lazy && (lazy->flags & PF_LAZY)) {
+        if (receiver.isObject() && receiver.asObject() == o) { lazy->flags &= (uint8_t)~PF_LAZY; lazy->val = Value::undef(); }
+        else materialize(o, k);
+    }
     if (o->cls == Cls::Host && !k.isSymbol()) {
         JSHost* h = (JSHost*)o;
         if (h->hooks && h->hooks->set && h->hooks->set(*this, o, k, v)) return true;
@@ -1454,6 +1488,7 @@ bool Vm::has(JSObject* o, PropKey k) {
 }
 bool Vm::del(JSObject* o, PropKey k) {
     if (o->cls == Cls::Proxy) return proxyDelete(o, k);
+    if (Prop* lazy = o->find(k); lazy && (lazy->flags & PF_LAZY)) { lazy->flags &= (uint8_t)~PF_LAZY; lazy->val = Value::undef(); }
     if (mappedArg(o, k)) {  // an arguments element lets go of its parameter once it is deleted (10.4.4.5)
         JSArguments* ao = (JSArguments*)o;
         int32_t slot = ao->mapSlots[k.asIndex()];
@@ -2581,7 +2616,7 @@ Value Vm::runFrames(size_t base) {
                         if (Prop* p = globalLex->find(k)) {
                             if (p->val.isEmpty()) throwError(Err::ReferenceError, "Cannot access '%s' before initialization", NAMEK(i.bx));
                             v = p->val;
-                        } else if (Prop* p2 = global->find(k); p2 && !(p2->flags & PF_ACC)) {
+                        } else if (Prop* p2 = global->find(k); p2 && !(p2->flags & (PF_ACC | PF_LAZY))) {
                             v = p2->val;
                         } else if (has(global, k)) {
                             v = getObj(global, k, Value::cell(global));

@@ -2,6 +2,7 @@
 // they need.
 #include "builtins.h"
 #include "builtins_js.h"
+#include "temporal_js.h"
 
 namespace tb::js {
 
@@ -64,6 +65,34 @@ JSFN(arrayCreate) {
     return V(a);
 }
 
+JSFN(toPrimitiveString) { return ci.vm.toPrimitive(ci.arg(0), 2); }
+JSFN(toBigIntNative) { return V(ci.vm.toBigInt(ci.arg(0))); }
+
+// Temporal is large and most scripts never use it, so it is compiled the first time something of it is used: the
+// global, or Date.prototype.toTemporalInstant. Its JavaScript fills in the natives object (temporal, toTemporalInstant).
+JSObject* temporalNatives(Vm& vm) {
+    if (vm.temporalNatives.isObject()) return vm.temporalNatives.asObject();
+    JSObject* natives = vm.newObject();
+    vm.temporalNatives = V(natives);
+    vm.defFn(natives, "protoFor", protoFor, 2);
+    vm.defFn(natives, "toPrimitiveString", toPrimitiveString, 1);
+    vm.defFn(natives, "toBigInt", toBigIntNative, 1);
+    static const std::u16string* source = [] {
+        std::string joined;
+        for (const char* part : kTemporalJsParts) joined += part;
+        return new std::u16string(utf8to16(joined));
+    }();
+    auto src = std::shared_ptr<const std::u16string>(source, [](const std::u16string*) {});
+    FuncProto* p = compileScript(vm, src, kBuiltinFile, false, nullptr);
+    JSFunction* outer = vm.makeClosure(p, nullptr, nullptr);
+    Value make = vm.callFunction(outer, V(vm.global), nullptr, 0, Value::undef(), false);
+    Value arg = V(natives);
+    vm.call(make, Value::undef(), &arg, 1);
+    return natives;
+}
+JSFN(makeTemporal) { return ci.vm.get(V(temporalNatives(ci.vm)), "temporal"); }
+JSFN(makeToTemporalInstant) { return ci.vm.get(V(temporalNatives(ci.vm)), "toTemporalInstant"); }
+
 }  // namespace
 
 void setupJsBuiltins(Vm& vm) {
@@ -94,6 +123,8 @@ void setupJsBuiltins(Vm& vm) {
     Value make = vm.callFunction(outer, V(vm.global), nullptr, 0, Value::undef(), false);
     vm.call(make, Value::undef(), &keep, 1);
     regexpSnapshot(vm);
+    vm.defLazy(vm.global, "Temporal", makeTemporal);
+    vm.defLazy(vm.dateProto, "toTemporalInstant", makeToTemporalInstant);
 }
 
 }  // namespace tb::js

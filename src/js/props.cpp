@@ -245,6 +245,7 @@ bool Vm::getOwnDesc(JSObject* o, PropKey k, PropDesc& d) {
 // [[DefineOwnProperty]]: false when the object refuses the change.
 bool Vm::defineOwnDesc(JSObject* o, PropKey k, const PropDesc& d) {
     if (o->cls == Cls::Proxy) return proxyDefineOwn(o, k, d);
+    if (Prop* lazy = o->find(k); lazy && (lazy->flags & PF_LAZY)) materialize(o, k);
     if (o->cls == Cls::Host && !k.isSymbol() && ((JSHost*)o)->hostKind == kModuleHostKind) {  // 10.4.6.6: nothing about an export can change
         JSHost* h = (JSHost*)o;
         Value current;

@@ -74,7 +74,8 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
    devtools Console. Behavior follows the ECMAScript specification (ECMA-262) and is checked against the test262
-   conformance suite: see "Conformance" below. Still open: Temporal, Intl.
+   conformance suite: see "Conformance" below. Temporal is there too (ISO 8601 calendar; time zones UTC, fixed offsets
+   and Etc/GMT, so far). Still open: Intl, and named time zones with daylight saving time.
 4. **Milestone 4 - DOM + Web APIs (in progress; required by Google results, YouTube and Reddit):** done so far: DOM
    bindings and events, classic and module scripts (import maps, `defer`, `nomodule`), timers + event loop, `fetch`/XHR with
    CORS, storage, cookies, MutationObserver, template contents, custom elements, shadow DOM (slots, scoped styles with
@@ -99,8 +100,8 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 `python tests/run_test262.py [path filter ...] [--jobs N] [--save name]` runs the ECMAScript conformance suite (test262,
 cloned into the git-ignored `third_party/test262`; the script's header has the command) and writes the failures to
-`out/test262-<name>.txt`. Fifteenth full run, 2026-11-27: 43,898 of 48,803 tests pass (89.9%). Without the 4,616 tests
-for Temporal, a proposal that is not part of ECMA-262 yet, that is 99.3%. Every test of ECMA-262 itself passes.
+`out/test262-<name>.txt`. Sixteenth full run, 2026-11-28: 48,514 of 48,803 tests pass (99.4%), Temporal's 4,616
+included. Every test of ECMA-262 itself passes.
 
 What the engine covers: the whole core language with its early errors (classes with private members and static
 blocks, generators and async generators, destructuring, modules, direct and indirect `eval`, `with`, Annex B, proper
@@ -109,9 +110,15 @@ Atomics (with waiting and notifying between agents: threads that have an engine 
 iterator helpers (including `concat`, `zip`, `chunks`, `windows`), Set methods, `Array.fromAsync`,
 `Error.prototype.stack`, `JSON.rawJSON`, `Math.sumPrecise`, DisposableStack, mapped `arguments` objects, import
 attributes with JSON modules, and several realms in one engine (each with its own global object and built-ins, which
-is what frames in a page will use). Of the proposals: ShadowRealm, and importing bytes.
+is what frames in a page will use). Of the proposals: Temporal, ShadowRealm, and importing bytes.
 
-What still fails are proposals only, largest first: Temporal (4,616), `import defer` and source-phase imports (about
+Temporal is written in JavaScript (`src/js/temporal/*.js`, following the proposal's algorithms step by step) and is
+compiled the first time a script reads `Temporal` or calls `Date.prototype.toTemporalInstant`, so pages that never use
+it pay nothing. After changing those files, run `python tools/gen_temporal.py` to regenerate `src/js/temporal_js.h`.
+Named time zones other than UTC and Etc/GMT are refused with a RangeError until the engine has time zone data; the
+`intl402` Temporal tests are not run yet.
+
+What still fails are proposals only, largest first: `import defer` and source-phase imports (about
 260), decorators (22).
 
 The Unicode tables are generated: `tools/gen_unicode.py` and `tools/gen_casing.py` read the test262 clone, and
