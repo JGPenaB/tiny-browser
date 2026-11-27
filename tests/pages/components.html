@@ -93,6 +93,9 @@
   made1.setAttribute('name', 'C'); made1.setAttribute('name', 'C2'); made1.setAttribute('other', 'x'); made1.removeAttribute('name'); made1.toggleAttribute('hidden');
   made1.className = 'k'; made1.classList.add('m'); made1.dataset.x = '1'; delete made1.dataset.x; made1.style.color = 'red'; made1.id = 'not-watched';
   eq('custom: attribute changes', taken(), 'name:null>C | name:C>C2 | name:C2>null | hidden:null> | class:null>k | class:k>k m | data-x:null>1 | data-x:1>null | style:null>color: red;');
+  var styled = new Greet(); taken();
+  styled.style.color = 'red'; var afterFirst = taken(); styled.style.opacity = '0.5';
+  eq('custom: a style assignment is reported before the next statement runs', afterFirst + ' / ' + taken(), 'style:null>color: red; / style:color: red;>color: red; opacity: 0.5;');
   made1.setAttribute('name', 'C'); taken();
   var slot = document.getElementById('slot');
   slot.appendChild(made1);

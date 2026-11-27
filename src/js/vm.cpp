@@ -325,7 +325,19 @@ bool ValueEq::operator()(Value a, Value b) const {
 
 // ---------------------------------------------------------------------------- Vm: setup and allocation
 static const size_t kMaxFrames = 12000;
-static const int kMaxDepth = 1800;
+// Recursion through native code is bounded by the thread's stack, not by a count: what is left of it is measured,
+// and the last megabyte is kept for whatever the code that was called still needs.
+static const size_t kStackReserve = 1024 * 1024;
+void Vm::checkStack() {
+    static thread_local uintptr_t floor = 0;
+    if (!floor) {
+        ULONG_PTR lo = 0, hi = 0;
+        GetCurrentThreadStackLimits(&lo, &hi);
+        floor = (uintptr_t)lo + kStackReserve;
+    }
+    char here;
+    if ((uintptr_t)&here < floor) throwError(Err::RangeError, "Maximum call stack size exceeded");
+}
 
 Vm::Vm() {
     stack.resize(1 << 19);
@@ -1616,10 +1628,8 @@ Value Vm::invoke(Value target, const char* method, const Value* args, int argc) 
 struct DepthGuard {
     Vm& vm;
     explicit DepthGuard(Vm& v) : vm(v) {
-        if (++vm.depth > kMaxDepth) {
-            --vm.depth;
-            vm.throwError(Err::RangeError, "Maximum call stack size exceeded");
-        }
+        vm.checkStack();
+        ++vm.depth;
     }
     ~DepthGuard() { --vm.depth; }
 };

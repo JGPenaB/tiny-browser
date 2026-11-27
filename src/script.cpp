@@ -1822,6 +1822,7 @@ bool styleHookGet(Vm& vm, JSObject* o, PropKey k, Value& out) {
 bool styleHookSet(Vm& vm, JSObject* o, PropKey k, Value v) {
     if (ownsKey(o, k)) return false;
     setStyleProp(I(vm), (Node*)((JSHost*)o)->ptr, cssName(k.str()->s), v.isNullish() ? "" : str8(vm, v));
+    I(vm).flushReactions();  // an assignment is no call of a native function: the reactions it caused run here
     return true;
 }
 const HostHooks kStyleHooks{styleHookGet, styleHookSet, nullptr, nullptr};

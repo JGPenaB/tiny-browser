@@ -834,6 +834,7 @@ public:
     Value* stackTop = nullptr;
     Value* stackEnd = nullptr;
     int depth = 0;             // C++ re-entrancy depth (native -> JS -> native ...)
+    void checkStack();         // RangeError when the thread's stack is nearly used up: every recursion in native code asks
     bool yielded = false;      // runFrames returned because of yield/await
     bool resumeThrow = false;  // resume a generator by throwing `pending` at the yield
 

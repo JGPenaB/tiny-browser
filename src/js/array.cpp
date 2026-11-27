@@ -608,17 +608,6 @@ Value fold(CallInfo& ci, bool right) {
 JSFN(reduce) { return fold(ci, false); }
 JSFN(reduceRight) { return fold(ci, true); }
 
-struct Deep {  // nested arrays can be arbitrarily deep; the native stack is not
-    Vm& vm;
-    explicit Deep(Vm& v) : vm(v) {
-        if (++vm.depth > 150) {
-            --vm.depth;
-            vm.throwError(Err::RangeError, "Maximum call stack size exceeded");
-        }
-    }
-    ~Deep() { --vm.depth; }
-};
-
 // FlattenIntoArray (23.1.3.13.1)
 double flatten(Vm& vm, JSObject* target, Value source, double sourceLen, double start, double depth, Value mapper, Value thisArg) {
     Arr s(vm, source, false);
@@ -632,7 +621,7 @@ double flatten(Vm& vm, JSObject* target, Value source, double sourceLen, double 
         }
         if (depth > 0 && vm.isArray(element)) {
             Arr inner(vm, element);
-            Deep guard(vm);
+            vm.checkStack();  // nested arrays can be arbitrarily deep; the native stack is not
             targetIndex = flatten(vm, target, element, inner.len, targetIndex, depth - 1, Value::undef(), Value::undef());
         } else {
             if (targetIndex >= kMaxLength) vm.throwError(Err::TypeError, "The result would be longer than the maximum array length");

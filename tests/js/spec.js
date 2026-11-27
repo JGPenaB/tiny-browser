@@ -312,6 +312,17 @@ test("references are made before values are read: super, patterns, object rest; 
   eq([eval("1; try { 2 } finally { 3 }"), eval("1; do { try { 2; break; } finally { 3 } } while (false);")], [2, 2]);
   for (using of = null; ;) break;
 });
+test("deep calls through native code end in a RangeError, and not early", function () {
+  function viaMap(n) { try { return [1].map(function () { return viaMap(n + 1); })[0]; } catch (e) { if (!(e instanceof RangeError)) throw e; return n; } }
+  eq(viaMap(0) > 3000, true);
+  function viaProxy(n) { const p = new Proxy({}, { get() { return viaProxy(n + 1); } }); try { return p.x; } catch (e) { return n; } }
+  eq(viaProxy(0) > 3000, true);
+  // flat() counts its own nesting, not how deep its caller already is
+  function flatDeep(n) { return n === 0 ? [[1, [2]], [3]].flat(Infinity).join() : [0].map(function () { return flatDeep(n - 1); })[0]; }
+  eq(flatDeep(300), "1,2,3");
+  const nest = []; for (let i = 0, cur = nest; i < 200000; i++) { const inner = []; cur.push(inner); cur = inner; }
+  throws(() => nest.flat(Infinity), RangeError);
+});
 test("realms: each has its own global object and intrinsics (9.3)", function () {
   const other = __createRealm(), OF = other.Function;
   eq([other !== globalThis, other.Object !== Object, other.Array.prototype !== Array.prototype], [true, true, true]);
