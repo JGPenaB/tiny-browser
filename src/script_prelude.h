@@ -897,7 +897,119 @@ Document.prototype.createElement = function createElement(name) {
   }
 };
 
-var exported = { CSSStyleSheet: CSSStyleSheet, DOMException: DOMException, EventTarget: EventTarget, AbortController: AbortController, AbortSignal: AbortSignal, URL: URL, URLSearchParams: URLSearchParams,
+)JS"
+R"JS(
+// ---- IntersectionObserver and ResizeObserver. The browser has no rendering steps to hang them on yet, so both
+// look at their targets on a timer for as long as there is something to watch.
+var setIntervalOwn = G.setInterval, clearIntervalOwn = G.clearInterval;
+var watchers = new Set(), watchTimer = 0;
+function checkWatchers() {
+  watchers.forEach(function (w) { try { w._check(); } catch (e) { reportError(e); } });
+}
+function watch(w) {
+  watchers.add(w);
+  if (!watchTimer) watchTimer = setIntervalOwn(checkWatchers, 100);
+}
+function unwatch(w) {
+  if (w._targets.size) return;
+  watchers.delete(w);
+  if (!watchers.size) { clearIntervalOwn(watchTimer); watchTimer = 0; }
+}
+function rectOf(left, top, width, height) {
+  return { x: left, y: top, left: left, top: top, width: width, height: height, right: left + width, bottom: top + height,
+    toJSON: function () { return { x: left, y: top, width: width, height: height, top: top, left: left, right: left + width, bottom: top + height }; } };
+}
+function hidden(object, name, value) { Object.defineProperty(object, name, { value: value, writable: true }); }
+function IntersectionObserverEntry() { throw new TypeError('Illegal constructor'); }
+function ResizeObserverEntry() { throw new TypeError('Illegal constructor'); }
+// rootMargin: one to four lengths in px or %, as in the CSS margin shorthand
+function marginsOf(text) {
+  var parts = String(text === undefined ? '0px' : text).trim().split(/\s+/);
+  if (parts.length > 4 || parts[0] === '') throw new SyntaxError('rootMargin takes one to four lengths');
+  var m = parts.map(function (p) {
+    var found = /^(-?(?:\d+\.?\d*|\.\d+))(px|%)$/.exec(p);
+    if (!found) throw new SyntaxError("rootMargin lengths are in pixels or percent, not '" + p + "'");
+    return { n: +found[1], percent: found[2] === '%' };
+  });
+  return [m[0], m[1] || m[0], m[2] || m[0], m[3] || m[1] || m[0]];
+}
+class IntersectionObserver {
+  constructor(callback, options) {
+    if (typeof callback !== 'function') throw new TypeError('IntersectionObserver needs a callback function');
+    options = options || {};
+    var margins = marginsOf(options.rootMargin);
+    var thresholds = (options.threshold === undefined ? [0] : [].concat(options.threshold)).map(Number);
+    thresholds.forEach(function (t) { if (!(t >= 0 && t <= 1)) throw new RangeError('A threshold must be between 0 and 1'); });
+    thresholds.sort(function (a, b) { return a - b; });
+    this.root = options.root || null;
+    this.rootMargin = margins.map(function (m) { return m.n + (m.percent ? '%' : 'px'); }).join(' ');
+    this.thresholds = thresholds;
+    hidden(this, '_callback', callback); hidden(this, '_margins', margins); hidden(this, '_targets', new Map()); hidden(this, '_queue', []);
+  }
+  observe(target) {
+    if (!(target instanceof Element)) throw new TypeError('IntersectionObserver.observe needs an element');
+    if (this._targets.has(target)) return;
+    this._targets.set(target, { index: -1, intersecting: false });
+    watch(this);
+  }
+  unobserve(target) { this._targets.delete(target); unwatch(this); }
+  disconnect() { this._targets.clear(); this._queue = []; unwatch(this); }
+  takeRecords() { var q = this._queue; this._queue = []; return q; }
+  // "Run the update intersection observations steps" (Intersection Observer 3.2.7) for this observer
+  _check() {
+    var self = this, m = this._margins, time = performance.now(), left = 0, top = 0, right = G.innerWidth, bottom = G.innerHeight;
+    if (this.root && this.root.nodeType === 1) { var rr = this.root.getBoundingClientRect(); left = rr.left; top = rr.top; right = rr.right; bottom = rr.bottom; }
+    var w = right - left, h = bottom - top;
+    top -= m[0].percent ? h * m[0].n / 100 : m[0].n; right += m[1].percent ? w * m[1].n / 100 : m[1].n;
+    bottom += m[2].percent ? h * m[2].n / 100 : m[2].n; left -= m[3].percent ? w * m[3].n / 100 : m[3].n;
+    this._targets.forEach(function (state, target) {
+      var r = target.getBoundingClientRect(), rendered = target.isConnected && target.getClientRects().length > 0;
+      var x0 = Math.max(r.left, left), y0 = Math.max(r.top, top), x1 = Math.min(r.right, right), y1 = Math.min(r.bottom, bottom);
+      var intersecting = rendered && x1 >= x0 && y1 >= y0;  // edge-adjacent counts
+      var area = r.width * r.height, ratio = !intersecting ? 0 : area > 0 ? Math.min(1, (x1 - x0) * (y1 - y0) / area) : 1;
+      var index = 0;
+      while (index < self.thresholds.length && self.thresholds[index] <= ratio) index++;
+      if (index === state.index && intersecting === state.intersecting) return;
+      state.index = index; state.intersecting = intersecting;
+      var entry = Object.create(IntersectionObserverEntry.prototype);
+      entry.time = time; entry.target = target; entry.isIntersecting = intersecting; entry.intersectionRatio = ratio; entry.isVisible = false;
+      entry.boundingClientRect = rectOf(r.left, r.top, r.width, r.height);
+      entry.rootBounds = rectOf(left, top, right - left, bottom - top);
+      entry.intersectionRect = intersecting ? rectOf(x0, y0, x1 - x0, y1 - y0) : rectOf(0, 0, 0, 0);
+      self._queue.push(entry);
+    });
+    if (this._queue.length) reflectApply(this._callback, this, [this.takeRecords(), this]);
+  }
+}
+class ResizeObserver {
+  constructor(callback) {
+    if (typeof callback !== 'function') throw new TypeError('ResizeObserver needs a callback function');
+    hidden(this, '_callback', callback); hidden(this, '_targets', new Map());
+  }
+  observe(target) {
+    if (!(target instanceof Element)) throw new TypeError('ResizeObserver.observe needs an element');
+    this._targets.set(target, { width: 0, height: 0 });  // the size last reported (Resize Observer 3.3)
+    watch(this);
+  }
+  unobserve(target) { this._targets.delete(target); unwatch(this); }
+  disconnect() { this._targets.clear(); unwatch(this); }
+  _check() {
+    var entries = [];
+    this._targets.forEach(function (state, target) {
+      var r = target.getBoundingClientRect();
+      if (r.width === state.width && r.height === state.height) return;
+      state.width = r.width; state.height = r.height;
+      var entry = Object.create(ResizeObserverEntry.prototype), size = [{ inlineSize: r.width, blockSize: r.height }];
+      entry.target = target; entry.contentRect = rectOf(0, 0, r.width, r.height);
+      entry.borderBoxSize = size; entry.contentBoxSize = size; entry.devicePixelContentBoxSize = size;
+      entries.push(entry);
+    });
+    if (entries.length) reflectApply(this._callback, this, [entries, this]);
+  }
+}
+
+var exported = { IntersectionObserver: IntersectionObserver, IntersectionObserverEntry: IntersectionObserverEntry, ResizeObserver: ResizeObserver,
+  ResizeObserverEntry: ResizeObserverEntry, CSSStyleSheet: CSSStyleSheet, DOMException: DOMException, EventTarget: EventTarget, AbortController: AbortController, AbortSignal: AbortSignal, URL: URL, URLSearchParams: URLSearchParams,
   Blob: Blob, File: File, FormData: FormData, Headers: Headers, Request: Request, Response: Response, fetch: fetch, XMLHttpRequest: XMLHttpRequest,
   NodeFilter: NodeFilter, TreeWalker: TreeWalker, MessageChannel: MessageChannel, DOMParser: DOMParser, XMLSerializer: XMLSerializer, Intl: Intl };
 for (var name of Object.keys(exported)) Object.defineProperty(G, name, { value: exported[name], writable: true, configurable: true, enumerable: false });

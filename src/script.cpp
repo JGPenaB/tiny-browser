@@ -1553,10 +1553,13 @@ JSFN(getBoundingClientRect) {
     for (int i = 0; i < 8; ++i) vm.def(r, names[i], Value::num(vals[i]), PF_ALL);
     return V(r);
 }
-JSFN(getClientRects) {
+JSFN(getClientRects) {  // one rectangle per box; none for an element that is not rendered (CSSOM View 6)
+    Node* n = thisElem(ci);
+    I(ci.vm).client.ensureLayout();
     JSArray* a = ci.vm.newArray();
-    a->elems.push_back(getBoundingClientRect(ci));
-    return V(a);
+    Value keep = V(a);
+    if (n->hasBox) a->elems.push_back(getBoundingClientRect(ci));
+    return keep;
 }
 JSFN(metric) {  // data: 0 width, 1 height, 2 left, 3 top, 4 scrollTop/scrollLeft and other zeros
     Impl& im = I(ci.vm);
@@ -2927,7 +2930,7 @@ void ScriptHost::Impl::setup() {
     vm.defFn(observerProto, "disconnect", mutationDisconnect, 0);
     vm.defFn(observerProto, "takeRecords", mutationTakeRecords, 0);
     deliverFn = V(vm.newNative(deliverMutations, "deliverMutations", 0));
-    for (const char* n : {"IntersectionObserver", "ResizeObserver", "PerformanceObserver"}) {
+    for (const char* n : {"PerformanceObserver"}) {  // exists so that feature checks pass; it never reports anything
         JSObject* p = vm.newObject();
         for (const char* m : {"observe", "unobserve", "disconnect"}) vm.defFn(p, m, noopFn, 1);
         vm.defFn(p, "takeRecords", emptyArrayFn, 0);

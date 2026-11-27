@@ -191,7 +191,7 @@
     dsd.shadowRoot.adoptedStyleSheets.length + ':' + document.adoptedStyleSheets.includes(docSheet), '700:3px:italic:1:true');
   sheet.replaceSync('.made { font-weight: 400; }');
   eq('sheets made by script: replaced', cs(dsd.shadowRoot.querySelector('.made'), 'fontWeight') + ':' + cs(dsd, 'borderLeftWidth'), '400:0px');
-  var watched = [], mo = new MutationObserver(function (records) { records.forEach(function (r) { if (r.target.id !== 'results') watched.push(r.target.id || r.target.nodeName); }); });
+  var watched = [], mo = new MutationObserver(function (records) { records.forEach(function (r) { if (r.target.id !== 'results' && r.target !== document.body) watched.push(r.target.id || r.target.nodeName); }); });
   mo.observe(document.body, { childList: true, subtree: true });
   dsd.shadowRoot.appendChild(document.createElement('hr')); dsd.appendChild(document.createElement('hr'));
   Promise.resolve().then(function () { eq('observers do not see into shadow trees', watched.join(), 'dsd'); mo.disconnect(); });
@@ -201,6 +201,30 @@
   mo2.observe(probe, { subtree: true, childList: true, attributeFilter: ['title'] });
   probeText.data = 'b'; probe.id = 'unwatched'; probe.title = 'watched'; probe.appendChild(document.createElement('hr'));
   Promise.resolve().then(function () { eq('observers get only what they asked for', kinds.join(), 'attributes:title,childList:DIV'); mo2.disconnect(); });
+  // ---- observers of position and size
+  var far = document.createElement('div'), near = document.createElement('div'), gone = document.createElement('div');
+  far.style.cssText = 'margin-top: 5000px; height: 20px'; near.style.cssText = 'height: 20px; width: 50px'; gone.style.display = 'none';
+  document.body.insertBefore(near, document.body.firstChild); document.body.appendChild(far); document.body.appendChild(gone);
+  var sightings = [], io = new IntersectionObserver(function (entries, observer) {
+    entries.forEach(function (e) { sightings.push((e.target === near ? 'near' : e.target === far ? 'far' : 'gone') + '=' + e.isIntersecting + '/' + e.intersectionRatio); });
+    if (observer !== io || !(entries[0] instanceof IntersectionObserverEntry)) sightings.push('wrong arguments');
+  });
+  io.observe(near); io.observe(far); io.observe(gone);
+  var sizes = [], ro = new ResizeObserver(function (entries) { entries.forEach(function (e) { sizes.push(e.contentRect.width + 'x' + e.contentRect.height + '/' + e.borderBoxSize[0].inlineSize); }); });
+  ro.observe(near); ro.observe(gone);
+  setTimeout(function () {
+    eq('IntersectionObserver reports each target once', sightings.join(' '), 'near=true/1 far=false/0 gone=false/0');
+    eq('ResizeObserver reports what has a size', sizes.join(' '), '50x20/50');
+    sightings.length = 0; sizes.length = 0;
+    near.style.width = '80px'; far.style.marginTop = '0px'; document.body.insertBefore(far, near);
+    setTimeout(function () {
+      eq('IntersectionObserver reports a change', sightings.join(' '), 'far=true/1');
+      eq('ResizeObserver reports a new size', sizes.join(' '), '80x20/80');
+      io.disconnect(); ro.disconnect(); far.remove();
+      eq('observers refuse what they cannot watch', thrown(function () { io.observe(document); }) + ':' + thrown(function () { new IntersectionObserver(function () {}, { threshold: 2 }); }) + ':' +
+        thrown(function () { new IntersectionObserver(function () {}, { rootMargin: '1em' }); }), 'TypeError:RangeError:SyntaxError');
+    }, 300);
+  }, 300);
   var textNode = document.createTextNode('t'), fragNode = document.createDocumentFragment();
   eq('only nodes with children have the ParentNode members', [typeof textNode.querySelectorAll, typeof textNode.children, typeof textNode.append, typeof textNode.remove, typeof textNode.nextElementSibling,
     typeof fragNode.querySelector, typeof fragNode.getElementById, typeof fragNode.getElementsByTagName, typeof document.body.getElementById, typeof document.body.append, typeof document.children].join(),
@@ -210,7 +234,7 @@
     setTimeout(function () {
       document.title = 'Components test: ' + pass + ' passed, ' + fail + ' failed';
       console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
-    }, 80);
+    }, 900);
   });
 </script>
 </body>
