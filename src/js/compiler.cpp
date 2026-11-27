@@ -28,6 +28,7 @@ struct Fn {
     std::unordered_map<uint64_t, uint32_t> kmap;
     std::vector<std::vector<size_t>> chains;  // optional-chain bail-out jumps
     std::vector<JSString*> pendingLabels;
+    int cptn = -1;  // eval code and scripts: the register that holds the completion value so far
 };
 struct ScopeMark {
     int regMark;
@@ -53,15 +54,8 @@ public:
         hoist(sc);
         int result = newReg();
         emit(OP_LoadUndef, result);
-        for (Node* s : info->body) {
-            if (s->type == N::ExprStmt) {
-                curLine = s->line;
-                int mark = f->nextReg;
-                expr(s->a, result);
-                f->nextReg = mark;
-            } else
-                stmt(s);
-        }
+        f->cptn = result;
+        for (Node* s : info->body) stmt(s);
         emit(OP_Return, result);
         return end(fn);
     }
@@ -299,15 +293,8 @@ private:
         if (info->isEvalBody) {  // the value of eval(...) is the value of its last expression statement
             int result = newReg();
             emit(OP_LoadUndef, result);
-            for (Node* s : info->body) {
-                if (s->type == N::ExprStmt) {
-                    curLine = s->line;
-                    int mark = f->nextReg;
-                    expr(s->a, result);
-                    f->nextReg = mark;
-                } else
-                    stmt(s);
-            }
+            f->cptn = result;
+            for (Node* s : info->body) stmt(s);
             emit(OP_Return, result);
             FuncProto* p = end(fn);
             f = parent;
@@ -1049,6 +1036,61 @@ private:
         f->nextReg = mark;
         return dst;
     }
+    // A name that may live in a `with` object or among eval-made variables is looked up once, before the right-hand
+    // side of an assignment runs (13.15.2: the reference is evaluated first). The register gets the object that holds
+    // the name at that moment, or undefined when the name is an ordinary variable.
+    int resolveDyn(Node* id) {
+        const std::vector<Variable*>* dl = dynOf(id);
+        int base = newReg();
+        int o = newReg(), flag = newReg(), name = newReg();
+        emit(OP_LoadUndef, base);
+        emitX(OP_LoadK, name, kstr(id->str));
+        std::vector<size_t> done;
+        for (Variable* d : *dl) {
+            loadScopeObj(d, o);
+            emit(OP_ScopeHas, flag, o, name);
+            size_t next = jump(OP_JmpF, flag);
+            emit(OP_Move, base, o);
+            done.push_back(jump(OP_Jmp));
+            patch(next);
+        }
+        for (size_t j : done) patch(j);
+        f->nextReg = base + 1;
+        return base;
+    }
+    void loadResolved(Node* id, int base, int dst) {
+        int mark = f->nextReg;
+        size_t dynamic = jump(OP_JmpNotUndef, base);
+        id->flags &= ~NF_DYN;
+        expr(id, dst);
+        id->flags |= NF_DYN;
+        size_t end = jump(OP_Jmp);
+        patch(dynamic);
+        int name = newReg();
+        emitX(OP_LoadK, name, kstr(id->str));
+        emit(OP_GetElem, dst, base, name);
+        patch(end);
+        f->nextReg = mark;
+    }
+    void storeResolved(Node* id, int base, int src) {
+        int mark = f->nextReg;
+        size_t dynamic = jump(OP_JmpNotUndef, base);
+        storeVar(id->var, id->str, src, false);
+        size_t end = jump(OP_Jmp);
+        patch(dynamic);
+        int name = newReg();
+        emitX(OP_LoadK, name, kstr(id->str));
+        if (f->info->strict) {
+            int still = newReg();
+            emit(OP_ScopeHas, still, base, name);
+            size_t ok = jump(OP_JmpT, still);
+            emitX(OP_ThrowUnresolved, 0, kstr(id->str));
+            patch(ok);
+        }
+        emit(OP_SetElem, base, name, src);
+        patch(end);
+        f->nextReg = mark;
+    }
     void storeIdent(Node* id, int src, bool init) {
         const std::vector<Variable*>* dl = dynOf(id);
         if (!dl) {
@@ -1120,7 +1162,13 @@ private:
         if (dst < 0) dst = newReg();
         int mark = f->nextReg;
         int oldv = newReg(), newv = newReg();
-        if (t->type == N::Ident) {
+        if (t->type == N::Ident && dynOf(t)) {
+            int base = resolveDyn(t);
+            loadResolved(t, base, oldv);
+            emit(OP_ToNumeric, oldv, oldv);
+            emit(op, newv, oldv);
+            storeResolved(t, base, newv);
+        } else if (t->type == N::Ident) {
             int cur = expr(t);
             emit(OP_ToNumeric, oldv, cur);
             emit(op, newv, oldv);
@@ -1134,7 +1182,9 @@ private:
         } else {
             int o = expr(t->a);
             int k = newReg();
-            emit(OP_ToPropKey, k, expr(t->b));
+            int kv = expr(t->b);
+            if (!(t->flags & NF_PRIVATE)) emit(OP_RequireObj, o);
+            emit(OP_ToPropKey, k, kv);
             emit((t->flags & NF_PRIVATE) ? OP_GetPrivate : OP_GetElem, oldv, o, k);
             emit(OP_ToNumeric, oldv, oldv);
             emit(op, newv, oldv);
@@ -1159,6 +1209,14 @@ private:
                 }
                 if (dst < 0) dst = newReg();
                 int mark = f->nextReg;
+                if (dynOf(t)) {  // the reference is resolved before the right-hand side runs
+                    int base = resolveDyn(t);
+                    int r = expr(n->b);
+                    storeResolved(t, base, r);
+                    if (r != dst) emit(OP_Move, dst, r);
+                    f->nextReg = mark;
+                    return dst;
+                }
                 int r = expr(n->b);
                 storeIdent(t, r, false);
                 if (r != dst) emit(OP_Move, dst, r);
@@ -1177,6 +1235,11 @@ private:
                     expr(n->b, dst);
                     setProp(o, t->str, dst);
                 }
+            } else if (t->type == N::Index && t->a->type == N::Super) {
+                int k = newReg();
+                expr(t->b, k);
+                expr(n->b, dst);
+                emit(OP_SetSuper, k, dst, thisReg(t->a));
             } else if (t->type == N::Index) {
                 int o = operand(t->a, n->b);
                 int k = expr(t->b);
@@ -1187,6 +1250,10 @@ private:
                 }
                 expr(n->b, dst);
                 emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, k, dst);
+            } else if (t->type == N::Ident && dynOf(t)) {
+                int base = resolveDyn(t);
+                expr(n->b, dst);
+                storeResolved(t, base, dst);
             } else {
                 expr(n->b, dst);
                 bindTarget(t, dst, false);
@@ -1200,8 +1267,11 @@ private:
         bool logical = n->op == P_AndAndEq || n->op == P_OrOrEq || n->op == P_QQEq;
         Op jop = n->op == P_AndAndEq ? OP_JmpF : n->op == P_OrOrEq ? OP_JmpT : OP_JmpNotNullish;
         int cur = newReg();
-        int o = -1, k = -1;
-        if (t->type == N::Ident) {
+        int o = -1, k = -1, dynBase = -1;
+        if (t->type == N::Ident && dynOf(t)) {
+            dynBase = resolveDyn(t);
+            loadResolved(t, dynBase, cur);
+        } else if (t->type == N::Ident) {
             int r = expr(t);
             if (r != cur) emit(OP_Move, cur, r);
         } else if (t->type == N::Member) {
@@ -1210,7 +1280,9 @@ private:
         } else {
             o = expr(t->a);
             k = newReg();
-            emit(OP_ToPropKey, k, expr(t->b));
+            int kv = expr(t->b);
+            if (!(t->flags & NF_PRIVATE)) emit(OP_RequireObj, o);
+            emit(OP_ToPropKey, k, kv);
             emit((t->flags & NF_PRIVATE) ? OP_GetPrivate : OP_GetElem, cur, o, k);
         }
         size_t skip = 0;
@@ -1221,7 +1293,8 @@ private:
             int r = expr(n->b);
             emit(binop(n->op), cur, cur, r);
         }
-        if (t->type == N::Ident) storeIdent(t, cur, false);
+        if (dynBase >= 0) storeResolved(t, dynBase, cur);
+        else if (t->type == N::Ident) storeIdent(t, cur, false);
         else if (t->type == N::Member) setProp(o, t->str, cur);
         else emit((t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, o, k, cur);
         if (logical) patch(skip);
@@ -1395,6 +1468,40 @@ private:
     }
 
     // ---------------------------------------------------------------- destructuring
+    // In a destructuring assignment a target that is a property access is worked out (its object and key expressions
+    // run) before the value for it is fetched (13.15.5.5, 13.15.5.6).
+    struct Ref {
+        Node* t = nullptr;
+        int o = -1, k = -1;
+    };
+    Ref prepareRef(Node* e, bool init) {
+        Ref r;
+        if (init) return r;
+        Node* t = e->type == N::AssignPat ? e->a : e;
+        if ((t->type != N::Member && t->type != N::Index) || t->a->type == N::Super) return r;
+        r.t = t;
+        r.o = newReg();
+        expr(t->a, r.o);
+        if (t->type == N::Index) {
+            r.k = newReg();
+            expr(t->b, r.k);
+        }
+        return r;
+    }
+    void storeRef(const Ref& r, Node* e, int src) {  // e may carry a default value
+        int mark = f->nextReg;
+        int v = src;
+        if (e->type == N::AssignPat) {
+            v = newReg();
+            emit(OP_Move, v, src);
+            size_t j = jump(OP_JmpNotUndef, v);
+            expr(e->b, v);
+            patch(j);
+        }
+        if (r.t->type == N::Member) setProp(r.o, r.t->str, v);
+        else emit((r.t->flags & NF_PRIVATE) ? OP_SetPrivate : OP_SetElem, r.o, r.k, v);
+        f->nextReg = mark;
+    }
     void bindTarget(Node* t, int src, bool init) {
         int mark = f->nextReg;
         switch (t->type) {
@@ -1425,7 +1532,9 @@ private:
                 int v = newReg(), done = newReg();
                 size_t start = here();
                 for (Node* e : t->list) {
+                    int m3 = f->nextReg;
                     if (e->type == N::Rest) {
+                        Ref ref = prepareRef(e->a, init);
                         int arr = newReg();
                         emit(OP_NewArray, arr);
                         size_t top = here();
@@ -1434,11 +1543,17 @@ private:
                         emit(OP_ArrayPush, arr, v);
                         patchTo(jump(OP_Jmp), top);
                         patch(out);
-                        bindTarget(e->a, arr, init);
-                    } else {
+                        if (ref.t) storeRef(ref, e->a, arr);
+                        else bindTarget(e->a, arr, init);
+                    } else if (e->type == N::Hole) {
                         emit(OP_IterNext, v, it, done);
-                        if (e->type != N::Hole) bindTarget(e, v, init);
+                    } else {
+                        Ref ref = prepareRef(e, init);
+                        emit(OP_IterNext, v, it, done);
+                        if (ref.t) storeRef(ref, e, v);
+                        else bindTarget(e, v, init);
                     }
+                    f->nextReg = m3;
                 }
                 // ECMA-262 8.6.2: an iterator that was not used up is closed, also when binding throws
                 size_t end = here();
@@ -1447,7 +1562,7 @@ private:
                 size_t handler = here();
                 int e = newReg();
                 emit(OP_Catch, e);
-                emit(OP_IterCloseQuiet, it);
+                emit(OP_IterCloseAbrupt, it, e);
                 emit(OP_Throw, e);
                 patch(over);
                 f->p->handlers.push_back({(uint32_t)start, (uint32_t)end, (uint32_t)handler, (uint16_t)f->ctxDepth, 1});
@@ -1467,10 +1582,14 @@ private:
                 for (Node* p : t->list) {
                     int m2 = f->nextReg;
                     if (p->type == N::Rest) {
+                        Ref ref = prepareRef(p->a, init);
                         emit(OP_ObjRest, v, src, excluded);
-                        bindTarget(p->a, v, init);
+                        if (ref.t) storeRef(ref, p->a, v);
+                        else bindTarget(p->a, v, init);
                     } else {
+                        Ref ref;
                         if (!(p->flags & NF_COMPUTED)) {
+                            ref = prepareRef(p->b, init);
                             getProp(v, src, p->a->str);
                             if (hasRest) {
                                 int kr = newReg();
@@ -1480,10 +1599,12 @@ private:
                         } else {
                             int kr = newReg();
                             emit(OP_ToPropKey, kr, expr(p->a));
+                            ref = prepareRef(p->b, init);
                             emit(OP_GetElem, v, src, kr);
                             if (hasRest) emit(OP_ArrayPush, excluded, kr);
                         }
-                        bindTarget(p->b, v, init);
+                        if (ref.t) storeRef(ref, p->b, v);
+                        else bindTarget(p->b, v, init);
                     }
                     f->nextReg = m2;
                 }
@@ -1566,7 +1687,7 @@ private:
             chain.resize(chainLen);
             int savedDepth = f->ctxDepth;
             f->ctxDepth = fin.ctxDepth;
-            stmt(fin.block);
+            quiet(fin.block);
             f->ctxDepth = savedDepth;
             chain.insert(chain.end(), savedChain.begin(), savedChain.end());
             for (auto& L : savedLoops) f->loops.push_back(std::move(L));
@@ -1628,6 +1749,10 @@ private:
         bool isAwait = isOf && (n->flags & NF_AWAIT);
         ScopeMark sm = enterScope(n->scope);
         int mark = f->nextReg;
+        if (n->a->type == N::VarDecl && n->a->list[0]->b) {  // B.3.5: the initializer runs once, before the loop
+            storeIdent(n->a->list[0]->a, expr(n->a->list[0]->b), true);
+            f->nextReg = mark;
+        }
         int src = expr(n->b);
         int state = newReg();
         newReg();
@@ -1690,12 +1815,12 @@ private:
         if (hasFin) {
             size_t endAll = here();
             f->fins.pop_back();
-            stmt(n->d);
+            quiet(n->d);
             size_t after = jump(OP_Jmp);
             size_t handler = here();
             int e = newReg();
             emit(OP_Catch, e);
-            stmt(n->d);
+            quiet(n->d);
             emit(OP_Throw, e);
             f->nextReg--;
             patch(after);
@@ -1703,11 +1828,25 @@ private:
         }
     }
 
+    // A finally block's value never becomes the value of its try statement.
+    void quiet(Node* n) {
+        int saved = f->cptn;
+        f->cptn = -1;
+        stmt(n);
+        f->cptn = saved;
+    }
     void stmt(Node* n) {
         curLine = n->line;
         int mark = f->nextReg;
+        // these statements have the value undefined unless something inside them produces one (UpdateEmpty)
+        if (f->cptn >= 0 && (n->type == N::If || n->type == N::While || n->type == N::DoWhile || n->type == N::For || n->type == N::ForIn ||
+                             n->type == N::ForOf || n->type == N::Switch || n->type == N::Try || n->type == N::With))
+            emit(OP_LoadUndef, f->cptn);
         switch (n->type) {
-            case N::ExprStmt: effect(n->a); break;
+            case N::ExprStmt:
+                if (f->cptn >= 0) expr(n->a, f->cptn);
+                else effect(n->a);
+                break;
             case N::VarDecl: varDecl(n); break;
             case N::Function:
                 // Annex B.3.3: reaching a block-level function declaration copies it to the function-level var

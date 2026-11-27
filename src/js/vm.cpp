@@ -1151,6 +1151,7 @@ bool Vm::setObj(JSObject* o, PropKey k, Value v, Value receiver) {
                 return true;
             }
         } else if (self && o->cls == Cls::Array && !k.isSymbol() && k.cell() == a.length) {
+            if (o->oflags & (OF_LENRO | OF_FROZEN)) return false;  // not writable: OrdinarySet stops before any conversion
             PropDesc d;
             d.hasValue = true;
             d.value = v;
@@ -2494,6 +2495,9 @@ Value Vm::runFrames(size_t base) {
                         if (R(i.a).isEmpty()) throwError(Err::ReferenceError, "Cannot access '%s' before initialization", NAMEK(i.bx));
                         break;
                     case OP_ThrowConst: throwError(Err::TypeError, "Assignment to constant variable.");
+                    case OP_ThrowUnresolved:
+                        fr->pc = pc;
+                        throwError(Err::ReferenceError, "%s is not defined", utf16to8(K[i.bx].asString()->s).c_str());
                     case OP_Closure: R(i.a) = Value::cell(makeClosure(fr->code->inner[i.bx], fr->ctx, fr)); break;
                     case OP_NewObject: R(i.a) = Value::cell(newObject()); break;
                     case OP_NewArray: R(i.a) = Value::cell(newArray()); break;
@@ -2611,20 +2615,30 @@ Value Vm::runFrames(size_t base) {
                         JSObject* home = fr->fn->home;
                         JSObject* sp = home ? home->proto : nullptr;
                         Value thisv = R(i.c);
-                        R(i.a) = sp ? getObj(sp, toKey(R(i.b)), thisv) : Value::undef();
+                        fr->pc = pc;
+                        PropKey k = toKey(R(i.b));
+                        if (!sp) throwError(Err::TypeError, "Cannot read properties of null (reading '%s')", keyName(*this, k).c_str());
+                        R(i.a) = getObj(sp, k, thisv);
                         break;
                     }
-                    case OP_SetSuper: {
+                    case OP_SetSuper: {  // super.x = v: the lookup starts at the home object's prototype, the receiver is `this`
+                        JSObject* home = fr->fn->home;
+                        JSObject* sp = home ? home->proto : nullptr;
+                        fr->pc = pc;
                         PropKey k = toKey(R(i.a));
-                        if (!set(R(i.c), k, R(i.b)) && fr->code->isStrict) {
-                            fr->pc = pc;
-                            failedSet(R(i.c), k);
-                        }
+                        if (!sp) throwError(Err::TypeError, "Cannot set properties of null (setting '%s')", keyName(*this, k).c_str());
+                        if (!setObj(sp, k, R(i.b), R(i.c)) && fr->code->isStrict) failedSet(R(i.c), k);
                         break;
                     }
                     case OP_DefField: defineOwn(R(i.a).asObject(), KEYK(i.b), R(i.c), PF_ALL); break;
                     case OP_DefElem: defineOwn(R(i.a).asObject(), toKey(R(i.b)), R(i.c), PF_ALL); break;
                     case OP_SetFnName: setFunctionName(R(i.a), R(i.b), i.c); break;
+                    case OP_RequireObj:
+                        if (R(i.a).isNullish()) {
+                            fr->pc = pc;
+                            throwError(Err::TypeError, "Cannot read properties of %s", R(i.a).isNull() ? "null" : "undefined");
+                        }
+                        break;
                     case OP_DefMethod:
                     case OP_DefMethodE: {
                         JSObject* o = R(i.a).asObject();
@@ -3026,12 +3040,13 @@ Value Vm::runFrames(size_t base) {
                         break;
                     }
                     case OP_IterClose:
+                    case OP_IterCloseAbrupt:
                     case OP_IterCloseQuiet: {
                         Value itv = R(i.a);
                         R(i.a) = Value::undef();  // closing happens once, even if return() throws
                         if (!itv.isObject() || R(i.a + 1).isEmpty()) break;
                         fr->pc = pc;
-                        if (i.op == OP_IterClose) {
+                        if (i.op == OP_IterClose || (i.op == OP_IterCloseAbrupt && R(i.b) == Value::cell(genReturnSignal))) {
                             Value ret = get(itv, a.return_);
                             if (isCallable(ret) && !call(ret, itv, nullptr, 0).isObject()) throwError(Err::TypeError, "Iterator result is not an object");
                         } else {

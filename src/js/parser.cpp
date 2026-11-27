@@ -505,10 +505,13 @@ public:
         JSString* res[] = {k.var_, k.const_, k.function_, k.class_, k.if_, k.else_, k.for_, k.while_, k.do_, k.return_, k.break_,
                            k.continue_, k.throw_, k.try_, k.catch_, k.finally_, k.switch_, k.case_, k.default_, k.new_, k.delete_,
                            k.typeof_, k.void_, k.in_, k.instanceof_, k.this_, k.super_, k.null_, k.true_, k.false_, k.debugger_,
-                           k.import_, k.export_, k.with_, k.enum_};
+                           k.import_, k.export_, k.with_, k.enum_, k.extends_};
         for (JSString* r : res) reserved[r] = true;
     }
 
+    void finish() {
+        if (!protoDups.empty()) throw SyntaxErr{"Duplicate __proto__ fields are not allowed in object literals", protoDups[0]->line};
+    }
     void program() {
         FunctionInfo& f = ast.fns.emplace_back();
         ast.top = &f;
@@ -976,6 +979,11 @@ private:
         noLetDecl = noLet;
         Node* r = statement();
         noLetDecl = false;
+        if (!labelled && r->type == N::Labeled) {  // IsLabelledFunction: a labelled function cannot be the body of if or a loop
+            Node* inner = r;
+            while (inner && inner->type == N::Labeled) inner = inner->a;
+            if (inner && inner->type == N::Function) fail("In this context a function can only be declared at the top level or inside a block");
+        }
         return r;
     }
     Node* loopBody() {
@@ -1606,10 +1614,16 @@ private:
             if (isDecl) {
                 finishDecl(mark);
                 if (init->list.size() != 1) fail("Invalid left-hand side in for-loop");
+                if (init->list[0]->b) {  // only `for (var x = 1 in obj)` in sloppy code may have an initializer (B.3.5)
+                    bool legacy = n->type == N::ForIn && init->op == VK_VAR && !fn->strict && init->list[0]->a->type == N::Ident;
+                    if (!legacy) fail("The variable of a for-in or for-of loop may not have an initializer");
+                }
                 // the loop variable is initialised by the loop itself
                 for (Variable* v : sc->vars) v->declEnd = 0;
-            } else
+            } else {
+                if (init->type == N::Assign) fail("Invalid left-hand side in for-loop");
                 init = toPattern(init);
+            }
             n->a = init;
             n->b = n->type == N::ForOf ? assign() : expression();
             expectP(P_RParen);
@@ -2155,7 +2169,7 @@ private:
             n->a = left;
             advance();
             n->b = assign(in);
-            if (left->type == N::Ident) nameFn(n->b, left->str);
+            if (left->type == N::Ident && !(left->flags & NF_PAREN)) nameFn(n->b, left->str);
             return n;
         }
         return left;
@@ -2588,6 +2602,7 @@ private:
         return a;
     }
 
+    std::vector<Node*> protoDups;  // object literals that spell __proto__: twice; fine only as destructuring patterns
     Node* objectLit() {
         Node* o = mk(N::Object);
         advance();
@@ -2614,9 +2629,10 @@ private:
                     kind = isK(k.get_) ? PK_GET : PK_SET;
                     advance();
                 }
-                bool isIdent = t.type == Tok::Ident && !t.esc;
+                bool isIdent = t.type == Tok::Ident && !t.esc, escaped = t.esc;
                 JSString* name = (t.type == Tok::Ident || t.type == Tok::Str) ? t.str : nullptr;
                 p->a = propertyName(p);
+                if (!isP(P_LParen) && (isAsync || gen || kind != PK_INIT)) unexpected();  // async, * and get/set need a method
                 if (isP(P_LParen)) {
                     p->op = kind == PK_INIT ? PK_METHOD : kind;
                     p->b = functionRest((p->flags & NF_COMPUTED) ? nullptr : name, start, isAsync, gen, false, kind == PK_GET ? 2 : kind == PK_SET ? 3 : 1);
@@ -2624,9 +2640,15 @@ private:
                 } else if (eatP(P_Colon)) {
                     p->op = PK_INIT;
                     p->b = assign();
-                    if (!(p->flags & NF_COMPUTED)) nameFn(p->b, name);
+                    bool proto = !(p->flags & NF_COMPUTED) && name == k.proto_;  // __proto__: value sets the prototype
+                    if (proto) {
+                        if (o->flags & NF_PREFIX) protoDups.push_back(o);  // an error unless this turns out to be a pattern
+                        o->flags |= NF_PREFIX;
+                    }
+                    if (!(p->flags & NF_COMPUTED) && !proto) nameFn(p->b, name);
                 } else {
                     if (!isIdent || isRes(name) || (p->flags & NF_COMPUTED)) unexpected();
+                    checkName(name, escaped);
                     p->op = PK_INIT;
                     p->flags |= NF_SHORTHAND;
                     Node* id = identRef(name);
@@ -2635,13 +2657,17 @@ private:
                         Node* ap = mk(N::AssignPat);
                         ap->a = id;
                         ap->b = assign();
+                        nameFn(ap->b, name);
                         p->b = ap;
                     } else
                         p->b = id;
                 }
             }
             o->list.push_back(p);
-            if (!isP(P_RBrace)) expectP(P_Comma);
+            if (!isP(P_RBrace)) {
+                expectP(P_Comma);
+                if (isP(P_RBrace)) o->flags |= NF_TRAILING;
+            }
         }
         advance();
         return o;
@@ -2654,11 +2680,13 @@ private:
             case N::Ident:
                 if (fn->strict && isEvalOrArguments(n->str)) fail("Unexpected eval or arguments in strict mode");
                 return n;
+            case N::AssignPat:
+                if (n->a->type == N::Ident && fn->strict && isEvalOrArguments(n->a->str)) fail("Unexpected eval or arguments in strict mode");
+                return n;
             case N::Member:
             case N::Index:
             case N::ArrayPat:
             case N::ObjectPat:
-            case N::AssignPat:
             case N::Hole: return n;
             case N::Array:
                 n->type = N::ArrayPat;
@@ -2673,6 +2701,7 @@ private:
                 }
                 return n;
             case N::Object:
+                protoDups.erase(std::remove(protoDups.begin(), protoDups.end(), n), protoDups.end());
                 n->type = N::ObjectPat;
                 for (Node*& p : n->list) {
                     if (p->op == PK_SPREAD) {
@@ -2687,7 +2716,7 @@ private:
                 }
                 return n;
             case N::Assign:
-                if (n->op != P_Assign) break;
+                if (n->op != P_Assign || !nested) break;
                 n->type = N::AssignPat;
                 n->a = toPattern(n->a, true);
                 return n;
@@ -2702,12 +2731,14 @@ private:
 void parseEval(Vm& vm, Ast& ast, const EvalSite& site) {
     Parser p(vm, ast);
     p.evalProgram(site);
+    p.finish();
 }
 
 void parseScript(Vm& vm, Ast& ast, bool asModule, const std::u16string*) {
     Parser p(vm, ast);
     if (asModule) p.module();
     else p.program();
+    p.finish();
 }
 
 }  // namespace tb::js

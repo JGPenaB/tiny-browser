@@ -87,6 +87,9 @@ enum Op : uint16_t {
     OP_ModuleInit,  // module start: bind the module whose namespace is in a to the current scope
     OP_ImportCall,  // a = import(b, b+1), called from the file named in b+2
     OP_DefGlobalFuncD,  // like OP_DefGlobalFunc, from eval code: the property can be deleted
+    OP_IterCloseAbrupt,  // close iterator a because of b: quietly for an exception, checked when b is a generator's return
+    OP_ThrowUnresolved,  // ReferenceError: consts[bx] is not defined
+    OP_RequireObj,  // TypeError unless a can have properties (not undefined or null); consts[bx]: the key, for the message
     OP_SetFnName,   // the anonymous function a is named after the property key b; c: 1 a getter, 2 a setter
     OP_Debugger,
     OP__Count
