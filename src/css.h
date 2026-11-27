@@ -19,6 +19,12 @@ struct Len {
 
 using VarMap = std::unordered_map<std::string, std::string>;
 
+// An SVG paint (SVG 2, section 13.2): none, a colour, or currentcolor, the element's own `color`.
+struct Paint {
+    enum K : uint8_t { None, Rgb, Current } k = None;
+    Color c{0, 0, 0, 1};
+};
+
 // One function of a transform list (CSS Transforms 1, section 7.1). Translations keep their lengths, because a
 // percentage is of the element's own border box and that is known only after layout; the rest are numbers
 // (angles in radians). 3D functions are kept as their 2D part (translate3d, scale3d, rotateZ); the others are
@@ -58,6 +64,11 @@ struct Style {
     Color borderColor[4] = {{0, 0, 0, -1}, {0, 0, 0, -1}, {0, 0, 0, -1}, {0, 0, 0, -1}};
     std::shared_ptr<const VarMap> vars;
     std::shared_ptr<const TransformList> transform;              // null for `none`
+    // SVG painting (SVG 2, section 13), all inherited
+    Paint fill{Paint::Rgb, {0, 0, 0, 1}}, stroke;
+    Len strokeWidth{Len::Px, 1};
+    bool fillEvenOdd = false;
+    float fillOpacity = 1, strokeOpacity = 1;
     Len transformOrigin[2] = {{Len::Pct, 50}, {Len::Pct, 50}};  // from the border box's top left corner
 
     // Positioning

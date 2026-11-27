@@ -92,6 +92,9 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
             case DItem::K::Widget:
                 if (wp) wp->paintWidget(rt, it);
                 break;
+            case DItem::K::Svg:
+                if (it.img >= 0 && it.img < (int)lo.svgs.size()) svg_paint(rt, br, lo.svgs[it.img], lo.svgShapes, it.x, it.y, it.w, it.h);
+                break;
             case DItem::K::Image: {
                 D2D1_RECT_F r = D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h);
                 if (it.img >= 0 && it.img < (int)imgs.size() && imgs[it.img].w > 0) {

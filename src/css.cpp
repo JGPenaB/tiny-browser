@@ -1154,7 +1154,7 @@ std::string subst_vars(std::string_view v, const Style& s, int depth) {
 }
 
 bool inherited_prop(std::string_view p) {
-    return p == "color" || istarts(p, "font") || p == "line-height" || p == "text-align" || p == "white-space" ||
+    return p == "color" || p == "fill" || p == "stroke" || istarts(p, "fill-") || istarts(p, "stroke-") || istarts(p, "font") || p == "line-height" || p == "text-align" || p == "white-space" ||
            istarts(p, "list-style") || p == "text-transform" || p == "visibility" || istarts(p, "text-decoration");
 }
 
@@ -1200,6 +1200,12 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
     else if (p == "max-height") d.maxHeight = s.maxHeight;
     else if (p == "position") d.position = s.position;
     else if (p == "transform") d.transform = s.transform;
+    else if (p == "fill") d.fill = s.fill;
+    else if (p == "stroke") d.stroke = s.stroke;
+    else if (p == "stroke-width") d.strokeWidth = s.strokeWidth;
+    else if (p == "fill-rule") d.fillEvenOdd = s.fillEvenOdd;
+    else if (p == "fill-opacity") d.fillOpacity = s.fillOpacity;
+    else if (p == "stroke-opacity") d.strokeOpacity = s.strokeOpacity;
     else if (p == "transform-origin") std::copy(s.transformOrigin, s.transformOrigin + 2, d.transformOrigin);
     else if (p == "top" || p == "right" || p == "bottom" || p == "left" || p == "inset") std::copy(s.inset, s.inset + 4, d.inset);
     else if (p == "z-index") {
@@ -1225,6 +1231,12 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
 
 void inherit(Style& s, const Style& p) {
     s.alpha = p.alpha;
+    s.fill = p.fill;
+    s.stroke = p.stroke;
+    s.strokeWidth = p.strokeWidth;
+    s.fillEvenOdd = p.fillEvenOdd;
+    s.fillOpacity = p.fillOpacity;
+    s.strokeOpacity = p.strokeOpacity;
     s.color = p.color;
     s.fontSize = p.fontSize;
     s.weight = p.weight;
@@ -1625,6 +1637,32 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
         if (prop == "overflow" || o > s.overflow || o == 0) s.overflow = o;
     } else if (prop == "float") {
         s.floatSide = (lv == "left" || lv == "inline-start") ? 1 : (lv == "right" || lv == "inline-end") ? 2 : 0;
+    } else if (prop == "fill" || prop == "stroke") {
+        // <paint> (SVG 2, section 13.2). A paint server (url()) is not drawn yet: its fallback colour is used, or none.
+        Paint& paint = prop == "fill" ? s.fill : s.stroke;
+        std::string v = lv;
+        if (istarts(v, "url(")) {
+            size_t close = v.find(')');
+            v = close == npos ? std::string() : std::string(trim(std::string_view(v).substr(close + 1)));
+            if (v.empty()) v = "none";
+        }
+        Color c;
+        if (v == "none") paint = {Paint::None, {}};
+        else if (v == "currentcolor") paint = {Paint::Current, {}};
+        else if (v == "context-fill" || v == "context-stroke") paint = {Paint::None, {}};
+        else if (parse_color(v, c)) paint = {Paint::Rgb, c};
+    } else if (prop == "stroke-width") {
+        Len l;
+        float v;
+        std::string_view u;
+        if (parse_num(lv, v, u) && u.empty() && v >= 0) s.strokeWidth = {Len::Px, v};
+        else if (parse_len(lv, fs, l, false) && (l.u == Len::Px || l.u == Len::Pct) && l.v >= 0) s.strokeWidth = l;
+    } else if (prop == "fill-rule") {
+        if (lv == "evenodd" || lv == "nonzero") s.fillEvenOdd = lv == "evenodd";
+    } else if (prop == "fill-opacity" || prop == "stroke-opacity") {
+        float v;
+        std::string_view u;
+        if (parse_num(lv, v, u) && (u.empty() || u == "%")) (prop == "fill-opacity" ? s.fillOpacity : s.strokeOpacity) = std::clamp(u == "%" ? v / 100 : v, 0.f, 1.f);
     } else if (prop == "transform") {
         TransformList list;
         if (lv == "none") s.transform.reset();
@@ -1803,6 +1841,27 @@ std::string dim_attr(const std::string& v) {
 void hints(const Node* e, std::vector<Decl>& out) {
     auto add = [&](const char* p, std::string v) { out.push_back({p, std::move(v), false}); };
     const std::string& n = e->name;
+    // SVG presentation attributes (SVG 2, section 6.6) are author rules that come before all others. Only elements
+    // inside an svg element have them; width and height are ones on the svg element itself.
+    static const char* presentation[] = {"fill", "stroke", "stroke-width", "fill-rule", "fill-opacity", "stroke-opacity", "opacity", "color", "display", "visibility"};
+    bool anyPresentation = n == "svg";
+    for (const char* a : presentation) anyPresentation = anyPresentation || e->attr(a);
+    if (anyPresentation) {
+        bool inSvg = false;
+        for (const Node* p = e; p && !inSvg; p = p->parent) inSvg = p->name == "svg";
+        if (inSvg) {
+            for (const char* a : presentation)
+                if (const std::string* v = e->attr(a)) add(a, *v);
+            if (n == "svg") {
+                for (const char* a : {"width", "height"})
+                    if (const std::string* v = e->attr(a)) {
+                        std::string t(trim(*v));
+                        bool plain = !t.empty() && t.find_first_not_of("0123456789.+-eE") == std::string::npos;
+                        add(a, plain ? t + "px" : t);  // a unitless length is in px
+                    }
+            }
+        }
+    }
     if (auto a = e->attr("bgcolor")) add("background-color", *a);
     if (auto a = e->attr("hidden"); a) add("display", "none");
     if (n == "font") {

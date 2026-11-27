@@ -7,7 +7,8 @@ JavaScript engine. The only dependencies are Windows system APIs:
 |---|---|
 | HTML | Own tokenizer + tree builder (`src/html.cpp`) |
 | CSS | Own parser, selectors, specificity, cascade, inheritance, media queries, custom properties (`src/css.cpp`) |
-| Layout | Own block / inline / table / flexbox layout, inline-block, absolute / relative / fixed positioning, overflow clipping, boxes that scroll (`src/layout_engine.cpp`) |
+| Layout | Own block / inline / table / flexbox layout, inline-block, absolute / relative / fixed positioning, overflow clipping, boxes that scroll, CSS transforms (`src/layout_engine.cpp`) |
+| SVG | Inline SVG: paths, basic shapes, groups, `use` and symbols, transforms, fill and stroke, viewBox fitting, drawn as Direct2D geometry (`src/svg.cpp`) |
 | Rendering | Display list painted on the GPU with Direct2D 1.1 on a Direct3D 11 flip-model swap chain (`src/gpu.cpp`, `src/render.cpp`) |
 | Text | DirectWrite (shaping, font fallback, color emoji) with word-width caches (`src/text.cpp`) |
 | Networking | WinHTTP transport (HTTPS via SChannel, HTTP/2, gzip/deflate/brotli); our own redirect handling, GET/POST, Referer/Origin policy; plus `file:` and `data:` (`src/http.cpp`) |
@@ -46,7 +47,7 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html` and `layout.html` are opened as `file:` URLs; `net.html`, `modules.html` and `late.html`
+`dom.html`, `components.html`, `layout.html` and `svg.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122"`: the wheel must log `WHEEL 100 of 100`, the first click
 `CLICK wheel 6`, and the second click, which lands on a row that was scrolled out of view, nothing.
@@ -66,7 +67,7 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 1. **Milestone 1 (done):** static HTML/CSS rendering on the GPU, tabs, history, bookmarks, DPAPI vault, devtools.
 2. **Milestone 2 (mostly done):** flexbox, inline-block, positioning, overflow clipping, rounded corners, interactive forms with
-   GET/POST, own cookie jar, password save + autofill, meta refresh. Still open: floats, grid, background images, inline SVG,
+   GET/POST, own cookie jar, password save + autofill, meta refresh. Still open: floats, grid, background images, SVG text, gradients, clip paths and masks,
    `::before`/`::after`, `:hover`, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp

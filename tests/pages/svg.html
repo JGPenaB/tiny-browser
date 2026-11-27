@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SVG test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; color: #202124; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  .icon { width: 48px; height: 48px; display: inline-block; color: #1a73e8; fill: currentcolor; }
+  .row > * { vertical-align: top; margin-right: 8px; }
+  #styled path { fill: #c5221f; }
+</style>
+</head>
+<body>
+<p>Inline SVG (SVG 2). The shapes in each row are drawn as the caption under it says; a reference browser draws the same.</p>
+<div class="row" id="shapes">
+  <svg id="s1" width="60" height="60" viewBox="0 0 60 60"><rect x="5" y="5" width="50" height="50" rx="10" fill="#1a7f37"/></svg>
+  <svg id="s2" width="60" height="60"><circle cx="30" cy="30" r="25" fill="none" stroke="#1a73e8" stroke-width="6"/></svg>
+  <svg id="s3" width="60" height="60" viewBox="0 0 24 24"><path d="M12 2L22 22H2Z" fill="#f9ab00"/></svg>
+  <svg id="s4" width="60" height="60" viewBox="0 0 10 10"><polygon points="0,0 10,0 5,10" fill="purple" transform="rotate(180 5 5)"/></svg>
+  <svg id="s5" width="90" height="60" viewBox="0 0 30 10" preserveAspectRatio="none"><ellipse cx="15" cy="5" rx="15" ry="5" fill="#c5221f"/></svg>
+</div>
+<p>green rounded square · blue ring · yellow triangle pointing up · purple triangle pointing up · red ellipse filling a wide box</p>
+<div class="row">
+  <span class="icon"><svg id="current" viewBox="0 0 24 24" style="width: 100%; height: 100%"><path d="M3 3h18v18H3z"/></svg></span>
+  <svg id="styled" width="48" height="48" viewBox="0 0 24 24"><path d="M2 12a10 10 0 1 0 20 0a10 10 0 1 0-20 0" fill="green"/></svg>
+  <svg width="0" height="0" style="position: absolute"><defs><symbol id="star" viewBox="0 0 10 10"><path d="M5 0l1.5 3.5L10 4l-2.7 2.4L8 10 5 8l-3 2 .7-3.6L0 4l3.5-.5z"/></symbol></defs></svg>
+  <svg id="used" width="48" height="48"><use href="#star" fill="#f9ab00" width="48" height="48"/></svg>
+  <svg id="sized" viewBox="0 0 40 20" style="width: 80px"><rect width="40" height="20" fill="#5f6368" fill-opacity="0.5"/></svg>
+</div>
+<p>blue square (currentColor) · red circle (a style sheet beats the fill attribute) · yellow star (use of a symbol) · grey half-transparent bar, 80 by 40</p>
+<div id="results"><b>Results</b></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var size = function (id) { var r = document.getElementById(id).getBoundingClientRect(); return Math.round(r.width) + 'x' + Math.round(r.height); };
+  eq('width and height attributes size the svg', [size('s1'), size('s5')].join(), '60x60,90x60');
+  eq('CSS sizes win, and auto height follows the viewBox', [size('current'), size('sized')].join(), '48x48,80x40');
+  var cs = function (id, p) { return getComputedStyle(document.querySelector(id))[p]; };
+  eq('presentation attributes and style sheets', [cs('#s1 rect', 'fill'), cs('#styled path', 'fill'), cs('#s2 circle', 'strokeWidth'), cs('#sized rect', 'fillOpacity')].join(' | '),
+    'rgb(26, 127, 55) | rgb(197, 34, 31) | 6px | 0.5');
+  eq('fill is inherited, currentcolor as a keyword', cs('#current path', 'fill'), 'rgb(26, 115, 232)');
+  window.addEventListener('load', function () {
+    document.title = 'SVG test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

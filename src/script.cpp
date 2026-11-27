@@ -2111,6 +2111,14 @@ std::string resolvedValue(const Node* n, const Style& s, const std::string& name
         return s.underline && s.strike ? "underline line-through" : s.underline ? "underline" : s.strike ? "line-through" : "none";
     if (name == "flex-direction") return oneOf(s.flexDir, {"row", "row-reverse", "column", "column-reverse"});
     if (name == "flex-wrap") return s.flexWrap ? "wrap" : "nowrap";
+    if (name == "fill" || name == "stroke") {  // SVG 2, 13.2: currentcolor resolves to the element's color
+        const Paint& p = name == "fill" ? s.fill : s.stroke;
+        return p.k == Paint::None ? "none" : rgb(p.k == Paint::Current ? s.color : p.c);
+    }
+    if (name == "stroke-width") return length(s.strokeWidth, "1px");
+    if (name == "fill-opacity") return number(s.fillOpacity, "");
+    if (name == "stroke-opacity") return number(s.strokeOpacity, "");
+    if (name == "fill-rule") return s.fillEvenOdd ? "evenodd" : "nonzero";
     if (name == "transform") {  // CSS Transforms 1, section 9: the matrix of the used value
         if (!s.transform) return "none";
         float m[6];

@@ -33,7 +33,7 @@ namespace tb {
 static const char* kUACss = R"CSS(
 html,address,blockquote,body,dd,div,dl,dt,fieldset,form,frame,frameset,h1,h2,h3,h4,h5,h6,noframes,ol,p,ul,center,dir,hr,menu,pre,
 article,aside,footer,header,hgroup,main,nav,section,figure,figcaption,details,summary,legend,search,dialog,optgroup,address,listing,xmp,plaintext{display:block}
-head,script,style,title,meta,link,template,base,datalist,param,noembed,area,map,source,track,option,svg,math,col,colgroup{display:none}
+head,script,style,title,meta,link,template,base,datalist,param,noembed,area,map,source,track,option,math,col,colgroup{display:none}
 dialog:not([open]),audio:not([controls]),input[type=hidden]{display:none}
 li{display:list-item}
 table{display:table}

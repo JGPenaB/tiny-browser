@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "dom.h"
+#include "svg.h"
 
 namespace tb {
 
@@ -25,7 +26,8 @@ struct ImageRes {
 struct DItem {
     // PushTransform holds a transform for everything up to its PopTransform: a b c d in bw[0..3], e f in w h, and
     // the transform origin in x y (document coordinates), so x' = origin + M (x - origin) + (e, f).
-    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform };
+    // Svg draws LayoutOut::svgs[img] into the item's box.
+    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform, Svg };
     K k = K::Rect;
     int16_t layer = 0;  // paint layer: 0 = normal flow, >0 positioned (z-index + 1), <0 behind
     float x = 0, y = 0, w = 0, h = 0;
@@ -64,6 +66,8 @@ struct LayoutOut {
     float height = 0;
     Color canvas{1, 1, 1, 1};
     bool fixed = false;  // the page has fixed boxes: they have to be laid out again when the page scrolls
+    std::vector<SvgImage> svgs;      // the svg elements of the page
+    std::vector<SvgShape> svgShapes;  // and their shapes
 };
 
 struct LayoutInput {

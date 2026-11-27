@@ -96,6 +96,8 @@ struct Item {
     Color bg;
     float w = -1, h = 0, base = 0;
     int img = -1;
+    int svg = -1;              // Image: an svg element, LayoutOut::svgs[svg]
+    float aspect = 0;          // Image of an svg: its viewBox width / height, 0 when it has none
     std::shared_ptr<Box> box;  // Atomic: inline-block / inline-flex
     Mark m0, m1;
 };
@@ -647,7 +649,22 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
         b.items.push_back(std::move(it));
         return;
     }
-    if (nm == "svg" || nm == "canvas" || nm == "video" || nm == "iframe" || nm == "object" || nm == "embed" || nm == "audio") {
+    if (nm == "svg") {
+        // An svg element is a replaced element (SVG 2, section 8.2): its width and height come from CSS, which its
+        // own width and height attributes feed; auto is 100% for the width and, with a viewBox, follows its aspect
+        // ratio for the height, else 150px. Sizes that depend on the line are settled there.
+        it.k = Item::Image;
+        it.img = -2;
+        it.svg = (int)c.out.svgs.size();
+        c.out.svgs.push_back(svg_build(n, c.in.doc, c.out.svgShapes));
+        it.aspect = svg_aspect(n);
+        it.w = s->width.u == Len::Px ? s->width.v : 0;
+        it.h = s->height.u == Len::Px ? s->height.v : -1;
+        if (it.h < 0 && s->width.u == Len::Px) it.h = it.aspect > 0 ? it.w / it.aspect : 150;
+        b.items.push_back(std::move(it));
+        return;
+    }
+    if (nm == "canvas" || nm == "video" || nm == "iframe" || nm == "object" || nm == "embed" || nm == "audio") {
         if (s->width.u == Len::Px && s->height.u == Len::Px) {
             it.k = Item::Image;
             it.w = s->width.v;
@@ -1005,12 +1022,12 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                             push(c, std::move(bgd));
                         }
                         DItem d;
-                        d.k = DItem::K::Image;
+                        d.k = it.svg >= 0 ? DItem::K::Svg : DItem::K::Image;
                         d.x = fx;
                         d.y = iy;
                         d.w = it.w;
                         d.h = it.h;
-                        d.img = it.img;
+                        d.img = it.svg >= 0 ? it.svg : it.img;
                         push(c, std::move(d));
                     } else {
                         c.out.widgets.push_back({it.node, fx, iy, it.w, it.h, it.st, (int16_t)std::clamp(c.layer, -30000, 30000)});
@@ -1118,6 +1135,10 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                     }
                     if (it.k == Item::Image && it.w != ow && ow > 0 && it.st->height.u != Len::Px) it.h = oh * it.w / ow;
                     if (it.k == Item::Image && it.st->height.u == Len::Pct && c.lineBlockH >= 0) it.h = it.st->height.resolve(c.lineBlockH);
+                    if (it.svg >= 0) {
+                        if (it.st->width.u == Len::Auto && !b.fillItem) it.w = it.st->height.definite() && it.h >= 0 && it.aspect > 0 ? it.h * it.aspect : avail;
+                        if (it.h < 0) it.h = it.aspect > 0 ? it.w / it.aspect : 150;
+                    }
                 }
                 ensureW(c, it);
                 if (!line.empty() && x + it.w > avail + 0.01f && it.brk && wraps(it.st)) commit(false);
