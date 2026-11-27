@@ -28,6 +28,10 @@ void setupDate(Vm& vm);
 void setupRegExp(Vm& vm);
 void setupTypedArrays(Vm& vm);
 void setupModules(Vm& vm);
+void setupShadowRealm(Vm& vm);
+// An indirect eval (19.2.1.1 PerformEval with direct = false) in two steps, each in the realm that is running then
+FuncProto* compileIndirectEval(Vm& vm, const std::u16string& text);
+Value runIndirectEval(Vm& vm, FuncProto* code);
 void setupProxy(Vm& vm);
 void setupBigInt(Vm& vm);
 void setupJsBuiltins(Vm& vm);

@@ -94,7 +94,8 @@ enum class CK : uint8_t { String, Symbol, Object, Context, Code, Accessor, BigIn
 enum class Cls : uint8_t {
     Object, Array, Arguments, Function, Native, Bound, Error, Boolean, Number, String, SymbolObj, Date, RegExp,
     Map, Set, WeakMap, WeakSet, Promise, Generator, ArrayIter, MapIter, SetIter, StringIter, ForIn, Global, Host, ArrayBuffer, TypedArray, DataView, Proxy, BigInt,
-    RawJSON  // made by JSON.rawJSON: JSON.stringify writes its text as it is
+    RawJSON,     // made by JSON.rawJSON: JSON.stringify writes its text as it is
+    ShadowRealm  // a JSPrimitive whose value is the number of the realm behind it
 };
 
 struct Cell {
@@ -581,6 +582,7 @@ struct RealmFields {
     Value arrayValuesFn, arrayIterNextFn;  // the original Array.prototype.values and array iterator next
     Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
+    Value moduleHost;  // the module loader's `host` object: the embedder's resolve and fetch functions live on it
     struct PropWatch {  // one property of RegExp.prototype as the engine made it (regexp.cpp)
         PropKey key;
         uint64_t value;

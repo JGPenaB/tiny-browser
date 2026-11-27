@@ -344,4 +344,27 @@ test("realms: each has its own global object and intrinsics (9.3)", function () 
   for (let i = 0; i < 200000; i++) ({ a: [i] });  // collections keep every realm alive
   eq([other.eval("[1, 2].map(function (x) { return x * 2; }).join()"), third.Object.keys({ a: 1 }).length], ["2,4", 1]);
 });
+test("ShadowRealm: only primitives and wrapped functions cross the boundary", function () {
+  const r = new ShadowRealm();
+  eq([r.evaluate("1 + 1"), r.evaluate("'a' + typeof globalThis.print"), r.evaluate("var kept = 5; let gone = 6; 0"), r.evaluate("kept + typeof gone")], [2, "aundefined", 0, "5undefined"]);
+  eq([typeof kept, Object.prototype.toString.call(r), typeof r.evaluate("Symbol.iterator") === "symbol" && r.evaluate("Symbol.iterator") === Symbol.iterator], ["undefined", "[object ShadowRealm]", true]);
+  throws(() => r.evaluate("({})"), TypeError); throws(() => r.evaluate("[]"), TypeError); throws(() => r.evaluate("syntax error here"), SyntaxError);
+  throws(() => r.evaluate("throw new RangeError('inside')"), TypeError); throws(() => r.evaluate(5), TypeError); throws(() => ShadowRealm(), TypeError);
+  throws(() => ShadowRealm.prototype.evaluate.call({}, "1"), TypeError);
+  // a function comes back as a wrapper of this realm: its own identity, the target's name and length, no other properties
+  const add = r.evaluate("function add(a, b) { return a + b; } add.extra = 1; add");
+  eq([add(2, 3), add.name, add.length, Object.getPrototypeOf(add) === Function.prototype, "extra" in add, add === r.evaluate("add"), add instanceof Function], [5, "add", 2, true, false, false, true]);
+  throws(() => new add(1, 2), TypeError); throws(() => add({}, 1), TypeError);
+  // functions passed in are wrapped for the other side, and results of calls cross back the same way
+  const call = r.evaluate("(f, x) => f(x) + (f instanceof Function ? ' inside' : ' foreign')");
+  eq(call(x => x * 2, 21), "42 inside");
+  const make = r.evaluate("(n) => () => n + 1"); eq(make(4)(), 5);
+  let seen; const inner = r.evaluate("(f) => { try { f(); } catch (e) { return e instanceof TypeError; } }");
+  eq(inner(() => { throw new RangeError("outside"); }), true);
+  const thrower = r.evaluate("() => { throw new Error('boom'); }"); try { thrower(); } catch (e) { seen = e; }
+  eq([seen instanceof TypeError, /boom/.test(seen.message)], [true, true]);
+  // its global object is an ordinary one, and nothing on it has to stay
+  eq(r.evaluate("Object.getPrototypeOf(globalThis) === Object.prototype && delete globalThis.Array && typeof Array"), "undefined");
+  eq(new ShadowRealm().evaluate("typeof Array + typeof ShadowRealm + typeof __modules"), "functionfunctionundefined");
+});
 done();

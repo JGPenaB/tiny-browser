@@ -160,6 +160,12 @@ function strictSet(o, k, v) { "use strict"; o[k] = v; }
   mod("usebytes.js", `import raw from './notes.bin' with { type: 'bytes' }; export { raw };`); mod("notes.bin", "AZ");
   const raw = (await load("usebytes.js")).raw;
   eq([raw instanceof Uint8Array, [...raw], raw.buffer.immutable, (await import("mem:/notes.bin", { with: { type: "bytes" } })).default === raw], [true, [65, 90], true, true]);
+  // ShadowRealm.prototype.importValue loads the module inside that realm, found the way this realm finds modules
+  mod("sv.js", `export const n = 7, o = {}; export function twice(x) { return x * 2; }`);
+  const shadow = new ShadowRealm(), twice = await shadow.importValue("./sv.js", "twice");
+  eq([await shadow.importValue("./sv.js", "n"), twice(4), Object.getPrototypeOf(twice) === Function.prototype], [7, 8, true]);
+  await rejects(shadow.importValue("./sv.js", "o"), TypeError); await rejects(shadow.importValue("./sv.js", "missing"), TypeError);
+  await rejects(shadow.importValue("./nowhere.js", "n"), TypeError);
   const viaScript = await import("mem:/a.js");
   ok(viaScript === A, "import() from a classic script");
   const p = import("mem:/a.js"); ok(p instanceof Promise);

@@ -599,6 +599,7 @@ void setupModules(Vm& vm) {
                         V(vm.newNative(moduleRun, "run", 1)), V(vm.newNative(moduleSetImport, "setImport", 1))};
     Value api = vm.call(make, Value::undef(), natives, 5);
     vm.def(vm.global, "__modules", api, PF_W | PF_C);
+    vm.moduleHost = vm.get(api, "host");
 }
 
 }  // namespace tb::js
