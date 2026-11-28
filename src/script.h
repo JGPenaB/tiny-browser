@@ -80,6 +80,9 @@ public:
     std::vector<std::pair<const Node*, std::string>> adoptedStyles() const;
     bool stopped() const;  // scripts were halted (time limit)
     bool busy() const;     // network requests started by script are still in flight
+    // Time the browser spent on its own work (styling, layout) while page script was running: it does not count
+    // towards the limit that stops scripts which run too long
+    void hostTime(uint64_t ms);
 
     struct Impl;
 

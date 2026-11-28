@@ -182,6 +182,27 @@
   Promise.resolve().then(function () { log('promise microtask', true); });
   requestAnimationFrame(function (t) { log('requestAnimationFrame', typeof t === 'number'); });
   document.addEventListener('DOMContentLoaded', function () { log('DOMContentLoaded', document.readyState === 'interactive'); });
+  // DOM 4.5: a load event on an element stops at the document; other events go on to the window
+  (function () {
+    var seen = [];
+    var spy = function (e) { seen.push(e.type); };
+    window.addEventListener('load', spy, true);
+    window.addEventListener('ping', spy, true);
+    var d = document.createElement('div');
+    document.body.appendChild(d);
+    d.dispatchEvent(new Event('load'));
+    d.dispatchEvent(new Event('ping'));
+    d.remove();
+    window.removeEventListener('load', spy, true);
+    window.removeEventListener('ping', spy, true);
+    eq('a load event on an element does not reach the window', seen.join(), 'ping');
+  })();
+  // HTML 7.2.2: window and top are [LegacyUnforgeable], self is [Replaceable]
+  (function () {
+    var d = Object.getOwnPropertyDescriptor(window, 'top');
+    window.top = 5;
+    eq('window.top is an unforgeable getter', [typeof d.get, d.configurable, window.top === window].join(), 'function,false,true');
+  })();
   window.addEventListener('load', function () {
     log('load', document.readyState === 'complete');
     setTimeout(function () {

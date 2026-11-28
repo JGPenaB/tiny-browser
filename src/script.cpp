@@ -839,7 +839,9 @@ struct ScriptHost::Impl {
             path.push_back(n);
             if (n->isShadowRoot() && !composed) break;  // the event stays inside its shadow tree
         }
-        bool leaves = !path.empty() && !path.back()->parent && path.back()->type == Node::T::Document;
+        // the event goes on from the document to the window, except a load event (DOM 4.5: a document's "get the
+        // parent" is null for load), so that a picture's load does not look like the page's to window listeners
+        bool leaves = !path.empty() && !path.back()->parent && path.back()->type == Node::T::Document && type != "load";
         e->flagA = e->flagB = false;
         // What a listener on `at` (null: the window) sees as the target: the target itself, or the host of the
         // outermost shadow tree around it that `at` is not inside of (DOM 2.5, retargeting).
@@ -939,14 +941,8 @@ struct Entry {
 
 Impl& I(Vm& vm) { return *(Impl*)vm.hostData; }
 
-// Brings styles and boxes up to date for a script that reads them. The time this takes is the browser's, not the
-// script's: it does not count towards the limit that stops scripts which run too long.
-void layoutForScript(Impl& im) {
-    uint64_t t0 = GetTickCount64();
-    im.client.ensureLayout();
-    uint64_t deadline = im.vm.deadlineTick;
-    if (deadline) im.vm.deadlineTick = deadline + (GetTickCount64() - t0);
-}
+// Brings styles and boxes up to date for a script that reads them
+void layoutForScript(Impl& im) { im.client.ensureLayout(); }
 std::string str8(Vm& vm, Value v) { return utf16to8(vm.toStr16(v)); }
 Value val8(Vm& vm, std::string_view s) { return vm.strv(utf8to16(s)); }
 
@@ -2347,6 +2343,7 @@ JSFN(viewportGet) {  // data: 0 innerWidth, 1 innerHeight, 2 scrollY, 3 scrollX
     int which = ci.callee->data.asInt();
     return Value::num(std::round(which == 0 ? w : which == 1 ? h : which == 2 ? sy : 0));
 }
+JSFN(windowSelfFn) { return V(ci.vm.global); }
 JSFN(scrollToFn) {
     Vm& vm = ci.vm;
     Impl& im = I(vm);
@@ -3250,7 +3247,10 @@ void ScriptHost::Impl::setup() {
     }
 
     // ---- window
-    for (const char* n : {"window", "self", "top", "parent", "frames"}) vm.def(G, n, V(G), PF_W | PF_C | PF_E);
+    // window and top are [LegacyUnforgeable] readonly attributes (HTML 7.2.2): getters that cannot be replaced,
+    // so `var top = ...` in a page script leaves them as they are. self, parent and frames are [Replaceable].
+    for (const char* n : {"window", "top"}) vm.defineAccessor(G, PropKey::of(vm.atom(n)), V(vm.newNative(windowSelfFn, n, 0)), Value::undef(), PF_E);
+    for (const char* n : {"self", "parent", "frames"}) vm.def(G, n, V(G), PF_W | PF_C | PF_E);
     vm.def(G, "document", wrap(docNode()), PF_C | PF_E);
     method(G, "setTimeout", setTimeoutFn, 2);
     method(G, "setInterval", setIntervalFn, 2);
@@ -3416,6 +3416,11 @@ ScriptHost::ScriptHost(Document& doc, const std::string& url, Client& client) : 
 ScriptHost::~ScriptHost() {
     std::lock_guard<std::mutex> lk(impl_->net->mu);
     impl_->net->alive = false;  // results still on their way are dropped
+}
+
+void ScriptHost::hostTime(uint64_t ms) {
+    uint64_t deadline = impl_->vm.deadlineTick;
+    if (deadline) impl_->vm.deadlineTick = deadline + ms;
 }
 
 bool ScriptHost::busy() const {

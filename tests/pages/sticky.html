@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sticky test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 0; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  /* CSS Position 3, 3.4 */
+  #results { height: 200px; overflow: auto; }
+  #long { height: 1500px; background: #f4f4f4; }
+  #head { position: sticky; top: 10px; height: 30px; background: #8af; }
+  #short { height: 300px; background: #eef; margin-top: 50px; }
+  #stuck { position: sticky; top: 0; height: 40px; background: #fa8; }
+  #tail { height: 2000px; }
+</style>
+</head>
+<body>
+<div id="results"></div>
+<div id="long"><div id="head">sticky header</div></div>
+<div id="short"><div id="stuck">sticky in a short box</div></div>
+<div id="tail"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var topOf = function (id) { return Math.round(document.getElementById(id).getBoundingClientRect().top); };
+  eq('before scrolling a sticky box is where the flow puts it', topOf('head'), 200);
+  window.scrollTo(0, 600);
+  eq('scrolled past, it stays at its top inset', topOf('head'), 10);
+  window.scrollTo(0, 1690);
+  eq('its containing block ends: it goes with it', topOf('head'), 1700 - 1690 - 30);
+  window.scrollTo(0, 1900);
+  eq('another sticks inside a short box', topOf('stuck'), 0);
+  window.scrollTo(0, 2100);
+  eq('and leaves with the box', topOf('stuck'), 1750 + 300 - 40 - 2100);
+  window.scrollTo(0, 0);
+  window.addEventListener('load', function () {
+    document.title = 'Sticky test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

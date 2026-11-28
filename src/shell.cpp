@@ -1160,6 +1160,13 @@ public:
     void ensureLayout(Tab& t) {
         if (!t.page || !t.page->doc) return;
         Page& p = *t.page;
+        struct HostTime {  // what this takes is not the page script's time, if a script is waiting for it
+            Page& p;
+            uint64_t start = GetTickCount64();
+            ~HostTime() {
+                if (p.script) p.script->hostTime(GetTickCount64() - start);
+            }
+        } hostTime{p};
         float vw = viewportW();
         if (userState(p, false)) p.layoutW = -1;
         bool widthChanged = std::fabs(p.layoutW - vw) >= 0.5f;

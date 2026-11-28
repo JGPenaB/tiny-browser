@@ -156,6 +156,12 @@ struct Ctx {
         float x0, x1, y0, y1;
     };
     std::vector<Float>* floats = nullptr;
+    // Stickily positioned boxes (CSS Position 3, 3.4) and what they painted: moved once the whole page is laid out
+    struct Sticky {
+        Box* b;
+        Mark m0, m1;
+    };
+    std::vector<Sticky> stickies;
 };
 
 // The room the floats leave between x0 and x1 for something from y to y + h: [left, right]
@@ -211,6 +217,7 @@ void shift(Ctx& c, const Mark& a, const Mark& e, float dx, float dy, size_t skip
 }
 
 void rollback(Ctx& c, const Mark& m) {
+    while (!c.stickies.empty() && c.stickies.back().m0.d >= m.d) c.stickies.pop_back();
     for (size_t i = m.b; i < c.boxed.size(); ++i) c.boxed[i]->hasBox = false;
     c.boxed.resize(m.b);
     c.out.items.resize(m.d);
@@ -2653,6 +2660,7 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         e.y = d.y;
         push(c, std::move(e));
     }
+    if (own && s->position == 4 && &b != c.root) c.stickies.push_back({&b, m0, mark(c)});
     if (own && s->position == 1) {
         float dx = s->inset[3].definite() ? s->inset[3].resolve(cw) : s->inset[1].definite() ? -s->inset[1].resolve(cw) : 0;
         float dy = s->inset[0].u == Len::Px ? s->inset[0].v : s->inset[2].u == Len::Px ? -s->inset[2].v : 0;
@@ -2703,6 +2711,34 @@ void sortRange(std::vector<DItem>& src, size_t a, size_t e, std::vector<DItem>& 
 // Scroll containers (CSS Overflow 3). Once every box has its final size, this records how far each clipping box
 // can scroll, holds its scroll offset within that and moves its content up by the offset. An `overflow: auto` box
 // that can scroll gets a thumb at its right edge that shows where it is.
+// A sticky box (CSS Position 3, 3.4) keeps its place in the flow until scrolling would take it past its top (or
+// bottom) inset in the viewport; then it stays at the inset, as far as its containing block's content box lets it.
+// Scrolling moves it, so the page is laid out again when it scrolls.
+void placeStickies(Ctx& c) {
+    for (auto& st : c.stickies) {
+        Box& b = *st.b;
+        const Style* s = b.st;
+        const Node* cb = b.node ? b.node->parent : nullptr;
+        while (cb && !(cb->type == Node::T::Element && cb->hasBox)) cb = cb->parent;
+        if (!cb || !cb->style) continue;
+        const Style& cs = *cb->style;
+        float cbTop = cb->by + cs.border[0] + cs.padding[0].resolve(cb->bw), cbBottom = cb->by + cb->bh - cs.border[2] - cs.padding[2].resolve(cb->bw);
+        float dy = 0;
+        if (s->inset[0].definite()) {
+            float want = c.in.scrollY + s->inset[0].resolve(c.in.vh);
+            if (b.y < want) dy = std::min(want - b.y, std::max(0.f, cbBottom - (b.y + b.h + b.m[2])));
+        } else if (s->inset[2].definite()) {
+            float want = c.in.scrollY + c.in.vh - s->inset[2].resolve(c.in.vh);
+            if (b.y + b.h > want) dy = std::max(want - (b.y + b.h), std::min(0.f, cbTop - (b.y - b.m[0])));
+        }
+        if (dy != 0) {
+            shift(c, st.m0, st.m1, 0, dy);
+            b.y += dy;
+        }
+        c.out.fixed = true;
+    }
+}
+
 void placeScrolled(Ctx& c) {
     std::sort(c.scrollers.begin(), c.scrollers.end());  // a box that was laid out twice is listed twice
     c.scrollers.erase(std::unique(c.scrollers.begin(), c.scrollers.end()), c.scrollers.end());
@@ -2752,6 +2788,7 @@ LayoutOut layout_document(const LayoutInput& in) {
     edges(*root, in.vw);
     layoutBox(c, *root, 0, root->m[0], in.vw);
     out.height = std::max(root->y + root->h + root->m[2], c.maxBottom);
+    placeStickies(c);
     placeScrolled(c);
 
     bool layered = false;
