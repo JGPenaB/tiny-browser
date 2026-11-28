@@ -7,7 +7,7 @@
 
 namespace tb {
 
-enum class Display : uint8_t { Inline, Block, ListItem, InlineBlock, None, Table, RowGroup, Row, Cell, Flex, InlineFlex };
+enum class Display : uint8_t { Inline, Block, ListItem, InlineBlock, None, Table, RowGroup, Row, Cell, Flex, InlineFlex, Grid, InlineGrid };
 
 struct Len {
     enum U : uint8_t { Auto, Px, Pct, None };
@@ -49,6 +49,46 @@ struct Background {
     std::vector<BgSize> size;
     std::vector<uint16_t> repeat;        // low byte x, high byte y: 0 repeat, 1 no-repeat, 2 space, 3 round
     std::vector<uint8_t> origin, clip;   // 0 border-box, 1 padding-box, 2 content-box, 3 text (clip only)
+};
+
+// Grid containers (CSS Grid 1, section 7). A track's minimum and maximum sizing functions; fit-content(limit) is
+// auto / max-content held to the limit.
+struct GridBreadth {
+    enum K : uint8_t { Auto, Length, Fr, MinContent, MaxContent } k = Auto;
+    Len len;     // Length: a length or a percentage of the grid container's content box
+    float fr = 0;
+};
+struct GridTrack {
+    GridBreadth min, max;
+    Len fitContent{Len::None, 0};
+};
+// grid-template-columns or -rows. names holds the names of each line: one more than there are tracks, and one more
+// again when a repeat(auto-fill | auto-fit, ...) group stands between line autoAt and line autoAt + 1.
+struct GridTrackList {
+    std::vector<GridTrack> tracks;
+    std::vector<std::vector<std::string>> names{1};
+    int autoAt = -1;
+    bool autoFit = false;
+    std::vector<GridTrack> autoTracks;
+    std::vector<std::vector<std::string>> autoNames;
+};
+struct GridArea {
+    std::string name;
+    int row0, col0, row1, col1;  // lines, from 0; the ends are after the area
+};
+struct GridTemplate {
+    GridTrackList cols, rows;
+    std::vector<GridTrack> autoCols{GridTrack{}}, autoRows{GridTrack{}};  // grid-auto-columns and -rows
+    std::vector<GridArea> areas;
+    int areaRows = 0, areaCols = 0;
+    bool flowColumn = false, dense = false;  // grid-auto-flow
+};
+// One end of a grid item's place (CSS Grid 1, 8.3): auto, a line number, a span, a name, or a name with a number
+struct GridLine {
+    int line = 0;  // not 0: the nth line, from the end when negative (with `name`: the nth line of that name)
+    int span = 0;  // not 0: span that many tracks (or lines of that name)
+    std::string name;
+    bool isAuto() const { return line == 0 && span == 0 && name.empty(); }
 };
 
 // An SVG paint (SVG 2, section 13.2): none, a colour, or currentcolor, the element's own `color`.
@@ -127,6 +167,14 @@ struct Style {
     uint8_t justify = 0;   // 0 start, 1 center, 2 end, 3 space-between, 4 space-around, 5 space-evenly
     uint8_t alignItems = 0;  // 0 stretch, 1 start, 2 center, 3 end
     uint8_t alignSelf = 255; // 255 = auto
+    bool justifyNormal = true;     // justify-content: normal or stretch, which a grid's auto tracks stretch to
+    uint8_t alignContent = 0;      // as `justify`, for the rows of a grid
+    bool alignContentNormal = true;
+    uint8_t justifyItems = 0;      // as alignItems, along the inline axis of grid areas
+    uint8_t justifySelf = 255;     // 255 = auto
+    // Grid container and grid item
+    std::shared_ptr<const GridTemplate> grid;  // null: no templates, auto tracks, rows filled first
+    GridLine gridRow[2], gridCol[2];           // grid-row-start / -end, grid-column-start / -end
     float gapRow = 0, gapCol = 0;
     // Flex item
     float flexGrow = 0, flexShrink = 1;

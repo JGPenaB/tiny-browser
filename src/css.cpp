@@ -502,6 +502,8 @@ const char* display_name(Display d) {
         case Display::Cell: return "table-cell";
         case Display::Flex: return "flex";
         case Display::InlineFlex: return "inline-flex";
+        case Display::Grid: return "grid";
+        case Display::InlineGrid: return "inline-grid";
     }
     return "?";
 }
@@ -1863,9 +1865,20 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
         d.flexBasis = s.flexBasis;
     } else if (p == "flex-direction") d.flexDir = s.flexDir;
     else if (p == "flex-wrap") d.flexWrap = s.flexWrap;
-    else if (p == "justify-content") d.justify = s.justify;
-    else if (p == "align-items") d.alignItems = s.alignItems;
+    else if (p == "justify-content") {
+        d.justify = s.justify;
+        d.justifyNormal = s.justifyNormal;
+    } else if (p == "align-content") {
+        d.alignContent = s.alignContent;
+        d.alignContentNormal = s.alignContentNormal;
+    } else if (p == "align-items") d.alignItems = s.alignItems;
     else if (p == "align-self") d.alignSelf = s.alignSelf;
+    else if (p == "justify-items") d.justifyItems = s.justifyItems;
+    else if (p == "justify-self") d.justifySelf = s.justifySelf;
+    else if (istarts(p, "grid-row") || istarts(p, "grid-column") || p == "grid-area") {
+        std::copy(s.gridRow, s.gridRow + 2, d.gridRow);
+        std::copy(s.gridCol, s.gridCol + 2, d.gridCol);
+    } else if (istarts(p, "grid")) d.grid = s.grid;
     else if (p == "gap") {
         d.gapRow = s.gapRow;
         d.gapCol = s.gapCol;
@@ -1903,10 +1916,12 @@ bool parse_display(const std::string& v, Display& d) {
     else if (in(v, {"flex", "block flex", "-webkit-box", "-ms-flexbox", "-webkit-flex"})) d = Display::Flex;
     else if (in(v, {"inline-flex", "inline flex", "inline-flexbox", "-webkit-inline-box", "-webkit-inline-flex"}))
         d = Display::InlineFlex;
-    else if (in(v, {"block", "flow-root", "grid", "block flow", "block grid", "table-caption", "block flow-root"}))
+    else if (v == "grid" || v == "block grid") d = Display::Grid;
+    else if (v == "inline-grid" || v == "inline grid") d = Display::InlineGrid;
+    else if (in(v, {"block", "flow-root", "block flow", "table-caption", "block flow-root"}))
         d = Display::Block;
     else if (in(v, {"inline", "contents", "inline flow", "ruby", "ruby-text"})) d = Display::Inline;
-    else if (in(v, {"inline-block", "inline-grid", "inline flow-root", "inline grid"})) d = Display::InlineBlock;
+    else if (in(v, {"inline-block", "inline flow-root"})) d = Display::InlineBlock;
     else if (v == "list-item" || v == "block list-item") d = Display::ListItem;
     else if (v == "table" || v == "inline-table") d = Display::Table;
     else if (in(v, {"table-row-group", "table-header-group", "table-footer-group"})) d = Display::RowGroup;
@@ -2116,6 +2131,260 @@ int list_kw(std::string_view t) {
     if (t == "lower-roman") return 7;
     if (t == "upper-roman") return 8;
     return -1;
+}
+
+// ---- CSS Grid 1, section 7: track lists, areas and placement
+// The component values of a track list, with each [line names] kept as one token
+std::vector<std::string> grid_tokens(std::string_view v) {
+    std::vector<std::string> out;
+    for (auto& t : tokens(v)) {
+        if (!out.empty() && out.back()[0] == '[' && out.back().back() != ']') out.back() += " " + t;
+        else out.push_back(t);
+    }
+    return out;
+}
+bool parse_breadth(std::string_view t, float fs, GridBreadth& b) {
+    std::string l = lower(t);
+    float n;
+    std::string_view u;
+    if (l == "auto") b.k = GridBreadth::Auto;
+    else if (l == "min-content") b.k = GridBreadth::MinContent;
+    else if (l == "max-content") b.k = GridBreadth::MaxContent;
+    else if (parse_num(l, n, u) && u == "fr" && n >= 0) {
+        b.k = GridBreadth::Fr;
+        b.fr = n;
+    } else if (parse_len(l, fs, b.len, false) && b.len.definite() && b.len.v >= 0) b.k = GridBreadth::Length;
+    else return false;
+    return true;
+}
+bool parse_track(std::string_view t, float fs, GridTrack& tr) {
+    std::string l = lower(t);
+    if (istarts(l, "minmax(") && l.back() == ')') {
+        auto args = split_top(std::string_view(l).substr(7, l.size() - 8), ',');
+        return args.size() == 2 && parse_breadth(trim(args[0]), fs, tr.min) && tr.min.k != GridBreadth::Fr &&
+               parse_breadth(trim(args[1]), fs, tr.max);
+    }
+    if (istarts(l, "fit-content(") && l.back() == ')') {
+        tr.min.k = GridBreadth::Auto;
+        tr.max.k = GridBreadth::MaxContent;
+        return parse_len(std::string_view(l).substr(12, l.size() - 13), fs, tr.fitContent, false) && tr.fitContent.definite();
+    }
+    if (!parse_breadth(l, fs, tr.max)) return false;
+    tr.min = tr.max;
+    if (tr.max.k == GridBreadth::Fr) tr.min = GridBreadth{};  // a flexible track has an automatic minimum
+    return true;
+}
+std::vector<std::string> line_names(std::string_view t) {  // "[a b]"
+    std::vector<std::string> out;
+    for (auto& n : tokens(t.substr(1, t.size() - 2))) out.push_back(n);
+    return out;
+}
+// grid-template-columns / -rows (7.2): "none" or a track list with names, repeat(n, ...) and one repeat(auto-fill
+// or auto-fit, ...) of fixed tracks
+bool parse_track_list(std::string_view v, float fs, GridTrackList& out, bool allowRepeat = true) {
+    out = GridTrackList{};
+    if (lower(trim(v)) == "none") return true;
+    for (auto& t : grid_tokens(v)) {
+        std::string l = lower(t);
+        if (t[0] == '[') {
+            if (t.back() != ']') return false;
+            for (auto& n : line_names(t)) out.names.back().push_back(n);
+        } else if (istarts(l, "repeat(") && l.back() == ')') {
+            if (!allowRepeat) return false;
+            std::string inner = t.substr(7, t.size() - 8);
+            size_t comma = inner.find(',');
+            if (comma == std::string::npos) return false;
+            std::string count = lower(trim(std::string_view(inner).substr(0, comma)));
+            GridTrackList sub;
+            if (!parse_track_list(std::string_view(inner).substr(comma + 1), fs, sub, false) || sub.tracks.empty()) return false;
+            if (count == "auto-fill" || count == "auto-fit") {
+                if (out.autoAt >= 0) return false;
+                out.autoAt = (int)out.tracks.size();
+                out.autoFit = count == "auto-fit";
+                out.autoTracks = sub.tracks;
+                out.autoNames = sub.names;
+                out.names.push_back({});  // the line after the group
+                continue;
+            }
+            int n = atoi(count.c_str());
+            if (n < 1 || n > 10000) return false;
+            for (int k = 0; k < n; ++k) {
+                for (auto& nm : sub.names[0]) out.names.back().push_back(nm);
+                for (size_t i = 0; i < sub.tracks.size(); ++i) {
+                    out.tracks.push_back(sub.tracks[i]);
+                    out.names.push_back(sub.names[i + 1]);
+                }
+            }
+        } else {
+            GridTrack tr;
+            if (!parse_track(t, fs, tr)) return false;
+            out.tracks.push_back(tr);
+            out.names.push_back({});
+        }
+    }
+    return true;
+}
+bool parse_auto_tracks(std::string_view v, float fs, std::vector<GridTrack>& out) {  // grid-auto-columns / -rows
+    std::vector<GridTrack> r;
+    for (auto& t : tokens(v)) {
+        GridTrack tr;
+        if (!parse_track(t, fs, tr)) return false;
+        r.push_back(tr);
+    }
+    if (r.empty()) return false;
+    out = std::move(r);
+    return true;
+}
+// grid-template-areas (7.3): each string a row, each name a cell, "." an empty cell; every name a rectangle
+bool parse_areas(std::string_view v, GridTemplate& g) {
+    g.areas.clear();
+    g.areaRows = g.areaCols = 0;
+    if (lower(trim(v)) == "none") return true;
+    std::vector<std::vector<std::string>> rows;
+    for (auto& t : tokens(v)) {
+        if (t.size() < 2 || (t[0] != '"' && t[0] != '\'')) return false;
+        std::vector<std::string> cells;
+        std::string inner = t.substr(1, t.size() - 2);
+        size_t i = 0;
+        while (i < inner.size()) {
+            if (isws(inner[i])) { ++i; continue; }
+            size_t st = i;
+            if (inner[i] == '.') {
+                while (i < inner.size() && inner[i] == '.') ++i;
+                cells.push_back("");
+            } else {
+                while (i < inner.size() && !isws(inner[i]) && inner[i] != '.') ++i;
+                cells.push_back(inner.substr(st, i - st));
+            }
+        }
+        if (!rows.empty() && cells.size() != rows[0].size()) return false;
+        if (cells.empty()) return false;
+        rows.push_back(std::move(cells));
+    }
+    std::vector<GridArea> areas;
+    for (int r = 0; r < (int)rows.size(); ++r)
+        for (int c = 0; c < (int)rows[r].size(); ++c) {
+            const std::string& n = rows[r][c];
+            if (n.empty()) continue;
+            auto it = std::find_if(areas.begin(), areas.end(), [&](const GridArea& a) { return a.name == n; });
+            if (it == areas.end()) areas.push_back({n, r, c, r + 1, c + 1});
+            else {
+                it->row1 = std::max(it->row1, r + 1);
+                it->col0 = std::min(it->col0, c);
+                it->col1 = std::max(it->col1, c + 1);
+            }
+        }
+    for (auto& a : areas)  // a name that does not fill its rectangle makes the declaration invalid
+        for (int r = a.row0; r < a.row1; ++r)
+            for (int c = a.col0; c < a.col1; ++c)
+                if (rows[r][c] != a.name) return false;
+    g.areas = std::move(areas);
+    g.areaRows = (int)rows.size();
+    g.areaCols = rows.empty() ? 0 : (int)rows[0].size();
+    return true;
+}
+// grid-template (7.4): none, <rows> / <columns>, or rows of area strings, each with its height
+bool parse_grid_template(std::string_view v, float fs, GridTemplate& g) {
+    g.cols = g.rows = GridTrackList{};
+    g.areas.clear();
+    g.areaRows = g.areaCols = 0;
+    if (lower(trim(v)) == "none") return true;
+    auto parts = split_top(v, '/');
+    if (parts.size() > 2) return false;
+    if (v.find('"') == std::string_view::npos && v.find('\'') == std::string_view::npos)
+        return parts.size() == 2 && parse_track_list(parts[0], fs, g.rows) && parse_track_list(parts[1], fs, g.cols);
+    std::string strings;
+    GridTrackList rows;
+    bool pendingRow = false;
+    for (auto& t : grid_tokens(parts[0])) {
+        if (t[0] == '"' || t[0] == '\'') {
+            if (pendingRow) {
+                rows.tracks.push_back(GridTrack{});
+                rows.names.push_back({});
+            }
+            strings += t + " ";
+            pendingRow = true;
+        } else if (t[0] == '[') {
+            for (auto& n : line_names(t)) rows.names.back().push_back(n);
+        } else {
+            GridTrack tr;
+            if (!pendingRow || !parse_track(t, fs, tr)) return false;
+            rows.tracks.push_back(tr);
+            rows.names.push_back({});
+            pendingRow = false;
+        }
+    }
+    if (pendingRow) {
+        rows.tracks.push_back(GridTrack{});
+        rows.names.push_back({});
+    }
+    if (!parse_areas(strings, g)) return false;
+    g.rows = std::move(rows);
+    return parts.size() == 1 || parse_track_list(parts[1], fs, g.cols, false);
+}
+// grid (7.8): a grid-template, or auto-flow on one side with the auto tracks of the other axis
+bool parse_grid(std::string_view v, float fs, GridTemplate& g) {
+    g = GridTemplate{};
+    std::string l = lower(v);
+    if (l.find("auto-flow") == std::string::npos) return parse_grid_template(v, fs, g);
+    auto parts = split_top(v, '/');
+    if (parts.size() != 2) return false;
+    for (int side = 0; side < 2; ++side) {
+        std::string p = lower(trim(parts[side]));
+        if (p.find("auto-flow") == std::string::npos) continue;
+        g.flowColumn = side == 1;
+        std::string rest;
+        for (auto& t : tokens(parts[side])) {
+            std::string tl = lower(t);
+            if (tl == "auto-flow") continue;
+            if (tl == "dense") g.dense = true;
+            else rest += t + " ";
+        }
+        if (!trim(rest).empty() && !parse_auto_tracks(rest, fs, side == 0 ? g.autoRows : g.autoCols)) return false;
+        return parse_track_list(parts[1 - side], fs, side == 0 ? g.cols : g.rows);
+    }
+    return false;
+}
+// <grid-line> (8.3): auto | <integer> && <ident>? | span && [<integer> || <ident>] | <ident>
+bool parse_grid_line(std::string_view v, GridLine& out) {
+    out = GridLine{};
+    auto T = tokens(v);
+    if (T.size() == 1 && lower(T[0]) == "auto") return true;
+    bool span = false;
+    for (auto& t : T) {
+        std::string l = lower(t);
+        float n;
+        std::string_view u;
+        if (l == "span") span = true;
+        else if (parse_num(l, n, u) && u.empty() && n == (int)n && n != 0) out.line = (int)n;
+        else if (l == "auto" || l == "span") return false;
+        else out.name = t;
+    }
+    if (T.empty()) return false;
+    if (span) {
+        out.span = out.line ? out.line : 1;
+        if (out.span < 0) return false;
+        out.line = 0;
+    }
+    return true;
+}
+// what an omitted end of grid-row, grid-column or grid-area becomes (8.4): the same name, or auto
+GridLine grid_line_default(const GridLine& from) {
+    GridLine g;
+    if (from.line == 0 && from.span == 0 && !from.name.empty()) g.name = from.name;
+    return g;
+}
+uint8_t self_alignment(const std::string& v) {  // 0 stretch (normal), 1 start, 2 center, 3 end
+    std::string t = istarts(v, "safe ") || istarts(v, "unsafe ") ? v.substr(v.find(' ') + 1) : v;
+    if (in(t, {"start", "flex-start", "self-start", "left", "baseline", "first baseline", "last baseline"})) return 1;
+    if (t == "center") return 2;
+    if (in(t, {"end", "flex-end", "self-end", "right"})) return 3;
+    return 0;
+}
+uint8_t content_distribution(const std::string& v) {  // as Style::justify
+    std::string t = istarts(v, "safe ") || istarts(v, "unsafe ") ? v.substr(v.find(' ') + 1) : v;
+    return t == "center" ? 1 : (t == "flex-end" || t == "end" || t == "right") ? 2 : t == "space-between" ? 3 : t == "space-around" ? 4
+                                                                                 : t == "space-evenly" ? 5 : 0;
 }
 
 void apply(Style& s, const Style& parent, std::string_view prop, std::string_view raw) {
@@ -2371,10 +2640,76 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
             else if (t == "wrap" || t == "wrap-reverse") s.flexWrap = true;
             else if (t == "nowrap") s.flexWrap = false;
         }
-    } else if (prop == "justify-content") {
-        std::string t = lv;
-        if (istarts(t, "safe ")) t = t.substr(5);
-        s.justify = (t == "center") ? 1 : (t == "flex-end" || t == "end" || t == "right") ? 2 : t == "space-between" ? 3 : t == "space-around" ? 4 : t == "space-evenly" ? 5 : 0;
+    } else if (prop == "justify-content" || prop == "align-content" || prop == "place-content") {
+        // place-content is <align-content> <justify-content>?, the second the same as the first when left out
+        std::string align = lv, justify = lv;
+        if (prop == "place-content") {
+            auto halves = tokens(lv);
+            if (halves.empty()) return;
+            align = halves[0];
+            justify = halves.size() > 1 ? halves[1] : halves[0];
+        }
+        if (prop != "justify-content") {
+            s.alignContent = content_distribution(align);
+            s.alignContentNormal = align == "normal" || align == "stretch";
+        }
+        if (prop != "align-content") {
+            s.justify = content_distribution(justify);
+            s.justifyNormal = justify == "normal" || justify == "stretch";
+        }
+    } else if (prop == "justify-items" || prop == "justify-self") {
+        uint8_t a = self_alignment(lv);
+        if (prop == "justify-items") s.justifyItems = a;
+        else s.justifySelf = lv == "auto" ? 255 : a;
+    } else if (prop == "place-items" || prop == "place-self") {
+        auto halves = tokens(lv);
+        if (halves.empty()) return;
+        std::string j = halves.size() > 1 ? halves[1] : halves[0];
+        if (prop == "place-items") {
+            s.alignItems = self_alignment(halves[0]);
+            s.justifyItems = self_alignment(j);
+        } else {
+            s.alignSelf = halves[0] == "auto" ? 255 : self_alignment(halves[0]);
+            s.justifySelf = j == "auto" ? 255 : self_alignment(j);
+        }
+    } else if (istarts(prop, "grid-template") || prop == "grid" || istarts(prop, "grid-auto")) {
+        auto g = s.grid ? std::make_shared<GridTemplate>(*s.grid) : std::make_shared<GridTemplate>();
+        bool ok = true;
+        if (prop == "grid-template-columns") ok = parse_track_list(val, fs, g->cols);
+        else if (prop == "grid-template-rows") ok = parse_track_list(val, fs, g->rows);
+        else if (prop == "grid-template-areas") ok = parse_areas(val, *g);
+        else if (prop == "grid-template") ok = parse_grid_template(val, fs, *g);
+        else if (prop == "grid") ok = parse_grid(val, fs, *g);
+        else if (prop == "grid-auto-columns") ok = parse_auto_tracks(val, fs, g->autoCols);
+        else if (prop == "grid-auto-rows") ok = parse_auto_tracks(val, fs, g->autoRows);
+        else if (prop == "grid-auto-flow") {
+            g->flowColumn = contains(lv, "column");
+            g->dense = contains(lv, "dense");
+        }
+        if (ok) s.grid = std::move(g);
+    } else if (prop == "grid-row-start" || prop == "grid-row-end" || prop == "grid-column-start" || prop == "grid-column-end") {
+        GridLine gl;
+        if (parse_grid_line(val, gl)) (contains(prop, "row") ? s.gridRow : s.gridCol)[contains(prop, "end") ? 1 : 0] = gl;
+    } else if (prop == "grid-row" || prop == "grid-column" || prop == "grid-area") {
+        auto parts = split_top(val, '/');
+        GridLine L[4];
+        size_t n = std::min<size_t>(parts.size(), prop == "grid-area" ? 4 : 2);
+        for (size_t i = 0; i < n; ++i)
+            if (!parse_grid_line(parts[i], L[i])) return;
+        if (prop == "grid-area") {
+            if (n < 2) L[1] = grid_line_default(L[0]);
+            if (n < 3) L[2] = grid_line_default(L[0]);
+            if (n < 4) L[3] = grid_line_default(L[1]);
+            s.gridRow[0] = L[0];
+            s.gridCol[0] = L[1];
+            s.gridRow[1] = L[2];
+            s.gridCol[1] = L[3];
+        } else {
+            if (n < 2) L[1] = grid_line_default(L[0]);
+            GridLine* to = prop == "grid-row" ? s.gridRow : s.gridCol;
+            to[0] = L[0];
+            to[1] = L[1];
+        }
     } else if (prop == "align-items" || prop == "align-self") {
         std::string t = lv;
         if (istarts(t, "safe ")) t = t.substr(5);
@@ -2872,6 +3207,7 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
     if (s->position == 2 || s->position == 3 || s->floatSide) {
         if (s->display == Display::Inline || s->display == Display::InlineBlock) s->display = Display::Block;
         else if (s->display == Display::InlineFlex) s->display = Display::Flex;
+        else if (s->display == Display::InlineGrid) s->display = Display::Grid;
     }
     e->style = std::move(s);
     if (e->style->display != Display::None) applyCounters(*e->style, e->style->display == Display::ListItem, depth_);
@@ -3022,6 +3358,7 @@ void StyleEngine::computePseudo(Node* e, uint8_t kind, Cascade& L) {
     if (s->position == 2 || s->position == 3) {
         if (s->display == Display::Inline || s->display == Display::InlineBlock) s->display = Display::Block;
         else if (s->display == Display::InlineFlex) s->display = Display::Flex;
+        else if (s->display == Display::InlineGrid) s->display = Display::Grid;
     }
     std::string content = lower(trim(s->content));
     if (s->display == Display::None || content.empty() || content == "none" || content == "normal") return;

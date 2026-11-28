@@ -2087,7 +2087,9 @@ std::string resolvedValue(const Node* n, const Style& s, const std::string& name
         // An automatic minimum size resolves to zero where there is no box and on a box laid out the CSS 2 way,
         // which leaves flex items (CSS Sizing 3, 3.1.2).
         const Node* holder = n->hasBox ? boxParent(n) : nullptr;
-        bool flexItem = holder && holder->style && (holder->style->display == Display::Flex || holder->style->display == Display::InlineFlex);
+        bool flexItem = holder && holder->style &&
+                        (holder->style->display == Display::Flex || holder->style->display == Display::InlineFlex ||
+                         holder->style->display == Display::Grid || holder->style->display == Display::InlineGrid);
         return length(name == "min-width" ? s.minWidth : s.minHeight, flexItem ? "auto" : "0px");
     }
     if (name == "max-width") return length(s.maxWidth, "none");
