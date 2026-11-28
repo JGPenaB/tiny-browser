@@ -65,6 +65,10 @@ public:
     // An AnimationEvent or TransitionEvent (CSS Animations 1, 4.1; CSS Transitions 1, 6.1): animationName or
     // propertyName, and elapsedTime in seconds
     void animationEvent(Node* target, const std::string& type, const std::string& name, double elapsed);
+    // The browser is about to navigate the document away or to a fragment of it (a link, a location change): the
+    // navigate event of the Navigation API (HTML 7.4.2.3). 0 go on, 1 a listener cancelled it, 2 a listener
+    // intercepted it and the URL has already changed without a load. type is "push" or "replace".
+    int beforeNavigate(const std::string& url, const std::string& type, bool userInitiated);
     // Fires the submit event (a SubmitEvent naming the submitter, HTML 4.10.21.3) at a form. False when cancelled.
     bool submitEvent(Node* form, Node* submitter);
     // Runs timers that are due. The shell calls this when a wake() delay has passed.

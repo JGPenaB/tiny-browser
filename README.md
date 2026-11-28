@@ -48,7 +48,7 @@ layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
 `dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html` and `animations.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
-come from the test server (`http://localhost:8765/pages/...`). `layout.html` also wants
+come from the test server (`http://localhost:8765/pages/...`), as does `navigation.html` (the Navigation API). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
 third, on a span inside a button, `BUTTON submitted by iconButton`. `animations.html` wants `--do "wait:900"`. `selectors.html` also wants
@@ -115,7 +115,10 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    `tests/pages/components.html`, whose expectations were compared with a reference browser. Style sheets and pictures
    that a script adds after the page was loaded are fetched in the background and applied when they arrive, with `load`
    and `error` events (`tests/pages/late.html`, served by `tests/server.py`), and IntersectionObserver and
-   ResizeObserver report for real. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
+   ResizeObserver report for real. The Navigation API (`window.navigation`: entries, keys and ids, its own state,
+   `navigate()`, `reload()`, `traverseTo()`, `back()`, `forward()`, `updateCurrentEntry()`, the navigate event with
+   `intercept()` for links, location changes, `pushState` and fragments, `currententrychange`, `navigatesuccess`,
+   `navigateerror`; `tests/pages/navigation.html`, served by `tests/server.py`) lists this document's entries only. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
    `getComputedStyle` returns resolved values (CSSOM), `max-height` and `min-height` bound a box as CSS 2 section 10.7
    says, column flex containers shrink their items and flex containers size themselves to their items (Flexbox 9.7
    and 9.9), `overflow: auto` boxes scroll with the wheel and `scrollTop`, fixed boxes stay in the viewport, and

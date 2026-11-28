@@ -178,7 +178,31 @@ struct ScriptHost::Impl {
     struct SessionEntry {
         std::string url;
         Value state = Value::null();
+        // the Navigation API's (HTML 7.2.6.2): a key that stays when the entry is replaced, an id that does not,
+        // and the navigation API state, undefined until one is set
+        std::string key, id;
+        Value navState = Value::undef();
     };
+    int navKeys = 0;
+    SessionEntry newEntry(const std::string& at, Value state, const std::string& key = {}) {
+        SessionEntry e{at, state};
+        e.key = key.empty() ? "k" + std::to_string(++navKeys) : key;
+        e.id = "i" + std::to_string(++navKeys);
+        return e;
+    }
+    Value navHooks = Value::undef();  // the prelude's side of the Navigation API
+    bool skipNavigateEvent = false;   // the next navigation was started by the Navigation API, which fired the event
+    // Calls one of the Navigation API hooks; undefined when there are none
+    Value navHook(const char* name, std::initializer_list<Value> args) {
+        if (!navHooks.isObject() || dead) return Value::undef();
+        std::vector<Value> a(args);
+        try {
+            return vm.call(vm.get(navHooks, name), navHooks, a.data(), (int)a.size());
+        } catch (JSThrow&) {
+            reportError();
+            return Value::undef();
+        }
+    }
     std::vector<SessionEntry> session;
     size_t sessionAt = 0;
     bool manualScrollRestoration = false;
@@ -760,8 +784,9 @@ struct ScriptHost::Impl {
 
     // The document's current session history entry changed without a load (HTML 7.4.6.2, update document for
     // history step application): popstate at once, and hashchange in a task of its own when the fragment changed.
-    void sessionEntryChanged(const std::string& oldUrl) {
+    void sessionEntryChanged(const std::string& oldUrl, const char* type) {
         url = session[sessionAt].url;
+        navHook("changed", {vm.strv(utf8to16(type))});
         if (Url::parse(oldUrl).fragment != Url::parse(url).fragment) {
             hashChanges.push_back({oldUrl, url});
             client.wake(0);
@@ -2550,18 +2575,86 @@ JSFN(historyPushState) {  // data: 0 pushState, 1 replaceState (the shared histo
         next = resolve_url(im.url, str8(vm, to));
         if (!canRewriteUrl(im.url, next)) throwDom(im, "SecurityError", "The URL of a history state must stay within the document's origin");
     }
-    // the URL and history update steps (HTML 7.4.4): no event is fired
+    // the navigate event of the Navigation API, which may cancel it (HTML 7.4.2.3)
+    if (vm.toBool(im.navHook("history", {val8(vm, next), val8(vm, push ? "push" : "replace")}))) return Value::undef();
+    // the URL and history update steps (HTML 7.4.4)
     if (push) {
         im.session.resize(im.sessionAt + 1);
-        im.session.push_back({next, state});
+        im.session.push_back(im.newEntry(next, state));
         ++im.sessionAt;
     } else {
-        im.session[im.sessionAt] = {next, state};
+        Value navState = im.session[im.sessionAt].navState;
+        im.session[im.sessionAt] = im.newEntry(next, state, im.session[im.sessionAt].key);
+        im.session[im.sessionAt].navState = navState;
     }
     im.url = next;
     im.client.urlChanged(next, push);
+    im.navHook("changed", {val8(vm, push ? "push" : "replace")});
     return Value::undef();
 }
+// ---- the native side of the Navigation API (HTML 7.2.6), which the prelude builds window.navigation on
+JSFN(navEntries) {  // [[url, key, id, navigation API state], ...] of this document's entries
+    Impl& im = I(ci.vm);
+    JSArray* list = ci.vm.newArray();
+    for (auto& e : im.session) {
+        JSArray* one = ci.vm.newArray();
+        one->elems = {val8(ci.vm, e.url), val8(ci.vm, e.key), val8(ci.vm, e.id), e.navState};
+        list->elems.push_back(V(one));
+    }
+    return V(list);
+}
+JSFN(navIndex) { return Value::i32((int32_t)I(ci.vm).sessionAt); }
+JSFN(navCanRewrite) { return Value::boolean(canRewriteUrl(I(ci.vm).url, str8(ci.vm, ci.arg(0)))); }
+JSFN(navCommit) {  // commit(url, state, replace): an intercepted navigation changes the URL without a load
+    Impl& im = I(ci.vm);
+    std::string next = str8(ci.vm, ci.arg(0));
+    bool replace = ci.vm.toBool(ci.arg(2));
+    if (!canRewriteUrl(im.url, next)) return Value::undef();
+    if (replace) {
+        im.session[im.sessionAt] = im.newEntry(next, Value::null(), im.session[im.sessionAt].key);
+    } else {
+        im.session.resize(im.sessionAt + 1);
+        im.session.push_back(im.newEntry(next, Value::null()));
+        ++im.sessionAt;
+    }
+    im.session[im.sessionAt].navState = ci.arg(1);
+    std::string old = im.url;
+    im.url = next;
+    im.client.urlChanged(next, !replace);
+    if (Url::parse(old).fragment != Url::parse(next).fragment) {
+        im.hashChanges.push_back({old, next});
+        im.client.wake(0);
+    }
+    return Value::undef();
+}
+JSFN(navSetState) {
+    Impl& im = I(ci.vm);
+    im.session[im.sessionAt].navState = ci.arg(0);
+    return Value::undef();
+}
+JSFN(navTraverse) {
+    Impl& im = I(ci.vm);
+    im.skipNavigateEvent = true;
+    im.client.traverse(ci.vm.toInt32(ci.arg(0)));
+    return Value::undef();
+}
+JSFN(navGo) {  // go(url, replace): a navigation the browser carries out, whose navigate event has been fired
+    Impl& im = I(ci.vm);
+    im.skipNavigateEvent = true;
+    im.client.navigate(str8(ci.vm, ci.arg(0)), ci.vm.toBool(ci.arg(1)));
+    return Value::undef();
+}
+JSFN(navReload) {
+    Impl& im = I(ci.vm);
+    im.skipNavigateEvent = true;
+    im.client.navigate(im.url, true);
+    return Value::undef();
+}
+JSFN(navHooksSet) {
+    I(ci.vm).navHooks = ci.arg(0);
+    return Value::undef();
+}
+
 JSFN(historyGet) {  // data: 0 length, 1 state, 2 scrollRestoration
     Impl& im = historyOf(ci);
     switch (ci.callee->data.asInt()) {
@@ -2955,7 +3048,11 @@ void ScriptHost::Impl::setup() {
             for (Value v : t.args) g.mark(v);
         }
         g.mark(currentScript);
-        for (auto& e : session) g.mark(e.state);
+        for (auto& e : session) {
+            g.mark(e.state);
+            g.mark(e.navState);
+        }
+        g.mark(navHooks);
         if (historyObject) g.mark(V(historyObject));
         if (allCollection) g.mark(V(allCollection));
         for (auto& ep : eventProtos) g.mark(V(ep.second));
@@ -3450,7 +3547,20 @@ void ScriptHost::Impl::setup() {
     historyObject = vm.newObject();
     historyObject->proto = historyProto;
     vm.def(G, "history", V(historyObject), PF_ALL);
-    session.push_back({url, Value::null()});
+    session.push_back(newEntry(url, Value::null()));
+    {
+        JSObject* nav = vm.newObject();
+        vm.defFn(nav, "entries", navEntries, 0);
+        vm.defFn(nav, "index", navIndex, 0);
+        vm.defFn(nav, "canRewrite", navCanRewrite, 1);
+        vm.defFn(nav, "commit", navCommit, 3);
+        vm.defFn(nav, "setState", navSetState, 1);
+        vm.defFn(nav, "traverse", navTraverse, 1);
+        vm.defFn(nav, "go", navGo, 2);
+        vm.defFn(nav, "reload", navReload, 0);
+        vm.defFn(nav, "hooks", navHooksSet, 1);
+        vm.def(G, "__navigation", V(nav), PF_ALL);
+    }
     getter(historyProto, "length", historyGet, nullptr, 0);
     getter(historyProto, "state", historyGet, nullptr, 1);
     getter(historyProto, "scrollRestoration", historyGet, historySetScrollRestoration, 2);
@@ -3658,14 +3768,28 @@ bool ScriptHost::submitEvent(Node* form, Node* submitter) {
     }
 }
 
+int ScriptHost::beforeNavigate(const std::string& url, const std::string& type, bool userInitiated) {
+    Impl& im = *impl_;
+    if (im.dead) return 0;
+    if (im.skipNavigateEvent) {
+        im.skipNavigateEvent = false;
+        return 0;
+    }
+    Entry entry(im);
+    Value r = im.navHook("before", {val8(im.vm, url), val8(im.vm, type), Value::boolean(userInitiated)});
+    return r.isNumber() ? im.vm.toInt32(r) : 0;
+}
+
 void ScriptHost::traversed(size_t index) {
     Impl& im = *impl_;
     if (im.dead || index >= im.session.size() || index == im.sessionAt) return;
     Entry entry(im);
     std::string old = im.url;
+    if (im.skipNavigateEvent) im.skipNavigateEvent = false;  // navigation.traverseTo() fired it
+    else im.navHook("before", {val8(im.vm, im.session[index].url), val8(im.vm, "traverse"), Value::boolean(false)});
     im.sessionAt = index;
     try {
-        im.sessionEntryChanged(old);
+        im.sessionEntryChanged(old, "traverse");
     } catch (JSThrow&) {
         im.reportError();
     }
@@ -3678,13 +3802,13 @@ void ScriptHost::fragmentNavigated(const std::string& url, bool push) {
     std::string old = im.url;
     if (push) {
         im.session.resize(im.sessionAt + 1);
-        im.session.push_back({url, Value::null()});  // the classic history API state is never carried over
+        im.session.push_back(im.newEntry(url, Value::null()));  // the classic history API state is never carried over
         ++im.sessionAt;
     } else {
-        im.session[im.sessionAt] = {url, Value::null()};
+        im.session[im.sessionAt] = im.newEntry(url, Value::null(), im.session[im.sessionAt].key);
     }
     try {
-        im.sessionEntryChanged(old);
+        im.sessionEntryChanged(old, push ? "push" : "replace");
     } catch (JSThrow&) {
         im.reportError();
     }

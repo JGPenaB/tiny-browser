@@ -458,9 +458,17 @@ public:
     }
 
     // `req` carries POST data; `fromPage` marks navigations started by page content (links, forms, refresh).
-    void navigate(Tab& t, const std::string& input, bool push = true, const FetchOpts* req = nullptr, bool fromPage = false) {
+    void navigate(Tab& t, const std::string& input, bool push = true, const FetchOpts* req = nullptr, bool fromPage = false,
+                  bool userInitiated = false) {
         std::string url = input;
         if (istarts(url, "javascript:")) return;  // javascript: links are not run
+        if (fromPage && !req && t.page && t.page->script) {  // the page's navigate event may cancel or intercept it
+            int decision = t.page->script->beforeNavigate(url, push ? "push" : "replace", userInitiated);
+            if (decision != 0) {
+                afterScript(t);
+                return;
+            }
+        }
         if (istarts(url, "about:bookmarks?remove=")) {
             bm.removeAt((size_t)atoi(url.c_str() + 23));
             url = "about:bookmarks";
@@ -2828,7 +2836,7 @@ public:
             if (!href.empty()) {
                 auto target = a->attr("target");
                 if (middle || ctrl || (target && *target == "_blank")) newTab(href, !(middle || ctrl));
-                else navigate(*t, href, true, nullptr, true);
+                else navigate(*t, href, true, nullptr, true, true);
             }
         }
         invalidate();

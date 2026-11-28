@@ -1014,10 +1014,283 @@ Object.defineProperty(Element.prototype, 'scrollTop', {
   enumerable: true, configurable: true
 });
 
+)JS"
+R"JS(
+// ---- the Navigation API (HTML 7.2.6): window.navigation over this document's session history entries. The native
+// side (G.__navigation) keeps the entries with their keys, ids and navigation API state, and tells this side when
+// the browser itself navigates, so that the navigate event can be cancelled or intercepted.
+var navNative = G.__navigation;
+delete G.__navigation;
+function makeEvent(proto, type, init, fields) {
+  var e = new Event(type, { bubbles: false, cancelable: !!(init && init.cancelable) });
+  Object.setPrototypeOf(e, proto);
+  for (var k in fields) Object.defineProperty(e, k, { value: fields[k], enumerable: true, configurable: true });
+  return e;
+}
+function NavigationHistoryEntry() { throw new TypeError('Illegal constructor'); }
+NavigationHistoryEntry.prototype = Object.create(EventTarget.prototype, {
+  constructor: { value: NavigationHistoryEntry, writable: true, configurable: true },
+  url: { get: function () { return this._e[0]; }, configurable: true, enumerable: true },
+  key: { get: function () { return this._e[1]; }, configurable: true, enumerable: true },
+  id: { get: function () { return this._e[2]; }, configurable: true, enumerable: true },
+  index: { get: function () { return this._i; }, configurable: true, enumerable: true },
+  sameDocument: { get: function () { return true; }, configurable: true, enumerable: true },
+  getState: { value: function getState() { var s = this._e[3]; return s === undefined ? undefined : structuredClone(s); }, writable: true, configurable: true }
+});
+var entryObjects = new Map();
+function entryAt(i, data) {
+  var o = entryObjects.get(data[2]);
+  if (!o) { o = Object.create(NavigationHistoryEntry.prototype); o.ondispose = null; entryObjects.set(data[2], o); }
+  o._i = i; o._e = data;
+  return o;
+}
+function currentEntry() { var list = navNative.entries(), i = navNative.index(); return entryAt(i, list[i]); }
+function NavigationDestination() { throw new TypeError('Illegal constructor'); }
+NavigationDestination.prototype = {
+  constructor: NavigationDestination,
+  getState: function getState() { return this._state === undefined ? undefined : structuredClone(this._state); }
+};
+function destination(url, entry, state) {
+  var d = Object.create(NavigationDestination.prototype);
+  d.url = url; d.key = entry ? entry.key : ''; d.id = entry ? entry.id : ''; d.index = entry ? entry.index : -1;
+  d.sameDocument = !!entry || sameDocumentUrl(url); d._state = state;
+  return d;
+}
+function NavigateEvent(type, init) {
+  if (!new.target) throw new TypeError("Constructor NavigateEvent requires 'new'");
+  init = init || {};
+  var e = makeEvent(NavigateEvent.prototype, type, init, {
+    navigationType: init.navigationType || 'push', destination: init.destination, canIntercept: !!init.canIntercept,
+    userInitiated: !!init.userInitiated, hashChange: !!init.hashChange, signal: init.signal || new AbortController().signal,
+    formData: init.formData || null, downloadRequest: init.downloadRequest == null ? null : String(init.downloadRequest),
+    info: init.info, hasUAVisualTransition: !!init.hasUAVisualTransition, sourceElement: init.sourceElement || null });
+  e._handlers = []; e._intercepted = false;
+  return e;
+}
+NavigateEvent.prototype = Object.create(Event.prototype, {
+  constructor: { value: NavigateEvent, writable: true, configurable: true },
+  intercept: { value: function intercept(options) {
+    if (!this.canIntercept) throw new DOMException('This navigation cannot be intercepted', 'SecurityError');
+    if (!this._dispatching) throw new DOMException('intercept() must be called while the navigate event is dispatched', 'InvalidStateError');
+    this._intercepted = true;
+    if (options && typeof options.handler === 'function') this._handlers.push(options.handler);
+  }, writable: true, configurable: true },
+  scroll: { value: function scroll() {}, writable: true, configurable: true }
+});
+function NavigationCurrentEntryChangeEvent(type, init) {
+  if (!new.target) throw new TypeError("Constructor NavigationCurrentEntryChangeEvent requires 'new'");
+  init = init || {};
+  return makeEvent(NavigationCurrentEntryChangeEvent.prototype, type, init, { navigationType: init.navigationType == null ? null : init.navigationType, from: init.from });
+}
+NavigationCurrentEntryChangeEvent.prototype = Object.create(Event.prototype, { constructor: { value: NavigationCurrentEntryChangeEvent, writable: true, configurable: true } });
+function NavigationTransition() { throw new TypeError('Illegal constructor'); }
+function Navigation() { throw new TypeError('Illegal constructor'); }
+Navigation.prototype = Object.create(EventTarget.prototype, {
+  constructor: { value: Navigation, writable: true, configurable: true },
+  entries: { value: function entries() { return navNative.entries().map(function (e, i) { return entryAt(i, e); }); }, writable: true, configurable: true },
+  currentEntry: { get: function () { return currentEntry(); }, configurable: true, enumerable: true },
+  canGoBack: { get: function () { return navNative.index() > 0; }, configurable: true, enumerable: true },
+  canGoForward: { get: function () { return navNative.index() < navNative.entries().length - 1; }, configurable: true, enumerable: true },
+  updateCurrentEntry: { value: function updateCurrentEntry(options) {
+    if (!options || !('state' in options)) throw new TypeError("updateCurrentEntry: 'state' is required");
+    navNative.setState(structuredClone(options.state));
+    var from = lastCurrent;
+    lastCurrent = currentEntry();
+    navigation.dispatchEvent(new NavigationCurrentEntryChangeEvent('currententrychange', { navigationType: null, from: from }));
+  }, writable: true, configurable: true },
+  navigate: { value: function navigate(url, options) {
+    options = options || {};
+    try { url = new URL(String(url), document.baseURI).href; } catch (e) { return failed(new DOMException('Invalid URL', 'SyntaxError')); }
+    var state = options.state === undefined ? undefined : structuredClone(options.state);
+    // "auto" replaces the entry for the same URL, and while the document is still loading (HTML 7.4.2.2)
+    var mode = options.history === 'replace' || (options.history !== 'push' && (url === location.href || document.readyState !== 'complete')) ? 'replace' : 'push';
+    if (url.split('#')[0] !== location.href.split('#')[0] && /^javascript:/i.test(url)) mode = 'replace';
+    return run(mode, url, state, options.info, function (r) {
+      if (r.intercepted) { navNative.commit(url, state, mode === 'replace'); return 'done'; }
+      navNative.go(url, mode === 'replace');  // a fragment navigation, or another document
+      return sameDocumentUrl(url) ? 'later' : 'away';
+    });
+  }, writable: true, configurable: true },
+  reload: { value: function reload(options) {
+    options = options || {};
+    var state = 'state' in options ? structuredClone(options.state) : currentEntry().getState();
+    return run('reload', location.href, state, options.info, function (r) {
+      if (r.intercepted) { navNative.setState(state); return 'done'; }
+      navNative.reload();
+      return 'away';
+    });
+  }, writable: true, configurable: true },
+  traverseTo: { value: function traverseTo(key, options) {
+    var list = navNative.entries(), at = navNative.index(), to = -1;
+    for (var i = 0; i < list.length; ++i) if (list[i][1] === key) to = i;
+    if (to < 0) return failed(new DOMException('No entry with that key', 'InvalidStateError'));
+    if (to === at) { var e = currentEntry(); return { committed: Promise.resolve(e), finished: Promise.resolve(e) }; }
+    var target = entryAt(to, list[to]);
+    var r = fireNavigate('traverse', target.url, target, target.getState(), options && options.info, true, false);
+    if (r.canceled) return failed(new DOMException('The navigation was cancelled', 'AbortError'));
+    pending = r;
+    navNative.traverse(to - at);
+    var settled = settle(r);
+    return { committed: settled.committed, finished: settled.finished };
+  }, writable: true, configurable: true },
+  back: { value: function back(options) {
+    var at = navNative.index();
+    if (at === 0) return failed(new DOMException('Cannot go back', 'InvalidStateError'));
+    return this.traverseTo(navNative.entries()[at - 1][1], options);
+  }, writable: true, configurable: true },
+  forward: { value: function forward(options) {
+    var list = navNative.entries(), at = navNative.index();
+    if (at >= list.length - 1) return failed(new DOMException('Cannot go forward', 'InvalidStateError'));
+    return this.traverseTo(list[at + 1][1], options);
+  }, writable: true, configurable: true }
+});
+var navigation = Object.create(Navigation.prototype);
+navigation.onnavigate = navigation.onnavigatesuccess = navigation.onnavigateerror = navigation.oncurrententrychange = null;
+navigation.transition = null;
+var lastCurrent = currentEntry();
+navigation.activation = { entry: lastCurrent, from: null, navigationType: 'push' };
+var pending = null;  // a navigation whose commit the browser carries out: its handlers run once it is committed
+var ongoing = null;  // the navigation whose navigatesuccess or navigateerror has not come yet (HTML 7.2.6.10)
+function navigateError(r, error) {
+  if (navigation.transition && navigation.transition === r.transition) navigation.transition = null;
+  var ev = new Event('navigateerror');
+  Object.defineProperty(ev, 'error', { value: error, enumerable: true });
+  Object.defineProperty(ev, 'message', { value: String(error && error.message || error), enumerable: true });
+  navigation.dispatchEvent(ev);
+}
+// A new navigation aborts the one still under way: its signal, navigateerror, and its finished promise
+function abortOngoing() {
+  var r = ongoing;
+  ongoing = null;
+  if (!r || r.settled) return;
+  r.settled = true;
+  var error = new DOMException('The navigation was aborted', 'AbortError');
+  r.controller.abort(error);
+  navigateError(r, error);
+  if (r.reject) r.reject(error);
+}
+function failed(error) {
+  var p = Promise.reject(error), q = Promise.reject(error);
+  p.catch(function () {}); q.catch(function () {});
+  return { committed: p, finished: q };
+}
+function sameDocumentUrl(url) { return url.split('#')[0] === location.href.split('#')[0] && url.indexOf('#') >= 0; }
+// The navigate event (HTML 7.4.2.3, "inner navigate event firing algorithm")
+function fireNavigate(type, url, entry, state, info, cancelable, user) {
+  abortOngoing();
+  var controller = new AbortController();
+  var ev = new NavigateEvent('navigate', {
+    navigationType: type, destination: destination(url, entry, state), cancelable: cancelable, userInitiated: user,
+    canIntercept: navNative.canRewrite(url), hashChange: type !== 'traverse' && type !== 'reload' && sameDocumentUrl(url) && url !== location.href,
+    info: info, signal: controller.signal });
+  ev._dispatching = true;
+  var go = navigation.dispatchEvent(ev);
+  ev._dispatching = false;
+  var r = { canceled: !go && ev.cancelable, intercepted: ev._intercepted, handlers: ev._handlers, type: type, controller: controller };
+  if (r.canceled) {
+    var error = new DOMException('The navigation was cancelled', 'AbortError');
+    controller.abort(error);
+    r.settled = true;
+    navigateError(r, error);
+  } else ongoing = r;
+  return r;
+}
+function entryChanged(type) {
+  var from = lastCurrent;
+  lastCurrent = currentEntry();
+  if (from === lastCurrent && type !== 'reload') return;
+  navigation.dispatchEvent(new NavigationCurrentEntryChangeEvent('currententrychange', { navigationType: type, from: from }));
+}
+// After the commit: the intercepting handlers, then navigatesuccess or navigateerror
+function settle(r) {
+  var commit, done, fail;
+  var committed = new Promise(function (res) { commit = res; });
+  var finished = new Promise(function (res, rej) { done = res; fail = rej; });
+  finished.catch(function () {});
+  r.reject = fail;
+  r.onCommit = function () {
+    var entry = currentEntry();
+    commit(entry);
+    var results = r.handlers.map(function (h) { try { return Promise.resolve(h()); } catch (e) { return Promise.reject(e); } });
+    var all = Promise.all(results);
+    var transition = Object.create(NavigationTransition.prototype);
+    transition.navigationType = r.type; transition.from = r.from; transition.finished = all.then(function () {});
+    transition.finished.catch(function () {});
+    navigation.transition = transition;
+    r.transition = transition;
+    all.then(function () {
+      if (r.settled) return;
+      r.settled = true;
+      if (ongoing === r) ongoing = null;
+      if (navigation.transition === transition) navigation.transition = null;
+      navigation.dispatchEvent(new Event('navigatesuccess'));
+      done(entry);
+    }, function (error) {
+      if (r.settled) return;
+      r.settled = true;
+      if (ongoing === r) ongoing = null;
+      navigateError(r, error);
+      fail(error);
+    });
+  };
+  return { committed: committed, finished: finished };
+}
+// A navigation the page asked for: 'done' when commitFn committed it here, 'later' when the browser will (the
+// changed hook then finishes it), 'away' when another document is coming
+function run(type, url, state, info, commitFn) {
+  var target = type === 'reload' ? currentEntry() : null;
+  var r = fireNavigate(type, url, target, state, info, true, false);
+  if (r.canceled) return failed(new DOMException('The navigation was cancelled', 'AbortError'));
+  r.from = lastCurrent;
+  var settled = settle(r);
+  var how = commitFn(r);
+  if (how === 'done') { entryChanged(type); r.onCommit(); }
+  else if (how === 'later') pending = r;
+  return how === 'away' ? { committed: new Promise(function () {}), finished: new Promise(function () {}) } : settled;
+}
+navNative.hooks({
+  // the browser is about to navigate (a link, a location change, a form): 0 go on, 1 cancelled, 2 intercepted
+  before: function (url, type, user) {
+    var traverse = type === 'traverse';
+    var r = fireNavigate(type, url, null, undefined, undefined, !traverse, !!user);
+    if (r.canceled) return 1;
+    r.from = lastCurrent;
+    settle(r);
+    if (r.intercepted && !traverse && !sameDocumentUrl(url)) {
+      navNative.commit(url, undefined, type === 'replace');
+      entryChanged(type);
+      r.onCommit();
+      return 2;
+    }
+    pending = r;
+    return 0;
+  },
+  // history.pushState() or replaceState(): true when cancelled
+  history: function (url, type) {
+    var r = fireNavigate(type, url, null, undefined, undefined, true, false);
+    if (r.canceled) return true;
+    r.from = lastCurrent;
+    settle(r);
+    pending = r;
+    return false;
+  },
+  // the current entry changed without a load: currententrychange, then what intercepted the navigation
+  changed: function (type) {
+    var r = pending;
+    pending = null;
+    entryChanged(type);
+    if (r && r.onCommit) r.onCommit();
+  }
+});
+Object.defineProperty(G, 'navigation', { get: function () { return navigation; }, configurable: true, enumerable: true });
+)JS"
+R"JS(
 var exported = { IntersectionObserver: IntersectionObserver, IntersectionObserverEntry: IntersectionObserverEntry, ResizeObserver: ResizeObserver,
   ResizeObserverEntry: ResizeObserverEntry, CSSStyleSheet: CSSStyleSheet, DOMException: DOMException, EventTarget: EventTarget, AbortController: AbortController, AbortSignal: AbortSignal, URL: URL, URLSearchParams: URLSearchParams,
   Blob: Blob, File: File, FormData: FormData, Headers: Headers, Request: Request, Response: Response, fetch: fetch, XMLHttpRequest: XMLHttpRequest,
-  NodeFilter: NodeFilter, TreeWalker: TreeWalker, MessageChannel: MessageChannel, DOMParser: DOMParser, XMLSerializer: XMLSerializer };
+  NodeFilter: NodeFilter, TreeWalker: TreeWalker, MessageChannel: MessageChannel, DOMParser: DOMParser, XMLSerializer: XMLSerializer,
+  Navigation: Navigation, NavigateEvent: NavigateEvent, NavigationHistoryEntry: NavigationHistoryEntry, NavigationDestination: NavigationDestination,
+  NavigationTransition: NavigationTransition, NavigationCurrentEntryChangeEvent: NavigationCurrentEntryChangeEvent };
 for (var name of Object.keys(exported)) Object.defineProperty(G, name, { value: exported[name], writable: true, configurable: true, enumerable: false });
 G.webkitURL = URL;
 })();

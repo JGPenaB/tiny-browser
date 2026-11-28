@@ -1,0 +1,93 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Navigation API test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+</style>
+</head>
+<body>
+<p>The Navigation API (HTML 7.2.6). Served by tests/server.py; open it in a fresh tab.</p>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var seen = [];
+  navigation.addEventListener('navigate', function (e) {
+    seen.push('navigate:' + e.navigationType + (e.hashChange ? ':hash' : ''));
+    var u = e.destination.url;
+    if (u.indexOf('cancel') >= 0) e.preventDefault();
+    if (u.indexOf('intercept') >= 0) e.intercept({ handler: function () { seen.push('handler'); return new Promise(function (r) { setTimeout(r, 10); }); } });
+    if (u.indexOf('broken') >= 0) e.intercept({ handler: function () { return Promise.reject(new Error('nope')); } });
+  });
+  navigation.addEventListener('currententrychange', function (e) { seen.push('change:' + e.navigationType); });
+  navigation.addEventListener('navigatesuccess', function () { seen.push('success'); });
+  navigation.addEventListener('navigateerror', function (e) { seen.push('error:' + (e.error && e.error.name === 'AbortError' ? 'abort' : e.error && e.error.message)); });
+  var base = location.pathname;
+  // after the load event: while a document loads, navigate() with history "auto" replaces (HTML 7.4.2.2)
+  window.addEventListener('load', function () { setTimeout(runTests, 0); });
+  function runTests() {
+
+  // a reference browser also lists same-origin entries of earlier documents in the tab: counts are relative
+  var first = navigation.currentEntry, n0 = navigation.entries().length;
+  eq('the current entry is the last of the entries', [first.url === location.href, first.index === n0 - 1, typeof first.key, first === navigation.currentEntry, navigation.canGoForward].join(),
+     'true,true,string,true,false');
+
+  seen = [];
+  history.pushState(null, '', base + '?a');
+  eq('pushState fires navigate and currententrychange (navigatesuccess comes later)', [seen.join(), navigation.entries().length - n0, location.search, navigation.canGoBack].join('|'),
+     'navigate:push,change:push|1|?a|true');
+
+  seen = [];
+  history.pushState(null, '', base + '?cancel');
+  eq('a new navigation aborts the one under way; a cancelled navigate event stops pushState', [seen.join(), location.search, navigation.entries().length - n0].join('|'),
+     'error:abort,navigate:push,error:abort|?a|1');
+
+  seen = [];
+  var aKey = navigation.currentEntry.key;
+  var res = navigation.navigate(base + '?intercept', { state: { x: 1 } });
+  var afterCall = [seen.join(), location.search, navigation.currentEntry.getState().x].join('|');
+  res.committed.then(function (entry) { seen.push('committed:' + (entry === navigation.currentEntry)); });
+  res.finished.then(function () {
+    eq('an intercepted navigate() changes the URL at once, its handler runs, then navigatesuccess', [afterCall, seen.join()].join('|'),
+       'navigate:push,change:push,handler|?intercept|1|navigate:push,change:push,handler,committed:true,success');
+
+    navigation.updateCurrentEntry({ state: 5 });
+    eq('updateCurrentEntry keeps the URL and changes the state', [navigation.currentEntry.getState(), location.search].join(), '5,?intercept');
+
+    seen = [];
+    var r2 = navigation.navigate(base + '?broken');
+    r2.finished.then(function () { log('a handler that fails rejects finished', false); }, function (e) {
+      eq('a handler that fails gives navigateerror and rejects finished', [e.message, seen.join()].join('|'), 'nope|navigate:push,change:push,error:nope');
+
+      seen = [];
+      var back = navigation.traverseTo(aKey);
+      back.finished.then(function () {
+        eq('traverseTo goes back to an earlier entry', [location.search, seen.join(), navigation.currentEntry.key === aKey].join('|'),
+           '?a|navigate:traverse,change:traverse,success|true');
+
+        seen = [];
+        location.hash = 'frag';
+        setTimeout(function () {
+          eq('a fragment navigation fires navigate with hashChange', [seen.join(), location.hash].join('|'), 'navigate:push:hash,change:push,success|#frag');
+          document.title = 'Navigation test: ' + pass + ' passed, ' + fail + ' failed';
+          console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+        }, 100);
+      });
+    });
+  });
+  }
+</script>
+</body>
+</html>
