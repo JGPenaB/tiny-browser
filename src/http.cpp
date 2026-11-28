@@ -964,6 +964,7 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
             FetchResult f = fetch(imgUrls[k], subImage);
             imgNet[k] = {imgUrls[k], f.contentType, f.error, f.status, f.body.size(), f.ms};
             images[k].url = imgUrls[k];
+            images[k].responseUrl = f.finalUrl.empty() ? imgUrls[k] : f.finalUrl;
             if (f.error.empty() && f.status < 400) {
                 if (!decode_image(f.body, images[k]) && imgNet[k].error.empty()) imgNet[k].error = "decode failed";
             }

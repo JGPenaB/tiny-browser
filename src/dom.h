@@ -91,5 +91,8 @@ Node* assigned_slot(const Node* n);             // the <slot> a child of a shado
 Node* flat_parent(const Node* n);               // the parent in the flat tree: the slot of an assigned node, a shadow root's host
 void assigned_nodes(const Node* slot, std::vector<Node*>& out);  // the host's children assigned to this slot
 extern int g_shadowRoots;  // shadow roots made so far in this process: while 0, every flat tree is the plain tree
+// The size of a canvas's bitmap (HTML 4.12.5): its width or height attribute as a non-negative integer, 300 by 150
+// when the attribute is missing or is not one
+int canvas_dimension(const Node* canvas, bool height);
 
 }  // namespace tb

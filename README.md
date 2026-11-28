@@ -10,6 +10,7 @@ JavaScript engine. The only dependencies are Windows system APIs:
 | Layout | Own block / inline / table / flexbox layout, inline-block, absolute / relative / fixed positioning, overflow clipping, boxes that scroll, CSS transforms (`src/layout_engine.cpp`) |
 | SVG | Inline SVG: paths, basic shapes, groups, `use` and symbols, transforms, fill and stroke, viewBox fitting, drawn as Direct2D geometry (`src/svg.cpp`) |
 | Rendering | Display list painted on the GPU with Direct2D 1.1 on a Direct3D 11 flip-model swap chain (`src/gpu.cpp`, `src/render.cpp`) |
+| WebGL | WebGL 1 on the GPU's OpenGL driver (opengl32 ships with Windows), GLSL ES shaders given to it as desktop GLSL (`src/webgl.cpp`) |
 | Text | DirectWrite (shaping, font fallback, color emoji) with word-width caches (`src/text.cpp`) |
 | Networking | WinHTTP transport (HTTPS via SChannel, HTTP/2, gzip/deflate/brotli); our own redirect handling, GET/POST, Referer/Origin policy; plus `file:` and `data:` (`src/http.cpp`) |
 | Cookies | Own cookie jar: third-party cookies blocked, SameSite enforced, persistent cookies DPAPI-encrypted on disk (`src/http.cpp`) |
@@ -47,7 +48,7 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html` and `animations.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html`, `animations.html` and `webgl.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`), as does `navigation.html` (the Navigation API). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
@@ -118,7 +119,19 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    ResizeObserver report for real. The Navigation API (`window.navigation`: entries, keys and ids, its own state,
    `navigate()`, `reload()`, `traverseTo()`, `back()`, `forward()`, `updateCurrentEntry()`, the navigate event with
    `intercept()` for links, location changes, `pushState` and fragments, `currententrychange`, `navigatesuccess`,
-   `navigateerror`; `tests/pages/navigation.html`, served by `tests/server.py`) lists this document's entries only. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
+   `navigateerror`; `tests/pages/navigation.html`, served by `tests/server.py`) lists this document's entries only.
+   WebGL 1 (`canvas.getContext("webgl")`, Khronos WebGL 1.0) draws on the GPU's own OpenGL driver: each context renders
+   into a framebuffer object of the canvas's size, GLSL ES 1.00 shaders are given to the driver as GLSL 1.20, and what a
+   script drew is read back when it returns and shown as the canvas's picture (a canvas is a replaced element as big as
+   its bitmap). Buffers, textures (from arrays, `ImageData`, `<img>` and other canvases, with `UNPACK_FLIP_Y_WEBGL` and
+   premultiplying), framebuffers, renderbuffers, uniforms, the WebGL errors and the extensions OES_vertex_array_object,
+   ANGLE_instanced_arrays, OES_element_index_uint, OES_standard_derivatives, OES_texture_(half_)float(_linear),
+   EXT_blend_minmax, WEBGL_debug_renderer_info and WEBGL_lose_context (a stub) are there. The checks WebGL makes so
+   that the driver never reads past what a script gave it are made: draws are checked against the buffers they read,
+   pixel arrays against the sizes they must hold, new buffers, textures and renderbuffers hold zeros, and a picture from
+   another origin cannot become a texture (pictures are not fetched with CORS yet, so that means any).
+   `tests/pages/webgl.html` (41 checks, compared with a reference browser). Not there yet: WebGL 2, the 2D canvas
+   context, `toDataURL`, context loss, antialiasing, and replaced elements (pictures, canvases) have no borders or padding of their own. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
    `getComputedStyle` returns resolved values (CSSOM), `max-height` and `min-height` bound a box as CSS 2 section 10.7
    says, column flex containers shrink their items and flex containers size themselves to their items (Flexbox 9.7
    and 9.9), `overflow: auto` boxes scroll with the wheel and `scrollTop`, fixed boxes stay in the viewport, and
@@ -128,7 +141,7 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    (script time and memory limits, certificate and mixed-content warnings, per-site exceptions), content blocker
    (EasyList-format lists), tab sleeping.
 5. **Milestone 5 - performance, security, graphics:** GPU layer compositor, off-thread layout, HTTP cache, process isolation,
-   CSP and sandboxed frames, media playback, WebGL (own GLSL-to-HLSL translator), 3D page view (page layers as a movable
+   CSP and sandboxed frames, media playback, WebGL 2, 3D page view (page layers as a movable
    parallax), save as PDF.
 
 ## Conformance

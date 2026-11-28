@@ -1,0 +1,260 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  canvas { margin-right: 8px; vertical-align: top; background: #eee; }
+</style>
+</head>
+<body>
+<p>WebGL 1 (Khronos WebGL 1.0). The first canvas should show a red, green and blue triangle on dark blue; the second a
+2 by 2 checker of red, green, blue and white; the third a 100 by 50 orange box (CSS size, 4 by 2 bitmap).</p>
+<canvas id="tri" width="160" height="120"></canvas>
+<canvas id="tex" width="80" height="80"></canvas>
+<canvas id="small" width="4" height="2" style="width: 100px"></canvas>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  function attempt(name, fn) { try { fn(); } catch (e) { log(name, false, 'threw ' + e); } }
+  function pixel(gl, x, y) { var p = new Uint8Array(4); gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p); return Array.prototype.join.call(p); }
+  function program(gl, vs, fs) {
+    function shader(type, src) { var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; }
+    var p = gl.createProgram();
+    gl.attachShader(p, shader(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    return p;
+  }
+
+  attempt('the context', function () {
+    var c = document.createElement('canvas');
+    eq('a canvas is 300 by 150 by default, and width and height reflect the attributes', [c.width, c.height, (c.width = 64, c.getAttribute('width')), (c.setAttribute('height', ' 20px'), c.height), (c.setAttribute('height', 'x'), c.height)].join(), '300,150,64,20,150');
+    var gl = c.getContext('webgl');
+    eq('getContext("webgl") gives a WebGLRenderingContext, the same one each time', [gl instanceof WebGLRenderingContext, c.getContext('webgl') === gl, gl.canvas === c, String(c.getContext('2d'))].join(), 'true,true,true,null');
+    eq('the drawing buffer has the canvas size', [gl.drawingBufferWidth, gl.drawingBufferHeight].join(), '64,150');
+    eq('constants are on the interface and the context', [WebGLRenderingContext.COLOR_BUFFER_BIT, gl.TRIANGLES, gl.UNSIGNED_BYTE, gl.FRAMEBUFFER_COMPLETE].join(), '16384,4,5121,36053');
+    eq('getParameter: version strings and the viewport', [/^WebGL 1\.0/.test(gl.getParameter(gl.VERSION)), /^WebGL GLSL ES 1\.0/.test(gl.getParameter(gl.SHADING_LANGUAGE_VERSION)), Array.prototype.join.call(gl.getParameter(gl.VIEWPORT)), gl.getParameter(gl.MAX_TEXTURE_SIZE) >= 2048, String(gl.getParameter(gl.ARRAY_BUFFER_BINDING))].join('|'), 'true|true|0,0,64,150|true|null');
+    var attrs = gl.getContextAttributes();
+    eq('getContextAttributes', [attrs.alpha, attrs.depth, attrs.stencil, attrs.premultipliedAlpha, attrs.preserveDrawingBuffer].join(), 'true,true,false,true,false');
+    eq('a new drawing buffer is transparent black', pixel(gl, 5, 5), '0,0,0,0');
+    gl.clearColor(1, 0.6, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    eq('clear fills the drawing buffer with the clear colour', pixel(gl, 5, 5), '255,153,0,255');
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(0, 0, 10, 10);
+    gl.clearColor(0, 0, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.SCISSOR_TEST);
+    eq('the scissor test limits clear', [pixel(gl, 5, 5), pixel(gl, 20, 20)].join('|'), '0,0,255,255|255,153,0,255');
+    eq('getError is NO_ERROR, then reports a bad enum once', [gl.getError(), (gl.enable(0x1234), gl.getError()), gl.getError()].join(), '0,1280,0');
+    gl.pixelStorei(0x0CF2 /* UNPACK_ROW_LENGTH, not in WebGL 1 */, 100);
+    eq('pixelStorei only takes WebGL parameters', gl.getError(), gl.INVALID_ENUM);
+    var noAlpha = document.createElement('canvas').getContext('webgl', { alpha: false });
+    noAlpha.clearColor(0, 1, 0, 0);
+    noAlpha.clear(noAlpha.COLOR_BUFFER_BIT);
+    eq('alpha: false is a drawing buffer without alpha', [noAlpha.getContextAttributes().alpha, pixel(noAlpha, 1, 1)].join('|'), 'false|0,255,0,255');
+  });
+
+  attempt('shaders and drawing', function () {
+    var c = document.getElementById('tri'), gl = c.getContext('webgl');
+    var bad = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(bad, 'void main() { gl_FragColor = nope; }');
+    gl.compileShader(bad);
+    eq('a shader that does not compile says so, with a log', [gl.getShaderParameter(bad, gl.COMPILE_STATUS), gl.getShaderInfoLog(bad).length > 0, gl.getShaderSource(bad)].join('|'), 'false|true|void main() { gl_FragColor = nope; }');
+    var p = program(gl,
+      'attribute vec2 pos; attribute vec3 col; varying lowp vec3 v; void main() { v = col; gl_Position = vec4(pos, 0.0, 1.0); }',
+      '#version 100\nprecision mediump float; varying vec3 v; uniform float k; void main() { gl_FragColor = vec4(v * k, 1.0); }');
+    eq('a GLSL ES program links', [gl.getProgramParameter(p, gl.LINK_STATUS), gl.getProgramParameter(p, gl.ACTIVE_ATTRIBUTES), gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS)].join(), 'true,2,1');
+    var info = gl.getActiveUniform(p, 0);
+    eq('getActiveUniform', [info instanceof WebGLActiveInfo, info.name, info.type === gl.FLOAT, info.size].join(), 'true,k,true,1');
+    gl.useProgram(p);
+    var k = gl.getUniformLocation(p, 'k');
+    gl.uniform1f(k, 1);
+    eq('getUniformLocation and getUniform', [k instanceof WebGLUniformLocation, gl.getUniform(p, k), String(gl.getUniformLocation(p, 'missing'))].join(), 'true,1,null');
+    var buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.8, -0.8, 1, 0, 0,  0.8, -0.8, 0, 1, 0,  0, 0.8, 0, 0, 1]), gl.STATIC_DRAW);
+    eq('bufferData', [gl.getBufferParameter(gl.ARRAY_BUFFER, gl.BUFFER_SIZE), gl.getParameter(gl.ARRAY_BUFFER_BINDING) === buf].join(), '60,true');
+    var pos = gl.getAttribLocation(p, 'pos'), col = gl.getAttribLocation(p, 'col');
+    gl.enableVertexAttribArray(pos);
+    gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 20, 0);
+    gl.enableVertexAttribArray(col);
+    gl.vertexAttribPointer(col, 3, gl.FLOAT, false, 20, 8);
+    gl.clearColor(0, 0, 0.2, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    var centre = pixel(gl, 80, 50).split(',').map(Number);
+    eq('drawArrays draws the triangle with its colours mixed', [gl.getError(), centre[0] > 40 && centre[1] > 40 && centre[2] > 40, centre[3], pixel(gl, 2, 117)].join('|'), '0|true|255|0,0,51,255');
+    gl.drawArrays(gl.TRIANGLES, 0, 4);
+    // WebGL 1.0, 6.6 lets an implementation with robust buffer access draw instead; this one refuses
+    eq('a draw that reaches past the buffer is refused', gl.getError(), gl.INVALID_OPERATION);
+    var idx = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idx);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 5]), gl.STATIC_DRAW);
+    gl.drawElements(gl.TRIANGLES, 3, gl.UNSIGNED_SHORT, 0);
+    var e1 = gl.getError();
+    gl.drawElements(gl.TRIANGLES, 3, gl.UNSIGNED_SHORT, 1);
+    var e2 = gl.getError();
+    gl.drawElements(gl.POINTS, 1, gl.UNSIGNED_SHORT, 6);
+    eq('drawElements reads indices; an odd offset, or an index past the vertices, is refused', [e1, e2, gl.getError()].join(), '0,1282,1282');
+    gl.bindBuffer(gl.ARRAY_BUFFER, idx);
+    eq('a buffer cannot be bound to another target', gl.getError(), gl.INVALID_OPERATION);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.uniform1f(k, 0.5);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.uniform1f(k, 1);
+    var half = pixel(gl, 80, 50).split(',').map(Number);
+    eq('a uniform changes what is drawn', half[0] < centre[0] && half[1] < centre[1], true);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    var other = program(gl, 'attribute vec2 pos; void main() { gl_Position = vec4(pos, 0.0, 1.0); }', 'uniform lowp float k; void main() { gl_FragColor = vec4(k); }');
+    gl.uniform1f(gl.getUniformLocation(other, 'k'), 1);
+    eq('a location of another program than the current one is refused', gl.getError(), gl.INVALID_OPERATION);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 0, 8);
+    eq('vertexAttribPointer with an offset needs a buffer', gl.getError(), gl.INVALID_OPERATION);
+    var threw = '';
+    try { gl.bindBuffer(gl.ARRAY_BUFFER, {}); } catch (e) { threw = e.name; }
+    eq('an argument of the wrong type is a TypeError', threw, 'TypeError');
+    var px = new Uint8Array(3);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    eq('readPixels into an array too small is refused', gl.getError(), gl.INVALID_OPERATION);
+  });
+
+  attempt('textures and framebuffers', function () {
+    var c = document.getElementById('tex'), gl = c.getContext('webgl');
+    var p = program(gl,
+      'attribute vec2 pos; varying vec2 uv; void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }',
+      'precision mediump float; varying vec2 uv; uniform sampler2D t; void main() { gl_FragColor = texture2D(t, uv); }');
+    gl.useProgram(p);
+    var buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(gl.getAttribLocation(p, 'pos'), 2, gl.FLOAT, false, 0, 0);
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    var texels = new Uint8Array([255, 0, 0, 255,  0, 255, 0, 255,  0, 0, 255, 255,  255, 255, 255, 255]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, texels);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    eq('a texture from a Uint8Array: its first row is at the bottom', [gl.getError(), pixel(gl, 20, 20), pixel(gl, 60, 20), pixel(gl, 20, 60), pixel(gl, 60, 60)].join('|'),
+       '0|255,0,0,255|0,255,0,255|0,0,255,255|255,255,255,255');
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(15));
+    eq('texImage2D with too few pixels is refused', gl.getError(), gl.INVALID_OPERATION);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Float32Array(16));
+    eq('texImage2D with the wrong array type is refused', gl.getError(), gl.INVALID_OPERATION);
+
+    // render to a texture
+    var target = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, target);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 4, 4, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);  // the default needs mipmaps
+    var fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target, 0);
+    eq('a texture with no pixels given holds zeros, and a framebuffer of it is complete', [pixel(gl, 1, 1), gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE].join('|'), '0,0,0,0|true');
+    gl.viewport(0, 0, 4, 4);
+    gl.clearColor(0, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    var fbPixel = pixel(gl, 2, 2);
+    var rb = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, 4, 4);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+    eq('a depth renderbuffer attaches', [gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE, gl.getRenderbufferParameter(gl.RENDERBUFFER, gl.RENDERBUFFER_WIDTH)].join(), 'true,4');
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, 80, 80);
+    eq('drawing into a framebuffer leaves the drawing buffer alone', [fbPixel, pixel(gl, 20, 20), String(gl.getParameter(gl.FRAMEBUFFER_BINDING))].join('|'), '0,255,255,255|255,0,0,255|null');
+    gl.bindTexture(gl.TEXTURE_2D, target);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    var fromTarget = pixel(gl, 40, 40);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, texels);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    eq('what was drawn into a texture can be drawn with', fromTarget, '0,255,255,255');
+
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    var check = document.createElement('canvas').getContext('webgl');
+    var cp = program(check, 'attribute vec2 pos; varying vec2 uv; void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }',
+      'precision mediump float; varying vec2 uv; uniform sampler2D t; void main() { gl_FragColor = texture2D(t, uv); }');
+    check.useProgram(cp);
+    check.bindBuffer(check.ARRAY_BUFFER, check.createBuffer());
+    check.bufferData(check.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), check.STATIC_DRAW);
+    check.enableVertexAttribArray(0);
+    check.vertexAttribPointer(0, 2, check.FLOAT, false, 0, 0);
+    check.bindTexture(check.TEXTURE_2D, check.createTexture());
+    check.texParameteri(check.TEXTURE_2D, check.TEXTURE_MIN_FILTER, check.NEAREST);
+    check.texParameteri(check.TEXTURE_2D, check.TEXTURE_MAG_FILTER, check.NEAREST);
+    check.pixelStorei(check.UNPACK_FLIP_Y_WEBGL, true);
+    check.texImage2D(check.TEXTURE_2D, 0, check.RGBA, check.RGBA, check.UNSIGNED_BYTE, new ImageData(new Uint8ClampedArray([255, 0, 0, 255,  0, 0, 255, 255]), 1, 2));
+    check.drawArrays(check.TRIANGLE_STRIP, 0, 4);
+    eq('a texture from ImageData, turned over by UNPACK_FLIP_Y_WEBGL', [check.getError(), pixel(check, 10, 10), pixel(check, 10, 140)].join('|'), '0|0,0,255,255|255,0,0,255');
+    threw = '';
+    try { check.texImage2D(check.TEXTURE_2D, 0, check.RGBA, check.RGBA, check.UNSIGNED_BYTE, { width: 1, height: 1, data: new Uint8ClampedArray(4) }); } catch (e) { threw = e.name; }
+    eq('texImage2D takes no object that is not a picture', threw, 'TypeError');
+
+    var ext = gl.getExtension('OES_vertex_array_object');
+    eq('extensions: listed, and the same object each time', [gl.getSupportedExtensions().indexOf('OES_vertex_array_object') >= 0, ext === gl.getExtension('oes_vertex_array_object'), String(gl.getExtension('NOPE_nothing'))].join(), 'true,true,null');
+    var vao = ext.createVertexArrayOES();
+    ext.bindVertexArrayOES(vao);
+    eq('a vertex array starts with nothing bound', [gl.getParameter(ext.VERTEX_ARRAY_BINDING_OES) === vao, String(gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING)), gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_ENABLED)].join(), 'true,null,false');
+    ext.bindVertexArrayOES(null);
+    eq('the default vertex array keeps its own state', [gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_ENABLED), gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING) === buf].join(), 'true,true');
+  });
+  var threw;
+
+  attempt('the canvas element', function () {
+    var c = document.getElementById('small'), gl = c.getContext('webgl');
+    gl.clearColor(1, 0.6, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    var r = c.getBoundingClientRect();
+    eq('a canvas is as large as its bitmap, or as CSS says keeping the ratio', [Math.round(r.width), Math.round(r.height)].join(), '100,50');
+    c.width = 8;
+    eq('a new width gives a new drawing buffer, cleared', [gl.drawingBufferWidth, pixel(gl, 1, 1)].join('|'), '8|0,0,0,0');
+    c.width = 4;
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  });
+
+  var img = new Image();
+  img.onload = function () {
+    attempt('a picture as a texture', function () {
+      var gl = document.createElement('canvas').getContext('webgl');
+      var p = program(gl, 'attribute vec2 pos; varying vec2 uv; void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }',
+        'precision mediump float; varying vec2 uv; uniform sampler2D t; void main() { gl_FragColor = texture2D(t, uv); }');
+      gl.useProgram(p);
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      eq('an <img> as a texture', [gl.getError(), pixel(gl, 50, 75), pixel(gl, 250, 75)].join('|'), '0|255,0,0,255|0,0,255,255');
+    });
+    document.title = 'WebGL test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  };
+  img.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII=';
+</script>
+</body>
+</html>

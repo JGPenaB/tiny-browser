@@ -52,6 +52,11 @@ public:
         // Whether what the window's load event waits for (HTML 8.4.1: style sheets and what they import, pictures)
         // is still on its way
         virtual bool loadBlocked() { return false; }
+        // The decoded picture of an <img>: non-premultiplied RGBA rows from the top. 1, or 0 when it has none (yet),
+        // 2 when it came from another origin than the document's (a script may not read it)
+        virtual int imagePixels(Node* img, int& w, int& h, std::vector<uint8_t>& rgba) { return 0; }
+        // A canvas has new contents (a WebGL context drew): premultiplied BGRA rows from the top
+        virtual void canvasPainted(Node* canvas, int w, int h, std::vector<uint8_t>&& bgra) {}
     };
 
     ScriptHost(Document& doc, const std::string& url, Client& client);

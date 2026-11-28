@@ -17,6 +17,7 @@
 #include "anim.h"
 #include "script_prelude.h"
 #include "url.h"
+#include "webgl.h"
 
 namespace tb {
 
@@ -963,6 +964,22 @@ struct ScriptHost::Impl {
     }
 
     void setup();
+
+    // What the WebGL contexts ask of the page (webgl.h)
+    struct Canvases : CanvasHost {
+        Impl& im;
+        explicit Canvases(Impl& i) : im(i) {}
+        Node* nodeOf(Value v) override;
+        Value wrapNode(Node* n) override { return im.wrap(n); }
+        int imagePixels(Node* source, int& w, int& h, std::vector<uint8_t>& rgba) override {
+            if (source->name == "canvas") return webgl_canvas_pixels(im.vm, source, w, h, rgba) ? 1 : 0;
+            return source->name == "img" ? im.client.imagePixels(source, w, h, rgba) : 0;
+        }
+        [[noreturn]] void securityError(const char* message) override;
+        void canvasPresented(Node* canvas, int w, int h, std::vector<uint8_t>&& bgra) override {
+            im.client.canvasPainted(canvas, w, h, std::move(bgra));
+        }
+    } canvases{*this};
 };
 
 namespace {
@@ -979,6 +996,7 @@ struct Entry {
     ~Entry() {
         if (--im.depth) return;
         im.vm.runMicrotasks();
+        webgl_present(im.vm);  // what the script drew is shown once it has returned
         im.vm.deadlineTick = 0;
         if (im.vm.terminated && !im.dead) {
             im.dead = true;
@@ -1007,6 +1025,9 @@ Node* toNode(Value v) {
     }
     return nullptr;
 }
+}  // namespace
+Node* ScriptHost::Impl::Canvases::nodeOf(Value v) { return toNode(v); }
+namespace {
 Node* thisNode(CallInfo& ci) {
     Node* n = toNode(ci.thisv);
     if (!n) illegal(ci, "a node");
@@ -2545,6 +2566,9 @@ JSFN(locationToString) { return val8(ci.vm, I(ci.vm).url); }
     Value args[] = {val8(im.vm, message), val8(im.vm, name)};
     im.vm.throwValue(im.vm.construct(im.domException, args, 2, im.domException));
 }
+}  // namespace
+void ScriptHost::Impl::Canvases::securityError(const char* message) { throwDom(im, "SecurityError", message); }
+namespace {
 JSFN(domExceptionSet) {  // __domException(class): the prelude hands over its DOMException
     I(ci.vm).domException = ci.arg(0);
     return Value::undef();
@@ -3620,6 +3644,7 @@ void ScriptHost::Impl::setup() {
     vm.defFn(G, "__isConstructor", isConstructorFn, 1);
     vm.defFn(G, "__scrollTop", scrollTopFn, 2);
     vm.defFn(G, "__domException", domExceptionSet, 1);
+    webgl_install(vm, G, canvases);
     try {
         vm.eval(utf8to16(kScriptPrelude), "browser:prelude");
         cloneFn = vm.get(V(G), "structuredClone");
@@ -3633,6 +3658,7 @@ void ScriptHost::Impl::setup() {
 // ---------------------------------------------------------------------------- public interface
 ScriptHost::ScriptHost(Document& doc, const std::string& url, Client& client) : impl_(std::make_unique<Impl>(doc, url, client)) { impl_->setup(); }
 ScriptHost::~ScriptHost() {
+    webgl_release(impl_->vm);
     std::lock_guard<std::mutex> lk(impl_->net->mu);
     impl_->net->alive = false;  // results still on their way are dropped
 }

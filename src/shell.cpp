@@ -775,6 +775,42 @@ public:
             app.ensureLayout(tab);  // styling asks for the sheets that are imported and the pictures it finds
             return app.lateBusy(*p);
         }
+        int imagePixels(Node* img, int& w, int& h, std::vector<uint8_t>& rgba) override {
+            Page* p = page();
+            if (!p) return 0;
+            std::string source = image_source(img);
+            auto it = source.empty() ? p->imgByUrl.end() : p->imgByUrl.find(resolve_url(p->doc->baseUrl, source));
+            if (it == p->imgByUrl.end() || it->second < 0 || p->images[it->second].w == 0) return 0;
+            const ImageRes& im = p->images[it->second];
+            // no CORS fetches for pictures yet: only those of the document's own origin, or of data:, may be read
+            const std::string& from = im.responseUrl.empty() ? im.url : im.responseUrl;
+            if (!istarts(from, "data:") && Url::parse(from).origin() != Url::parse(p->url).origin()) return 2;
+            w = im.w;
+            h = im.h;
+            rgba.resize(im.px.size());
+            for (size_t i = 0; i + 3 < im.px.size(); i += 4) {  // premultiplied BGRA to straight RGBA
+                uint8_t a = im.px[i + 3];
+                for (int k = 0; k < 3; ++k) rgba[i + k] = a ? (uint8_t)std::min(255, (im.px[i + 2 - k] * 255 + a / 2) / a) : 0;
+                rgba[i + 3] = a;
+            }
+            return 1;
+        }
+        void canvasPainted(Node* canvas, int w, int h, std::vector<uint8_t>&& bgra) override {
+            Page* p = page();
+            if (!p) return;
+            auto it = p->imgNode.find(canvas);
+            if (it == p->imgNode.end()) {  // its first picture: the layout gives it one
+                it = p->imgNode.emplace(canvas, (int)p->images.size()).first;
+                p->images.emplace_back();
+                p->layoutW = -1;
+            }
+            ImageRes& im = p->images[it->second];
+            im.w = w;
+            im.h = h;
+            im.px = std::move(bgra);
+            im.bmp.Reset();
+            app.invalidate();
+        }
     };
 
     void startScripts(Tab& t, const std::vector<ScriptSource>& scripts) {
@@ -1048,6 +1084,7 @@ public:
                 } else if (d.ok && image) {
                     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
                     d.picture.url = url;
+                    d.picture.responseUrl = f.finalUrl.empty() ? url : f.finalUrl;
                     d.ok = decode_image(f.body, d.picture);
                     if (!d.ok) d.net.error = "decode failed";
                     CoUninitialize();

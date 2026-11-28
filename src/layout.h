@@ -19,6 +19,7 @@ struct ImageRes {
     int w = 0, h = 0;
     std::vector<uint8_t> px;  // premultiplied BGRA
     std::string url;
+    std::string responseUrl;  // where it came from after any redirects: its origin decides whether scripts may read it
     Microsoft::WRL::ComPtr<ID2D1Bitmap> bmp;
     uint64_t gen = 0;  // render-target generation the bitmap belongs to
 };

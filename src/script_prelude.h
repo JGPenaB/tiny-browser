@@ -399,7 +399,26 @@ R"JS(
 function prop(ctor, name, get, set) { Object.defineProperty(ctor.prototype, name, { get: get, set: set, configurable: true, enumerable: true }); }
 function textProp(ctor) { prop(ctor, 'text', function () { return this.textContent; }, function (v) { this.textContent = v; }); }
 [HTMLScriptElement, HTMLAnchorElement, HTMLOptionElement, HTMLTitleElement].forEach(textProp);
-HTMLCanvasElement.prototype.getContext = function () { return null; };
+// getContext (HTML 4.12.5.1): a WebGL 1 context, made the first time and the same one after; no other kind yet
+var webglContext = G.__webglContext;
+delete G.__webglContext;
+HTMLCanvasElement.prototype.getContext = function (type, attributes) {
+  type = String(type);
+  if (type === 'webgl' || type === 'experimental-webgl') return webglContext(this, type, attributes);
+  return null;
+};
+// width and height reflect the attributes as unsigned longs with the bitmap's defaults (HTML 4.12.5)
+[['width', 300], ['height', 150]].forEach(function (d) {
+  Object.defineProperty(HTMLCanvasElement.prototype, d[0], {
+    get: function () {
+      var m = /^[ \t\n\f\r]*\+?(\d+)/.exec(this.getAttribute(d[0]) || '');
+      var n = m ? Number(m[1]) : NaN;
+      return n >= 0 && n <= 2147483647 ? n : d[1];
+    },
+    set: function (v) { v = v >>> 0; this.setAttribute(d[0], String(v > 2147483647 ? d[1] : v)); },
+    enumerable: true, configurable: true
+  });
+});
 HTMLCanvasElement.prototype.toDataURL = function () { return 'data:,'; };
 HTMLCanvasElement.prototype.toBlob = function (cb) { setTimeout(function () { cb(null); }, 0); };
 HTMLMediaElement.prototype.play = function () { return Promise.reject(new DOMException('Media playback is not supported yet', 'NotSupportedError')); };
@@ -487,8 +506,33 @@ var windowProto = Object.create(EventTarget.prototype);
 Object.setPrototypeOf(G, windowProto);
 named('Window').prototype = windowProto;
 ['Range', 'Selection', 'NamedNodeMap', 'Attr', 'DocumentType', 'ProcessingInstruction', 'CDATASection', 'XMLDocument', 'MediaQueryList', 'StyleSheet',
- 'CSSRule', 'CSSRuleList', 'StyleSheetList', 'MutationRecord', 'DOMRectList', 'DataTransfer', 'FileList', 'ValidityState', 'Touch', 'TextMetrics', 'ImageData',
+ 'CSSRule', 'CSSRuleList', 'StyleSheetList', 'MutationRecord', 'DOMRectList', 'DataTransfer', 'FileList', 'ValidityState', 'Touch', 'TextMetrics',
  'CanvasRenderingContext2D', 'MediaError', 'TimeRanges', 'DOMImplementation', 'DOMStringMap', 'NodeIterator', 'Plugin', 'MimeType', 'PluginArray', 'MimeTypeArray'].forEach(function (n) { named(n); });
+// ImageData (HTML 4.12.5.1.15): width by height RGBA pixels in a Uint8ClampedArray
+class ImageData {
+  #width; #height; #data;
+  constructor(a, b, c) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'ImageData': 2 arguments required");
+    var data, w, h;
+    if (a instanceof Uint8ClampedArray) {
+      data = a; w = b >>> 0;
+      if (!data.length || data.length % 4) throw new DOMException('The input data length is not a multiple of 4.', 'InvalidStateError');
+      if (!w) throw new DOMException('The source width is zero or not a number.', 'IndexSizeError');
+      if ((data.length / 4) % w) throw new DOMException('The input data length is not a multiple of (4 * width).', 'IndexSizeError');
+      h = data.length / 4 / w;
+      if (c !== undefined && (c >>> 0) !== h) throw new DOMException('The input data length is not equal to (4 * width * height).', 'IndexSizeError');
+    } else {
+      w = a >>> 0; h = b >>> 0;
+      if (!w || !h) throw new DOMException('The source ' + (w ? 'height' : 'width') + ' is zero or not a number.', 'IndexSizeError');
+      data = new Uint8ClampedArray(w * h * 4);
+    }
+    this.#width = w; this.#height = h; this.#data = data;
+  }
+  get width() { return this.#width; }
+  get height() { return this.#height; }
+  get data() { return this.#data; }
+  get colorSpace() { return 'srgb'; }
+}
 class DOMRect {
   constructor(x, y, w, h) { this.x = x || 0; this.y = y || 0; this.width = w || 0; this.height = h || 0; }
   get left() { return this.x; } get top() { return this.y; } get right() { return this.x + this.width; } get bottom() { return this.y + this.height; }
@@ -513,7 +557,7 @@ class WebSocket extends EventTarget {
 WebSocket.CONNECTING = 0; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
 class Notification { constructor() { throw new TypeError('Notifications are not supported'); } static requestPermission() { return Promise.resolve('denied'); } }
 Notification.permission = 'denied';
-var more = { DOMRect: DOMRect, DOMRectReadOnly: DOMRect, DOMPoint: DOMPoint, FileReader: FileReader, WebSocket: WebSocket, Notification: Notification };
+var more = { ImageData: ImageData, DOMRect: DOMRect, DOMRectReadOnly: DOMRect, DOMPoint: DOMPoint, FileReader: FileReader, WebSocket: WebSocket, Notification: Notification };
 for (var key of Object.keys(more)) Object.defineProperty(G, key, { value: more[key], writable: true, configurable: true });
 
 )JS"

@@ -15,6 +15,23 @@ const std::string* Node::attr(std::string_view n) const {
     return nullptr;
 }
 
+int canvas_dimension(const Node* canvas, bool height) {
+    int dflt = height ? 150 : 300;
+    const std::string* v = canvas->attr(height ? "height" : "width");
+    if (!v) return dflt;
+    // the rules for parsing non-negative integers (HTML 2.3.4.1): spaces, an optional sign, then digits
+    size_t i = 0;
+    auto space = [](char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\f' || ch == '\r'; };
+    while (i < v->size() && space((*v)[i])) ++i;
+    bool minus = i < v->size() && (*v)[i] == '-';
+    if (i < v->size() && ((*v)[i] == '+' || minus)) ++i;
+    if (i >= v->size() || !isdigit((unsigned char)(*v)[i])) return dflt;
+    long long n = 0;
+    while (i < v->size() && isdigit((unsigned char)(*v)[i]) && n < 100000000) n = n * 10 + ((*v)[i++] - '0');
+    if (minus && n != 0) return dflt;
+    return (int)std::min<long long>(n, 2147483647);
+}
+
 std::string text_content(const Node* n) {
     if (n->type == Node::T::Text) return n->text;
     std::string r;

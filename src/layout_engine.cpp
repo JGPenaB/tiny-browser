@@ -727,7 +727,30 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
         b.items.push_back(std::move(it));
         return;
     }
-    if (nm == "canvas" || nm == "video" || nm == "iframe" || nm == "object" || nm == "embed" || nm == "audio") {
+    if (nm == "canvas") {
+        // A replaced element whose natural size is its bitmap's (HTML 4.12.5), with what a context drew as its picture
+        float nw = (float)canvas_dimension(n, false), nh = (float)canvas_dimension(n, true);
+        float w = s->width.u == Len::Px ? s->width.v : -1, h = s->height.u == Len::Px ? s->height.v : -1;
+        if (w < 0 && h < 0) {
+            w = nw;
+            h = nh;
+        } else if (w < 0)
+            w = nh > 0 ? h * nw / nh : 0;
+        else if (h < 0)
+            h = nw > 0 ? w * nh / nw : 0;
+        int idx = -2;  // nothing drawn yet: it shows nothing
+        if (c.in.imgNode) {
+            auto f = c.in.imgNode->find(n);
+            if (f != c.in.imgNode->end()) idx = f->second;
+        }
+        it.k = Item::Image;
+        it.w = w;
+        it.h = h;
+        it.img = idx;
+        b.items.push_back(std::move(it));
+        return;
+    }
+    if (nm == "video" || nm == "iframe" || nm == "object" || nm == "embed" || nm == "audio") {
         if (s->width.u == Len::Px && s->height.u == Len::Px) {
             it.k = Item::Image;
             it.w = s->width.v;

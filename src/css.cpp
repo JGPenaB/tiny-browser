@@ -4080,10 +4080,10 @@ void hints(const Node* e, std::vector<Decl>& out) {
         if (auto a = e->attr("background"); a && !e->attr("bgcolor")) {
         }
     }
-    if (in(n, {"img", "table", "td", "th", "hr", "col", "iframe", "canvas", "video", "embed", "object", "input"})) {
+    if (in(n, {"img", "table", "td", "th", "hr", "col", "iframe", "video", "embed", "object", "input"})) {
         if (auto a = e->attr("width")) add("width", dim_attr(*a));
     }
-    if (in(n, {"img", "table", "td", "th", "tr", "iframe", "canvas", "video", "embed", "object"})) {
+    if (in(n, {"img", "table", "td", "th", "tr", "iframe", "video", "embed", "object"})) {
         if (auto a = e->attr("height")) add("height", dim_attr(*a));
     }
     if (auto a = e->attr("align")) {
