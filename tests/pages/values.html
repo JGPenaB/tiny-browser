@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Values test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 16px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  /* CSS Values 4, 10: math functions. Each box's width is measured in a 400px container (some in a 200px one) */
+  .c { width: 400px; } .c2 { width: 200px; }
+  .c > div, .c2 > div { height: 4px; background: #8af; margin: 2px 0; }
+  #a { width: calc(100px + 2 * 10px); }
+  #b { width: calc(50% - 20px); }
+  #c { width: min(50%, 150px); }
+  #c2 { width: min(50%, 150px); }
+  #d { width: max(100px, 30%); }
+  #e { width: clamp(100px, 50%, 180px); }
+  #f { width: calc((100% - 40px) / 3); }
+  #g { width: round(17px, 5px); }
+  #h { width: round(up, 17px, 5px); }
+  #i { width: calc(100px * sin(30deg) * 2); }
+  #j { width: abs(-50px); }
+  #k { width: hypot(30px, 40px); }
+  #l { width: calc(mod(-7px, 5px) * 10); }
+  #m { width: calc(pow(2, 3) * 10px); }
+  #n { width: calc(sqrt(16) * 10px); }
+  #o { width: calc(2em + 10px); }
+  #p { width: max(10em, 50% - 10px); }
+  #q { width: calc(1e2px); }
+  #r { width: clamp(50px, 100%, 120px); }
+</style>
+</head>
+<body>
+<div class="c"><div id="a"></div><div id="b"></div><div id="c"></div><div id="d"></div><div id="e"></div><div id="f"></div>
+<div id="g"></div><div id="h"></div><div id="i"></div><div id="j"></div><div id="k"></div><div id="l"></div><div id="m"></div>
+<div id="n"></div><div id="o"></div><div id="p"></div><div id="q"></div></div>
+<div class="c2"><div id="c2"></div><div id="r"></div></div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  var want = {a: 120, b: 180, c: 150, c2: 100, d: 120, e: 180, f: 120, g: 15, h: 20, i: 100, j: 50, k: 50, l: 30, m: 80, n: 40,
+              o: 42, p: 190, q: 100, r: 120};
+  var bad = Object.keys(want).filter(function (id) {
+    return Math.round(document.getElementById(id).getBoundingClientRect().width) !== want[id];
+  }).map(function (id) { return id + ' ' + Math.round(document.getElementById(id).getBoundingClientRect().width) + ' want ' + want[id]; });
+  log('calc(), min(), max(), clamp(), round(), mod(), the trigonometric and exponential functions', bad.length === 0, bad.join('; '));
+
+  window.addEventListener('load', function () {
+    document.title = 'Values test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

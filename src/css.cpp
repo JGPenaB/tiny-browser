@@ -98,76 +98,6 @@ bool parse_num(std::string_view s, float& v, std::string_view& unit) {
 
 bool parse_len(std::string_view sv, float fs, Len& out, bool allowAuto);
 
-bool parse_calc(std::string_view inner, float fs, Len& out) {
-    auto T = tokens(inner);
-    float px = 0, pct = 0;
-    bool hasPct = false;
-    float sign = 1;
-    char pend = 0;
-    float lastPx = 0, lastPct = 0;
-    for (auto& t : T) {
-        if (t == "+") {
-            sign = 1;
-            continue;
-        }
-        if (t == "-") {
-            sign = -1;
-            continue;
-        }
-        if (t == "*" || t == "/") {
-            pend = t[0];
-            continue;
-        }
-        float n;
-        std::string_view u;
-        if (pend && parse_num(t, n, u) && u.empty()) {
-            // apply to the last term
-            px -= lastPx;
-            pct -= lastPct;
-            if (pend == '*') {
-                lastPx *= n;
-                lastPct *= n;
-            } else if (n != 0) {
-                lastPx /= n;
-                lastPct /= n;
-            }
-            px += lastPx;
-            pct += lastPct;
-            pend = 0;
-            continue;
-        }
-        Len l;
-        std::string_view tv = t;
-        if (tv.size() > 1 && tv.front() == '(' && tv.back() == ')') tv = tv.substr(1, tv.size() - 2);
-        if (istarts(tv, "calc(")) tv = tv.substr(5, tv.size() - 6);
-        if (tv != std::string_view(t) && tv.find(' ') != npos) {
-            if (!parse_calc(tv, fs, l)) return false;
-        } else if (!parse_len(tv, fs, l, false)) {
-            if (parse_num(tv, n, u) && u.empty()) {
-                l = {Len::Px, n};
-            } else
-                return false;
-        }
-        lastPx = lastPct = 0;
-        if (l.u == Len::Px)
-            lastPx = sign * l.v;
-        else if (l.u == Len::Pct) {
-            lastPct = sign * l.v;
-            lastPx = sign * l.off;
-            hasPct = true;
-        } else
-            return false;
-        px += lastPx;
-        pct += lastPct;
-        sign = 1;
-    }
-    if (hasPct)
-        out = {Len::Pct, pct, px};
-    else
-        out = {Len::Px, px};
-    return true;
-}
-
 // <angle> (CSS Values 4, 7.1) in radians; a plain 0 is allowed where the grammar says <zero>.
 bool parse_angle(std::string_view t, double& rad) {  // double: cos(90deg) must come out as 6e-17, not 4e-8
     float v;
@@ -270,6 +200,283 @@ void transform_matrix(const TransformList& list, float width, float height, floa
     std::copy(m, m + 6, out);
 }
 
+// ---- CSS Values 4, 10: math functions. An expression is parsed into a tree whose leaves are numbers, lengths in px
+// (every absolute and relative unit is converted when the declaration is applied) and percentages. One without
+// percentages is worked out at once; one whose percentages only add up (calc(100% - 2em)) becomes a percentage and an
+// offset; any other keeps its tree, which Len::resolve evaluates against the percentage's basis.
+struct MathExpr {
+    enum K : uint8_t { Num, Px, Pct, Add, Sub, Mul, Div, Neg, Fn } k = Num;
+    double v = 0;
+    std::string fn;  // Fn: the function; for round() the rounding strategy goes in `arg`
+    std::string arg;
+    std::vector<std::shared_ptr<const MathExpr>> args;
+};
+
+namespace {
+using MathPtr = std::shared_ptr<const MathExpr>;
+MathPtr leaf(MathExpr::K k, double v) {
+    auto e = std::make_shared<MathExpr>();
+    e->k = k;
+    e->v = v;
+    return e;
+}
+MathPtr node(MathExpr::K k, MathPtr a, MathPtr b = nullptr) {
+    auto e = std::make_shared<MathExpr>();
+    e->k = k;
+    e->args.push_back(std::move(a));
+    if (b) e->args.push_back(std::move(b));
+    return e;
+}
+bool is_math_function(std::string_view name) {
+    static const char* const names[] = {"calc", "-webkit-calc", "min", "max", "clamp", "round", "mod", "rem", "abs", "sign", "sin",
+                                        "cos", "tan", "asin", "acos", "atan", "atan2", "pow", "sqrt", "hypot", "log", "exp"};
+    for (const char* n : names)
+        if (name == n) return true;
+    return false;
+}
+
+struct MathParser {
+    std::string_view s;
+    size_t i = 0;
+    float fs;
+    bool pct = false;  // a percentage was met
+    void ws() {
+        while (i < s.size() && isws(s[i])) ++i;
+    }
+    MathPtr sum() {
+        MathPtr a = product();
+        while (a) {
+            size_t save = i;
+            bool spaced = i < s.size() && isws(s[i]);
+            ws();
+            if (i < s.size() && (s[i] == '+' || s[i] == '-') && spaced && i + 1 < s.size() && isws(s[i + 1])) {
+                char op = s[i++];
+                MathPtr b = product();
+                if (!b) return nullptr;
+                a = node(op == '+' ? MathExpr::Add : MathExpr::Sub, a, b);
+            } else {
+                i = save;
+                break;
+            }
+        }
+        return a;
+    }
+    MathPtr product() {
+        MathPtr a = value();
+        while (a) {
+            size_t save = i;
+            ws();
+            if (i < s.size() && (s[i] == '*' || s[i] == '/')) {
+                char op = s[i++];
+                MathPtr b = value();
+                if (!b) return nullptr;
+                a = node(op == '*' ? MathExpr::Mul : MathExpr::Div, a, b);
+            } else {
+                i = save;
+                break;
+            }
+        }
+        return a;
+    }
+    MathPtr value() {
+        ws();
+        if (i >= s.size()) return nullptr;
+        if (s[i] == '(') {
+            ++i;
+            MathPtr e = sum();
+            ws();
+            if (!e || i >= s.size() || s[i] != ')') return nullptr;
+            ++i;
+            return e;
+        }
+        size_t st = i;
+        if (isalpha((unsigned char)s[i]) || (s[i] == '-' && i + 1 < s.size() && isalpha((unsigned char)s[i + 1]))) {
+            while (i < s.size() && (isalnum((unsigned char)s[i]) || s[i] == '-' || s[i] == '_')) ++i;
+            std::string name = lower(s.substr(st, i - st));
+            if (i < s.size() && s[i] == '(') {
+                ++i;
+                if (!is_math_function(name)) return nullptr;
+                auto f = std::make_shared<MathExpr>();
+                f->k = MathExpr::Fn;
+                f->fn = name == "-webkit-calc" ? "calc" : name;
+                ws();
+                if (name == "round") {  // an optional rounding strategy first
+                    size_t k = i;
+                    while (k < s.size() && isalpha((unsigned char)s[k]) || (k < s.size() && s[k] == '-')) ++k;
+                    std::string word = lower(s.substr(i, k - i));
+                    if (word == "nearest" || word == "up" || word == "down" || word == "to-zero") {
+                        f->arg = word;
+                        i = k;
+                        ws();
+                        if (i < s.size() && s[i] == ',') ++i;
+                    }
+                }
+                for (;;) {
+                    MathPtr a = sum();
+                    if (!a) return nullptr;
+                    f->args.push_back(a);
+                    ws();
+                    if (i < s.size() && s[i] == ',') {
+                        ++i;
+                        continue;
+                    }
+                    if (i < s.size() && s[i] == ')') {
+                        ++i;
+                        break;
+                    }
+                    return nullptr;
+                }
+                return f;
+            }
+            if (name == "e") return leaf(MathExpr::Num, 2.718281828459045);
+            if (name == "pi") return leaf(MathExpr::Num, 3.141592653589793);
+            if (name == "infinity") return leaf(MathExpr::Num, INFINITY);
+            if (name == "-infinity") return leaf(MathExpr::Num, -INFINITY);
+            if (name == "nan") return leaf(MathExpr::Num, NAN);
+            return nullptr;
+        }
+        // a number, with a unit or a percent sign
+        if (s[i] == '+' || s[i] == '-') ++i;
+        bool digits = false;
+        while (i < s.size() && (isdigit((unsigned char)s[i]) || s[i] == '.')) ++i, digits = true;
+        if (!digits) return nullptr;
+        if (i + 1 < s.size() && (s[i] == 'e' || s[i] == 'E') && (isdigit((unsigned char)s[i + 1]) || ((s[i + 1] == '-' || s[i + 1] == '+') && i + 2 < s.size() && isdigit((unsigned char)s[i + 2])))) {
+            i += 2;
+            while (i < s.size() && isdigit((unsigned char)s[i])) ++i;
+        }
+        double n = atof(std::string(s.substr(st, i - st)).c_str());
+        size_t u0 = i;
+        if (i < s.size() && s[i] == '%') {
+            ++i;
+            pct = true;
+            return leaf(MathExpr::Pct, n);
+        }
+        while (i < s.size() && isalpha((unsigned char)s[i])) ++i;
+        std::string unit = lower(s.substr(u0, i - u0));
+        if (unit.empty()) return leaf(MathExpr::Num, n);
+        static const double pi = 3.141592653589793;
+        if (unit == "deg") return leaf(MathExpr::Num, n * pi / 180);  // angles as radians, for the trigonometric functions
+        if (unit == "rad") return leaf(MathExpr::Num, n);
+        if (unit == "grad") return leaf(MathExpr::Num, n * pi / 200);
+        if (unit == "turn") return leaf(MathExpr::Num, n * 2 * pi);
+        Len l;
+        if (!parse_len(std::to_string(n) + unit, fs, l, false) || l.u != Len::Px) return nullptr;
+        return leaf(MathExpr::Px, l.v);
+    }
+};
+
+double eval_node(const MathExpr& e, double base) {
+    auto a = [&](size_t k) { return k < e.args.size() ? eval_node(*e.args[k], base) : 0.0; };
+    switch (e.k) {
+        case MathExpr::Num:
+        case MathExpr::Px: return e.v;
+        case MathExpr::Pct: return e.v * base / 100;
+        case MathExpr::Add: return a(0) + a(1);
+        case MathExpr::Sub: return a(0) - a(1);
+        case MathExpr::Mul: return a(0) * a(1);
+        case MathExpr::Div: return a(0) / a(1);
+        case MathExpr::Neg: return -a(0);
+        case MathExpr::Fn: break;
+    }
+    const std::string& f = e.fn;
+    size_t n = e.args.size();
+    if (f == "calc") return a(0);
+    if (f == "min" || f == "max") {
+        double r = a(0);
+        for (size_t k = 1; k < n; ++k) r = f == "min" ? std::min(r, a(k)) : std::max(r, a(k));
+        return r;
+    }
+    if (f == "clamp") return std::max(a(0), std::min(a(1), a(2)));
+    if (f == "round") {
+        double v = a(0), step = n > 1 ? a(1) : 1;
+        if (step == 0) return NAN;
+        double q = v / step;
+        double r = e.arg == "up" ? std::ceil(q) : e.arg == "down" ? std::floor(q) : e.arg == "to-zero" ? std::trunc(q) : std::floor(q + 0.5);
+        return r * step;
+    }
+    if (f == "mod") {  // the sign of the divisor
+        double b = a(1), r = std::fmod(a(0), b);
+        return r != 0 && (r < 0) != (b < 0) ? r + b : r;
+    }
+    if (f == "rem") return std::fmod(a(0), a(1));
+    if (f == "abs") return std::fabs(a(0));
+    if (f == "sign") return a(0) > 0 ? 1 : a(0) < 0 ? -1 : 0;
+    if (f == "sin") return std::sin(a(0));
+    if (f == "cos") return std::cos(a(0));
+    if (f == "tan") return std::tan(a(0));
+    if (f == "asin") return std::asin(a(0));
+    if (f == "acos") return std::acos(a(0));
+    if (f == "atan") return std::atan(a(0));
+    if (f == "atan2") return std::atan2(a(0), a(1));
+    if (f == "pow") return std::pow(a(0), a(1));
+    if (f == "sqrt") return std::sqrt(a(0));
+    if (f == "hypot") {
+        double r = 0;
+        for (size_t k = 0; k < n; ++k) r += a(k) * a(k);
+        return std::sqrt(r);
+    }
+    if (f == "log") return n > 1 ? std::log(a(0)) / std::log(a(1)) : std::log(a(0));
+    if (f == "exp") return std::exp(a(0));
+    return NAN;
+}
+// The expression as percentage + offset, when it is that simple: sums, and products and quotients by plain numbers
+bool linear(const MathExpr& e, double& pct, double& px, bool& constant) {
+    switch (e.k) {
+        case MathExpr::Num:
+        case MathExpr::Px: pct = 0, px = e.v, constant = true; return true;
+        case MathExpr::Pct: pct = e.v, px = 0, constant = false; return true;
+        case MathExpr::Add:
+        case MathExpr::Sub:
+        case MathExpr::Mul:
+        case MathExpr::Div: {
+            double p1, x1, p2, x2;
+            bool c1, c2;
+            if (!linear(*e.args[0], p1, x1, c1) || !linear(*e.args[1], p2, x2, c2)) return false;
+            double sign = e.k == MathExpr::Sub ? -1 : 1;
+            if (e.k == MathExpr::Add || e.k == MathExpr::Sub) {
+                pct = p1 + sign * p2, px = x1 + sign * x2, constant = c1 && c2;
+                return true;
+            }
+            if (e.k == MathExpr::Mul && (c1 || c2)) {
+                double k = c1 ? x1 : x2;
+                pct = (c1 ? p2 : p1) * k, px = (c1 ? x2 : x1) * k, constant = c1 && c2;
+                return true;
+            }
+            if (e.k == MathExpr::Div && c2 && x2 != 0) {
+                pct = p1 / x2, px = x1 / x2, constant = c1;
+                return true;
+            }
+            return false;
+        }
+        case MathExpr::Fn:
+            if (e.fn == "calc" && e.args.size() == 1) return linear(*e.args[0], pct, px, constant);
+            return false;
+        default: return false;
+    }
+}
+// A clamp to what a float holds: infinities in lengths become very large ones (CSS Values 4, 10.9)
+float finite(double v) { return std::isnan(v) ? 0.f : (float)std::clamp(v, -1e7, 1e7); }
+}  // namespace
+
+double eval_math(const MathExpr& e, float base) { return finite(eval_node(e, base)); }
+
+// A math function as a length: worked out now, a percentage and an offset, or kept to be evaluated later
+bool parse_math_len(std::string_view v, float fs, Len& out) {
+    MathParser p{v, 0, fs};
+    MathPtr e = p.value();
+    p.ws();
+    if (!e || p.i != v.size() || e->k != MathExpr::Fn) return false;
+    double pct, px;
+    bool constant;
+    if (!p.pct) out = {Len::Px, finite(eval_node(*e, 0))};
+    else if (linear(*e, pct, px, constant)) out = {Len::Pct, finite(pct), finite(px)};
+    else {
+        out = {Len::Pct, 0, 0};
+        out.expr = e;
+    }
+    return true;
+}
+
 namespace {
 
 bool parse_len(std::string_view sv, float fs, Len& out, bool allowAuto) {
@@ -284,19 +491,8 @@ bool parse_len(std::string_view sv, float fs, Len& out, bool allowAuto) {
         out = {Len::None, 0};
         return true;
     }
-    if (istarts(s, "calc(") || istarts(s, "-webkit-calc(")) {
-        size_t a = s.find('('), b = s.rfind(')');
-        if (b == std::string::npos || b < a) return false;
-        return parse_calc(std::string_view(s).substr(a + 1, b - a - 1), fs, out);
-    }
-    if (istarts(s, "min(") || istarts(s, "max(") || istarts(s, "clamp(")) {
-        // Approximate: use the last argument for min()/clamp(), first for max().
-        size_t a = s.find('('), b = s.rfind(')');
-        if (b == std::string::npos) return false;
-        auto args = split_top(std::string_view(s).substr(a + 1, b - a - 1), ',');
-        std::string_view pick = istarts(s, "max(") ? args.front() : (istarts(s, "clamp(") && args.size() == 3 ? args[1] : args.back());
-        return parse_len(pick, fs, out, allowAuto);
-    }
+    if (size_t open = s.find('('); open != std::string::npos && is_math_function(std::string_view(s).substr(0, open)))
+        return parse_math_len(s, fs, out);
     float v;
     std::string_view u;
     if (!parse_num(s, v, u)) return false;
@@ -335,6 +531,10 @@ bool parse_len(std::string_view sv, float fs, Len& out, bool allowAuto) {
         out = {Len::Px, v * std::max(g_vw, g_vh) / 100.f};
     else if (u == "ex" || u == "ch")
         out = {Len::Px, v * fs * 0.5f};
+    else if (u == "q")
+        out = {Len::Px, v * 37.795f / 40.f};
+    else if (u == "lh" || u == "rlh")
+        out = {Len::Px, v * fs * 1.2f};
     else
         return false;
     return true;

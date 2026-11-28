@@ -9,12 +9,18 @@ namespace tb {
 
 enum class Display : uint8_t { Inline, Block, ListItem, InlineBlock, None, Table, RowGroup, Row, Cell, Flex, InlineFlex, Grid, InlineGrid };
 
+struct MathExpr;
+double eval_math(const MathExpr& e, float base);  // a math function's value with percentages of `base`
 struct Len {
     enum U : uint8_t { Auto, Px, Pct, None };
     U u = Auto;
     float v = 0;
     float off = 0;  // px offset for calc(% +/- px)
-    float resolve(float base) const { return u == Px ? v : u == Pct ? v * base / 100.f + off : 0.f; }
+    std::shared_ptr<const MathExpr> expr;  // (Pct) a math function that is more than a percentage and an offset
+    float resolve(float base) const {
+        if (expr) return (float)eval_math(*expr, base);
+        return u == Px ? v : u == Pct ? v * base / 100.f + off : 0.f;
+    }
     bool definite() const { return u == Px || u == Pct; }
 };
 
