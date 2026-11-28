@@ -49,12 +49,15 @@ public:
         virtual void urlChanged(const std::string& url, bool push) = 0;
         virtual int historyLength() = 0;       // how many entries the tab's session history has
         virtual void traverse(int delta) = 0;  // history.go(delta): carried out after the script returns
+        // Whether what the window's load event waits for (HTML 8.4.1: style sheets and what they import, pictures)
+        // is still on its way
+        virtual bool loadBlocked() { return false; }
     };
 
     ScriptHost(Document& doc, const std::string& url, Client& client);
     ~ScriptHost();
 
-    // Runs the page's scripts in document order, then fires DOMContentLoaded and load.
+    // Runs the page's scripts in document order, then fires DOMContentLoaded, and load once nothing holds it back.
     void runScripts(const std::vector<ScriptSource>& scripts);
     void fireLoadEvents();
     // Fires a user-interface event at a node (null: the window). Returns false when a listener cancelled it.

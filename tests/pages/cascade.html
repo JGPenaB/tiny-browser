@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <title>Cascade test</title>
 <style>
+  /* CSS Cascade 5, 2: imports, one into a layer, one for print */
+  @import url("cascade-a.css");
+  @import "cascade-b.css" layer(imp);
+  @import "cascade-c.css" print;
   body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
   .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
   .t span { color: rgb(0, 0, 0); }
@@ -28,6 +32,20 @@
   .n9 { .k { color: rgb(0, 0, 255); } color: rgb(255, 0, 0); }
   .n10 { .k { .m { color: rgb(255, 0, 0); } } }
   .n11 { @supports (no-such: 1) { color: rgb(0, 0, 255); } }
+  /* CSS Cascade 5, 6.4: cascade layers */
+  @layer base, theme;
+  @layer theme { #l1 { color: rgb(255, 0, 0); } }
+  @layer base { #l1 { color: rgb(0, 0, 255); } }
+  @layer base { #l2#l2 { color: rgb(0, 0, 255); } }
+  .l2 { color: rgb(255, 0, 0); }
+  @layer base { #l3 { color: rgb(255, 0, 0) !important; } }
+  #l3 { color: rgb(0, 0, 255) !important; }
+  @layer outer { #l4 { color: rgb(255, 0, 0); } @layer inner { #l4 { color: rgb(0, 0, 255); } } }
+  @layer { #l5 { color: rgb(0, 0, 255); } }
+  @layer { #l5 { color: rgb(255, 0, 0); } }
+  @layer x.y { #l6 { color: rgb(0, 0, 255); } }
+  @layer x { #l6 { color: rgb(255, 0, 0); } }
+  .i3 { color: rgb(0, 0, 255); }
 </style>
 </head>
 <body>
@@ -45,6 +63,8 @@
 <div class="n9" id="n9"><i class="k" id="n9k">k</i></div>
 <div class="n10"><i class="k"><b class="m" id="n10m">m</b></i></div>
 <div class="n11" id="n11">n11</div>
+<div><span id="l1">l1</span> <span id="l2" class="l2">l2</span> <span id="l3">l3</span> <span id="l4">l4</span> <span id="l5">l5</span> <span id="l6">l6</span></div>
+<div><b id="i1">i1</b> <b id="i2">i2</b> <b id="i3" class="i3">i3</b> <b id="i4">i4</b></div>
 <div id="results"></div>
 <script>
   var pass = 0, fail = 0;
@@ -74,7 +94,11 @@
   eq('nesting two deep', red('n10m'), true);
   eq('@supports inside a rule', getComputedStyle($('n11')).color === 'rgb(0, 0, 255)', false);
 
+  eq('later layers win, unlayered rules beat layered ones, !important turns the order round, a layer beats the layers in it, anonymous layers', reds(['l1', 'l2', 'l3', 'l4', 'l5', 'l6']), 'l1,l2,l3,l4,l5,l6');
+
   window.addEventListener('load', function () {
+    // imported sheets come a little later
+    eq('@import, into a layer, and for other media', reds(['i1', 'i2', 'i3', 'i4']), 'i1,i2');
     document.title = 'Cascade test: ' + pass + ' passed, ' + fail + ' failed';
     console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
   });

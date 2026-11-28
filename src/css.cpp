@@ -1042,6 +1042,48 @@ bool supports_condition(std::string_view v) {
     return any;
 }
 
+// The index of a layer in the sheet's list, which it joins the first time it is named
+int sheet_layer(Sheet& sh, const std::string& name) {
+    if (name.empty()) return -1;
+    for (size_t i = 0; i < sh.layers.size(); ++i)
+        if (sh.layers[i] == name) return (int)i;
+    sh.layers.push_back(name);
+    return (int)sh.layers.size() - 1;
+}
+// @layer's name inside the layer `outer`: dotted names are relative to it, and a block without a name is a layer
+// of its own that no other rule can name
+std::string layer_name(const std::string& outer, std::string_view name) {
+    static int anonymous = 0;
+    std::string n(trim(name));
+    if (n.empty()) n = "\x01" + std::to_string(++anonymous);
+    return outer.empty() ? n : outer + "." + n;
+}
+bool parse_url_token(std::string_view t, std::string& out);
+int parse_media(std::string_view prelude, Sheet& sh);
+// @import url [layer | layer(name)]? [supports(...)]? <media-query-list>? (CSS Cascade 5, 2)
+void parse_import(std::string_view v, Sheet& sh) {
+    auto T = tokens(v);
+    if (T.empty()) return;
+    SheetImport im;
+    if (T[0].size() >= 2 && (T[0][0] == '"' || T[0][0] == '\'')) im.url = T[0].substr(1, T[0].size() - 2);
+    else if (!parse_url_token(T[0], im.url)) return;
+    size_t i = 1;
+    if (i < T.size() && (lower(T[i]) == "layer" || istarts(lower(T[i]), "layer("))) {
+        std::string l = T[i];
+        im.layer = sheet_layer(sh, layer_name({}, l.size() > 6 ? std::string_view(l).substr(6, l.size() - 7) : std::string_view()));
+        ++i;
+    }
+    if (i < T.size() && istarts(lower(T[i]), "supports(")) {
+        std::string c = T[i].substr(9, T[i].size() - 10);
+        if (!supports_condition(c.find(':') != std::string::npos && c[0] != '(' ? "(" + c + ")" : c)) return;
+        ++i;
+    }
+    std::string mediaText;
+    for (; i < T.size(); ++i) mediaText += T[i] + " ";
+    if (!trim(mediaText).empty()) im.media = parse_media(mediaText, sh);
+    sh.imports.push_back(std::move(im));
+}
+
 // ---- CSS Nesting 1: a rule inside a rule. The nested selector is taken relative to the parent: & stands for the
 // parent's elements, and a selector without & is a descendant of them. & becomes :is(parent) unless the parent's
 // text can stand in for it unchanged: a single compound selector, or a single selector at the start.
@@ -1078,9 +1120,9 @@ std::string nest_selector(std::string_view parent, std::string_view child) {
     return out;
 }
 
-void parse_block(std::string_view s, int media, Sheet& sh, int depth);
+void parse_block(std::string_view s, int media, Sheet& sh, int depth, const std::string& layer = {});
 // A style rule, with the rules nested in it (CSS Nesting 1, section 2)
-void parse_style_rule(std::string_view selText, std::string_view body, int media, Sheet& sh, int depth) {
+void parse_style_rule(std::string_view selText, std::string_view body, int media, Sheet& sh, int depth, const std::string& layer) {
     std::string decls;
     std::vector<std::pair<std::string_view, std::string_view>> nested;
     size_t i = 0, start = 0;
@@ -1115,7 +1157,7 @@ void parse_style_rule(std::string_view selText, std::string_view body, int media
     if (!d->empty())
         for (auto part : split_top(selText, ',')) {
             Selector x;
-            if (parse_selector(trim(part), x)) sh.rules.push_back({std::move(x), d, media});
+            if (parse_selector(trim(part), x)) sh.rules.push_back({std::move(x), d, media, sheet_layer(sh, layer)});
         }
     if (depth >= 8) return;
     for (auto& [prelude, inner] : nested) {
@@ -1124,18 +1166,20 @@ void parse_style_rule(std::string_view selText, std::string_view body, int media
             size_t j = 1;
             std::string kw = lower(read_ident(prelude, j));
             std::string_view rest = trim(prelude.substr(j));
-            if (kw == "media") parse_style_rule(selText, inner, parse_media(rest, sh), sh, depth + 1);
+            if (kw == "media") parse_style_rule(selText, inner, parse_media(rest, sh), sh, depth + 1, layer);
             else if (kw == "supports") {
-                if (supports_condition(rest)) parse_style_rule(selText, inner, media, sh, depth + 1);
-            } else if (kw == "layer" || kw == "container" || kw == "scope")
-                parse_style_rule(selText, inner, media, sh, depth + 1);
+                if (supports_condition(rest)) parse_style_rule(selText, inner, media, sh, depth + 1, layer);
+            } else if (kw == "layer")
+                parse_style_rule(selText, inner, media, sh, depth + 1, layer_name(layer, rest));
+            else if (kw == "container" || kw == "scope")
+                parse_style_rule(selText, inner, media, sh, depth + 1, layer);
             continue;
         }
-        parse_style_rule(nest_selector(selText, prelude), inner, media, sh, depth + 1);
+        parse_style_rule(nest_selector(selText, prelude), inner, media, sh, depth + 1, layer);
     }
 }
 
-void parse_block(std::string_view s, int media, Sheet& sh, int depth) {
+void parse_block(std::string_view s, int media, Sheet& sh, int depth, const std::string& layer) {
     size_t i = 0;
     while (i < s.size()) {
         while (i < s.size() && (isws(s[i]) || s[i] == ';')) ++i;
@@ -1162,8 +1206,13 @@ void parse_block(std::string_view s, int media, Sheet& sh, int depth) {
                     }
                 }
             }
-            if (brace == npos) break;
-            if (s[brace] == ';') {
+            if (brace == npos) brace = s.size();  // a statement at the very end may leave out its semicolon
+            if (brace == s.size() || s[brace] == ';') {
+                std::string_view statement = trim(s.substr(j, brace - j));
+                if (kw == "layer")  // @layer a, b; puts the layers in order before their rules come
+                    for (auto name : split_top(statement, ',')) sheet_layer(sh, layer_name(layer, name));
+                else if (kw == "import" && sh.rules.empty() && depth == 0)
+                    parse_import(statement, sh);
                 i = brace + 1;
                 continue;
             }
@@ -1173,11 +1222,13 @@ void parse_block(std::string_view s, int media, Sheet& sh, int depth) {
             std::string_view inner = s.substr(brace + 1, end - brace - 1);
             if (depth < 8) {
                 if (kw == "media")
-                    parse_block(inner, parse_media(prelude, sh), sh, depth + 1);
+                    parse_block(inner, parse_media(prelude, sh), sh, depth + 1, layer);
                 else if (kw == "supports") {
-                    if (supports_condition(prelude)) parse_block(inner, media, sh, depth + 1);
-                } else if (kw == "layer" || kw == "container" || kw == "scope" || kw == "document" || kw == "-moz-document")
-                    parse_block(inner, media, sh, depth + 1);
+                    if (supports_condition(prelude)) parse_block(inner, media, sh, depth + 1, layer);
+                } else if (kw == "layer")
+                    parse_block(inner, media, sh, depth + 1, layer_name(layer, prelude));
+                else if (kw == "container" || kw == "scope" || kw == "document" || kw == "-moz-document")
+                    parse_block(inner, media, sh, depth + 1, layer);
             }
             i = end + 1;
             continue;
@@ -1186,7 +1237,7 @@ void parse_block(std::string_view s, int media, Sheet& sh, int depth) {
         if (brace == npos) break;
         size_t end = block_end(s, brace);
         if (end == npos) end = s.size();
-        parse_style_rule(trim(s.substr(i, brace - i)), s.substr(brace + 1, std::min(end, s.size()) - brace - 1), media, sh, depth);
+        parse_style_rule(trim(s.substr(i, brace - i)), s.substr(brace + 1, std::min(end, s.size()) - brace - 1), media, sh, depth, layer);
         i = end + 1;
     }
 }
@@ -1657,10 +1708,12 @@ Sheet parse_sheet(std::string_view css, const std::string& base) {
     Sheet sh;
     std::string clean = strip_comments(css);
     parse_block(clean, -1, sh, 0);
-    if (!base.empty())
+    if (!base.empty()) {
         for (auto& r : sh.rules)
             for (auto& d : *r.decls)
                 if (d.val.find("url(") != std::string::npos) absolutize_urls(d.val, base);
+        for (auto& im : sh.imports) im.url = resolve_url(base, im.url);
+    }
     return sh;
 }
 
@@ -3225,8 +3278,11 @@ void hints(const Node* e, std::vector<Decl>& out) {
 const Node* g_selectorScope = nullptr;
 UserState g_userState;
 namespace {
-uint64_t key(int lvl, uint32_t spec, uint32_t order) {
-    return (uint64_t(lvl) << 56) | (uint64_t(spec & 0x3FFFFFFF) << 24) | uint64_t(order & 0xFFFFFF);
+// The cascade's order of precedence (CSS Cascade 5, 6): origin and importance, then the layer, then specificity,
+// then order of appearance. Important declarations of a layer beat those of later layers and unlayered ones.
+uint64_t key(int lvl, uint32_t spec, uint32_t order, uint8_t layerRank = 0) {
+    if (lvl == 3) layerRank = (uint8_t)(255 - layerRank);
+    return (uint64_t(lvl) << 60) | (uint64_t(layerRank) << 52) | (uint64_t(spec & 0x3FFFFFFF) << 22) | uint64_t(order & 0x3FFFFF);
 }
 
 uint8_t user_actions(const Selector& s) {
@@ -3264,15 +3320,53 @@ void StyleEngine::build(float vw) {
     pseudoByTag_.clear();
     pseudoUni_.clear();
     hasMedia_ = false;
+    // The layer order (CSS Cascade 5, 6.4.3): layers in the order their names first appear, each after the layers
+    // nested in it; unlayered rules after every layer. Rank 0 is left for presentational hints.
+    struct LayerNode {
+        std::vector<int> kids;
+        uint8_t rank = 0;
+    };
+    std::vector<LayerNode> tree(1);
+    std::unordered_map<std::string, int> layerId{{"", 0}};
+    std::function<int(const std::string&)> layerOf = [&](const std::string& full) -> int {
+        auto found = layerId.find(full);
+        if (found != layerId.end()) return found->second;
+        size_t dot = full.rfind('.');
+        int parent = dot == std::string::npos ? 0 : layerOf(full.substr(0, dot));  // a.b comes into being inside a
+        tree.push_back({});
+        int id = (int)tree.size() - 1;
+        layerId[full] = id;
+        tree[parent].kids.push_back(id);
+        return id;
+    };
+    auto fullName = [](const std::string& prefix, const std::string& name) {
+        return prefix.empty() ? name : name.empty() ? prefix : prefix + "." + name;
+    };
+    for (auto& a : sheets_) {
+        if (a.ua) continue;
+        if (!a.layer.empty()) layerOf(a.layer);
+        for (auto& name : a.sheet->layers) layerOf(fullName(a.layer, name));
+    }
+    int next = 1;
+    std::function<void(int)> rankFrom = [&](int id) {
+        for (int k : tree[id].kids) rankFrom(k);
+        tree[id].rank = (uint8_t)std::min(next++, 255);
+    };
+    rankFrom(0);
     uint32_t order = 1;
-    for (auto& [sh, ua, scope] : sheets_) {
+    for (auto& [sh, ua, scope, layer, gate] : sheets_) {
+        bool gated = gate != nullptr;  // an import for media that never match (print) has no alternatives
+        if (gated) hasMedia_ = true;
+        if (gated && !media_match(*gate, vw)) continue;
         for (auto& r : sh->rules) {
             ++order;
             if (r.media >= 0) {
                 hasMedia_ = true;
                 if (!media_match(sh->media[r.media], vw)) continue;
             }
-            all_.push_back({&r, order, ua, scope});
+            uint8_t rank = 0;
+            if (!ua) rank = tree[layerOf(fullName(layer, r.layer >= 0 ? sh->layers[r.layer] : std::string()))].rank;
+            all_.push_back({&r, order, ua, scope, rank});
             uint32_t idx = (uint32_t)all_.size() - 1;
             const Compound& last = r.sel.parts.back();
             if (last.never) continue;
@@ -3469,7 +3563,7 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
         for (const Decl& d : *ir.r->decls) {
             int lvl = d.important ? (ir.ua ? 5 : 3) : (ir.ua ? 0 : 1);
             // rules that reach out of a shadow tree give way to the outer tree's own rules for the element (CSS Scoping 3.4)
-            L.push_back({key(lvl, role ? 0 : ir.r->sel.spec, role ? 0 : ir.order), &d});
+            L.push_back({key(lvl, role ? 0 : ir.r->sel.spec, role ? 0 : ir.order, role ? 0 : ir.layerRank), &d});
         }
     }
     std::vector<Decl> IL;
@@ -3540,7 +3634,8 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
         if (!hit) continue;
         for (const Decl& d : *ir.r->decls) {
             int lvl = d.important ? (ir.ua ? 5 : 3) : (ir.ua ? 0 : 1);
-            P[ir.r->sel.parts.back().pseudoElement].push_back({key(lvl, role ? 0 : ir.r->sel.spec, role ? 0 : ir.order), &d});
+            P[ir.r->sel.parts.back().pseudoElement].push_back(
+                {key(lvl, role ? 0 : ir.r->sel.spec, role ? 0 : ir.order, role ? 0 : ir.layerRank), &d});
         }
     }
     for (uint8_t kind = 1; kind <= 2; ++kind)

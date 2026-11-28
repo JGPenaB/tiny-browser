@@ -747,6 +747,12 @@ public:
         }
         int historyLength() override { return (int)tab.hist.size(); }
         void traverse(int delta) override { tab.traverseBy = delta; }
+        bool loadBlocked() override {
+            Page* p = page();
+            if (!p) return false;
+            app.ensureLayout(tab);  // styling asks for the sheets that are imported and the pictures it finds
+            return app.lateBusy(*p);
+        }
     };
 
     void startScripts(Tab& t, const std::vector<ScriptSource>& scripts) {
@@ -1016,6 +1022,26 @@ public:
         StyleEngine se;
         se.add(&ua_sheet(), true);
         if (p.doc->quirks) se.add(&quirks_sheet(), true);
+        // A sheet comes after the sheets it imports (CSS Cascade 5, 2), which are fetched the first time they are
+        // needed; the page is styled again when they arrive. An import's layer and media hold for all it imports.
+        std::function<void(Sheet*, const Node*, const std::string&, const MediaQuery*, int)> addSheet =
+            [&](Sheet* sheet, const Node* scope, const std::string& layer, const MediaQuery* media, int depth) {
+                for (auto& im : sheet->imports) {
+                    if (depth >= 4) break;
+                    std::string url = resolve_url(p.doc->baseUrl, im.url);
+                    auto it = p.sheetCache.find("u:" + url);
+                    if (it == p.sheetCache.end()) {
+                        p.sheetCache["u:" + url] = nullptr;
+                        requestLate(p, url, false);
+                        continue;
+                    }
+                    if (!it->second) continue;  // still on its way
+                    std::string inner = layer;
+                    if (im.layer >= 0) inner = layer.empty() ? sheet->layers[im.layer] : layer + "." + sheet->layers[im.layer];
+                    addSheet(it->second.get(), scope, inner, im.media >= 0 ? &sheet->media[im.media] : media, depth + 1);
+                }
+                se.add(sheet, false, scope, layer, media);
+            };
         // The page's sheets, in tree order: every <style>, and every linked sheet that has arrived, wherever it is
         // now. One inside a shadow tree styles that tree only.
         std::vector<Node*> st{p.doc->root.get()};
@@ -1036,14 +1062,14 @@ public:
                         requestLate(p, url, false);
                     }
                 }
-                if (sheet) se.add(sheet, false, shadow_root_of(n));
+                if (sheet) addSheet(sheet, shadow_root_of(n), {}, nullptr, 0);
             }
             if (n->shadow) st.push_back(n->shadow.get());
             for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
         }
         if (p.script) se.add(&scripting_sheet(), true);
         if (p.script)
-            for (auto& [scope, css] : p.script->adoptedStyles()) se.add(sheetFromText(p, css), false, scope);
+            for (auto& [scope, css] : p.script->adoptedStyles()) addSheet(sheetFromText(p, css), scope, {}, nullptr, 0);
         se.compute(*p.doc, vw, contentRect().h());
         p.userActions = se.userActions();
         p.hasMedia = se.hasMedia();

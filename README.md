@@ -83,7 +83,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    line, span and area placement, auto-placement by rows or columns, sparse or dense, implicit tracks, the track
    sizing algorithm, and box alignment of tracks and items; `tests/pages/grid.html`). `clip-path` with the basic shapes (`inset()`, `circle()`, `ellipse()`, `polygon()`) in a reference box
    (`tests/pages/clippath.html`, checked by eye), `@supports` conditions evaluated (CSS Conditional 3 and
-   `selector()`), and nested style rules (CSS Nesting 1; `tests/pages/cascade.html`). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
+   `selector()`), nested style rules (CSS Nesting 1), cascade layers
+   (`@layer`, CSS Cascade 5) and `@import` with `layer()`, `supports()` and media; the window's load event now waits
+   for style sheets, their imports and pictures (`tests/pages/cascade.html`). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),

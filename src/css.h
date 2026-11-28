@@ -247,10 +247,19 @@ struct Rule {
     Selector sel;
     std::shared_ptr<std::vector<Decl>> decls;
     int media = -1;
+    int layer = -1;  // the cascade layer (CSS Cascade 5, 6.4): an index into Sheet::layers, -1 when unlayered
+};
+// @import (CSS Cascade 5, 2): another sheet whose rules come before this one's
+struct SheetImport {
+    std::string url;    // resolved against the sheet's own URL where it has one
+    int layer = -1;     // layer or layer(name): the layer the imported rules go in, an index into Sheet::layers
+    int media = -1;     // the media the import is for, an index into Sheet::media
 };
 struct Sheet {
     std::vector<Rule> rules;
     std::vector<MediaQuery> media;
+    std::vector<std::string> layers;  // the layer names, dotted from the outermost, in the order they first appear
+    std::vector<SheetImport> imports;
 };
 // What the selectors of user actions, of the target and of form control states see (Selectors 4, 9.2, 10 and 13).
 // The shell keeps it for the page being styled. The nodes are only compared, never followed: one a script has
@@ -291,7 +300,10 @@ public:
     static FontResolver fontResolver;
 
     // scope: the shadow root whose <style> the sheet is, or null for a sheet of the document
-    void add(const Sheet* s, bool ua, const Node* scope = nullptr) { sheets_.push_back({s, ua, scope}); }
+    // layer: the cascade layer an imported sheet goes in ("" for none); media: what an import's media must match
+    void add(const Sheet* s, bool ua, const Node* scope = nullptr, std::string layer = {}, const MediaQuery* media = nullptr) {
+        sheets_.push_back({s, ua, scope, std::move(layer), media});
+    }
     void compute(Document& d, float vw, float vh);
     bool hasMedia() const { return hasMedia_; }
     size_t ruleCount() const { return all_.size(); }
@@ -305,11 +317,14 @@ private:
         uint32_t order;
         bool ua;
         const Node* scope;
+        uint8_t layerRank;  // where the rule's layer comes in the layer order; unlayered rules last
     };
     struct Added {
         const Sheet* sheet;
         bool ua;
         const Node* scope;
+        std::string layer;
+        const MediaQuery* media;
     };
     void build(float vw);
     void computeTree(Node* e, const Style& parent);

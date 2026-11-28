@@ -200,6 +200,7 @@ struct ScriptHost::Impl {
     std::vector<ScriptSource> deferred;  // scripts that wait for the document to be parsed
     bool loadPending = false;           // deferred scripts are still running; the load events come after them
     bool loadDue = false;               // they are done: fire the load events on the next pump
+    bool windowLoadDue = false;         // DOMContentLoaded has fired; load waits for Client::loadBlocked()
     // Custom elements (HTML 4.13). The registry and the callbacks are in the prelude. This side knows which
     // elements are custom (Node::ceState), notes what happens to them while the DOM changes, and hands the notes
     // to the prelude once the operation that caused them is over ([CEReactions], 4.13.6).
@@ -3419,7 +3420,7 @@ ScriptHost::~ScriptHost() {
 
 bool ScriptHost::busy() const {
     if (impl_->dead) return false;
-    if (impl_->loadPending || impl_->loadDue) return true;
+    if (impl_->loadPending || impl_->loadDue || impl_->windowLoadDue) return true;
     if (impl_->net->inflight.load() > 0) return true;
     std::lock_guard<std::mutex> lk(impl_->net->mu);
     return !impl_->net->done.empty();
@@ -3490,13 +3491,18 @@ void ScriptHost::runScripts(const std::vector<ScriptSource>& scripts) {
     im.callPage("deferred", args, 2);
 }
 
+// The end of parsing (HTML 13.2.7): DOMContentLoaded now, then the window's load event once nothing delays it
 void ScriptHost::fireLoadEvents() {
     Impl& im = *impl_;
     im.loadPending = im.loadDue = false;
     dispatch(im.docNode(), "DOMContentLoaded", true, false);
-    im.readyState = "complete";
-    dispatch(im.docNode(), "readystatechange", false, false);
-    dispatch(nullptr, "load", false, false);
+    im.windowLoadDue = true;
+    if (!im.dead && !im.client.loadBlocked()) {
+        im.windowLoadDue = false;
+        im.readyState = "complete";
+        dispatch(im.docNode(), "readystatechange", false, false);
+        dispatch(nullptr, "load", false, false);
+    }
 }
 
 bool ScriptHost::dispatch(Node* target, const std::string& type, bool bubbles, bool cancelable) {
@@ -3562,6 +3568,12 @@ void ScriptHost::pump() {
     if (im.dead || im.depth) return;
     drainNet(im);
     if (im.loadDue) fireLoadEvents();
+    else if (im.windowLoadDue && !im.client.loadBlocked()) {
+        im.windowLoadDue = false;
+        im.readyState = "complete";
+        dispatch(im.docNode(), "readystatechange", false, false);
+        dispatch(nullptr, "load", false, false);
+    }
     while (!im.hashChanges.empty() && !im.dead) {
         auto [oldUrl, newUrl] = im.hashChanges.front();
         im.hashChanges.erase(im.hashChanges.begin());
