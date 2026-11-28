@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Animations test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  .box { width: 60px; height: 30px; background: #8af; margin: 6px; display: inline-block; }
+  /* CSS Animations 1 and CSS Transitions 1, for opacity and transform */
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes blink { 50% { opacity: 0.2; } }
+  @keyframes held { from { opacity: 0.3; } to { opacity: 0.6; } }
+  #fade { animation: fade 300ms linear forwards; }
+  #spin { animation: spin 1s linear infinite; }
+  #thrice { animation: blink 60ms linear 3; }
+  #gone { opacity: 0.5; animation: held 50ms linear; }
+  #kept { opacity: 0.5; animation: held 50ms linear forwards; }
+  #early { animation: held 50ms linear 400ms backwards; }
+  #trans { transition: opacity 200ms linear; }
+  #slide { transition: transform 200ms linear; }
+</style>
+</head>
+<body>
+<div class="box" id="fade"></div><div class="box" id="spin"></div><div class="box" id="thrice"></div>
+<div class="box" id="gone"></div><div class="box" id="kept"></div><div class="box" id="early"></div>
+<div class="box" id="trans"></div><div class="box" id="slide"></div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var $ = function (id) { return document.getElementById(id); };
+  var op = function (id) { return parseFloat(getComputedStyle($(id)).opacity); };
+  var events = [];
+  ['animationstart', 'animationiteration', 'animationend', 'transitionend'].forEach(function (type) {
+    document.addEventListener(type, function (e) { events.push(e.target.id + ':' + type + ':' + (e.animationName || e.propertyName)); });
+  });
+  var t0 = performance.now();
+  var startOpacity = op('fade'), spin1 = getComputedStyle($('spin')).transform, early0 = op('early');
+  setTimeout(function () {
+    var mid = op('fade');
+    log('an animation moves opacity on over time', startOpacity < 0.3 && mid > startOpacity && mid < 1, startOpacity + ' then ' + mid);
+    log('an infinite rotation changes the transform', getComputedStyle($('spin')).transform !== spin1, spin1);
+    $('trans').style.opacity = '0';
+    $('slide').style.transform = 'translateX(100px)';
+    var a = op('trans');
+    setTimeout(function () {
+      var b = op('trans');
+      log('a transition starts from the old value and heads for the new one', a > 0.8 && b < a && b > 0, a + ' then ' + b);
+      var m = getComputedStyle($('slide')).transform.match(/[-\d.]+/g).map(Number);
+      log('a transform transition is part of the way', m[4] > 0 && m[4] < 100, m.join());
+    }, 100);
+  }, 120);
+  setTimeout(function () {
+    eq('forwards keeps the last keyframe', op('fade'), 1);
+    eq('without a fill mode the element goes back to its own value; forwards keeps the end', [op('gone'), op('kept')].join(), '0.5,0.6');
+    log('backwards shows the first keyframe during the delay', early0 > 0.29 && early0 < 0.31, early0);
+    eq('after a transition the new value holds', op('trans'), 0);
+    var want = ['fade:animationstart:fade', 'fade:animationend:fade', 'thrice:animationstart:blink', 'thrice:animationiteration:blink',
+                'thrice:animationend:blink', 'trans:transitionend:opacity', 'slide:transitionend:transform'];
+    var missing = want.filter(function (w) { return events.indexOf(w) < 0; });
+    log('animationstart, animationiteration, animationend and transitionend', missing.length === 0 && events.filter(function (e) { return e === 'thrice:animationiteration:blink'; }).length === 2,
+        'missing ' + missing.join() + '; got ' + events.join());
+    document.title = 'Animations test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  }, 700);
+</script>
+</body>
+</html>

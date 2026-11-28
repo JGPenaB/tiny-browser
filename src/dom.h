@@ -23,6 +23,7 @@ struct Node {
     // It is not among the children either; the flat tree (FlatKids below) is where the two come together.
     std::unique_ptr<Node> shadow;
     std::unique_ptr<Style> style;  // computed style (elements only)
+    std::shared_ptr<struct NodeAnim> anim;  // its animations and transitions under way (anim.h)
     // The ::before and ::after boxes of an element (CSS 2 12.1), made when its style is computed: elements named
     // "::before" and "::after" holding the generated text. They are not part of the DOM; FlatKids lists them first and last.
     std::unique_ptr<Node> before, after;

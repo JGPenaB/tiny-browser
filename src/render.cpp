@@ -2,6 +2,7 @@
 #include <cmath>
 
 #include "layout.h"
+#include "anim.h"
 
 namespace tb {
 
@@ -510,11 +511,47 @@ void paintTextShadows(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIt
     }
 }
 
-void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo, std::vector<ImageRes>& imgs,
+bool paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo, std::vector<ImageRes>& imgs,
                  float y0, float y1, uint64_t gen, WidgetPainter* wp) {
     std::vector<bool> clips;  // the open clips, innermost last: a clip-path layer (true) or a rectangle
+    std::vector<bool> animLayers;  // the open PushAnims: whether each pushed an opacity layer
+    bool running = false;
     std::vector<D2D1_MATRIX_3X2_F> outer;  // the transforms in force around each open PushTransform
     for (auto& it : lo.items) {
+        if (it.k == DItem::K::PushAnim && it.anim) {  // opacity and transform as the animations have them now
+            const AnimPaint& a = *it.anim;
+            float opacity;
+            std::shared_ptr<const TransformList> list;
+            running = animate(a, now_ms(), opacity, list) || running;
+            D2D1_MATRIX_3X2_F now;
+            rt->GetTransform(&now);
+            outer.push_back(now);
+            if (a.transform && list) {
+                float m[6];
+                transform_matrix(*list, it.w, it.h, m);
+                float ox = it.x + a.origin[0].resolve(it.w), oy = it.y + a.origin[1].resolve(it.h);
+                D2D1::Matrix3x2F local = D2D1::Matrix3x2F::Translation(-ox, -oy) * D2D1::Matrix3x2F(m[0], m[1], m[2], m[3], m[4], m[5]) *
+                                         D2D1::Matrix3x2F::Translation(ox, oy);
+                rt->SetTransform(local * *D2D1::Matrix3x2F::ReinterpretBaseType(&now));
+            }
+            bool faded = a.opacity && opacity < 0.999f;
+            if (faded)
+                rt->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), opacity),
+                              nullptr);
+            animLayers.push_back(faded);
+            continue;
+        }
+        if (it.k == DItem::K::PopAnim) {
+            if (!animLayers.empty()) {
+                if (animLayers.back()) rt->PopLayer();
+                animLayers.pop_back();
+            }
+            if (!outer.empty()) {
+                rt->SetTransform(outer.back());
+                outer.pop_back();
+            }
+            continue;
+        }
         if (it.k == DItem::K::PushTransform) {
             D2D1_MATRIX_3X2_F now;
             rt->GetTransform(&now);
@@ -625,7 +662,10 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
         if (clips.back()) rt->PopLayer();
         else rt->PopAxisAlignedClip();
     }
+    for (; !animLayers.empty(); animLayers.pop_back())
+        if (animLayers.back()) rt->PopLayer();
     if (!outer.empty()) rt->SetTransform(outer.front());
+    return running;
 }
 
 }  // namespace tb

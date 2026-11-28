@@ -19,6 +19,7 @@
 #include "css.h"
 #include "gpu.h"
 #include "layout.h"
+#include "anim.h"
 #include "net.h"
 #include "storage.h"
 #include "text.h"
@@ -165,6 +166,8 @@ struct Page {
     std::unordered_map<std::string, std::vector<std::wstring>> fontFamiliesOf;
     int webFontsLoaded = 0;
     int fontScope = 0;  // what tells this page's font names from another's
+    std::vector<Node*> animatedNodes;  // the elements with animations or transitions, from the last styling
+    bool animEventsPending = false;    // some of them have events still to come
     std::unordered_set<std::string> fontRequested;
     std::unordered_map<std::string, std::vector<Node*>> waiting;  // the elements to tell when a late resource arrives
     std::vector<std::pair<Node*, bool>> lateEvents;               // load (true) or error events owed to elements
@@ -631,6 +634,7 @@ public:
 
     // ------------------------------------------------------------------ page scripts
     static constexpr UINT_PTR kScriptTimerBase = 0x40000000;
+    static constexpr UINT_PTR kAnimTimer = 0x3fff0000;
 
     struct PageClient : ScriptHost::Client {
         App& app;
@@ -811,6 +815,57 @@ public:
         if (t.page->lo.fixed) t.page->scrollDirty = true;
         fireEvent(t, t.page->doc->root.get(), "scroll", true, false);
     }
+    // animationstart, animationiteration, animationend and transitionend (CSS Animations 1, 4.2; CSS Transitions 1,
+    // 6): each animation's phase and iteration now against what was seen at the last frame
+    void animationEvents(Tab& t) {
+        if (!t.page) return;
+        if (!t.page->script) {  // no one to tell
+            t.page->animEventsPending = false;
+            return;
+        }
+        Page& p = *t.page;
+        double now = now_ms();
+        std::vector<std::tuple<Node*, std::string, std::string, double>> events;  // node, type, name, elapsed seconds
+        bool pending = false;
+        for (Node* n : p.animatedNodes) {
+            NodeAnim& na = *n->anim;
+            if (n->style && n->style->animations) {
+                const auto& list = *n->style->animations;
+                if (na.seen.size() != list.size()) na.seen.assign(list.size(), {-1, -1});
+                for (size_t i = 0; i < list.size(); ++i) {
+                    const AnimationDecl& d = list[i];
+                    double start = now;
+                    for (auto& [name, at] : na.starts)
+                        if (name == d.name) start = at;
+                    int phase, iteration;
+                    double elapsed;
+                    animation_phase(d, start, now, phase, iteration, elapsed);
+                    auto& [lastIter, lastPhase] = na.seen[i];
+                    if (phase >= 1 && lastPhase < 1) events.emplace_back(n, "animationstart", d.name, d.delay < 0 ? -d.delay / 1000 : 0);
+                    if (phase == 1 && lastPhase == 1 && iteration > lastIter)
+                        events.emplace_back(n, "animationiteration", d.name, iteration * d.duration / 1000);
+                    if (phase == 2 && lastPhase < 2) events.emplace_back(n, "animationend", d.name, elapsed);
+                    lastIter = iteration;
+                    lastPhase = phase;
+                    pending = pending || phase < 2;
+                }
+            }
+            pending = pending || !na.transitions.empty();
+            for (auto it = na.transitions.begin(); it != na.transitions.end();) {
+                if (now >= it->start + it->delay + it->duration) {
+                    events.emplace_back(n, "transitionend", it->transform ? "transform" : "opacity", it->duration / 1000);
+                    it = na.transitions.erase(it);
+                } else
+                    ++it;
+            }
+        }
+        p.animEventsPending = pending;
+        for (auto& [n, type, name, elapsed] : events) {
+            if (t.page.get() != &p || !p.script) break;
+            p.script->animationEvent(n, type, name, elapsed);
+        }
+        afterScript(t);
+    }
     void runScriptTimers(Tab& t) {
         t.scriptDue = -1;
         noticeScroll(t);
@@ -828,8 +883,10 @@ public:
             if (t.scriptDue < 0 && !busy) break;
             double wait = t.scriptDue < 0 ? 5 : t.scriptDue - now_ms();
             if (busy) wait = std::min(wait, 5.0);
+            if (!t.page->animatedNodes.empty()) wait = std::min(wait, 16.0);  // animation frames, for their events
             if (now_ms() + std::max(0.0, wait) > end) break;
             if (wait > 0) Sleep((DWORD)wait + 1);
+            animationEvents(t);
             runScriptTimers(t);
         }
     }
@@ -1151,6 +1208,15 @@ public:
         ts.setWebFamilies(&p.webFamilies, ((uint64_t)p.fontScope << 32) | (uint32_t)p.webFontsLoaded);
         se.compute(*p.doc, vw, contentRect().h());
         ts.setWebFamilies(nullptr, 0);
+        p.animatedNodes.clear();
+        for (std::vector<Node*> st{p.doc->root.get()}; !st.empty();) {
+            Node* n = st.back();
+            st.pop_back();
+            if (n->anim && n->style && (n->style->animations || !n->anim->transitions.empty())) p.animatedNodes.push_back(n);
+            for (auto& k : n->kids) st.push_back(k.get());
+            if (n->shadow) st.push_back(n->shadow.get());
+        }
+        p.animEventsPending = !p.animatedNodes.empty();
         p.userActions = se.userActions();
         p.hasMedia = se.hasMedia();
         p.rules = se.ruleCount();
@@ -1328,6 +1394,11 @@ public:
 
     void onTimer(UINT_PTR id) {
         if (hwnd) KillTimer(hwnd, id);
+        if (id == kAnimTimer) {
+            if (Tab* t = cur()) animationEvents(*t);
+            invalidate();
+            return;
+        }
         if (id >= kScriptTimerBase) {
             for (auto& t : tabs)
                 if (kScriptTimerBase + t->id == id) {
@@ -2029,7 +2100,8 @@ public:
             rt->FillRectangle(cr.d(), brush.Get());
             rt->SetTransform(D2D1::Matrix3x2F::Translation(cr.l, cr.t - t->scroll));
             paintPage = &p;
-            paint_items(rt, brush.Get(), p.lo, p.images, t->scroll, t->scroll + cr.h(), gen, this);
+            bool running = paint_items(rt, brush.Get(), p.lo, p.images, t->scroll, t->scroll + cr.h(), gen, this);
+            if ((running || p.animEventsPending) && hwnd) SetTimer(hwnd, kAnimTimer, 16, nullptr);  // the next frame
             paintPage = nullptr;
             if (popup >= 0 && popup < (int)p.lo.widgets.size()) {
                 const WidgetArea& w = p.lo.widgets[popup];

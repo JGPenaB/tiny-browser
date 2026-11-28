@@ -14,6 +14,7 @@
 #include "js/builtins.h"
 #include "net.h"
 #include "script.h"
+#include "anim.h"
 #include "script_prelude.h"
 #include "url.h"
 
@@ -2128,6 +2129,26 @@ std::string resolvedValue(const Node* n, const Style& s, const std::string& name
     if (name == "visibility") return s.hidden ? "hidden" : "visible";
     if (name == "color") return rgb(s.color);
     if (name == "background-color") return rgb(s.bg);
+    if ((name == "opacity" || name == "transform") && n->anim && (s.animOpacity || s.animTransform)) {
+        // what animations and transitions make of them now (CSS Animations 1, 3: they are computed values)
+        AnimPaint a;
+        a.anims = s.animations;
+        a.state = *n->anim;
+        a.baseOpacity = s.opacity;
+        a.baseTransform = s.transform;
+        a.opacity = s.animOpacity;
+        a.transform = s.animTransform;
+        float opacity;
+        std::shared_ptr<const TransformList> list;
+        animate(a, now_ms(), opacity, list);
+        if (name == "opacity") return number(opacity, "");
+        if (!list) return "none";
+        float m[6];
+        transform_matrix(*list, n->hasBox ? n->bw : 0, n->hasBox ? n->bh : 0, m);
+        std::string out = "matrix(";
+        for (int i = 0; i < 6; ++i) out += cssNumber(m[i]) + (i < 5 ? ", " : ")");
+        return out;
+    }
     if (name == "opacity") return number(s.opacity, "");
     if (name == "position") return oneOf(s.position, {"static", "relative", "absolute", "fixed", "sticky"});
     if (name == "z-index") return s.zAuto ? "auto" : std::to_string(s.zIndex);
@@ -3607,6 +3628,21 @@ bool ScriptHost::dispatch(Node* target, const std::string& type, bool bubbles, b
     } catch (JSThrow&) {
         im.reportError();
         return true;
+    }
+}
+
+void ScriptHost::animationEvent(Node* target, const std::string& type, const std::string& name, double elapsed) {
+    Impl& im = *impl_;
+    if (im.dead) return;
+    Entry entry(im);
+    try {
+        Value ev = im.makeEvent(type, true, false);
+        im.vm.set(ev, type.rfind("transition", 0) == 0 ? "propertyName" : "animationName", val8(im.vm, name));
+        im.vm.set(ev, "elapsedTime", Value::dbl(elapsed));
+        im.vm.set(ev, "pseudoElement", val8(im.vm, ""));
+        im.fire(target, ev);
+    } catch (JSThrow&) {
+        im.reportError();
     }
 }
 

@@ -1,5 +1,6 @@
 ﻿#include "css.h"
 #include "url.h"
+#include "anim.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -157,13 +158,12 @@ bool parse_transform(std::string_view lv, float fs, TransformList& out) {
                 if ((name == "scalex" && n != 1) || (name == "scale" && n > 2) || (name == "scale3d" && n != 3)) return false;
                 if (n >= 2 && name != "scalex" && !number(1, sy)) return false;
             }
-            f.v[0] = sx;
-            f.v[3] = sy;
+            f.set_scale(sx, sy);
         } else if (name == "rotate" || name == "rotatez") {
             double a;
             if (n != 1 || !parse_angle(args[0], a)) return false;
             f.k = TransformFn::Rotate;
-            f.v[0] = (float)std::cos(a), f.v[1] = (float)std::sin(a), f.v[2] = (float)-std::sin(a), f.v[3] = (float)std::cos(a);
+            f.set_rotate((float)a);
         } else if (name == "skew" || name == "skewx" || name == "skewy") {
             double ax = 0, ay = 0;
             if (name == "skewy") {
@@ -172,8 +172,7 @@ bool parse_transform(std::string_view lv, float fs, TransformList& out) {
                 return false;
             }
             f.k = TransformFn::Skew;
-            f.v[1] = (float)std::tan(ay);
-            f.v[2] = (float)std::tan(ax);
+            f.set_skew((float)ax, (float)ay);
         } else if (name == "translatez" || name == "scalez" || name == "rotatex" || name == "rotatey" || name == "rotate3d" ||
                    name == "perspective" || name == "matrix3d") {
             continue;  // no 2D part that this engine draws
@@ -1621,6 +1620,62 @@ void parse_font_face(std::string_view body, Sheet& sh) {
     if (!face.family.empty() && !face.src.empty()) sh.fontFaces.push_back(std::move(face));
 }
 
+// @keyframes (CSS Animations 1, 3.1): the opacity, transform and timing function of each keyframe selector
+void parse_keyframes(std::string_view prelude, std::string_view body, Sheet& sh) {
+    std::string name(trim(prelude));
+    if (name.size() >= 2 && (name[0] == '"' || name[0] == '\'')) name = name.substr(1, name.size() - 2);
+    if (name.empty()) return;
+    auto kf = std::make_shared<Keyframes>();
+    size_t i = 0;
+    while (i < body.size()) {
+        size_t open = body.find('{', i);
+        if (open == npos) break;
+        size_t close = block_end(body, open);
+        if (close == npos) close = body.size();
+        std::string_view selectors = trim(body.substr(i, open - i));
+        auto decls = parse_decls(body.substr(open + 1, close - open - 1));
+        i = close + 1;
+        for (auto sel : split_top(selectors, ',')) {
+            std::string l = lower(trim(sel));
+            float offset;
+            std::string_view u;
+            if (l == "from") offset = 0;
+            else if (l == "to") offset = 1;
+            else if (parse_num(l, offset, u) && u == "%") offset /= 100;
+            else continue;
+            if (offset < 0 || offset > 1) continue;
+            Keyframe* f = nullptr;  // keyframes of the same offset merge, the later winning
+            for (auto& k : kf->frames)
+                if (k.offset == offset) f = &k;
+            if (!f) {
+                kf->frames.push_back(Keyframe{});
+                f = &kf->frames.back();
+                f->offset = offset;
+            }
+            for (auto& d : decls) {
+                std::string v = lower(trim(d.val));
+                if (d.prop == "opacity") {
+                    float n;
+                    std::string_view unit;
+                    if (parse_num(v, n, unit)) f->opacity = std::clamp(unit == "%" ? n / 100 : n, 0.f, 1.f), f->hasOpacity = true;
+                } else if (d.prop == "transform" || d.prop == "-webkit-transform") {
+                    TransformList list;
+                    if (v == "none") f->transform = nullptr, f->hasTransform = true;
+                    else if (parse_transform(v, 16, list)) f->transform = std::make_shared<const TransformList>(std::move(list)), f->hasTransform = true;
+                } else if (d.prop == "animation-timing-function") {
+                    f->hasTiming = parse_timing(v, f->timing);
+                }
+            }
+        }
+    }
+    std::stable_sort(kf->frames.begin(), kf->frames.end(), [](const Keyframe& a, const Keyframe& b) { return a.offset < b.offset; });
+    for (auto& f : kf->frames) {
+        kf->opacity = kf->opacity || f.hasOpacity;
+        kf->transform = kf->transform || f.hasTransform;
+    }
+    sh.keyframes.push_back({name, std::move(kf)});
+}
+
 // ---- CSS Nesting 1: a rule inside a rule. The nested selector is taken relative to the parent: & stands for the
 // parent's elements, and a selector without & is a descendant of them. & becomes :is(parent) unless the parent's
 // text can stand in for it unchanged: a single compound selector, or a single selector at the start.
@@ -1768,6 +1823,8 @@ void parse_block(std::string_view s, int media, Sheet& sh, int depth, const std:
                     parse_block(inner, media, sh, depth + 1, layer);
                 else if (kw == "font-face")
                     parse_font_face(inner, sh);
+                else if (kw == "keyframes" || kw == "-webkit-keyframes")
+                    parse_keyframes(prelude, inner, sh);
             }
             i = end + 1;
             continue;
@@ -2698,6 +2755,10 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
     else if (p == "justify-items") d.justifyItems = s.justifyItems;
     else if (p == "justify-self") d.justifySelf = s.justifySelf;
     else if (p == "clip-path") d.clipPath = s.clipPath;
+    else if (istarts(p, "animation")) {
+        d.animLists = s.animLists;
+        d.animated = s.animated;
+    } else if (istarts(p, "transition")) d.transitionLists = s.transitionLists;
     else if (p == "box-shadow") d.boxShadow = s.boxShadow;
     else if (p == "text-shadow") d.textShadow = s.textShadow;
     else if (istarts(p, "outline")) {
@@ -3616,8 +3677,75 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
             s.opacity = std::clamp(u == "%" ? v / 100.f : v, 0.f, 1.f);
             s.opacity0 = s.opacity <= 0.01f;
         }
-    } else if (prop == "animation" || prop == "animation-name") {
-        s.animated = lv != "none";
+    } else if (istarts(prop, "animation")) {
+        auto lists = s.animLists ? std::make_shared<AnimLists>(*s.animLists) : std::make_shared<AnimLists>();
+        std::vector<std::string> items;
+        for (auto part : split_top(val, ',')) items.emplace_back(trim(part));
+        if (prop == "animation") {  // each item: a name, times (duration, then delay), a timing function and keywords
+            *lists = AnimLists{};
+            for (auto& item : items) {
+                std::string name = "none", dur = "0s", delay = "0s", count = "1", dir = "normal", fill = "none", state = "running", timing = "ease";
+                int times = 0;
+                for (auto& t : tokens(item)) {
+                    std::string l = lower(t);
+                    float n;
+                    std::string_view u;
+                    Timing tf;
+                    if (parse_num(l, n, u) && (u == "s" || u == "ms")) (times++ == 0 ? dur : delay) = l;
+                    else if (parse_timing(l, tf)) timing = l;
+                    else if (l == "infinite" || (parse_num(l, n, u) && u.empty())) count = l;
+                    else if (in(l, {"normal", "reverse", "alternate", "alternate-reverse"})) dir = l;
+                    else if (in(l, {"forwards", "backwards", "both"})) fill = l;
+                    else if (l == "running" || l == "paused") state = l;
+                    else name = t;
+                }
+                lists->names.push_back(name);
+                lists->durations.push_back(dur);
+                lists->delays.push_back(delay);
+                lists->iterations.push_back(count);
+                lists->directions.push_back(dir);
+                lists->fills.push_back(fill);
+                lists->states.push_back(state);
+                lists->timings.push_back(timing);
+            }
+        } else if (prop == "animation-name") lists->names = items;
+        else if (prop == "animation-duration") lists->durations = items;
+        else if (prop == "animation-delay") lists->delays = items;
+        else if (prop == "animation-iteration-count") lists->iterations = items;
+        else if (prop == "animation-direction") lists->directions = items;
+        else if (prop == "animation-fill-mode") lists->fills = items;
+        else if (prop == "animation-play-state") lists->states = items;
+        else if (prop == "animation-timing-function") lists->timings = items;
+        s.animLists = std::move(lists);
+        s.animated = false;
+        for (auto& n : s.animLists->names) s.animated = s.animated || lower(n) != "none";
+    } else if (istarts(prop, "transition")) {
+        auto lists = s.transitionLists ? std::make_shared<TransitionLists>(*s.transitionLists) : std::make_shared<TransitionLists>();
+        std::vector<std::string> items;
+        for (auto part : split_top(lv, ',')) items.emplace_back(trim(part));
+        if (prop == "transition") {
+            *lists = TransitionLists{};
+            for (auto& item : items) {
+                std::string property = "all", dur = "0s", delay = "0s", timing = "ease";
+                int times = 0;
+                for (auto& t : tokens(item)) {
+                    float n;
+                    std::string_view u;
+                    Timing tf;
+                    if (parse_num(t, n, u) && (u == "s" || u == "ms")) (times++ == 0 ? dur : delay) = t;
+                    else if (parse_timing(t, tf)) timing = t;
+                    else if (t != "allow-discrete" && t != "normal") property = t;
+                }
+                lists->properties.push_back(property);
+                lists->durations.push_back(dur);
+                lists->delays.push_back(delay);
+                lists->timings.push_back(timing);
+            }
+        } else if (prop == "transition-property") lists->properties = items;
+        else if (prop == "transition-duration") lists->durations = items;
+        else if (prop == "transition-delay") lists->delays = items;
+        else if (prop == "transition-timing-function") lists->timings = items;
+        s.transitionLists = std::move(lists);
     } else if (prop == "mask-image" || prop == "-webkit-mask-image" || prop == "mask" || prop == "-webkit-mask") {
         s.masked = lv != "none";
     } else if (prop == "clip" || prop == "clip-path") {
@@ -4202,6 +4330,9 @@ bool media_matches(std::string_view list, const MediaEnv& env) {
 
 void StyleEngine::build(float vw, float vh) {
     MediaEnv env{vw, vh, 1};
+    keyframes_.clear();
+    for (auto& a : sheets_)
+        for (auto& [name, kf] : a.sheet->keyframes) keyframes_[name] = kf;
     all_.clear();
     byAttr_.clear();
     root_.clear();
@@ -4501,8 +4632,10 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
         if (s->borderColor[i].a < 0) s->borderColor[i] = s->color;
     }
     // No compositor yet: fully transparent elements are simply not painted (unless an animation would reveal them).
-    if (s->opacity0 && !s->animated) s->hidden = true;
-    s->alpha = parent.alpha * (s->opacity0 ? 1.f : s->opacity);  // an animated element that starts at 0 is shown as it will end
+    resolveAnimations(e, *s);
+    if (s->opacity0 && !s->animated && !s->animOpacity) s->hidden = true;
+    // an element whose opacity runs is painted with it (anim.h); an animated one that starts at 0 is shown as it will end
+    s->alpha = parent.alpha * (s->opacity0 || s->animOpacity ? 1.f : s->opacity);
     if (s->masked) s->bg = Color{};
     // Out-of-flow boxes are blockified (CSS 2 9.7); an absolutely positioned box does not float.
     if (s->position == 2 || s->position == 3) s->floatSide = 0;
@@ -4690,6 +4823,128 @@ bool StyleEngine::generatedText(Node* e, const Style& s, std::string& out) {
         return r;
     };
     return generated_text(e, s.content, values, out);
+}
+
+namespace {
+float time_ms(const std::string& t) {  // <time>: s or ms
+    float n;
+    std::string_view u;
+    if (!parse_num(lower(t), n, u)) return 0;
+    return u == "ms" ? n : u == "s" ? n * 1000 : 0;
+}
+bool same_transform(const std::shared_ptr<const TransformList>& a, const std::shared_ptr<const TransformList>& b) {
+    if (a == b) return true;
+    float ma[6] = {1, 0, 0, 1, 0, 0}, mb[6] = {1, 0, 0, 1, 0, 0};
+    if (a) transform_matrix(*a, 100, 100, ma);
+    if (b) transform_matrix(*b, 100, 100, mb);
+    for (int i = 0; i < 6; ++i)
+        if (std::fabs(ma[i] - mb[i]) > 1e-4f) return false;
+    return true;
+}
+}  // namespace
+
+// Animations and transitions (CSS Animations 1, CSS Transitions 1): each animation gets its @keyframes and keeps
+// the time it started while its name stays; a change of opacity or transform that a transition covers starts one
+// from where the old value is now
+void StyleEngine::resolveAnimations(Node* e, Style& s) {
+    double now = now_ms();
+    std::shared_ptr<NodeAnim>& na = e->anim;
+    if (s.animLists && s.animated) {
+        const AnimLists& L = *s.animLists;
+        auto at = [](const std::vector<std::string>& v, size_t i, const char* dflt) { return v.empty() ? std::string(dflt) : v[i % v.size()]; };
+        auto list = std::make_shared<std::vector<AnimationDecl>>();
+        for (size_t i = 0; i < L.names.size(); ++i) {
+            AnimationDecl d;
+            d.name = L.names[i];
+            if (lower(d.name) == "none") continue;
+            if (d.name.size() >= 2 && (d.name[0] == '"' || d.name[0] == '\'')) d.name = d.name.substr(1, d.name.size() - 2);
+            d.duration = time_ms(at(L.durations, i, "0s"));
+            d.delay = time_ms(at(L.delays, i, "0s"));
+            std::string count = lower(at(L.iterations, i, "1"));
+            d.iterations = count == "infinite" ? -1.f : std::max(0.f, (float)atof(count.c_str()));
+            std::string dir = lower(at(L.directions, i, "normal"));
+            d.direction = dir == "reverse" ? 1 : dir == "alternate" ? 2 : dir == "alternate-reverse" ? 3 : 0;
+            std::string fill = lower(at(L.fills, i, "none"));
+            d.fill = fill == "forwards" ? 1 : fill == "backwards" ? 2 : fill == "both" ? 3 : 0;
+            d.paused = lower(at(L.states, i, "running")) == "paused";
+            parse_timing(at(L.timings, i, "ease"), d.timing);
+            if (auto kf = keyframes_.find(d.name); kf != keyframes_.end()) d.frames = kf->second;
+            if (d.frames) {
+                s.animOpacity = s.animOpacity || d.frames->opacity;
+                s.animTransform = s.animTransform || d.frames->transform;
+            }
+            list->push_back(std::move(d));
+        }
+        if (!list->empty()) {
+            if (!na) na = std::make_shared<NodeAnim>();
+            std::vector<std::pair<std::string, double>> starts;
+            for (auto& d : *list) {
+                double start = now;
+                for (auto& [name, t] : na->starts)
+                    if (name == d.name) start = t;
+                starts.push_back({d.name, start});
+            }
+            if (starts.size() != na->starts.size()) na->seen.clear();
+            na->starts = std::move(starts);
+            s.animations = std::move(list);
+        } else if (na) {
+            na->starts.clear();
+            na->seen.clear();
+        }
+    } else if (na) {
+        na->starts.clear();
+        na->seen.clear();
+    }
+    if (s.transitionLists && !na) na = std::make_shared<NodeAnim>();
+    if (!na) return;
+    // transitions (CSS Transitions 1, 3): only a change from a style the element had before starts one
+    if (s.transitionLists && na->styled) {
+        const TransitionLists& T = *s.transitionLists;
+        auto find = [&](const char* property, TransitionDecl& out) {
+            bool found = false;
+            for (size_t i = 0; i < T.properties.size(); ++i) {
+                std::string p = lower(T.properties[i]);
+                if (p != property && p != "all") continue;
+                auto at = [&](const std::vector<std::string>& v, const char* dflt) { return v.empty() ? std::string(dflt) : v[i % v.size()]; };
+                out.property = p;
+                out.duration = time_ms(at(T.durations, "0s"));
+                out.delay = time_ms(at(T.delays, "0s"));
+                parse_timing(at(T.timings, "ease"), out.timing);
+                found = out.duration > 0 || out.delay > 0;  // the last that names the property counts
+            }
+            return found;
+        };
+        AnimPaint current;  // where a running transition has got to
+        current.state = *na;
+        current.baseOpacity = na->lastOpacity;
+        current.baseTransform = na->lastTransform;
+        current.opacity = current.transform = true;
+        float nowOpacity;
+        std::shared_ptr<const TransformList> nowTransform;
+        animate(current, now, nowOpacity, nowTransform);
+        TransitionDecl t;
+        if (std::fabs(s.opacity - na->lastOpacity) > 1e-4f && find("opacity", t)) {
+            std::erase_if(na->transitions, [](const NodeAnim::Transition& x) { return !x.transform; });
+            NodeAnim::Transition tr;
+            tr.fromOpacity = nowOpacity, tr.toOpacity = s.opacity, tr.start = now, tr.duration = t.duration, tr.delay = t.delay, tr.timing = t.timing;
+            na->transitions.push_back(tr);
+        }
+        if (!same_transform(s.transform, na->lastTransform) && find("transform", t)) {
+            std::erase_if(na->transitions, [](const NodeAnim::Transition& x) { return x.transform; });
+            NodeAnim::Transition tr;
+            tr.transform = true, tr.from = nowTransform, tr.to = s.transform, tr.start = now, tr.duration = t.duration, tr.delay = t.delay, tr.timing = t.timing;
+            na->transitions.push_back(tr);
+        }
+    }
+    // finished transitions are done with; a value that changed with none running ends them too
+    std::erase_if(na->transitions, [&](const NodeAnim::Transition& x) {
+        if (now >= x.start + x.delay + x.duration) return true;
+        return x.transform ? !same_transform(x.to, s.transform) : std::fabs(x.toOpacity - s.opacity) > 1e-4f;
+    });
+    for (auto& x : na->transitions) (x.transform ? s.animTransform : s.animOpacity) = true;
+    na->styled = true;
+    na->lastOpacity = s.opacity;
+    na->lastTransform = s.transform;
 }
 
 // Selector access for the scripting layer (querySelector, matches, closest).

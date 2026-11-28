@@ -1,5 +1,7 @@
 #include <cstdlib>
 #include <deque>
+
+#include "anim.h"
 #include <cwctype>
 
 #include "css.h"
@@ -2340,11 +2342,31 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     bool own = s && b.kind != BK::Anon && b.kind != BK::Marker;
     Mark m0 = mark(c);
     int savedLayer = c.layer;
+    // An element whose opacity or transform animations and transitions run: painting works them out (anim.h), and
+    // its own transform is theirs to apply
+    bool animated = own && (s->animOpacity || s->animTransform) && &b != c.root && b.node && b.node->anim;
     // A transformed box is painted like a positioned one with z-index auto (CSS Transforms 1, section 2).
-    bool transformed = own && s->transform && &b != c.root;
-    if (own && (s->position != 0 || transformed) && &b != c.root) {
+    bool transformed = own && s->transform && !(animated && s->animTransform) && &b != c.root;
+    if (own && (s->position != 0 || transformed || animated) && &b != c.root) {
         int L = s->position == 0 || s->zAuto ? 1 : (s->zIndex >= 0 ? s->zIndex + 1 : s->zIndex);
         c.layer = L < 0 ? L : std::max(c.layer, L);
+    }
+    size_t animIdx = SIZE_MAX;
+    if (animated) {
+        auto paint = std::make_shared<AnimPaint>();
+        paint->anims = s->animations;
+        paint->state = *b.node->anim;
+        paint->baseOpacity = s->opacity;
+        paint->baseTransform = s->transform;
+        paint->origin[0] = s->transformOrigin[0];
+        paint->origin[1] = s->transformOrigin[1];
+        paint->opacity = s->animOpacity;
+        paint->transform = s->animTransform;
+        DItem d;
+        d.k = DItem::K::PushAnim;
+        d.anim = std::move(paint);
+        animIdx = push(c, std::move(d));
+        c.out.animations = true;
     }
     size_t transformIdx = SIZE_MAX;
     if (transformed) {
@@ -2667,6 +2689,16 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         shift(c, m0, mark(c), dx, dy);
     }
     if (transformIdx != SIZE_MAX) applyTransform(c, b, transformIdx, m0);
+    if (animIdx != SIZE_MAX) {
+        DItem& d = c.out.items[animIdx];
+        d.x = b.node->hasBox ? b.node->bx : b.x;
+        d.y = b.node->hasBox ? b.node->by : b.y;
+        d.w = b.w;
+        d.h = b.h;
+        DItem pop;
+        pop.k = DItem::K::PopAnim;
+        push(c, std::move(pop));
+    }
     c.layer = savedLayer;
 }
 
@@ -2680,8 +2712,8 @@ void sortRange(std::vector<DItem>& src, size_t a, size_t e, std::vector<DItem>& 
     bool mixed = false;
     for (size_t i = a; i < e;) {
         size_t j = i + 1;
-        auto opens = [&](size_t at) { return src[at].k == DItem::K::PushClip || src[at].k == DItem::K::PushTransform; };
-        auto closes = [&](size_t at) { return src[at].k == DItem::K::PopClip || src[at].k == DItem::K::PopTransform; };
+        auto opens = [&](size_t at) { return src[at].k == DItem::K::PushClip || src[at].k == DItem::K::PushTransform || src[at].k == DItem::K::PushAnim; };
+        auto closes = [&](size_t at) { return src[at].k == DItem::K::PopClip || src[at].k == DItem::K::PopTransform || src[at].k == DItem::K::PopAnim; };
         if (opens(i)) {  // a clip or a transform and what it holds stay together, sorted inside
             int depth = 0;
             for (j = i; j < e; ++j) {
@@ -2696,11 +2728,11 @@ void sortRange(std::vector<DItem>& src, size_t a, size_t e, std::vector<DItem>& 
     }
     if (mixed) std::stable_sort(units.begin(), units.end(), [](const U& x, const U& y) { return x.layer < y.layer; });
     for (auto& u : units) {
-        bool group = src[u.a].k == DItem::K::PushClip || src[u.a].k == DItem::K::PushTransform;
+        bool group = src[u.a].k == DItem::K::PushClip || src[u.a].k == DItem::K::PushTransform || src[u.a].k == DItem::K::PushAnim;
         if (u.e - u.a < 2 || !group) {
             for (size_t i = u.a; i < u.e; ++i) dst.push_back(std::move(src[i]));
         } else {
-            bool closed = src[u.e - 1].k == DItem::K::PopClip || src[u.e - 1].k == DItem::K::PopTransform;
+            bool closed = src[u.e - 1].k == DItem::K::PopClip || src[u.e - 1].k == DItem::K::PopTransform || src[u.e - 1].k == DItem::K::PopAnim;
             dst.push_back(std::move(src[u.a]));
             sortRange(src, u.a + 1, closed ? u.e - 1 : u.e, dst);
             if (closed) dst.push_back(std::move(src[u.e - 1]));

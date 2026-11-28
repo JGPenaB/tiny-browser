@@ -29,7 +29,9 @@ struct DItem {
     // the transform origin in x y (document coordinates), so x' = origin + M (x - origin) + (e, f).
     // Svg draws LayoutOut::svgs[img] into the item's box.
     // Background paints one layer of a background image (bg) in the clip box x y w h.
-    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform, Svg, Background };
+    // PushAnim..PopAnim: an element whose opacity or transform animations and transitions run (anim), worked out
+    // when painting; x y w h is its border box.
+    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform, Svg, Background, PushAnim, PopAnim };
     K k = K::Rect;
     int16_t layer = 0;  // paint layer: 0 = normal flow, >0 positioned (z-index + 1), <0 behind
     float x = 0, y = 0, w = 0, h = 0;
@@ -43,6 +45,7 @@ struct DItem {
     // Box: the box-shadow (outer shadows with the first Box item of an element, inset ones with its last, inside
     // its borders bw); Text: the text-shadow. Their colours are resolved.
     std::shared_ptr<const Shadows> shadows;
+    std::shared_ptr<const struct AnimPaint> anim;
     uint8_t shadowParts = 0;  // Box: 1 the outer shadows, 2 the inset ones
     uint8_t objectFit = 0;    // Image: Style::objectFit, with objectPos where the picture goes in the box
     Len objectPos[2];
@@ -92,6 +95,7 @@ struct LayoutOut {
     float height = 0;
     Color canvas{1, 1, 1, 1};
     bool fixed = false;  // the page has fixed boxes: they have to be laid out again when the page scrolls
+    bool animations = false;  // it has PushAnim items: painting says whether they still run
     std::vector<SvgImage> svgs;      // the svg elements of the page
     std::vector<SvgShape> svgShapes;  // and their shapes
 };
@@ -112,7 +116,8 @@ struct WidgetPainter {
     virtual void paintWidget(ID2D1RenderTarget* rt, const DItem& it) = 0;
 };
 
-void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo, std::vector<ImageRes>& imgs,
+// True when animations or transitions are still running: the page wants painting again soon
+bool paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo, std::vector<ImageRes>& imgs,
                  float y0, float y1, uint64_t gen, WidgetPainter* wp);
 
 }  // namespace tb

@@ -11,6 +11,7 @@ add_executable(tinybrowser WIN32
   src/url.cpp
   src/html.cpp
   src/css.cpp
+  src/anim.cpp
   src/svg.cpp
   src/text.cpp
   src/layout_engine.cpp

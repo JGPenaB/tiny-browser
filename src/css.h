@@ -164,11 +164,37 @@ struct TransformFn {
     enum K : uint8_t { Matrix, Translate, Scale, Rotate, Skew } k = Matrix;
     float v[6] = {1, 0, 0, 1, 0, 0};
     Len tx, ty;
+    // the function's own arguments, which animations interpolate: the angle of rotate() and the two of scale()
+    // and skew() (angles in radians)
+    float angle = 0, ax = 1, ay = 1;
+    void set_rotate(float a) {
+        angle = a;
+        v[0] = std::cos(a), v[1] = std::sin(a), v[2] = -std::sin(a), v[3] = std::cos(a);
+    }
+    void set_scale(float sx, float sy) {
+        ax = sx, ay = sy;
+        v[0] = sx, v[3] = sy;
+    }
+    void set_skew(float x, float y) {
+        ax = x, ay = y;
+        v[1] = std::tan(y), v[2] = std::tan(x);
+    }
 };
 using TransformList = std::vector<TransformFn>;
 // The transform of a box of the given size as a 2D matrix a b c d e f: x' = a x + c y + e, y' = b x + d y + f.
 void transform_matrix(const TransformList& list, float width, float height, float out[6]);
 
+struct Keyframes;
+// animation-* and transition-* as lists (CSS Animations 1, 3; CSS Transitions 1, 2), each property's list on its own:
+// styling makes them into one animation or transition per name, repeating the shorter lists
+struct AnimLists {
+    std::vector<std::string> names, durations, delays, iterations, directions, fills, states, timings;
+};
+struct TransitionLists {
+    std::vector<std::string> properties, durations, delays, timings;
+};
+struct AnimationDecl;
+struct TransitionDecl;
 struct Style {
     Display display = Display::Inline;
     Color color{0, 0, 0, 1};
@@ -226,6 +252,13 @@ struct Style {
     bool flowRoot = false; // display: flow-root: the box makes a block formatting context of its own
     float radius = 0;      // border-radius in px (uniform)
     bool opacity0 = false, animated = false;
+    std::shared_ptr<const AnimLists> animLists;
+    std::shared_ptr<const TransitionLists> transitionLists;
+    // what styling made of them: the animations with their @keyframes, and whether animations or transitions run the
+    // element's opacity or transform (which painting then works out, see anim.h)
+    std::shared_ptr<const std::vector<AnimationDecl>> animations;
+    std::shared_ptr<const std::vector<TransitionDecl>> transitions;
+    bool animOpacity = false, animTransform = false;
     // opacity: the element's own value, and `alpha`, that value times the ancestors'. There is no compositor yet,
     // so an element is not blended as a group: each thing it paints is made that much see-through instead.
     float opacity = 1, alpha = 1;
@@ -331,6 +364,7 @@ struct FontFace {
 };
 struct Sheet {
     std::vector<Rule> rules;
+    std::vector<std::pair<std::string, std::shared_ptr<const Keyframes>>> keyframes;  // @keyframes, in sheet order
     std::vector<FontFace> fontFaces;
     std::vector<MediaQuery> media;
     std::vector<std::string> layers;  // the layer names, dotted from the outermost, in the order they first appear
@@ -406,6 +440,8 @@ private:
     void computeElem(Node* e, const Style& parent);
     using Cascade = std::vector<std::pair<uint64_t, const Decl*>>;
     void computePseudo(Node* e, uint8_t kind, Cascade& L);
+    void resolveAnimations(Node* e, Style& s);
+    std::unordered_map<std::string, std::shared_ptr<const Keyframes>> keyframes_;
     // CSS Lists 3, 4.5: the counters in scope where styling has got to in tree order, innermost last. A counter lives
     // while styling is inside the parent of the element that made it; `depth` is that element's depth.
     struct Counter {

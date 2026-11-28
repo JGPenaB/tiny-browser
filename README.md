@@ -47,11 +47,11 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html` and `sticky.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html` and `animations.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
-third, on a span inside a button, `BUTTON submitted by iconButton`. `selectors.html` also wants
+third, on a span inside a button, `BUTTON submitted by iconButton`. `animations.html` wants `--do "wait:900"`. `selectors.html` also wants
 `--do "move:150,200;click:150,200;move:150,60"`, after which its `HOVER` lines go from grey to green with a blue
 child (hovered), then a red text (pressed), then grey with the red text (pressed, no longer hovered).
 
@@ -97,7 +97,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    trigonometric and exponential ones; percentages resolved when the basis is known; `tests/pages/values.html`), and web fonts (`@font-face`
    with TrueType, OpenType, WOFF and WOFF2 files unpacked by DirectWrite, variable fonts at each weight, the faces
    whose `unicode-range` covers Latin; `tests/pages/fonts.html` uses a Windows font by its file URL), and
-   `position: sticky` against the viewport (`tests/pages/sticky.html`). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
+   `position: sticky` against the viewport (`tests/pages/sticky.html`), and CSS Animations and Transitions of
+   `opacity` and `transform` (`@keyframes`, the `animation-*` and `transition-*` properties, timing functions, fill
+   modes, directions, the four events; run when painting, as a compositor would; `tests/pages/animations.html`). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),

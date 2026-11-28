@@ -62,6 +62,9 @@ public:
     void fireLoadEvents();
     // Fires a user-interface event at a node (null: the window). Returns false when a listener cancelled it.
     bool dispatch(Node* target, const std::string& type, bool bubbles = true, bool cancelable = true);
+    // An AnimationEvent or TransitionEvent (CSS Animations 1, 4.1; CSS Transitions 1, 6.1): animationName or
+    // propertyName, and elapsedTime in seconds
+    void animationEvent(Node* target, const std::string& type, const std::string& name, double elapsed);
     // Fires the submit event (a SubmitEvent naming the submitter, HTML 4.10.21.3) at a form. False when cancelled.
     bool submitEvent(Node* form, Node* submitter);
     // Runs timers that are due. The shell calls this when a wake() delay has passed.
