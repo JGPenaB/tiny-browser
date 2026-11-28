@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Cascade test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  .t span { color: rgb(0, 0, 0); }
+  /* CSS Conditional 3, section 2 and Conditional 4 selector() */
+  @supports (display: grid) { #s1 { color: rgb(255, 0, 0); } }
+  @supports not (display: grid) { #s2 { color: rgb(255, 0, 0); } }
+  @supports (display: no-such-thing) { #s3 { color: rgb(255, 0, 0); } }
+  @supports (no-such-property: 1) or (color: red) { #s4 { color: rgb(255, 0, 0); } }
+  @supports (color: red) and (no-such-property: 1) { #s5 { color: rgb(255, 0, 0); } }
+  @supports selector(:has(a)) { #s6 { color: rgb(255, 0, 0); } }
+  @supports selector(:no-such-pseudo) { #s7 { color: rgb(255, 0, 0); } }
+  @supports (--anything: at all) { #s8 { color: rgb(255, 0, 0); } }
+  @supports ((color: red) and (display: block)) or (no-such: 1) { #s9 { color: rgb(255, 0, 0); } }
+  /* CSS Nesting 1 */
+  .n1 { color: rgb(0, 0, 0); .k { color: rgb(255, 0, 0); } }
+  .n2 { &.on { color: rgb(255, 0, 0); } }
+  .n3 { > .k { color: rgb(255, 0, 0); } }
+  .n4 { .p & { color: rgb(255, 0, 0); } }
+  .n5, .n6 { & .k { color: rgb(255, 0, 0); } }
+  .n7 { @media screen { color: rgb(255, 0, 0); } }
+  .a .b { .c & { color: rgb(255, 0, 0); } }
+  .n9 { .k { color: rgb(0, 0, 255); } color: rgb(255, 0, 0); }
+  .n10 { .k { .m { color: rgb(255, 0, 0); } } }
+  .n11 { @supports (no-such: 1) { color: rgb(0, 0, 255); } }
+</style>
+</head>
+<body>
+<div class="t">
+  <span id="s1">s1</span> <span id="s2">s2</span> <span id="s3">s3</span> <span id="s4">s4</span> <span id="s5">s5</span>
+  <span id="s6">s6</span> <span id="s7">s7</span> <span id="s8">s8</span> <span id="s9">s9</span>
+</div>
+<div class="n1"><i class="k" id="n1k">k</i></div>
+<div class="n2 on" id="n2">n2</div>
+<div class="n3"><i class="k" id="n3k">k</i><b><i class="k" id="n3deep">k</i></b></div>
+<div class="p"><div class="n4" id="n4">n4</div></div><div class="n4" id="n4no">n4</div>
+<div class="n5"><i class="k" id="n5k">k</i></div><div class="n6"><i class="k" id="n6k">k</i></div>
+<div class="n7" id="n7">n7</div>
+<div class="a"><div class="c"><div class="b" id="ab">ab</div></div></div>
+<div class="n9" id="n9"><i class="k" id="n9k">k</i></div>
+<div class="n10"><i class="k"><b class="m" id="n10m">m</b></i></div>
+<div class="n11" id="n11">n11</div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var $ = function (id) { return document.getElementById(id); };
+  var red = function (id) { return getComputedStyle($(id)).color === 'rgb(255, 0, 0)'; };
+  var reds = function (ids) { return ids.filter(red).join(); };
+
+  eq('@supports with declarations, not, and, or and selector()', reds(['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9']), 's1,s4,s6,s8,s9');
+  eq('a nested rule without & is a descendant', red('n1k'), true);
+  eq('&.class adds to the parent', red('n2'), true);
+  eq('a nested rule may start with a combinator', reds(['n3k', 'n3deep']), 'n3k');
+  eq('& after another selector', reds(['n4', 'n4no']), 'n4');
+  eq('a parent selector list', reds(['n5k', 'n6k']), 'n5k,n6k');
+  eq('@media inside a rule holds declarations for it', red('n7'), true);
+  eq('& stands for :is(parent), not for its text', red('ab'), true);
+  eq('declarations after a nested rule', [red('n9'), getComputedStyle($('n9k')).color].join(), 'true,rgb(0, 0, 255)');
+  eq('nesting two deep', red('n10m'), true);
+  eq('@supports inside a rule', getComputedStyle($('n11')).color === 'rgb(0, 0, 255)', false);
+
+  window.addEventListener('load', function () {
+    document.title = 'Cascade test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

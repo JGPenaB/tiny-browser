@@ -934,6 +934,207 @@ int parse_media(std::string_view prelude, Sheet& sh) {
     return (int)sh.media.size() - 1;
 }
 
+bool parse_display(const std::string& v, Display& d);
+
+// ---- @supports (CSS Conditional 3, section 2; selector() from Conditional 4)
+// Whether this engine takes a declaration: a property it knows, with a value of the kind the property takes
+bool supports_declaration(std::string_view decl) {
+    size_t colon = decl.find(':');
+    if (colon == npos) return false;
+    std::string prop = lower(trim(decl.substr(0, colon)));
+    std::string value = lower(trim(decl.substr(colon + 1)));
+    if (value.empty() || contains(value, "!important")) return false;
+    if (prop.size() > 2 && prop[0] == '-' && prop[1] == '-') return true;  // a custom property takes anything
+    static const char* const known[] = {
+        "align-content", "align-items", "align-self", "animation", "animation-name", "background", "background-attachment",
+        "background-clip", "background-color", "background-image", "background-origin", "background-position",
+        "background-repeat", "background-size", "block-size", "border", "border-bottom", "border-bottom-color",
+        "border-bottom-style", "border-bottom-width", "border-color", "border-left", "border-left-color", "border-left-style",
+        "border-left-width", "border-radius", "border-right", "border-right-color", "border-right-style", "border-right-width",
+        "border-style", "border-top", "border-top-color", "border-top-style", "border-top-width", "border-width", "bottom",
+        "box-sizing", "clear", "clip-path", "color", "column-gap", "content", "counter-increment", "counter-reset",
+        "counter-set", "display", "fill", "fill-opacity", "fill-rule", "flex", "flex-basis", "flex-direction", "flex-flow",
+        "flex-grow", "flex-shrink", "flex-wrap", "float", "font", "font-family", "font-size", "font-style", "font-weight", "gap",
+        "grid", "grid-area", "grid-auto-columns", "grid-auto-flow", "grid-auto-rows", "grid-column", "grid-column-end",
+        "grid-column-start", "grid-row", "grid-row-end", "grid-row-start", "grid-template", "grid-template-areas",
+        "grid-template-columns", "grid-template-rows", "height", "inline-size", "inset", "justify-content", "justify-items",
+        "justify-self", "left", "line-height", "list-style", "list-style-type", "margin", "margin-bottom", "margin-left",
+        "margin-right", "margin-top", "mask", "mask-image", "max-height", "max-width", "min-height", "min-width", "opacity",
+        "overflow", "overflow-x", "overflow-y", "padding", "padding-bottom", "padding-left", "padding-right", "padding-top",
+        "place-content", "place-items", "place-self", "position", "right", "row-gap", "stroke", "stroke-opacity",
+        "stroke-width", "text-align", "text-decoration", "text-decoration-line", "text-transform", "text-wrap", "top",
+        "transform", "transform-origin", "vertical-align", "visibility", "white-space", "width", "z-index"};
+    bool isKnown = false;
+    for (const char* k : known) isKnown = isKnown || prop == k;
+    if (!isKnown) return false;
+    if (contains(value, "var(")) return true;
+    if (in(value, {"inherit", "initial", "unset", "revert", "revert-layer"})) return true;
+    if (prop == "display") {
+        Display d;
+        return parse_display(value, d);
+    }
+    if (prop == "position") return in(value, {"static", "relative", "absolute", "fixed", "sticky"});
+    if (prop == "color" || prop == "background-color" || (istarts(prop, "border-") && prop.size() > 6 && prop.compare(prop.size() - 6, 6, "-color") == 0)) {
+        Color c;
+        return parse_color(value, c);
+    }
+    if (in(prop, {"width", "height", "min-width", "min-height", "max-width", "max-height", "top", "right", "bottom", "left",
+                  "margin-top", "margin-right", "margin-bottom", "margin-left", "padding-top", "padding-right", "padding-bottom",
+                  "padding-left", "row-gap", "column-gap", "inline-size", "block-size", "flex-basis"})) {
+        Len l;
+        return parse_len(value, 16, l, true);
+    }
+    return true;
+}
+bool supports_condition(std::string_view v);
+bool supports_in_parens(std::string_view v) {
+    v = trim(v);
+    std::string l = lower(v);
+    if (istarts(l, "selector(") && l.back() == ')') {
+        Selector sel;
+        if (!parse_selector(trim(v.substr(9, v.size() - 10)), sel)) return false;
+        for (auto& part : sel.parts)
+            if (part.never) return false;
+        return true;
+    }
+    if (v.size() < 2 || v[0] != '(' || v.back() != ')') return false;  // font-tech(), font-format() and the unknown
+    std::string_view inner = trim(v.substr(1, v.size() - 2));
+    if (!inner.empty() && (inner[0] == '(' || istarts(lower(inner), "not ") || istarts(lower(inner), "selector(")))
+        return supports_condition(inner);
+    return supports_declaration(inner);
+}
+// not <in-parens> | <in-parens> [and <in-parens>]* | <in-parens> [or <in-parens>]*
+bool supports_condition(std::string_view v) {
+    v = trim(v);
+    if (istarts(lower(v), "not ") || istarts(lower(v), "not(")) return !supports_in_parens(v.substr(3));
+    std::vector<std::string_view> terms;
+    std::vector<std::string> ops;
+    size_t i = 0, start = 0;
+    int depth = 0;
+    while (i < v.size()) {
+        char c = v[i];
+        if (c == '(') ++depth;
+        else if (c == ')') --depth;
+        else if (depth == 0 && isws(c)) {
+            size_t j = i;
+            while (j < v.size() && isws(v[j])) ++j;
+            size_t k = j;
+            while (k < v.size() && isalpha((unsigned char)v[k])) ++k;
+            std::string word = lower(v.substr(j, k - j));
+            if ((word == "and" || word == "or") && k < v.size() && (isws(v[k]) || v[k] == '(')) {
+                terms.push_back(v.substr(start, i - start));
+                ops.push_back(word);
+                start = i = k;
+                continue;
+            }
+        }
+        ++i;
+    }
+    terms.push_back(v.substr(start));
+    for (size_t k = 1; k < ops.size(); ++k)
+        if (ops[k] != ops[0]) return false;  // and and or may not be mixed without parentheses
+    bool any = ops.empty() || ops[0] == "and";
+    for (auto& t : terms) {
+        bool r = supports_in_parens(t);
+        if (ops.empty() || ops[0] == "and") any = any && r;
+        else any = any || r;
+    }
+    return any;
+}
+
+// ---- CSS Nesting 1: a rule inside a rule. The nested selector is taken relative to the parent: & stands for the
+// parent's elements, and a selector without & is a descendant of them. & becomes :is(parent) unless the parent's
+// text can stand in for it unchanged: a single compound selector, or a single selector at the start.
+std::string nest_selector(std::string_view parent, std::string_view child) {
+    auto parents = split_top(parent, ',');
+    std::string list = std::string(trim(parent));
+    bool single = parents.size() == 1;
+    bool compound = single;
+    int depth = 0;
+    for (char c : list) {
+        if (c == '(' || c == '[') ++depth;
+        else if (c == ')' || c == ']') --depth;
+        else if (depth == 0 && (isws(c) || c == '>' || c == '+' || c == '~')) compound = false;
+    }
+    std::string out;
+    for (auto part : split_top(child, ',')) {
+        std::string_view p = trim(part);
+        std::string one;
+        if (p.find('&') == npos) {
+            one = (single ? list : ":is(" + list + ")") + " " + std::string(p);
+        } else {
+            for (size_t i = 0; i < p.size(); ++i) {
+                if (p[i] != '&') {
+                    one += p[i];
+                    continue;
+                }
+                bool leading = trim(std::string_view(one)).empty();
+                one += single && (compound || leading) ? list : ":is(" + list + ")";
+            }
+        }
+        if (!out.empty()) out += ", ";
+        out += one;
+    }
+    return out;
+}
+
+void parse_block(std::string_view s, int media, Sheet& sh, int depth);
+// A style rule, with the rules nested in it (CSS Nesting 1, section 2)
+void parse_style_rule(std::string_view selText, std::string_view body, int media, Sheet& sh, int depth) {
+    std::string decls;
+    std::vector<std::pair<std::string_view, std::string_view>> nested;
+    size_t i = 0, start = 0;
+    int paren = 0;
+    char q = 0;
+    while (i < body.size()) {
+        char c = body[i];
+        if (q) {
+            if (c == '\\') ++i;
+            else if (c == q) q = 0;
+            ++i;
+            continue;
+        }
+        if (c == '"' || c == '\'') q = c;
+        else if (c == '(') ++paren;
+        else if (c == ')') --paren;
+        else if (paren <= 0 && c == ';') {
+            decls.append(body.substr(start, i - start + 1));
+            start = i + 1;
+        } else if (paren <= 0 && c == '{') {
+            size_t end = block_end(body, i);
+            if (end == npos) end = body.size();
+            nested.push_back({trim(body.substr(start, i - start)), body.substr(i + 1, std::min(end, body.size()) - i - 1)});
+            i = end + 1;
+            start = std::min(i, body.size());
+            continue;
+        }
+        ++i;
+    }
+    if (start < body.size()) decls.append(body.substr(start));
+    auto d = std::make_shared<std::vector<Decl>>(parse_decls(decls));
+    if (!d->empty())
+        for (auto part : split_top(selText, ',')) {
+            Selector x;
+            if (parse_selector(trim(part), x)) sh.rules.push_back({std::move(x), d, media});
+        }
+    if (depth >= 8) return;
+    for (auto& [prelude, inner] : nested) {
+        if (prelude.empty()) continue;
+        if (prelude[0] == '@') {  // conditional group rules inside a style rule hold declarations for it (2.3)
+            size_t j = 1;
+            std::string kw = lower(read_ident(prelude, j));
+            std::string_view rest = trim(prelude.substr(j));
+            if (kw == "media") parse_style_rule(selText, inner, parse_media(rest, sh), sh, depth + 1);
+            else if (kw == "supports") {
+                if (supports_condition(rest)) parse_style_rule(selText, inner, media, sh, depth + 1);
+            } else if (kw == "layer" || kw == "container" || kw == "scope")
+                parse_style_rule(selText, inner, media, sh, depth + 1);
+            continue;
+        }
+        parse_style_rule(nest_selector(selText, prelude), inner, media, sh, depth + 1);
+    }
+}
+
 void parse_block(std::string_view s, int media, Sheet& sh, int depth) {
     size_t i = 0;
     while (i < s.size()) {
@@ -973,8 +1174,9 @@ void parse_block(std::string_view s, int media, Sheet& sh, int depth) {
             if (depth < 8) {
                 if (kw == "media")
                     parse_block(inner, parse_media(prelude, sh), sh, depth + 1);
-                else if (kw == "supports" || kw == "layer" || kw == "container" || kw == "scope" || kw == "document" ||
-                         kw == "-moz-document")
+                else if (kw == "supports") {
+                    if (supports_condition(prelude)) parse_block(inner, media, sh, depth + 1);
+                } else if (kw == "layer" || kw == "container" || kw == "scope" || kw == "document" || kw == "-moz-document")
                     parse_block(inner, media, sh, depth + 1);
             }
             i = end + 1;
@@ -984,16 +1186,7 @@ void parse_block(std::string_view s, int media, Sheet& sh, int depth) {
         if (brace == npos) break;
         size_t end = block_end(s, brace);
         if (end == npos) end = s.size();
-        std::string_view sel = s.substr(i, brace - i);
-        std::string_view body = s.substr(brace + 1, end - brace - 1);
-        // CSS nesting: treat nested rule blocks inside a declaration block conservatively (ignore them).
-        auto decls = std::make_shared<std::vector<Decl>>(parse_decls(body));
-        if (!decls->empty()) {
-            for (auto part : split_top(sel, ',')) {
-                Selector x;
-                if (parse_selector(trim(part), x)) sh.rules.push_back({std::move(x), decls, media});
-            }
-        }
+        parse_style_rule(trim(s.substr(i, brace - i)), s.substr(brace + 1, std::min(end, s.size()) - brace - 1), media, sh, depth);
         i = end + 1;
     }
 }
