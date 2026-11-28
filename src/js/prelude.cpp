@@ -73,6 +73,18 @@ JSFN(toBigIntNative) { return V(ci.vm.toBigInt(ci.arg(0))); }
 
 // Temporal is large and most scripts never use it, so it is compiled the first time something of it is used: the
 // global, or Date.prototype.toTemporalInstant. Its JavaScript fills in the natives object (temporal, toTemporalInstant).
+// For Temporal: its toLocaleString methods format through Intl (src/js/intl/4_date.js temporalToLocaleString)
+JSFN(temporalToLocaleString) {
+    return callIntl(ci.vm, "temporalToLocaleString", {ci.arg(0), ci.arg(1), ci.arg(2), ci.arg(3), ci.arg(4), ci.arg(5)});
+}
+// For Intl: what a Temporal object holds, or undefined. When Temporal was never built, no object can be one of its.
+JSFN(temporalInfo) {
+    Vm& vm = ci.vm;
+    if (!vm.temporalNatives.isObject()) return Value::undef();
+    Value info = vm.get(vm.temporalNatives, "info");
+    Value arg = ci.arg(0);
+    return vm.call(info, Value::undef(), &arg, 1);
+}
 const std::u16string* joinParts(const char* const* parts, size_t count) {
     std::string joined;
     for (size_t i = 0; i < count; i++) joined += parts[i];
@@ -89,6 +101,8 @@ JSObject* bundleNatives(Vm& vm, Value& slot, const std::u16string* source) {
     vm.defFn(natives, "toPrimitiveNumber", toPrimitiveNumber, 1);
     vm.defFn(natives, "toBigInt", toBigIntNative, 1);
     vm.def(natives, "icu", V(icuNatives(vm)));
+    vm.defFn(natives, "toLocaleString", temporalToLocaleString, 6);
+    vm.defFn(natives, "temporalInfo", temporalInfo, 1);
     auto src = std::shared_ptr<const std::u16string>(source, [](const std::u16string*) {});
     FuncProto* p = compileScript(vm, src, kBuiltinFile, false, nullptr);
     JSFunction* outer = vm.makeClosure(p, nullptr, nullptr);

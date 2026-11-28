@@ -3,7 +3,7 @@ var toPrimitiveNumber = natives.toPrimitiveNumber;
 var FALLBACK = $Symbol('IntlLegacyConstructedSymbol');  // %Intl%.[[FallbackSymbol]] (8.1)
 // ResolveOptions (9.2.8). descriptors are [key, property, type, values]; localeData(locale) gives the supported
 // values of each relevant key.
-function resolveOptions(locales, options, coerce, descriptors, relevantKeys, localeData) {
+function resolveOptions(locales, options, coerce, descriptors, relevantKeys, localeData, modify) {
   var requested = canonicalizeLocaleList(locales);
   options = coerce ? coerceOptionsToObject(options) : getOptionsObject(options);
   var opt = record({ localeMatcher: getOption(options, 'localeMatcher', 'string', ['lookup', 'best fit'], 'best fit') });
@@ -15,6 +15,7 @@ function resolveOptions(locales, options, coerce, descriptors, relevantKeys, loc
     }
     opt[d[0]] = value;
   }
+  if (modify !== undefined) modify(opt);
   return record({ options: options, resolved: resolveLocale(requested, opt, relevantKeys, localeData), opt: opt });
 }
 // The numbering systems a locale offers: its default one first, then every one with digits of its own (9.1)

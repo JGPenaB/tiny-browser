@@ -40,6 +40,19 @@ function slotOf(x, kind) {
 }
 function kindOf(x) { var r = isObject(x) ? wmGet(slots, x) : undefined; return r === undefined ? undefined : r.kind; }
 function recordOf(x) { return wmGet(slots, x); }
+// The toLocaleString methods (Temporal 15.11) format through Intl.DateTimeFormat, which the engine reaches for them
+function temporalInfo(r) {
+  var info = create(null), date = r.date, t = r.time;
+  info.kind = r.kind;
+  info.calendar = r.calendar;
+  if (date !== undefined) { info.year = date.year; info.month = date.month; info.day = date.day; }
+  if (t !== undefined) { info.hour = t.hour; info.minute = t.minute; info.second = t.second; info.millisecond = t.millisecond; }
+  if (r.ns !== undefined) info.epochMs = $Number(floorDiv(r.ns, 1000000n));
+  return info;
+}
+function intlToLocaleString(r, self, args, required, defaults, timeZone) {
+  return natives.toLocaleString(temporalInfo(r), args[0], args[1], required, defaults, timeZone);
+}
 // Installs the getters of an object literal on a prototype the way a class body would: non-enumerable, configurable
 function copyAccessors(target, source) {
   var names = getOwnPropertyNames(source);

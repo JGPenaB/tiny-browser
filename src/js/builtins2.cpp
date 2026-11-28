@@ -1517,6 +1517,11 @@ JSFN(dateFormat) {
     int kind = ci.callee->data.asInt();
     double t = thisDate(ci)->prim.number();
     if (kind == 3 && std::isnan(t)) vm.throwError(Err::RangeError, "Invalid time value");
+    if (kind >= 5) {  // ECMA-402 21.4.4.39-41: through Intl.DateTimeFormat
+        static const char* required[] = {"date", "time", "any"};
+        static const char* defaults[] = {"date", "time", "all"};
+        return callIntl(vm, "dateToLocaleString", {Value::num(t), ci.arg(0), ci.arg(1), vm.strv(required[kind - 5]), vm.strv(defaults[kind - 5])});
+    }
     return vm.strv(formatDate(t, kind));
 }
 JSFN(dateToJSON) {

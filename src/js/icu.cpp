@@ -423,6 +423,142 @@ JSFN(pluralKeywords) {
     return V(a);
 }
 
+// ---------------------------------------------------------------- dates
+// A BCP 47 tag as an ICU locale id ("ja-JP-u-ca-japanese" is "ja_JP@calendar=japanese")
+std::string icuLocale(const std::string& tag) {
+    char id[ULOC_FULLNAME_CAPACITY];
+    UErrorCode err = U_ZERO_ERROR;
+    int32_t parsed = 0;
+    uloc_forLanguageTag(tag.c_str(), id, sizeof id, &parsed, &err);
+    return U_FAILURE(err) ? tag : std::string(id);
+}
+UDateTimePatternGenerator* patternGenerator(const std::string& locale, UErrorCode& err) {
+    thread_local FormatterCache<UDateTimePatternGenerator, udatpg_close> cache;
+    std::u16string key = fromAsciiKey(locale);
+    if (auto* g = cache.find(key)) return g;
+    UDateTimePatternGenerator* g = udatpg_open(icuLocale(locale).c_str(), &err);
+    if (U_FAILURE(err)) return nullptr;
+    cache.put(key, g);
+    return g;
+}
+// dateBestPattern(locale, skeleton): the locale's pattern for those fields, with the field widths asked for
+JSFN(dateBestPattern) {
+    Vm& vm = ci.vm;
+    UErrorCode err = U_ZERO_ERROR;
+    UDateTimePatternGenerator* g = patternGenerator(toAscii(ustring(vm, ci.arg(0))), err);
+    if (!g) vm.throwError(Err::RangeError, "The date format cannot be made");
+    std::u16string skeleton = ustring(vm, ci.arg(1));
+    UChar out[256];
+    int32_t n = udatpg_getBestPatternWithOptions(g, (const UChar*)skeleton.data(), (int32_t)skeleton.size(), UDATPG_MATCH_ALL_FIELDS_LENGTH, out, 256, &err);
+    if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The date format cannot be made");
+    return V(vm.str(fromUChars(out, n)));
+}
+// dateSkeleton(pattern): the fields of a pattern, as a skeleton
+JSFN(dateSkeleton) {
+    Vm& vm = ci.vm;
+    std::u16string pattern = ustring(vm, ci.arg(0));
+    UChar out[256];
+    UErrorCode err = U_ZERO_ERROR;
+    int32_t n = udatpg_getSkeleton(nullptr, (const UChar*)pattern.data(), (int32_t)pattern.size(), out, 256, &err);
+    return U_FAILURE(err) ? Value::undef() : V(vm.str(fromUChars(out, n)));
+}
+// dateStylePattern(locale, dateStyle, timeStyle): the pattern of a style (0 full to 3 short, -1 none)
+JSFN(dateStylePattern) {
+    Vm& vm = ci.vm;
+    std::string locale = icuLocale(toAscii(ustring(vm, ci.arg(0))));
+    int dateStyle = (int)vm.toNumber(ci.arg(1)), timeStyle = (int)vm.toNumber(ci.arg(2));
+    UErrorCode err = U_ZERO_ERROR;
+    UDateFormat* f = udat_open(timeStyle < 0 ? UDAT_NONE : (UDateFormatStyle)timeStyle, dateStyle < 0 ? UDAT_NONE : (UDateFormatStyle)dateStyle,
+                               locale.c_str(), u"UTC", 3, nullptr, 0, &err);
+    if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The date format cannot be made");
+    UChar out[256];
+    int32_t n = udat_toPattern(f, false, out, 256, &err);
+    udat_close(f);
+    return V(vm.str(fromUChars(out, n)));
+}
+UDateFormat* dateFormatter(const std::string& locale, const std::u16string& timeZone, const std::u16string& pattern, UErrorCode& err) {
+    thread_local FormatterCache<UDateFormat, udat_close> cache;
+    std::u16string key = fromAsciiKey(locale) + u'|' + timeZone + u'|' + pattern;
+    if (UDateFormat* f = cache.find(key)) return f;
+    UDateFormat* f = udat_open(UDAT_PATTERN, UDAT_PATTERN, icuLocale(locale).c_str(), (const UChar*)timeZone.data(), (int32_t)timeZone.size(),
+                               (const UChar*)pattern.data(), (int32_t)pattern.size(), &err);
+    if (U_FAILURE(err)) return nullptr;
+    // proleptic Gregorian, as ECMA-262 dates are
+    UCalendar* cal = (UCalendar*)udat_getCalendar(f);
+    UCalendar* copy = ucal_clone(cal, &err);
+    if (U_SUCCESS(err) && copy) {
+        ucal_setGregorianChange(copy, -8.64e15, &err);
+        udat_setCalendar(f, copy);
+        ucal_close(copy);
+    }
+    err = U_ZERO_ERROR;
+    cache.put(key, f);
+    return f;
+}
+// dateFormat(locale, timeZone, pattern, epochMs, parts): with parts, [text, 1, field, start, end, ...] (category 1: dates)
+JSFN(dateFormat) {
+    Vm& vm = ci.vm;
+    UErrorCode err = U_ZERO_ERROR;
+    UDateFormat* f = dateFormatter(toAscii(ustring(vm, ci.arg(0))), ustring(vm, ci.arg(1)), ustring(vm, ci.arg(2)), err);
+    if (!f) vm.throwError(Err::RangeError, "The date format cannot be made");
+    double ms = vm.toNumber(ci.arg(3));
+    bool parts = vm.toBool(ci.arg(4));
+    UFieldPositionIterator* it = parts ? ufieldpositer_open(&err) : nullptr;
+    UChar buf[512];
+    int32_t n = udat_formatForFields(f, ms, buf, 512, it, &err);
+    std::u16string text;
+    if (err == U_BUFFER_OVERFLOW_ERROR) {
+        text.resize(n);
+        err = U_ZERO_ERROR;
+        if (it) { ufieldpositer_close(it); it = ufieldpositer_open(&err); }
+        udat_formatForFields(f, ms, (UChar*)text.data(), n, it, &err);
+    } else text = fromUChars(buf, n);
+    if (U_FAILURE(err)) {
+        if (it) ufieldpositer_close(it);
+        vm.throwError(Err::RangeError, "The date cannot be formatted");
+    }
+    if (!parts) return V(vm.str(std::move(text)));
+    JSArray* a = vm.newArray();
+    std::vector<Value> held{V(a)};
+    RootScope keep(vm, held);
+    a->elems.push_back(V(vm.str(std::move(text))));
+    int32_t start = 0, end = 0, field;
+    while ((field = ufieldpositer_next(it, &start, &end)) >= 0) {
+        a->elems.push_back(Value::num(1));
+        a->elems.push_back(Value::num(field));
+        a->elems.push_back(Value::num(start));
+        a->elems.push_back(Value::num(end));
+    }
+    ufieldpositer_close(it);
+    return V(a);
+}
+// dateFormatRange(locale, timeZone, skeleton, startMs, endMs, parts): with parts, the fields as for formattedValue
+// (category 1 dates, category 0x1005 the range spans)
+JSFN(dateFormatRange) {
+    Vm& vm = ci.vm;
+    using FormatToResult = void (*)(const UDateIntervalFormat*, UDate, UDate, UFormattedDateInterval*, UErrorCode*);
+    static FormatToResult formatToResult = icuFunction<FormatToResult>("udtitvfmt_formatToResult");
+    if (!formatToResult) vm.throwError(Err::RangeError, "This version of Windows cannot format date ranges");
+    thread_local FormatterCache<UDateIntervalFormat, udtitvfmt_close> cache;
+    std::string locale = toAscii(ustring(vm, ci.arg(0)));
+    std::u16string timeZone = ustring(vm, ci.arg(1)), skeleton = ustring(vm, ci.arg(2));
+    std::u16string key = fromAsciiKey(locale) + u'|' + timeZone + u'|' + skeleton;
+    UErrorCode err = U_ZERO_ERROR;
+    UDateIntervalFormat* f = cache.find(key);
+    if (!f) {
+        f = udtitvfmt_open(icuLocale(locale).c_str(), (const UChar*)skeleton.data(), (int32_t)skeleton.size(), (const UChar*)timeZone.data(),
+                           (int32_t)timeZone.size(), &err);
+        if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The date range format cannot be made");
+        cache.put(key, f);
+    }
+    UFormattedDateInterval* result = udtitvfmt_openResult(&err);
+    formatToResult(f, vm.toNumber(ci.arg(3)), vm.toNumber(ci.arg(4)), result, &err);
+    Value v = formattedValue(vm, udtitvfmt_resultAsValue(result, &err), vm.toBool(ci.arg(5)), err);
+    udtitvfmt_closeResult(result);
+    if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The dates cannot be formatted");
+    return v;
+}
+
 }  // namespace
 
 JSObject* icuNatives(Vm& vm) {
@@ -444,6 +580,11 @@ JSObject* icuNatives(Vm& vm) {
     vm.defFn(o, "pluralSelect", pluralSelect, 4);
     vm.defFn(o, "pluralSelectRange", pluralSelectRange, 5);
     vm.defFn(o, "pluralKeywords", pluralKeywords, 2);
+    vm.defFn(o, "dateBestPattern", dateBestPattern, 2);
+    vm.defFn(o, "dateSkeleton", dateSkeleton, 1);
+    vm.defFn(o, "dateStylePattern", dateStylePattern, 3);
+    vm.defFn(o, "dateFormat", dateFormat, 5);
+    vm.defFn(o, "dateFormatRange", dateFormatRange, 6);
     return o;
 }
 

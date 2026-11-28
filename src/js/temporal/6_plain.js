@@ -147,7 +147,7 @@ class PlainDate extends $Object {
     var showCalendar = getShowCalendarOption(getOptionsObject(arguments[0]));
     return dateString(r.date) + formatCalendarAnnotation(r.calendar, showCalendar);
   }
-  toLocaleString() { var r = slotOf(this, 'PlainDate'); return dateString(r.date) + formatCalendarAnnotation(r.calendar, 'auto'); }
+  toLocaleString() { return intlToLocaleString(slotOf(this, 'PlainDate'), this, arguments, 'date', 'date'); }
   toJSON() { var r = slotOf(this, 'PlainDate'); return dateString(r.date) + formatCalendarAnnotation(r.calendar, 'auto'); }
   valueOf() { throwType('Use Temporal.PlainDate.compare to compare dates'); }
 }
@@ -261,7 +261,7 @@ class PlainTime extends $Object {
     var precision = toSecondsStringPrecision(smallestUnit, digits);
     return timeRecordToString(roundTime(t, precision.increment, precision.unit, roundingMode), precision.precision);
   }
-  toLocaleString() { return timeRecordToString(plainTimeOf(this), AUTO); }
+  toLocaleString() { return intlToLocaleString(slotOf(this, 'PlainTime'), this, arguments, 'time', 'time'); }
   toJSON() { return timeRecordToString(plainTimeOf(this), AUTO); }
   valueOf() { throwType('Use Temporal.PlainTime.compare to compare times'); }
 }
@@ -419,7 +419,7 @@ class PlainDateTime extends $Object {
     if (!isoDateTimeWithinLimits(result.date, result.time)) throwRange('The date and time are out of range');
     return dateTimeToString(result, r.calendar, precision.precision, showCalendar);
   }
-  toLocaleString() { var r = plainDateTimeOf(this); return dateTimeToString(dateTime(r.date, r.time), r.calendar, AUTO, 'auto'); }
+  toLocaleString() { return intlToLocaleString(plainDateTimeOf(this), this, arguments, 'any', 'all'); }
   toJSON() { var r = plainDateTimeOf(this); return dateTimeToString(dateTime(r.date, r.time), r.calendar, AUTO, 'auto'); }
   valueOf() { throwType('Use Temporal.PlainDateTime.compare to compare date-times'); }
   toZonedDateTime(temporalTimeZoneLike) {

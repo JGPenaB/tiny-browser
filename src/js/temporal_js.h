@@ -46,6 +46,19 @@ function slotOf(x, kind) {
 }
 function kindOf(x) { var r = isObject(x) ? wmGet(slots, x) : undefined; return r === undefined ? undefined : r.kind; }
 function recordOf(x) { return wmGet(slots, x); }
+// The toLocaleString methods (Temporal 15.11) format through Intl.DateTimeFormat, which the engine reaches for them
+function temporalInfo(r) {
+  var info = create(null), date = r.date, t = r.time;
+  info.kind = r.kind;
+  info.calendar = r.calendar;
+  if (date !== undefined) { info.year = date.year; info.month = date.month; info.day = date.day; }
+  if (t !== undefined) { info.hour = t.hour; info.minute = t.minute; info.second = t.second; info.millisecond = t.millisecond; }
+  if (r.ns !== undefined) info.epochMs = $Number(floorDiv(r.ns, 1000000n));
+  return info;
+}
+function intlToLocaleString(r, self, args, required, defaults, timeZone) {
+  return natives.toLocaleString(temporalInfo(r), args[0], args[1], required, defaults, timeZone);
+}
 // Installs the getters of an object literal on a prototype the way a class body would: non-enumerable, configurable
 function copyAccessors(target, source) {
   var names = getOwnPropertyNames(source);
@@ -251,7 +264,8 @@ function getDifferenceSettings(operation, options, group, disallowed, fallbackSm
   var maximum = MAX_INCREMENT[smallestUnit];
   if (maximum !== undefined) validateRoundingIncrement(roundingIncrement, maximum, false);
   if (operation === 'since') roundingMode = negateRoundingMode(roundingMode);
-  return { smallestUnit: smallestUnit, largestUnit: largestUnit, roundingMode: roundingMode, roundingIncrement: roundingIncrement };
+)JS",
+R"JS(  return { smallestUnit: smallestUnit, largestUnit: largestUnit, roundingMode: roundingMode, roundingIncrement: roundingIncrement };
 }
 // A string option bag for the methods that take one string argument instead of an object (round, total, ...)
 function stringToOptions(value, key) {
@@ -264,8 +278,7 @@ function isLeapYear(y) { return y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
 function daysInMonth(y, m) { return m === 2 ? (isLeapYear(y) ? 29 : 28) : (m === 4 || m === 6 || m === 9 || m === 11) ? 30 : 31; }
 function daysInYear(y) { return isLeapYear(y) ? 366 : 365; }
 // ISODateToEpochDays (13.1), with a 1-based month that may lie outside 1-12
-)JS",
-R"JS(function epochDays(y, m, d) {
+function epochDays(y, m, d) {
   y += floor((m - 1) / 12);
   m = ((m - 1) % 12 + 12) % 12 + 1;
   var yy = m <= 2 ? y - 1 : y;
@@ -526,7 +539,8 @@ function primaryZoneIds() {
 function isDigit(s, i) { var c = charCodeAt(s, i); return c >= 48 && c <= 57; }
 function isAlpha(s, i) { var c = charCodeAt(s, i); return (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
 function digits(s, i, n) { for (var k = 0; k < n; k++) if (!isDigit(s, i + k)) return -1; return i + n; }
-function numberAt(s, i, n) { return +strSlice(s, i, i + n); }
+)JS",
+R"JS(function numberAt(s, i, n) { return +strSlice(s, i, i + n); }
 function charAt(s, i) { return i < s.length ? s[i] : ''; }
 function isSign(s, i) { var c = charAt(s, i); return c === '+' || c === '-'; }
 
@@ -556,8 +570,7 @@ function parseDay(s, i, r) {
   r.day = d;
   return i + 2;
 }
-)JS",
-R"JS(function validMonthDay(m, d) { return !(d === 31 && (m === 2 || m === 4 || m === 6 || m === 9 || m === 11)) && !(m === 2 && d === 30); }
+function validMonthDay(m, d) { return !(d === 31 && (m === 2 || m === 4 || m === 6 || m === 9 || m === 11)) && !(m === 2 && d === 30); }
 // DateSpec[?Extended]: both separators present or both absent
 function parseDateSpec(s, i, r) {
   var j = parseYear(s, i, r);
@@ -910,7 +923,8 @@ function parseTemporalTimeZoneString(s) {
   if (r.z) return { name: 'UTC' };
   if (r.offsetString !== undefined) {
     if (r.offsetParts > 2) throwRange('A time zone offset has minutes at most');
-    return parseTimeZoneIdentifier(r.offsetString);
+)JS",
+R"JS(    return parseTimeZoneIdentifier(r.offsetString);
   }
   throwRange(s + ' names no time zone');
 }
@@ -928,8 +942,7 @@ function isUTC(timeZone) { return timeZone === 'UTC' || namedZone(timeZone).prim
 // GetOffsetNanosecondsFor (11.1.9), as a Number
 function getOffsetNsFor(timeZone, epochNs) {
   if (isSign(timeZone, 0)) return parseUTCOffsetNs(timeZone);
-)JS",
-R"JS(  if (isUTC(timeZone)) return 0;
+  if (isUTC(timeZone)) return 0;
   return icu.tzOffset(icuZone(timeZone), $Number(floorDiv(epochNs, 1000000n))) * 1e6;
 }
 function getISODateTimeFor(timeZone, epochNs) {
@@ -1191,7 +1204,8 @@ function calendarISOToDate(date) { return date; }
 // BigInt number of nanoseconds (a "time duration").
 function dateDuration(years, months, weeks, days) { return { years: years, months: months, weeks: weeks, days: days }; }
 var ZERO_DATE_DURATION = dateDuration(0, 0, 0, 0);
-function createDateDuration(years, months, weeks, days) {
+)JS",
+R"JS(function createDateDuration(years, months, weeks, days) {
   if (!isValidDuration([years, months, weeks, days, 0, 0, 0, 0, 0, 0])) throwRange('The duration is out of range');
   return dateDuration(years, months, weeks, days);
 }
@@ -1206,8 +1220,7 @@ function dateDurationSign(d) {
 function internalDuration(date, t) { return { date: date, time: t }; }
 function internalDurationSign(d) { var s = dateDurationSign(d.date); return s !== 0 ? s : bigSign(d.time); }
 function timeDurationFromComponents(h, mi, s, ms, us, ns) {
-)JS",
-R"JS(  return (((($BigInt(h) * 60n + $BigInt(mi)) * 60n + $BigInt(s)) * 1000n + $BigInt(ms)) * 1000n + $BigInt(us)) * 1000n + $BigInt(ns);
+  return (((($BigInt(h) * 60n + $BigInt(mi)) * 60n + $BigInt(s)) * 1000n + $BigInt(ms)) * 1000n + $BigInt(us)) * 1000n + $BigInt(ns);
 }
 function addTimeDuration(a, b) { var r = a + b; if (bigAbs(r) > maxTimeDuration) throwRange('The duration is out of range'); return r; }
 function add24HourDays(d, days) { var r = d + $BigInt(days) * nsPerDay; if (bigAbs(r) > maxTimeDuration) throwRange('The duration is out of range'); return r; }
@@ -1446,7 +1459,8 @@ function getRelativeToOption(options) {
   var value = options.relativeTo;
   if (value === undefined) return { plain: undefined, zoned: undefined };
   var offsetBehaviour = 'option', matchBehaviour = 'exactly', calendar, date, t, timeZone, offsetString;
-  if (isObject(value)) {
+)JS",
+R"JS(  if (isObject(value)) {
     var k = kindOf(value);
     if (k === 'ZonedDateTime') return { plain: undefined, zoned: value };
     if (k === 'PlainDate') return { plain: value, zoned: undefined };
@@ -1460,8 +1474,7 @@ function getRelativeToOption(options) {
     date = result.date;
     t = result.time;
   } else {
-)JS",
-R"JS(    if (typeof value !== 'string') throwType('relativeTo must be an object or a string');
+    if (typeof value !== 'string') throwType('relativeTo must be an object or a string');
     var parsed = parseISODateTime(value, ['zonedDateTime', 'dateTime']);
     offsetString = parsed.offsetString;
     if (parsed.timeZoneAnnotation === undefined) timeZone = undefined;
@@ -1709,7 +1722,8 @@ class Instant extends $Object {
     if (!isValidEpochNs(ns)) throwRange('The instant is out of range');
     return createInstant(ns);
   }
-  static compare(one, two) { var a = toInstantNs(one), b = toInstantNs(two); return a < b ? -1 : a > b ? 1 : 0; }
+)JS",
+R"JS(  static compare(one, two) { var a = toInstantNs(one), b = toInstantNs(two); return a < b ? -1 : a > b ? 1 : 0; }
   get epochMilliseconds() { return $Number(floorDiv(slotOf(this, 'Instant').ns, 1000000n)); }
   get epochNanoseconds() { return slotOf(this, 'Instant').ns; }
   add(temporalDurationLike) { return addDurationToInstant('add', slotOf(this, 'Instant').ns, temporalDurationLike); }
@@ -1719,8 +1733,7 @@ class Instant extends $Object {
   round(roundTo) {
     var ns = slotOf(this, 'Instant').ns;
     if (roundTo === undefined) throwType('round needs an argument');
-)JS",
-R"JS(    var options = stringToOptions(roundTo, 'smallestUnit');
+    var options = stringToOptions(roundTo, 'smallestUnit');
     var roundingIncrement = getRoundingIncrementOption(options);
     var roundingMode = getRoundingModeOption(options, 'halfExpand');
     var smallestUnit = getUnitOption(options, 'smallestUnit', true);
@@ -1746,7 +1759,7 @@ R"JS(    var options = stringToOptions(roundTo, 'smallestUnit');
     return instantToString(rounded, timeZone, precision.precision);
   }
   toJSON() { return instantToString(slotOf(this, 'Instant').ns, undefined, AUTO); }
-  toLocaleString() { return instantToString(slotOf(this, 'Instant').ns, undefined, AUTO); }
+  toLocaleString() { return intlToLocaleString(slotOf(this, 'Instant'), this, arguments, 'any', 'all'); }
   valueOf() { throwType('Use Temporal.Instant.compare to compare instants'); }
   toZonedDateTimeISO(timeZone) {
     var ns = slotOf(this, 'Instant').ns;
@@ -1903,7 +1916,7 @@ class PlainDate extends $Object {
     var showCalendar = getShowCalendarOption(getOptionsObject(arguments[0]));
     return dateString(r.date) + formatCalendarAnnotation(r.calendar, showCalendar);
   }
-  toLocaleString() { var r = slotOf(this, 'PlainDate'); return dateString(r.date) + formatCalendarAnnotation(r.calendar, 'auto'); }
+  toLocaleString() { return intlToLocaleString(slotOf(this, 'PlainDate'), this, arguments, 'date', 'date'); }
   toJSON() { var r = slotOf(this, 'PlainDate'); return dateString(r.date) + formatCalendarAnnotation(r.calendar, 'auto'); }
   valueOf() { throwType('Use Temporal.PlainDate.compare to compare dates'); }
 }
@@ -1981,7 +1994,8 @@ class PlainTime extends $Object {
     return createPlainTime(time(v[0], v[1], v[2], v[3], v[4], v[5]), new.target);
   }
   static from(item) { return toPlainTime(item, arguments[1]); }
-  static compare(one, two) { return compareTime(recordOf(toPlainTime(one)).time, recordOf(toPlainTime(two)).time); }
+)JS",
+R"JS(  static compare(one, two) { return compareTime(recordOf(toPlainTime(one)).time, recordOf(toPlainTime(two)).time); }
   add(temporalDurationLike) { return addDurationToTime('add', plainTimeOf(this), temporalDurationLike); }
   subtract(temporalDurationLike) { return addDurationToTime('subtract', plainTimeOf(this), temporalDurationLike); }
   with(temporalTimeLike) {
@@ -1992,8 +2006,7 @@ class PlainTime extends $Object {
     var get = function (k) { return p[k] !== undefined ? p[k] : t[k]; };
     return createPlainTime(regulateTime(get('hour'), get('minute'), get('second'), get('millisecond'), get('microsecond'), get('nanosecond'), overflow));
   }
-)JS",
-R"JS(  until(other) { return differenceTemporalPlainTime('until', plainTimeOf(this), other, arguments[1]); }
+  until(other) { return differenceTemporalPlainTime('until', plainTimeOf(this), other, arguments[1]); }
   since(other) { return differenceTemporalPlainTime('since', plainTimeOf(this), other, arguments[1]); }
   round(roundTo) {
     var t = plainTimeOf(this);
@@ -2018,7 +2031,7 @@ R"JS(  until(other) { return differenceTemporalPlainTime('until', plainTimeOf(th
     var precision = toSecondsStringPrecision(smallestUnit, digits);
     return timeRecordToString(roundTime(t, precision.increment, precision.unit, roundingMode), precision.precision);
   }
-  toLocaleString() { return timeRecordToString(plainTimeOf(this), AUTO); }
+  toLocaleString() { return intlToLocaleString(slotOf(this, 'PlainTime'), this, arguments, 'time', 'time'); }
   toJSON() { return timeRecordToString(plainTimeOf(this), AUTO); }
   valueOf() { throwType('Use Temporal.PlainTime.compare to compare times'); }
 }
@@ -2176,7 +2189,7 @@ class PlainDateTime extends $Object {
     if (!isoDateTimeWithinLimits(result.date, result.time)) throwRange('The date and time are out of range');
     return dateTimeToString(result, r.calendar, precision.precision, showCalendar);
   }
-  toLocaleString() { var r = plainDateTimeOf(this); return dateTimeToString(dateTime(r.date, r.time), r.calendar, AUTO, 'auto'); }
+  toLocaleString() { return intlToLocaleString(plainDateTimeOf(this), this, arguments, 'any', 'all'); }
   toJSON() { var r = plainDateTimeOf(this); return dateTimeToString(dateTime(r.date, r.time), r.calendar, AUTO, 'auto'); }
   valueOf() { throwType('Use Temporal.PlainDateTime.compare to compare date-times'); }
   toZonedDateTime(temporalTimeZoneLike) {
@@ -2212,7 +2225,8 @@ function interpretISODateTimeOffset(date, t, offsetBehaviour, offsetNs, timeZone
   }
   checkISODaysRange(date);
   var utc = utcEpochNs(date, t);
-  var possible = getPossibleEpochNs(timeZone, dt);
+)JS",
+R"JS(  var possible = getPossibleEpochNs(timeZone, dt);
   for (var i = 0; i < possible.length; i++) {
     var candidateOffset = $Number(utc - possible[i]);
     if (candidateOffset === offsetNs) return possible[i];
@@ -2228,8 +2242,7 @@ function toZonedDateTime(item, options) {
     if (kindOf(item) === 'ZonedDateTime') {
       var r = recordOf(item);
       resolved = getOptionsObject(options);
-)JS",
-R"JS(      getDisambiguationOption(resolved);
+      getDisambiguationOption(resolved);
       getOffsetOption(resolved, 'reject');
       getOverflowOption(resolved);
       return createZonedDateTime(r.ns, r.timeZone, r.calendar);
@@ -2434,7 +2447,7 @@ class ZonedDateTime extends $Object {
     var precision = toSecondsStringPrecision(smallestUnit, digits);
     return zonedDateTimeToString(r, precision.precision, showCalendar, showTimeZone, showOffset, precision.increment, precision.unit, roundingMode);
   }
-  toLocaleString() { return zonedDateTimeToString(zonedOf(this), AUTO, 'auto', 'auto', 'auto'); }
+  toLocaleString() { var r = zonedOf(this); return intlToLocaleString(r, this, arguments, 'any', 'all', r.timeZone); }
   toJSON() { return zonedDateTimeToString(zonedOf(this), AUTO, 'auto', 'auto', 'auto'); }
   valueOf() { throwType('Use Temporal.ZonedDateTime.compare to compare zoned date-times'); }
   startOfDay() {
@@ -2448,7 +2461,8 @@ class ZonedDateTime extends $Object {
     var direction = getOption(options, 'direction', ['next', 'previous'], undefined, true);
     if (isOffsetIdentifier(r.timeZone)) return null;
     var transition = getNamedTimeZoneTransition(r.timeZone, r.ns, direction === 'next');
-    return transition === null ? null : createZonedDateTime(transition, r.timeZone, r.calendar);
+)JS",
+R"JS(    return transition === null ? null : createZonedDateTime(transition, r.timeZone, r.calendar);
   }
   toInstant() { return createInstant(zonedOf(this).ns); }
   toPlainDate() { var r = zonedOf(this); return createPlainDate(getISODateTimeFor(r.timeZone, r.ns).date, r.calendar); }
@@ -2461,8 +2475,7 @@ copyAccessors(ZonedDateTimeProto, timeGetters(function (x) { return zonedDateTim
 
 // ---------------------------------------------------------------- Temporal.PlainYearMonth (9)
 var PlainYearMonthProto, PlainMonthDayProto;
-)JS",
-R"JS(function createPlainYearMonth(date, calendar, newTarget) {
+function createPlainYearMonth(date, calendar, newTarget) {
   if (!isoYearMonthWithinLimits(date)) throwRange('The month is out of range');
   var o = create(newTarget === undefined ? PlainYearMonthProto : protoFor(newTarget, PlainYearMonthProto));
   wmSet(slots, o, { kind: 'PlainYearMonth', date: date, calendar: calendar });
@@ -2571,7 +2584,7 @@ class PlainYearMonth extends $Object {
     return compareISODate(r.date, o.date) === 0 && r.calendar === o.calendar;
   }
   toString() { var r = yearMonthOf(this); return yearMonthToString(r, getShowCalendarOption(getOptionsObject(arguments[0]))); }
-  toLocaleString() { return yearMonthToString(yearMonthOf(this), 'auto'); }
+  toLocaleString() { return intlToLocaleString(yearMonthOf(this), this, arguments, 'date', 'date'); }
   toJSON() { return yearMonthToString(yearMonthOf(this), 'auto'); }
   valueOf() { throwType('Use Temporal.PlainYearMonth.compare to compare year-months'); }
   toPlainDate(item) {
@@ -2648,7 +2661,7 @@ class PlainMonthDay extends $Object {
     return compareISODate(r.date, o.date) === 0 && r.calendar === o.calendar;
   }
   toString() { var r = monthDayOf(this); return monthDayToString(r, getShowCalendarOption(getOptionsObject(arguments[0]))); }
-  toLocaleString() { return monthDayToString(monthDayOf(this), 'auto'); }
+  toLocaleString() { return intlToLocaleString(monthDayOf(this), this, arguments, 'date', 'date'); }
   toJSON() { return monthDayToString(monthDayOf(this), 'auto'); }
   valueOf() { throwType('Use equals to compare month-days'); }
   toPlainDate(item) {
@@ -2699,6 +2712,14 @@ tag(nowObject, 'Temporal.Now');
 hidden(Temporal, 'Now', nowObject);
 tag(Temporal, 'Temporal');
 natives.temporal = Temporal;
+// What Intl.DateTimeFormat needs of a Temporal object (ECMA-402 with Temporal, 15.6.22), or undefined for any other
+// value. Its fields are those of the ISO date and time; epochMs for an Instant or ZonedDateTime.
+natives.info = function (x) {
+  var kind = kindOf(x);
+)JS",
+R"JS(  if (kind === undefined || kind === 'Duration') return undefined;
+  return temporalInfo(recordOf(x));
+};
 // Date.prototype.toTemporalInstant (14.1.1): installed by the engine without building Temporal until it is first read
 var dateValueOf = uncurry($Date.prototype.valueOf);
 natives.toTemporalInstant = {

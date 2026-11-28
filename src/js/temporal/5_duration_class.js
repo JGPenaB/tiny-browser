@@ -302,7 +302,7 @@ class Instant extends $Object {
     return instantToString(rounded, timeZone, precision.precision);
   }
   toJSON() { return instantToString(slotOf(this, 'Instant').ns, undefined, AUTO); }
-  toLocaleString() { return instantToString(slotOf(this, 'Instant').ns, undefined, AUTO); }
+  toLocaleString() { return intlToLocaleString(slotOf(this, 'Instant'), this, arguments, 'any', 'all'); }
   valueOf() { throwType('Use Temporal.Instant.compare to compare instants'); }
   toZonedDateTimeISO(timeZone) {
     var ns = slotOf(this, 'Instant').ns;

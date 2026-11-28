@@ -240,7 +240,7 @@ class ZonedDateTime extends $Object {
     var precision = toSecondsStringPrecision(smallestUnit, digits);
     return zonedDateTimeToString(r, precision.precision, showCalendar, showTimeZone, showOffset, precision.increment, precision.unit, roundingMode);
   }
-  toLocaleString() { return zonedDateTimeToString(zonedOf(this), AUTO, 'auto', 'auto', 'auto'); }
+  toLocaleString() { var r = zonedOf(this); return intlToLocaleString(r, this, arguments, 'any', 'all', r.timeZone); }
   toJSON() { return zonedDateTimeToString(zonedOf(this), AUTO, 'auto', 'auto', 'auto'); }
   valueOf() { throwType('Use Temporal.ZonedDateTime.compare to compare zoned date-times'); }
   startOfDay() {
@@ -376,7 +376,7 @@ class PlainYearMonth extends $Object {
     return compareISODate(r.date, o.date) === 0 && r.calendar === o.calendar;
   }
   toString() { var r = yearMonthOf(this); return yearMonthToString(r, getShowCalendarOption(getOptionsObject(arguments[0]))); }
-  toLocaleString() { return yearMonthToString(yearMonthOf(this), 'auto'); }
+  toLocaleString() { return intlToLocaleString(yearMonthOf(this), this, arguments, 'date', 'date'); }
   toJSON() { return yearMonthToString(yearMonthOf(this), 'auto'); }
   valueOf() { throwType('Use Temporal.PlainYearMonth.compare to compare year-months'); }
   toPlainDate(item) {
@@ -453,7 +453,7 @@ class PlainMonthDay extends $Object {
     return compareISODate(r.date, o.date) === 0 && r.calendar === o.calendar;
   }
   toString() { var r = monthDayOf(this); return monthDayToString(r, getShowCalendarOption(getOptionsObject(arguments[0]))); }
-  toLocaleString() { return monthDayToString(monthDayOf(this), 'auto'); }
+  toLocaleString() { return intlToLocaleString(monthDayOf(this), this, arguments, 'date', 'date'); }
   toJSON() { return monthDayToString(monthDayOf(this), 'auto'); }
   valueOf() { throwType('Use equals to compare month-days'); }
   toPlainDate(item) {
@@ -504,6 +504,13 @@ tag(nowObject, 'Temporal.Now');
 hidden(Temporal, 'Now', nowObject);
 tag(Temporal, 'Temporal');
 natives.temporal = Temporal;
+// What Intl.DateTimeFormat needs of a Temporal object (ECMA-402 with Temporal, 15.6.22), or undefined for any other
+// value. Its fields are those of the ISO date and time; epochMs for an Instant or ZonedDateTime.
+natives.info = function (x) {
+  var kind = kindOf(x);
+  if (kind === undefined || kind === 'Duration') return undefined;
+  return temporalInfo(recordOf(x));
+};
 // Date.prototype.toTemporalInstant (14.1.1): installed by the engine without building Temporal until it is first read
 var dateValueOf = uncurry($Date.prototype.valueOf);
 natives.toTemporalInstant = {

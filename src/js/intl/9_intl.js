@@ -16,7 +16,7 @@ for (var ci = 0; ci < classNames.length; ci++) {
   hidden(Intl, classNames[ci], cls);
 }
 // the constructors written as functions, because they may also be called as functions (4.3 Note 1)
-var functions = { NumberFormat: NumberFormat };
+var functions = { DateTimeFormat: DateTimeFormat, NumberFormat: NumberFormat };
 var functionNames = getOwnPropertyNames(functions);
 for (var fi = 0; fi < functionNames.length; fi++) {
   tag(functions[functionNames[fi]].prototype, 'Intl.' + functionNames[fi]);
