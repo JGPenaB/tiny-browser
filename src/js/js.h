@@ -585,7 +585,8 @@ struct RealmFields {
     Value evalFn;  // the built-in eval: a call that names it directly sees the caller's variables
     Value importHook;  // called for import(): (specifier, options, file of the calling code)
     Value moduleHost;  // the module loader's `host` object: the embedder's resolve and fetch functions live on it
-    Value temporalNatives;  // once Temporal is built: the object its JavaScript filled in (prelude.cpp temporalNatives)
+    // once Temporal or Intl is built: the object its JavaScript filled in (prelude.cpp bundleNatives)
+    Value temporalNatives, intlNatives;
     struct PropWatch {  // one property of RegExp.prototype as the engine made it (regexp.cpp)
         PropKey key;
         uint64_t value;

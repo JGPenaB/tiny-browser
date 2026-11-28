@@ -4,6 +4,7 @@
 #include "builtins.h"
 #include "icu_bridge.h"
 #include <icu.h>
+#include <cstring>
 #include <unordered_map>
 
 namespace tb::js {
@@ -38,15 +39,22 @@ Value dumpResource(Vm& vm, UResourceBundle* r, std::vector<Value>& held) {
             bool table = ures_getType(r) == URES_TABLE;
             JSObject* o = table ? vm.newObject() : vm.newArray();
             held.push_back(V(o));
-            ures_resetIterator(r);
-            while (ures_hasNext(r)) {
+            int32_t n = ures_getSize(r);  // by index: the iterator can revisit an alias without end
+            for (int32_t i = 0; i < n; i++) {
                 UErrorCode e = U_ZERO_ERROR;
-                UResourceBundle* child = ures_getNextResource(r, nullptr, &e);
-                if (U_FAILURE(e)) break;
+                UResourceBundle* child = ures_getByIndex(r, i, nullptr, &e);
+                if (U_FAILURE(e)) continue;
+                const char* key = ures_getKey(child);
                 Value v = dumpResource(vm, child, held);
                 held.push_back(v);
-                if (table) vm.def(o, ures_getKey(child), v, PF_ALL);
-                else ((JSArray*)o)->elems.push_back(v);
+                if (!table) ((JSArray*)o)->elems.push_back(v);
+                else if (key) {  // through toKey: a key such as "810" is an index
+                    PropDesc d;
+                    d.value = v;
+                    d.hasValue = d.hasWritable = d.hasEnumerable = d.hasConfigurable = true;
+                    d.writable = d.enumerable = d.configurable = true;
+                    vm.defineOwnDesc(o, vm.toKey(V(vm.str(std::string_view(key)))), d);
+                }
                 ures_close(child);
             }
             return V(o);
@@ -54,13 +62,48 @@ Value dumpResource(Vm& vm, UResourceBundle* r, std::vector<Value>& held) {
         default: return Value::undef();
     }
 }
-// resource(name): the whole of one of ICU's data tables, such as "metadata" (locale aliases) or "likelySubtags"
+// resource(pkg, bundle, path): one of ICU's data tables as plain values. pkg is undefined for the root tables (such
+// as "metadata", "supplementalData", "keyTypeData") or names a locale data tree ("coll", "curr", "lang", "region",
+// "unit", "zone"; bundle is then a locale id, with fallback to its parents). path is "/"-separated keys into it.
 JSFN(resource) {
     Vm& vm = ci.vm;
     UErrorCode err = U_ZERO_ERROR;
-    std::string name = toAscii(vm.toString(ci.arg(0))->s);
-    UResourceBundle* r = ures_openDirect(nullptr, name.c_str(), &err);
+    std::string bundle = toAscii(vm.toString(ci.arg(1))->s);
+    UResourceBundle* r;
+    if (ci.arg(0).isUndef()) r = ures_openDirect(nullptr, bundle.c_str(), &err);
+    else {
+        UVersionInfo version;
+        u_getVersion(version);
+        std::string pkg = "icudt" + std::to_string(version[0]) + "l-" + toAscii(vm.toString(ci.arg(0))->s);
+        if (pkg.back() == '-') pkg.pop_back();  // "": the main locale tree
+        r = ures_open(pkg.c_str(), bundle.c_str(), &err);
+        // ICU falls back to the computer's own locale for a locale it has no data for: use the root data instead
+        UErrorCode e = U_ZERO_ERROR;
+        const char* actual = U_SUCCESS(err) ? ures_getLocaleByType(r, ULOC_ACTUAL_LOCALE, &e) : nullptr;
+        if (actual && strcmp(actual, "root") != 0 && bundle.compare(0, strlen(actual), actual) != 0) {
+            ures_close(r);
+            err = U_ZERO_ERROR;
+            r = ures_open(pkg.c_str(), "root", &err);
+        }
+    }
     if (U_FAILURE(err)) return Value::undef();
+    if (!ci.arg(2).isUndef()) {
+        std::string path = toAscii(vm.toString(ci.arg(2))->s);
+        size_t start = 0;
+        while (start <= path.size()) {
+            size_t end = path.find('/', start);
+            if (end == std::string::npos) end = path.size();
+            std::string key = path.substr(start, end - start);
+            UResourceBundle* child = ures_getByKey(r, key.c_str(), nullptr, &err);
+            ures_close(r);
+            r = child;
+            if (U_FAILURE(err)) {
+                ures_close(r);
+                return Value::undef();
+            }
+            start = end + 1;
+        }
+    }
     std::vector<Value> held;
     RootScope keep(vm, held);
     Value v = dumpResource(vm, r, held);
@@ -99,6 +142,21 @@ JSFN(availableLocales) {
     return V(a);
 }
 
+// scriptDirection(code): "rtl" or "ltr" for a script that has a direction of its own, undefined for any other
+JSFN(scriptDirection) {
+    Vm& vm = ci.vm;
+    std::string name = toAscii(vm.toString(ci.arg(0))->s);
+    UScriptCode codes[4];
+    UErrorCode err = U_ZERO_ERROR;
+    int32_t n = uscript_getCode(name.c_str(), codes, 4, &err);
+    if (U_FAILURE(err) || n != 1 || name.size() != 4) return Value::undef();
+    UScriptCode c = codes[0];
+    if (c == USCRIPT_COMMON || c == USCRIPT_INHERITED || c == USCRIPT_UNKNOWN || c == USCRIPT_UNWRITTEN_LANGUAGES ||
+        c == USCRIPT_MATHEMATICAL_NOTATION || c == USCRIPT_SYMBOLS || c == USCRIPT_SYMBOLS_EMOJI || c == USCRIPT_INVALID_CODE)
+        return Value::undef();
+    return V(vm.str(std::string_view(uscript_isRightToLeft(c) ? "rtl" : "ltr")));
+}
+
 // ---------------------------------------------------------------- time zones
 // One calendar per zone, kept for the thread: opening one reads the zone's rules.
 UCalendar* zoneCalendar(const std::u16string& id) {
@@ -112,14 +170,16 @@ UCalendar* zoneCalendar(const std::u16string& id) {
     calendars.emplace(id, cal);
     return cal;
 }
-// tzIds(): every zone name ICU knows, with links
+// tzIds(region): every zone name ICU knows, with links; or with a region, the zones of that region
 JSFN(tzIds) {
     Vm& vm = ci.vm;
     JSArray* a = vm.newArray();
     std::vector<Value> held{V(a)};
     RootScope keep(vm, held);
     UErrorCode err = U_ZERO_ERROR;
-    UEnumeration* e = ucal_openTimeZoneIDEnumeration(UCAL_ZONE_TYPE_ANY, nullptr, nullptr, &err);
+    std::string region = ci.arg(0).isUndef() ? std::string() : toAscii(vm.toString(ci.arg(0))->s);
+    UEnumeration* e = region.empty() ? ucal_openTimeZoneIDEnumeration(UCAL_ZONE_TYPE_ANY, nullptr, nullptr, &err)
+                                     : ucal_openTimeZoneIDEnumeration(UCAL_ZONE_TYPE_CANONICAL_LOCATION, region.c_str(), nullptr, &err);
     if (U_FAILURE(err)) return V(a);
     int32_t n = 0;
     while (const UChar* s = uenum_unext(e, &n, &err)) {
@@ -175,10 +235,11 @@ JSObject* icuNatives(Vm& vm) {
     JSObject* o = vm.newObject();
     std::vector<Value> held{V(o)};
     RootScope keep(vm, held);
-    vm.defFn(o, "resource", resource, 1);
+    vm.defFn(o, "resource", resource, 3);
     vm.defFn(o, "likelySubtags", likelySubtags, 2);
     vm.defFn(o, "availableLocales", availableLocales, 0);
-    vm.defFn(o, "tzIds", tzIds, 0);
+    vm.defFn(o, "scriptDirection", scriptDirection, 1);
+    vm.defFn(o, "tzIds", tzIds, 1);
     vm.defFn(o, "tzCanonical", tzCanonical, 1);
     vm.defFn(o, "tzOffset", tzOffset, 2);
     vm.defFn(o, "tzTransition", tzTransition, 3);

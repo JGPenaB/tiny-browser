@@ -3,6 +3,7 @@
 #include "builtins.h"
 #include "builtins_js.h"
 #include "temporal_js.h"
+#include "intl_js.h"
 #include "icu_bridge.h"
 
 namespace tb::js {
@@ -71,19 +72,21 @@ JSFN(toBigIntNative) { return V(ci.vm.toBigInt(ci.arg(0))); }
 
 // Temporal is large and most scripts never use it, so it is compiled the first time something of it is used: the
 // global, or Date.prototype.toTemporalInstant. Its JavaScript fills in the natives object (temporal, toTemporalInstant).
-JSObject* temporalNatives(Vm& vm) {
-    if (vm.temporalNatives.isObject()) return vm.temporalNatives.asObject();
+const std::u16string* joinParts(const char* const* parts, size_t count) {
+    std::string joined;
+    for (size_t i = 0; i < count; i++) joined += parts[i];
+    return new std::u16string(utf8to16(joined));  // kept for the life of the process, shared by all engines
+}
+// Compiles one of the bundles of JavaScript built-ins (tools/gen_js_parts.py) and runs it with a natives object that
+// it fills in; the object is kept in the realm (slot) so the bundle runs once per realm.
+JSObject* bundleNatives(Vm& vm, Value& slot, const std::u16string* source) {
+    if (slot.isObject()) return slot.asObject();
     JSObject* natives = vm.newObject();
-    vm.temporalNatives = V(natives);
+    slot = V(natives);
     vm.defFn(natives, "protoFor", protoFor, 2);
     vm.defFn(natives, "toPrimitiveString", toPrimitiveString, 1);
     vm.defFn(natives, "toBigInt", toBigIntNative, 1);
     vm.def(natives, "icu", V(icuNatives(vm)));
-    static const std::u16string* source = [] {
-        std::string joined;
-        for (const char* part : kTemporalJsParts) joined += part;
-        return new std::u16string(utf8to16(joined));
-    }();
     auto src = std::shared_ptr<const std::u16string>(source, [](const std::u16string*) {});
     FuncProto* p = compileScript(vm, src, kBuiltinFile, false, nullptr);
     JSFunction* outer = vm.makeClosure(p, nullptr, nullptr);
@@ -92,6 +95,15 @@ JSObject* temporalNatives(Vm& vm) {
     vm.call(make, Value::undef(), &arg, 1);
     return natives;
 }
+JSObject* temporalNatives(Vm& vm) {
+    static const std::u16string* source = joinParts(kTemporalJsParts, std::size(kTemporalJsParts));
+    return bundleNatives(vm, vm.temporalNatives, source);
+}
+JSObject* intlNatives(Vm& vm) {
+    static const std::u16string* source = joinParts(kIntlJsParts, std::size(kIntlJsParts));
+    return bundleNatives(vm, vm.intlNatives, source);
+}
+JSFN(makeIntl) { return ci.vm.get(V(intlNatives(ci.vm)), "intl"); }
 JSFN(makeTemporal) { return ci.vm.get(V(temporalNatives(ci.vm)), "temporal"); }
 JSFN(makeToTemporalInstant) { return ci.vm.get(V(temporalNatives(ci.vm)), "toTemporalInstant"); }
 
@@ -126,6 +138,7 @@ void setupJsBuiltins(Vm& vm) {
     vm.call(make, Value::undef(), &keep, 1);
     regexpSnapshot(vm);
     vm.defLazy(vm.global, "Temporal", makeTemporal);
+    vm.defLazy(vm.global, "Intl", makeIntl);
     vm.defLazy(vm.dateProto, "toTemporalInstant", makeToTemporalInstant);
 }
 

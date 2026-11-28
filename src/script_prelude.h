@@ -558,18 +558,21 @@ class XMLSerializer { serializeToString(n) { return n.outerHTML !== undefined ? 
 
 )JS"
 R"JS(
-// Intl: formatting falls back to the engine's own en-US output
+// Intl is the engine's (ECMA-402). Until it has every service, the ones it lacks are stand-ins that format the way
+// the engine's own en-US output does.
 function locales() { return ['en-US']; }
-var Intl = {
+var Intl = G.Intl, intlStandIns = {
   DateTimeFormat: class { constructor(l, o) { this._o = o || {}; } format(d) { var x = d === undefined ? new Date() : new Date(d); return this._o.timeStyle || this._o.hour ? (this._o.dateStyle || this._o.year ? x.toLocaleString() : x.toLocaleTimeString()) : x.toLocaleDateString(); } formatToParts(d) { return [{ type: 'literal', value: this.format(d) }]; } resolvedOptions() { return { locale: 'en-US', calendar: 'gregory', numberingSystem: 'latn', timeZone: 'UTC' }; } static supportedLocalesOf() { return locales(); } },
   NumberFormat: class { constructor(l, o) { this._o = o || {}; } format(n) { var o = this._o, s = Number(n).toLocaleString(); if (o.style === 'percent') s = (Number(n) * 100).toLocaleString() + '%'; if (o.style === 'currency') s = (o.currency === 'EUR' ? '€' : o.currency === 'GBP' ? '£' : '$') + s; return s; } formatToParts(n) { return [{ type: 'integer', value: this.format(n) }]; } resolvedOptions() { return { locale: 'en-US', numberingSystem: 'latn' }; } static supportedLocalesOf() { return locales(); } },
   Collator: class { compare(a, b) { return String(a).localeCompare(String(b)); } resolvedOptions() { return { locale: 'en-US' }; } static supportedLocalesOf() { return locales(); } },
   PluralRules: class { select(n) { return n === 1 ? 'one' : 'other'; } resolvedOptions() { return { locale: 'en-US' }; } static supportedLocalesOf() { return locales(); } },
   RelativeTimeFormat: class { format(v, unit) { var n = Math.abs(v), u = unit + (n === 1 ? '' : 's'); return v < 0 ? n + ' ' + u + ' ago' : 'in ' + n + ' ' + u; } static supportedLocalesOf() { return locales(); } },
   ListFormat: class { format(list) { return Array.from(list).join(', '); } static supportedLocalesOf() { return locales(); } },
-  Segmenter: class { segment(s) { return Array.from(String(s)).map(function (c, i) { return { segment: c, index: i }; }); } },
-  getCanonicalLocales: function (l) { return l === undefined ? [] : [].concat(l); }, supportedValuesOf: function () { return []; }
+  Segmenter: class { segment(s) { return Array.from(String(s)).map(function (c, i) { return { segment: c, index: i }; }); } }
 };
+Object.keys(intlStandIns).forEach(function (name) {
+  if (!(name in Intl)) Object.defineProperty(Intl, name, { value: intlStandIns[name], writable: true, configurable: true });
+});
 )JS"
 R"JS(
 // ---- module scripts: how specifiers become URLs (import maps), how module text is fetched, and the order in

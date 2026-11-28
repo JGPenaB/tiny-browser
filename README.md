@@ -114,7 +114,7 @@ is what frames in a page will use). Of the proposals: Temporal, ShadowRealm, and
 
 Temporal is written in JavaScript (`src/js/temporal/*.js`, following the proposal's algorithms step by step) and is
 compiled the first time a script reads `Temporal` or calls `Date.prototype.toTemporalInstant`, so pages that never use
-it pay nothing. After changing those files, run `python tools/gen_temporal.py` to regenerate `src/js/temporal_js.h`.
+it pay nothing. After changing those files, run `python tools/gen_js_parts.py` to regenerate `src/js/temporal_js.h`.
 Named time zones other than UTC and Etc/GMT are refused with a RangeError until the engine has time zone data; the
 `intl402` Temporal tests are not run yet.
 

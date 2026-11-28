@@ -1,5 +1,5 @@
 // Temporal (TC39 proposal, https://tc39.es/proposal-temporal/): the whole API written in JavaScript on top of the
-// engine. tools/gen_temporal.py turns these files into temporal_js.h; the engine compiles them the first time the
+// engine. tools/gen_js_parts.py turns these files into temporal_js.h; the engine compiles them the first time the
 // global `Temporal` is read (prelude.cpp temporalNatives). Section numbers in comments are those of the proposal.
 //
 // Supported: the ISO 8601 calendar; UTC, offset time zones (+01:00) and the named time zones of the IANA database,
