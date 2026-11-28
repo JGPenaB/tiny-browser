@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdio>
 #include <deque>
+#include <unordered_set>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -136,6 +137,8 @@ struct LateLoads {
     struct Done {
         std::string url;
         bool image = false, ok = false;
+        bool font = false;
+        std::string fontBytes;
         ImageRes picture;
         std::unique_ptr<Sheet> sheet;
         NetEntry net;
@@ -155,7 +158,14 @@ struct Page {
     std::unordered_map<const Node*, int> imgNode;
     std::unordered_map<std::string, int> imgByUrl;  // every picture asked for: its place in `images`, -1 while on its way
     std::shared_ptr<LateLoads> late = std::make_shared<LateLoads>();
-    std::deque<std::pair<std::string, bool>> lateQueue;           // URL, is a picture: waiting for a free fetch thread
+    std::deque<std::pair<std::string, uint8_t>> lateQueue;        // URL, 0 sheet, 1 picture, 2 font: waiting for a fetch thread
+    // Web fonts (CSS Fonts 4, 4): each @font-face family by its CSS name in lower case, the name its faces have in the
+    // text system, the families each font file is for, and how many faces have come
+    std::unordered_map<std::string, std::wstring> webFamilies;
+    std::unordered_map<std::string, std::vector<std::wstring>> fontFamiliesOf;
+    int webFontsLoaded = 0;
+    int fontScope = 0;  // what tells this page's font names from another's
+    std::unordered_set<std::string> fontRequested;
     std::unordered_map<std::string, std::vector<Node*>> waiting;  // the elements to tell when a late resource arrives
     std::vector<std::pair<Node*, bool>> lateEvents;               // load (true) or error events owed to elements
     std::function<void()> wake;                                   // any thread: asks the UI thread to look at `late`
@@ -884,12 +894,68 @@ public:
 
     // ---- style sheets and pictures that are asked for after the page was loaded
     void requestLate(Page& p, const std::string& url, bool image) {
-        p.lateQueue.push_back({url, image});
+        p.lateQueue.push_back({url, (uint8_t)(image ? 1 : 0)});
         startLate(p);
+    }
+    // The @font-face rules of a sheet: each family gets a name of the page's own, and the file of each face that
+    // covers Latin text is fetched (the first source in a format DirectWrite reads)
+    void requestFonts(Page& p, const Sheet& sheet) {
+        static int scopes = 0;
+        if (!p.fontScope) p.fontScope = ++scopes;
+        for (const FontFace& face : sheet.fontFaces) {
+            if (!face.unicodeRange.empty() && !covers_latin(face.unicodeRange)) continue;
+            std::string fam = lower(face.family);
+            std::wstring name = L"wf" + std::to_wstring(p.fontScope) + L"-" + widen(fam);
+            p.webFamilies.emplace(fam, name);
+            for (auto& [src, format] : face.src) {
+                if (istarts(src, "local:")) continue;
+                if (!format.empty() && format != "woff2" && format != "woff" && format != "truetype" && format != "opentype" &&
+                    format != "woff2-variations" && format != "woff-variations" && format != "truetype-variations" &&
+                    format != "opentype-variations")
+                    continue;
+                std::string url = resolve_url(p.doc->baseUrl, src);
+                auto& fams = p.fontFamiliesOf[url];
+                if (std::find(fams.begin(), fams.end(), name) == fams.end()) fams.push_back(name);
+                if (fams.size() == 1 && !p.fontRequested.count(url)) {
+                    p.fontRequested.insert(url);
+                    p.lateQueue.push_back({url, (uint8_t)2});
+                    startLate(p);
+                }
+                break;
+            }
+        }
+    }
+    // Whether a unicode-range takes in the basic Latin letters (CSS Fonts 4, 4.5)
+    static bool covers_latin(const std::string& ranges) {
+        size_t i = 0;
+        while (i < ranges.size()) {
+            size_t comma = ranges.find(',', i);
+            if (comma == std::string::npos) comma = ranges.size();
+            std::string r = lower(trim(std::string_view(ranges).substr(i, comma - i)));
+            i = comma + 1;
+            if (!istarts(r, "u+")) continue;
+            r = r.substr(2);
+            unsigned long lo, hi;
+            size_t dash = r.find('-');
+            if (r.find('?') != std::string::npos) {
+                std::string a = r, b = r;
+                for (auto& ch : a)
+                    if (ch == '?') ch = '0';
+                for (auto& ch : b)
+                    if (ch == '?') ch = 'f';
+                lo = strtoul(a.c_str(), nullptr, 16), hi = strtoul(b.c_str(), nullptr, 16);
+            } else if (dash != std::string::npos) {
+                lo = strtoul(r.substr(0, dash).c_str(), nullptr, 16), hi = strtoul(r.substr(dash + 1).c_str(), nullptr, 16);
+            } else
+                lo = hi = strtoul(r.c_str(), nullptr, 16);
+            if (lo <= 0x61 && hi >= 0x41) return true;
+        }
+        return false;
     }
     void startLate(Page& p) {
         while (!p.lateQueue.empty() && p.late->inFlight < 6) {
-            auto [url, image] = p.lateQueue.front();
+            auto [url, kind] = p.lateQueue.front();
+            bool image = kind == 1, font = kind == 2;
             p.lateQueue.pop_front();
             if (++p.lateCount > 600) {  // a page that never stops asking: the rest count as failed
                 std::lock_guard<std::mutex> g(p.late->lock);
@@ -904,14 +970,17 @@ public:
             opts.firstPartySite = du.valid && !du.host.empty() ? site_of(du.host) : std::string("local");
             opts.purpose = image ? FetchOpts::For::Image : FetchOpts::For::Style;
             ++p.late->inFlight;
-            std::thread([late = p.late, wake = p.wake, url = url, image = image, opts] {
+            std::thread([late = p.late, wake = p.wake, url = url, image = image, font = font, opts] {
                 LateLoads::Done d;
                 d.url = url;
                 d.image = image;
+                d.font = font;
                 FetchResult f = fetch(url, opts);
                 d.net = {url, f.contentType, f.error, f.status, f.body.size(), f.ms};
                 d.ok = f.error.empty() && f.status < 400;
-                if (d.ok && image) {
+                if (d.ok && font) {
+                    d.fontBytes = std::move(f.body);
+                } else if (d.ok && image) {
                     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
                     d.picture.url = url;
                     d.ok = decode_image(f.body, d.picture);
@@ -946,7 +1015,10 @@ public:
         if (done.empty() && events.empty()) return;
         for (auto& d : done) {
             if (!d.net.url.empty()) p->net.push_back(d.net);
-            if (d.image) {
+            if (d.font) {
+                for (const std::wstring& name : p->fontFamiliesOf[d.url])
+                    if (d.ok && ts.addWebFont(name, d.fontBytes)) ++p->webFontsLoaded;
+            } else if (d.image) {
                 p->imgByUrl[d.url] = (int)p->images.size();
                 p->images.push_back(std::move(d.picture));
             } else
@@ -1040,6 +1112,7 @@ public:
                     if (im.layer >= 0) inner = layer.empty() ? sheet->layers[im.layer] : layer + "." + sheet->layers[im.layer];
                     addSheet(it->second.get(), scope, inner, im.media >= 0 ? &sheet->media[im.media] : media, depth + 1);
                 }
+                if (!sheet->fontFaces.empty()) requestFonts(p, *sheet);
                 se.add(sheet, false, scope, layer, media);
             };
         // The page's sheets, in tree order: every <style>, and every linked sheet that has arrived, wherever it is
@@ -1075,7 +1148,9 @@ public:
         if (p.script) se.add(&scripting_sheet(), true);
         if (p.script)
             for (auto& [scope, css] : p.script->adoptedStyles()) addSheet(sheetFromText(p, css), scope, {}, nullptr, 0);
+        ts.setWebFamilies(&p.webFamilies, ((uint64_t)p.fontScope << 32) | (uint32_t)p.webFontsLoaded);
         se.compute(*p.doc, vw, contentRect().h());
+        ts.setWebFamilies(nullptr, 0);
         p.userActions = se.userActions();
         p.hasMedia = se.hasMedia();
         p.rules = se.ruleCount();

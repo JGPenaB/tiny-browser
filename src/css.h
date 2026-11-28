@@ -323,8 +323,15 @@ struct SheetImport {
     int layer = -1;     // layer or layer(name): the layer the imported rules go in, an index into Sheet::layers
     int media = -1;     // the media the import is for, an index into Sheet::media
 };
+// @font-face (CSS Fonts 4, 4): a family name and where its faces come from
+struct FontFace {
+    std::string family;
+    std::vector<std::pair<std::string, std::string>> src;  // url (resolved against the sheet's own) and format, or "local:" + name
+    std::string unicodeRange;                             // as written; empty for all of Unicode
+};
 struct Sheet {
     std::vector<Rule> rules;
+    std::vector<FontFace> fontFaces;
     std::vector<MediaQuery> media;
     std::vector<std::string> layers;  // the layer names, dotted from the outermost, in the order they first appear
     std::vector<SheetImport> imports;

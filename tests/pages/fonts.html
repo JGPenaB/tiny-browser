@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Web fonts test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 20px; }
+  .ok { color: #1a7f37; font-size: 14px; } .bad { color: #c5221f; font-weight: bold; font-size: 14px; }
+  /* CSS Fonts 4, 4: a family of the page's own, from a font file (here one of Windows' own, by its file URL) */
+  @font-face { font-family: "Page Mono"; src: url("file:///C:/Windows/Fonts/consola.ttf") format("truetype"); }
+  @font-face { font-family: "Not Latin"; src: url("file:///C:/Windows/Fonts/consola.ttf"); unicode-range: U+0400-04FF; }
+  @font-face { font-family: "Missing"; src: url("no-such-font.woff2") format("woff2"); }
+  #web { font-family: "Page Mono", serif; }
+  #system { font-family: Consolas; }
+  #fallback { font-family: "Missing", Arial; }
+  #arial { font-family: Arial; }
+  #notLatin { font-family: "Not Latin", Arial; }
+</style>
+</head>
+<body>
+<div><span id="web">iiiii WWWWW</span></div>
+<div><span id="system">iiiii WWWWW</span></div>
+<div><span id="fallback">iiiii WWWWW</span></div>
+<div><span id="arial">iiiii WWWWW</span></div>
+<div><span id="notLatin">iiiii WWWWW</span></div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var w = function (id) { return Math.round(document.getElementById(id).getBoundingClientRect().width * 10) / 10; };
+  window.addEventListener('load', function () {
+    // the load event waits for the fonts
+    eq('text in the @font-face family is set in its font file', w('web'), w('system'));
+    eq('a family whose file does not come falls back to the next one', w('fallback'), w('arial'));
+    eq('a face whose unicode-range has no Latin letters is not used for them', w('notLatin'), w('arial'));
+    document.title = 'Web fonts test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

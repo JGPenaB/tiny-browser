@@ -47,7 +47,7 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html` and `values.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html` and `fonts.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
@@ -94,7 +94,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    (`lab()`, `lch()`, `oklab()`, `oklch()`, `hwb()`, `color()` in sRGB, linear sRGB, Display P3, Rec. 2020 and XYZ,
    `color-mix()`, system colours, hue units; `tests/pages/colors.html`), and the math functions of CSS Values 4
    (`calc()` with proper precedence, `min()`, `max()`, `clamp()`, `round()`, `mod()`, `rem()`, `abs()`, `sign()`, the
-   trigonometric and exponential ones; percentages resolved when the basis is known; `tests/pages/values.html`). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
+   trigonometric and exponential ones; percentages resolved when the basis is known; `tests/pages/values.html`), and web fonts (`@font-face`
+   with TrueType, OpenType, WOFF and WOFF2 files unpacked by DirectWrite, variable fonts at each weight, the faces
+   whose `unicode-range` covers Latin; `tests/pages/fonts.html` uses a Windows font by its file URL). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),

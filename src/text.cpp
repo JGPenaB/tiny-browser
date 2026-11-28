@@ -1,6 +1,6 @@
 #include "text.h"
 
-#include <dwrite_1.h>
+#include <dwrite_3.h>
 
 #include "css.h"
 
@@ -30,7 +30,99 @@ static std::wstring key_of(const Style& s) {
     return k;
 }
 
+IDWriteFontCollection* TextSystem::collectionFor(const std::wstring& family) {
+    auto it = web_.find(family);
+    return it != web_.end() && it->second.collection ? it->second.collection.Get() : sys_.Get();
+}
+
+bool TextSystem::addWebFont(const std::wstring& name, const std::string& bytes) {
+    ComPtr<IDWriteFactory5> f5;
+    if (bytes.empty() || FAILED(f_.As(&f5))) return false;
+    if (!memLoader_) {
+        ComPtr<IDWriteInMemoryFontFileLoader> loader;
+        if (FAILED(f5->CreateInMemoryFontFileLoader(&loader)) || FAILED(f5->RegisterFontFileLoader(loader.Get()))) return false;
+        memLoader_ = loader;
+    }
+    ComPtr<IDWriteInMemoryFontFileLoader> loader;
+    memLoader_.As(&loader);
+    // WOFF and WOFF2 are unpacked first (CSS Fonts 4, 4.3)
+    ComPtr<IDWriteFontFile> file;
+    DWRITE_CONTAINER_TYPE container = f5->AnalyzeContainerType(bytes.data(), (UINT32)bytes.size());
+    if (container != DWRITE_CONTAINER_TYPE_UNKNOWN) {
+        ComPtr<IDWriteFontFileStream> stream;
+        if (FAILED(f5->UnpackFontFile(container, bytes.data(), (UINT32)bytes.size(), &stream))) return false;
+        UINT64 size = 0;
+        stream->GetFileSize(&size);
+        const void* data = nullptr;
+        void* ctx = nullptr;
+        if (size == 0 || FAILED(stream->ReadFileFragment(&data, 0, size, &ctx))) return false;
+        HRESULT hr = loader->CreateInMemoryFontFileReference(f5.Get(), data, (UINT32)size, nullptr, &file);
+        stream->ReleaseFileFragment(ctx);
+        if (FAILED(hr)) return false;
+    } else if (FAILED(loader->CreateInMemoryFontFileReference(f5.Get(), bytes.data(), (UINT32)bytes.size(), nullptr, &file)))
+        return false;
+    BOOL supported = FALSE;
+    DWRITE_FONT_FILE_TYPE fileType;
+    DWRITE_FONT_FACE_TYPE faceType;
+    UINT32 faces = 0;
+    if (FAILED(file->Analyze(&supported, &fileType, &faceType, &faces)) || !supported || faces == 0) return false;
+    WebFamily& fam = web_[name];
+    ComPtr<IDWriteFactory6> f6;
+    f_.As(&f6);
+    for (UINT32 i = 0; i < faces; ++i) {
+        // a variable font with a weight axis stands in for each weight from 100 to 900 that the axis reaches
+        ComPtr<IDWriteFontResource> res;
+        if (f6 && SUCCEEDED(f6->CreateFontResource(file.Get(), i, &res)) && res->GetFontAxisCount() > 0) {
+            UINT32 n = res->GetFontAxisCount();
+            std::vector<DWRITE_FONT_AXIS_VALUE> values(n);
+            std::vector<DWRITE_FONT_AXIS_RANGE> ranges(n);
+            res->GetDefaultFontAxisValues(values.data(), n);
+            res->GetFontAxisRanges(ranges.data(), n);
+            int wght = -1;
+            for (UINT32 k = 0; k < n; ++k)
+                if (ranges[k].axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT && ranges[k].maxValue > ranges[k].minValue) wght = (int)k;
+            if (wght >= 0) {
+                for (int w = 100; w <= 900; w += 100) {
+                    if (w < ranges[wght].minValue - 50 || w > ranges[wght].maxValue + 50) continue;
+                    values[wght].value = std::clamp((float)w, ranges[wght].minValue, ranges[wght].maxValue);
+                    ComPtr<IDWriteFontFaceReference1> ref;
+                    if (SUCCEEDED(res->CreateFontFaceReference(DWRITE_FONT_SIMULATIONS_NONE, values.data(), n, &ref)))
+                        fam.faces.push_back({ref, w});
+                }
+                continue;
+            }
+        }
+        ComPtr<IDWriteFontFaceReference> ref;
+        if (SUCCEEDED(f5->CreateFontFaceReference(file.Get(), i, DWRITE_FONT_SIMULATIONS_NONE, &ref))) fam.faces.push_back({ref, 0});
+    }
+    // the family again, with every face it has so far, under the page's name for it
+    ComPtr<IDWriteFontSetBuilder1> builder;
+    if (FAILED(f5->CreateFontSetBuilder(&builder))) return false;
+    DWRITE_FONT_PROPERTY props[] = {{DWRITE_FONT_PROPERTY_ID_WEIGHT_STRETCH_STYLE_FAMILY_NAME, name.c_str(), L""},
+                                    {DWRITE_FONT_PROPERTY_ID_TYPOGRAPHIC_FAMILY_NAME, name.c_str(), L""},
+                                    {DWRITE_FONT_PROPERTY_ID_WIN32_FAMILY_NAME, name.c_str(), L""}};
+    for (auto& [face, weight] : fam.faces) {
+        ComPtr<IDWriteFontFaceReference> ref;
+        face.As(&ref);
+        std::wstring w = std::to_wstring(weight);
+        DWRITE_FONT_PROPERTY withWeight[] = {props[0], props[1], props[2], {DWRITE_FONT_PROPERTY_ID_WEIGHT, w.c_str(), L""}};
+        builder->AddFontFaceReference(ref.Get(), withWeight, weight ? 4 : 3);
+    }
+    ComPtr<IDWriteFontSet> set;
+    ComPtr<IDWriteFontCollection1> coll;
+    if (FAILED(builder->CreateFontSet(&set)) || FAILED(f5->CreateFontCollectionFromFontSet(set.Get(), &coll))) return false;
+    fam.collection = coll;
+    famExists_.erase(name);
+    for (auto it = fmts_.begin(); it != fmts_.end();)  // formats made before the face came
+        it = it->first.rfind(name + L"|", 0) == 0 ? fmts_.erase(it) : std::next(it);
+    lastStyle_ = nullptr;
+    lastEntry_ = nullptr;
+    widths_.clear();
+    return true;
+}
+
 bool TextSystem::hasFamily(const std::wstring& name) {
+    if (web_.count(name)) return web_[name].collection != nullptr;
     auto it = famExists_.find(name);
     if (it != famExists_.end()) return it->second;
     UINT32 idx = 0;
@@ -49,15 +141,16 @@ TextSystem::Entry& TextSystem::entry(const Style& s) {
     DWRITE_FONT_WEIGHT w = (DWRITE_FONT_WEIGHT)std::clamp<int>(s.weight, 1, 999);
     DWRITE_FONT_STYLE st = s.italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL;
     std::wstring fam = hasFamily(s.family) ? s.family : L"Segoe UI";
-    f_->CreateTextFormat(fam.c_str(), sys_.Get(), w, st, DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &e.fmt);
+    IDWriteFontCollection* coll = collectionFor(fam);
+    f_->CreateTextFormat(fam.c_str(), coll, w, st, DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &e.fmt);
     float asc = 0.9f, desc = 0.22f;
     UINT32 idx = 0;
     BOOL exists = FALSE;
-    sys_->FindFamilyName(fam.c_str(), &idx, &exists);
+    coll->FindFamilyName(fam.c_str(), &idx, &exists);
     if (exists) {
         ComPtr<IDWriteFontFamily> ff;
         ComPtr<IDWriteFont> font;
-        if (SUCCEEDED(sys_->GetFontFamily(idx, &ff)) &&
+        if (SUCCEEDED(coll->GetFontFamily(idx, &ff)) &&
             SUCCEEDED(ff->GetFirstMatchingFont(w, DWRITE_FONT_STRETCH_NORMAL, st, &font))) {
             DWRITE_FONT_METRICS m;
             font->GetMetrics(&m);
@@ -134,6 +227,7 @@ ComPtr<IDWriteTextLayout> TextSystem::layout(const Style& s, std::wstring_view t
 
 std::wstring TextSystem::resolveFamily(std::string_view list) {
     std::string key(list);
+    if (webFamilies_ && !webFamilies_->empty()) key += "\x01" + std::to_string(webVersion_);  // the page's own fonts count
     auto it = famCache_.find(key);
     if (it != famCache_.end()) return it->second;
     std::wstring result = L"Times New Roman";
@@ -145,6 +239,11 @@ std::wstring TextSystem::resolveFamily(std::string_view list) {
         if (name.size() >= 2 && (name[0] == '"' || name[0] == '\'')) name = name.substr(1, name.size() - 2);
         std::string l = lower(name);
         std::wstring cand;
+        if (webFamilies_)  // the page's @font-face families come before the system's (CSS Fonts 4, 4.1)
+            if (auto wf = webFamilies_->find(l); wf != webFamilies_->end() && hasFamily(wf->second)) {
+                result = wf->second;
+                break;
+            }
         if (l == "serif" || l == "ui-serif") cand = L"Times New Roman";
         else if (l == "sans-serif") cand = L"Arial";
         else if (l == "monospace" || l == "ui-monospace" || l == "menlo" || l == "monaco" || l == "sf mono" ||

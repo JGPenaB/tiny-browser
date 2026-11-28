@@ -1581,6 +1581,46 @@ void parse_import(std::string_view v, Sheet& sh) {
     sh.imports.push_back(std::move(im));
 }
 
+// @font-face (CSS Fonts 4, 4.1-4.5): font-family and src; the rest is left to the font files themselves
+void parse_font_face(std::string_view body, Sheet& sh) {
+    FontFace face;
+    for (auto& d : parse_decls(body)) {
+        if (d.prop == "font-family") {
+            std::string f(trim(d.val));
+            if (f.size() >= 2 && (f[0] == '"' || f[0] == '\'')) f = f.substr(1, f.size() - 2);
+            face.family = f;
+        } else if (d.prop == "unicode-range") {
+            face.unicodeRange = lower(trim(d.val));
+        } else if (d.prop == "src") {
+            for (auto part : split_top(d.val, ',')) {
+                std::string spaced;  // url(a)format(b) is two tokens
+                for (size_t k = 0; k < part.size(); ++k) {
+                    spaced += part[k];
+                    if (part[k] == ')' && k + 1 < part.size() && !isws(part[k + 1])) spaced += ' ';
+                }
+                auto T = tokens(trim(spaced));
+                if (T.empty()) continue;
+                std::string url, format;
+                if (istarts(lower(T[0]), "local(")) {
+                    std::string n = T[0].substr(6, T[0].size() - 7);
+                    if (n.size() >= 2 && (n[0] == '"' || n[0] == '\'')) n = n.substr(1, n.size() - 2);
+                    face.src.push_back({"local:" + n, ""});
+                    continue;
+                }
+                if (!parse_url_token(T[0], url)) continue;
+                for (size_t k = 1; k < T.size(); ++k)
+                    if (istarts(lower(T[k]), "format(")) {
+                        format = lower(T[k].substr(7, T[k].size() - 8));
+                        if (format.size() >= 2 && (format[0] == '"' || format[0] == '\'')) format = format.substr(1, format.size() - 2);
+                        format = format.substr(0, format.find(' '));  // "woff2 supports variations": the format is the first word
+                    }
+                face.src.push_back({url, format});
+            }
+        }
+    }
+    if (!face.family.empty() && !face.src.empty()) sh.fontFaces.push_back(std::move(face));
+}
+
 // ---- CSS Nesting 1: a rule inside a rule. The nested selector is taken relative to the parent: & stands for the
 // parent's elements, and a selector without & is a descendant of them. & becomes :is(parent) unless the parent's
 // text can stand in for it unchanged: a single compound selector, or a single selector at the start.
@@ -1726,6 +1766,8 @@ void parse_block(std::string_view s, int media, Sheet& sh, int depth, const std:
                     parse_block(inner, media, sh, depth + 1, layer_name(layer, prelude));
                 else if (kw == "container" || kw == "scope" || kw == "document" || kw == "-moz-document")
                     parse_block(inner, media, sh, depth + 1, layer);
+                else if (kw == "font-face")
+                    parse_font_face(inner, sh);
             }
             i = end + 1;
             continue;
@@ -2210,6 +2252,9 @@ Sheet parse_sheet(std::string_view css, const std::string& base) {
             for (auto& d : *r.decls)
                 if (d.val.find("url(") != std::string::npos) absolutize_urls(d.val, base);
         for (auto& im : sh.imports) im.url = resolve_url(base, im.url);
+        for (auto& face : sh.fontFaces)
+            for (auto& [url, format] : face.src)
+                if (!istarts(url, "local:")) url = resolve_url(base, url);
     }
     return sh;
 }
