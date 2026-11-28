@@ -37,21 +37,23 @@ tinybrowser.exe [url]
 tinybrowser.exe --selftest [results.txt]          # engine unit tests, exit code 0 = pass
 tinybrowser.exe --js <script.js> [output.txt]     # run a script in the JavaScript engine (console, timers, agents)
 tinybrowser.exe --screenshot <url> <out.png> [--size 1280x860] [--devtools elements|network|perf|console] [--scroll N]
-                [--do "click:x,y;wheel:x,y,delta;type:text;key:enter;key:tab;key:save"] [--vault test-vault.dat]
+                [--do "click:x,y;move:x,y;wheel:x,y,delta;type:text;key:enter;key:tab;key:save"] [--vault test-vault.dat]
 ```
 
 `--screenshot` renders headlessly (same drawing code, offscreen target) and writes `<out.png>.txt` with timings and the
-position of every form control. `--do` scripts clicks, the mouse wheel (`delta` as the mouse reports it: -120 is one
+position of every form control. `--do` scripts clicks, pointer moves (`move:x,y`), the mouse wheel (`delta` as the mouse reports it: -120 is one
 notch down) and typing, so pages can be tested without a window; cookies stay in memory in this mode.
 `python tests/server.py` runs a local test site on http://localhost:8765 with GET/POST forms, cookies, a redirect and
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html` and `floats.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html` and `selectors.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
-third, on a span inside a button, `BUTTON submitted by iconButton`.
+third, on a span inside a button, `BUTTON submitted by iconButton`. `selectors.html` also wants
+`--do "move:150,200;click:150,200;move:150,60"`, after which its `HOVER` lines go from grey to green with a blue
+child (hovered), then a red text (pressed), then grey with the red text (pressed, no longer hovered).
 
 `python tests/run_js_tests.py` runs the JavaScript suites in `tests/js/` (language, built-ins, async, garbage collection,
 regular expressions). In the browser, F12 then Console gives a prompt for the same engine; a script that runs longer than
@@ -71,7 +73,10 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    GET/POST, own cookie jar, password save + autofill, meta refresh, `::before` and `::after` with `content` (strings, escapes,
    `attr()`, quotes; `tests/pages/generated.html`), background images and gradients in layers (linear, radial and
    repeating; position, size, repeat, origin, clip; `tests/pages/backgrounds.html` is checked by eye), floats with
-   `clear` and block formatting contexts (CSS 2 9.5; `tests/pages/floats.html`). Still open: grid, conic gradients, SVG text, clip paths and masks, counters, `:hover`, find-in-page, zoom, downloads, text selection.
+   `clear` and block formatting contexts (CSS 2 9.5; `tests/pages/floats.html`), the Selectors 4 pseudo-classes: `:is()`,
+   `:where()`, `:not()` and `:has()` with selector lists, the of-type ones, `:hover`, `:active`, `:focus`,
+   `:focus-within`, `:focus-visible`, `:target`, `:lang()` and the form states (`tests/pages/selectors.html`); a page is
+   styled again only when a state its rules look at changes. Still open: grid, conic gradients, SVG text, clip paths and masks, counters, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),

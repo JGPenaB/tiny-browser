@@ -1,6 +1,7 @@
 ﻿#include "css.h"
 #include "url.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -619,6 +620,7 @@ bool parse_nth(std::string_view arg, int& a, int& b) {
     return true;
 }
 
+bool parse_selector(std::string_view s, Selector& out);
 bool parse_compound(std::string_view s, size_t& i, Compound& c, uint32_t& spec) {
     bool any = false;
     while (i < s.size()) {
@@ -747,27 +749,99 @@ bool parse_compound(std::string_view s, size_t& i, Compound& c, uint32_t& spec) 
                 p.k = Pseudo::FirstOfType;
             else if (name == "last-of-type")
                 p.k = Pseudo::LastOfType;
-            else if (name == "nth-child" || name == "nth-last-child" || name == "nth-of-type") {
+            else if (name == "nth-child" || name == "nth-last-child") {
                 p.k = name == "nth-last-child" ? Pseudo::NthLastChild : Pseudo::NthChild;
                 if (!parse_nth(arg, p.a, p.b)) c.never = true;
-            } else if (name == "not") {
-                auto inner = std::make_shared<Compound>();
-                size_t k = 0;
-                uint32_t sp2 = 0;
-                std::string_view a = trim(arg);
-                if (!parse_compound(a, k, *inner, sp2) || k != a.size()) {
+            } else if (name == "not" || name == "is" || name == "where" || name == "matches" || name == "-webkit-any" || name == "has") {
+                // a selector list (Selectors 4, 4.2-4.5); :is() and :not() count as their most specific argument,
+                // :where() as nothing. An argument that does not parse drops out of :is() and :where().
+                auto list = std::make_shared<std::vector<Selector>>();
+                uint32_t most = 0;
+                bool bad = false;
+                for (auto part : split_top(arg, ',')) {
+                    std::string_view a = trim(part);
+                    char comb = ' ';
+                    if (name == "has" && !a.empty() && (a[0] == '>' || a[0] == '+' || a[0] == '~')) {
+                        comb = a[0];
+                        a = trim(a.substr(1));
+                    }
+                    Selector one;
+                    bool unknown = false;  // a compound with a part that is not understood never matches
+                    bool parsed = parse_selector(a, one);
+                    for (auto& part : one.parts) unknown = unknown || part.never;
+                    if (!parsed || unknown || one.parts.back().pseudoElement) {
+                        bad = true;
+                        continue;
+                    }
+                    most = std::max(most, one.spec);
+                    if (name == "has") {  // anchor the relative selector at the element :has() is tried on
+                        Selector rel;
+                        rel.parts.emplace_back().pseudos.push_back(Pseudo{Pseudo::HasAnchor});
+                        rel.combs.push_back(comb);
+                        for (auto& part : one.parts) rel.parts.push_back(std::move(part));
+                        for (char k : one.combs) rel.combs.push_back(k);
+                        one = std::move(rel);
+                    }
+                    list->push_back(std::move(one));
+                }
+                // :not() and :has() take only arguments that parse (their lists are not forgiving); :is() and :where()
+                // drop the ones that do not, and match nothing when none is left
+                if (list->empty() || (bad && (name == "not" || name == "has"))) {
                     c.never = true;
                     continue;
                 }
-                p.k = Pseudo::Not;
-                p.inner = inner;
+                p.k = name == "not" ? Pseudo::Not : name == "has" ? Pseudo::Has : Pseudo::Is;
+                p.list = list;
+                spec -= 1 << 10;  // the pseudo-class itself counts as its argument does
+                if (name != "where") spec += most;
             } else if (name == "defined") {
                 p.k = Pseudo::Defined;
-            } else if (in(name, {"enabled", "visited-not", "scope", "lang", "dir", "ltr"})) {
-                continue;  // treated as always-true
+            } else if (name == "nth-of-type" || name == "nth-last-of-type") {
+                p.k = name == "nth-of-type" ? Pseudo::NthOfType : Pseudo::NthLastOfType;
+                if (!parse_nth(arg, p.a, p.b)) c.never = true;
+            } else if (name == "only-of-type") {
+                p.k = Pseudo::OnlyOfType;
+            } else if (name == "hover") {
+                p.k = Pseudo::Hover;
+            } else if (name == "active") {
+                p.k = Pseudo::Active;
+            } else if (name == "focus") {
+                p.k = Pseudo::Focus;
+            } else if (name == "focus-within") {
+                p.k = Pseudo::FocusWithin;
+            } else if (name == "focus-visible") {
+                p.k = Pseudo::FocusVisible;
+            } else if (name == "checked") {
+                p.k = Pseudo::Checked;
+            } else if (name == "disabled") {
+                p.k = Pseudo::Disabled;
+            } else if (name == "enabled") {
+                p.k = Pseudo::Enabled;
+            } else if (name == "required") {
+                p.k = Pseudo::Required;
+            } else if (name == "optional") {
+                p.k = Pseudo::Optional;
+            } else if (name == "read-only") {
+                p.k = Pseudo::ReadOnly;
+            } else if (name == "read-write") {
+                p.k = Pseudo::ReadWrite;
+            } else if (name == "placeholder-shown") {
+                p.k = Pseudo::PlaceholderShown;
+            } else if (name == "target") {
+                p.k = Pseudo::Target;
+            } else if (name == "lang") {
+                p.k = Pseudo::Lang;
+                p.arg = lower(trim(arg));
+                if (p.arg.size() >= 2 && (p.arg[0] == '"' || p.arg[0] == '\'')) p.arg = p.arg.substr(1, p.arg.size() - 2);
+            } else if (in(name, {"scope", "dir", "valid", "in-range"})) {
+                // treated as always true: there is no scoping root but the document, text runs left to right, and
+                // form controls are not validated
+                continue;
+            } else if (in(name, {"visited", "indeterminate", "invalid", "out-of-range", "fullscreen", "modal", "popover-open", "playing",
+                                 "paused", "autofill", "user-invalid", "picture-in-picture", "open", "closed"})) {
+                p.k = Pseudo::Never;  // states that never hold here (a link is never reported as visited: Selectors 4, 8.1)
             } else {
-                // hover, focus, active, visited, checked, is(), where(), has()... never match in M1.
-                c.never = true;
+                c.never = true;  // vendor and unknown pseudo-classes make the whole rule invalid
                 continue;
             }
             c.pseudos.push_back(std::move(p));
@@ -1379,6 +1453,58 @@ bool match_nth(int a, int b, int n) {
 // What the element is to the scope of the rule being matched: 0 an element of that tree (or any element, for a
 // rule of the document), 1 the tree's host, 2 a child of the host that a slot may hold.
 int g_scopeRole = 0;
+bool match_at(const Selector& s, int idx, const Node* e, int budget = 0);
+// The form-associated elements that can be disabled (HTML 4.10.18.5)
+bool form_control(const Node* e) { return in(e->name, {"button", "input", "select", "textarea", "optgroup", "option", "fieldset"}); }
+bool actually_disabled(const Node* e) {
+    if (e->attr("disabled")) return true;
+    for (const Node* n = e->parent; n; n = n->parent) {  // inside a disabled fieldset, outside its first legend
+        if (n->type != Node::T::Element || n->name != "fieldset" || !n->attr("disabled")) continue;
+        const Node* legend = nullptr;
+        for (auto& k : n->kids)
+            if (k->type == Node::T::Element && k->name == "legend") { legend = k.get(); break; }
+        bool inLegend = false;
+        for (const Node* m = e; m && m != n; m = m->parent) inLegend = inLegend || m == legend;
+        if (!inLegend) return true;
+    }
+    return false;
+}
+bool text_input(const Node* e) {
+    const std::string* t = e->attr("type");
+    std::string type = t ? lower(*t) : "text";
+    return in(type, {"text", "search", "url", "tel", "email", "password", "number", "date", "month", "week", "time", "datetime-local", ""});
+}
+// :has() (Selectors 4, 4.5): an element matches one of the relative selectors, anchored at e. Only elements after e
+// in tree order can: its descendants, or for '+' and '~' its later siblings and what they hold.
+const Node* g_hasAnchor = nullptr;
+bool has_relative(const Pseudo& p, const Node* e) {
+    const Node* saved = g_hasAnchor;
+    g_hasAnchor = e;
+    bool found = false;
+    for (const Selector& one : *p.list) {
+        std::vector<const Node*> todo;
+        auto push_kids = [&](const Node* n) {
+            for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) todo.push_back(it->get());
+        };
+        if (one.combs[0] == '+' || one.combs[0] == '~') {
+            if (!e->parent) continue;
+            auto& sibs = e->parent->kids;
+            for (auto it = sibs.rbegin(); it != sibs.rend() && it->get() != e; ++it) todo.push_back(it->get());
+        } else
+            push_kids(e);
+        while (!todo.empty() && !found) {
+            const Node* n = todo.back();
+            todo.pop_back();
+            if (n->type != Node::T::Element) continue;
+            found = match_at(one, (int)one.parts.size() - 1, n);
+            push_kids(n);
+        }
+        if (found) break;
+    }
+    g_hasAnchor = saved;
+    return found;
+}
+
 bool match_compound(const Compound& c, const Node* e) {
     bool isHost = g_selectorScope && e == g_selectorScope->parent;
     bool isSlotted = g_scopeRole == 2 && g_selectorScope && e->parent == g_selectorScope->parent;
@@ -1477,8 +1603,100 @@ bool match_compound(const Compound& c, const Node* e) {
                 break;
             }
             case Pseudo::Not:
-                if (p.inner && match_compound(*p.inner, e)) return false;
+                for (auto& one : *p.list)
+                    if (match_at(one, (int)one.parts.size() - 1, e)) return false;
                 break;
+            case Pseudo::Is: {
+                bool any = false;
+                for (auto& one : *p.list)
+                    if (match_at(one, (int)one.parts.size() - 1, e)) {
+                        any = true;
+                        break;
+                    }
+                if (!any) return false;
+                break;
+            }
+            case Pseudo::Has:
+                if (!has_relative(p, e)) return false;
+                break;
+            case Pseudo::HasAnchor:
+                if (e != g_hasAnchor) return false;
+                break;
+            case Pseudo::NthOfType:
+            case Pseudo::NthLastOfType:
+            case Pseudo::OnlyOfType: {
+                if (!e->parent) return false;
+                int before = 0, after = 0;
+                bool seen = false;
+                for (auto& k : e->parent->kids) {
+                    if (k.get() == e) { seen = true; continue; }
+                    if (k->type == Node::T::Element && k->name == e->name) (seen ? after : before)++;
+                }
+                if (p.k == Pseudo::OnlyOfType ? before + after != 0
+                                              : !match_nth(p.a, p.b, p.k == Pseudo::NthOfType ? before + 1 : after + 1)) return false;
+                break;
+            }
+            case Pseudo::Hover:  // the element, or one inside it, is under the pointer or pressed
+            case Pseudo::Active:
+            case Pseudo::FocusWithin: {
+                auto& chain = p.k == Pseudo::Hover ? g_userState.hover : p.k == Pseudo::Active ? g_userState.active : g_userState.focus;
+                if (std::find(chain.begin(), chain.end(), e) == chain.end()) return false;
+                break;
+            }
+            case Pseudo::Focus:
+            case Pseudo::FocusVisible:
+                if (g_userState.focus.empty() || g_userState.focus[0] != e || (p.k == Pseudo::FocusVisible && !g_userState.focusVisible)) return false;
+                break;
+            case Pseudo::Checked: {
+                bool on = false;
+                if (e->name == "input" || e->name == "option") on = g_userState.checked ? g_userState.checked(e) : (e->attr("checked") || e->attr("selected"));
+                if (!on) return false;
+                break;
+            }
+            case Pseudo::Disabled:
+            case Pseudo::Enabled: {
+                if (!form_control(e)) return false;
+                if (actually_disabled(e) != (p.k == Pseudo::Disabled)) return false;
+                break;
+            }
+            case Pseudo::Required:
+            case Pseudo::Optional: {
+                if (!(e->name == "input" || e->name == "select" || e->name == "textarea")) return false;
+                if ((e->attr("required") != nullptr) != (p.k == Pseudo::Required)) return false;
+                break;
+            }
+            case Pseudo::ReadOnly:
+            case Pseudo::ReadWrite: {
+                bool editable = (e->name == "textarea" || (e->name == "input" && text_input(e))) && !e->attr("readonly") && !actually_disabled(e);
+                if (!editable) {
+                    const std::string* ce = e->attr("contenteditable");
+                    editable = ce && (ce->empty() || lower(*ce) == "true" || lower(*ce) == "plaintext-only");
+                }
+                if (editable != (p.k == Pseudo::ReadWrite)) return false;
+                break;
+            }
+            case Pseudo::PlaceholderShown: {
+                if (!((e->name == "input" && text_input(e)) || e->name == "textarea") || !e->attr("placeholder")) return false;
+                bool empty = g_userState.valueEmpty ? g_userState.valueEmpty(e) : !(e->attr("value") && !e->attr("value")->empty());
+                if (!empty) return false;
+                break;
+            }
+            case Pseudo::Target:
+                if (!g_userState.target || g_userState.target != e) return false;
+                break;
+            case Pseudo::Lang: {  // the nearest lang attribute, matched as a language range prefix (Selectors 4, 7.2)
+                std::string lang;
+                for (const Node* n = e; n; n = n->parent)
+                    if (const std::string* a = n->type == Node::T::Element ? n->attr("lang") : nullptr) {
+                        lang = lower(*a);
+                        break;
+                    }
+                if (!(lang == p.arg || (lang.size() > p.arg.size() && lang.compare(0, p.arg.size(), p.arg) == 0 && lang[p.arg.size()] == '-')))
+                    return false;
+                break;
+            }
+            case Pseudo::Never:
+                return false;
             case Pseudo::Host:
             case Pseudo::Slotted: {
                 if (!g_selectorScope || (p.k == Pseudo::Host ? e != g_selectorScope->parent : e->parent != g_selectorScope->parent)) return false;
@@ -1506,7 +1724,7 @@ const Node* selector_parent(const Node* e) {
     if (par && par->isShadowRoot()) return par == g_selectorScope ? par->parent : nullptr;
     return par;
 }
-bool match_at(const Selector& s, int idx, const Node* e, int budget = 0) {
+bool match_at(const Selector& s, int idx, const Node* e, int budget) {
     if (!match_compound(s.parts[idx], e)) return false;
     if (idx == 0) return true;
     char comb = s.combs[idx - 1];
@@ -2356,15 +2574,38 @@ void hints(const Node* e, std::vector<Decl>& out) {
 
 }  // namespace
 const Node* g_selectorScope = nullptr;
+UserState g_userState;
 namespace {
 uint64_t key(int lvl, uint32_t spec, uint32_t order) {
     return (uint64_t(lvl) << 56) | (uint64_t(spec & 0x3FFFFFFF) << 24) | uint64_t(order & 0xFFFFFF);
+}
+
+uint8_t user_actions(const Selector& s) {
+    uint8_t r = 0;
+    for (auto& c : s.parts)
+        for (auto& p : c.pseudos) {
+            switch (p.k) {
+                case Pseudo::Hover: r |= StyleEngine::UsesHover; break;
+                case Pseudo::Active: r |= StyleEngine::UsesActive; break;
+                case Pseudo::Focus:
+                case Pseudo::FocusWithin:
+                case Pseudo::FocusVisible: r |= StyleEngine::UsesFocus; break;
+                case Pseudo::Checked:
+                case Pseudo::PlaceholderShown: r |= StyleEngine::UsesFormState; break;
+                case Pseudo::Target: r |= StyleEngine::UsesTarget; break;
+                default: break;
+            }
+            if (p.list)
+                for (auto& one : *p.list) r |= user_actions(one);
+        }
+    return r;
 }
 
 }  // namespace
 
 void StyleEngine::build(float vw) {
     all_.clear();
+    userActions_ = 0;
     byId_.clear();
     byClass_.clear();
     byTag_.clear();
@@ -2386,6 +2627,7 @@ void StyleEngine::build(float vw) {
             uint32_t idx = (uint32_t)all_.size() - 1;
             const Compound& last = r.sel.parts.back();
             if (last.never) continue;
+            userActions_ |= user_actions(r.sel);
             bool gen = last.pseudoElement != 0;
             if (!last.id.empty())
                 (gen ? pseudoById_ : byId_)[last.id].push_back(idx);

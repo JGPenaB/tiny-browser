@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <functional>
 #include <unordered_map>
 
 #include "common.h"
@@ -140,11 +141,21 @@ struct AttrSel {
     char op = 0;  // 0 exists, '=', '~', '|', '^', '$', '*'
 };
 struct Compound;
+struct Selector;
 struct Pseudo {
-    enum K : uint8_t { FirstChild, LastChild, OnlyChild, Root, Link, Empty, NthChild, NthLastChild, FirstOfType, LastOfType, Not, Defined, Host, Slotted };
+    enum K : uint8_t {
+        FirstChild, LastChild, OnlyChild, Root, Link, Empty, NthChild, NthLastChild, FirstOfType, LastOfType, Not, Defined, Host, Slotted,
+        // Selectors 4: of-type counting (14.4), selector lists (4), user actions (10), input states (13), the target (9.2)
+        NthOfType, NthLastOfType, OnlyOfType, Is, Has, Hover, Active, Focus, FocusWithin, FocusVisible, Checked, Disabled, Enabled,
+        Required, Optional, ReadOnly, ReadWrite, PlaceholderShown, Target, Lang, Never, HasAnchor
+    };
     K k = FirstChild;
     int a = 0, b = 0;
     std::shared_ptr<Compound> inner;
+    // :is(), :where(), :not() and :has(). A relative selector of :has() starts with a HasAnchor compound, which only
+    // the element :has() is tried on matches.
+    std::shared_ptr<std::vector<Selector>> list;
+    std::string arg;                              // :lang()
 };
 struct Compound {
     std::string tag, id;
@@ -175,6 +186,20 @@ struct Sheet {
     std::vector<Rule> rules;
     std::vector<MediaQuery> media;
 };
+// What the selectors of user actions, of the target and of form control states see (Selectors 4, 9.2, 10 and 13).
+// The shell keeps it for the page being styled. The nodes are only compared, never followed: one a script has
+// removed since may still be named here until the next update.
+struct UserState {
+    std::vector<const Node*> hover;   // the element under the pointer, then its ancestors
+    std::vector<const Node*> active;  // the element being pressed, then its ancestors
+    std::vector<const Node*> focus;   // the focused element, then its ancestors
+    bool focusVisible = false;        // the focus came from the keyboard, or is in a text control
+    const Node* target = nullptr;     // the element the URL's fragment names
+    // the live checkedness and emptiness of a form control, which can differ from its attributes
+    std::function<bool(const Node*)> checked;
+    std::function<bool(const Node*)> valueEmpty;
+};
+extern UserState g_userState;
 // Selectors of a shadow tree's style sheet are matched with that tree as their scope: nothing above its root is
 // seen, except the host through :host. Set while such a rule is matched; null for the document's own rules.
 extern const Node* g_selectorScope;
@@ -201,6 +226,9 @@ public:
     void compute(Document& d, float vw, float vh);
     bool hasMedia() const { return hasMedia_; }
     size_t ruleCount() const { return all_.size(); }
+    // Which kinds of UserState the rules in force look at, so that the shell restyles only when one of them changes
+    enum : uint8_t { UsesHover = 1, UsesActive = 2, UsesFocus = 4, UsesFormState = 8, UsesTarget = 16 };
+    uint8_t userActions() const { return userActions_; }
 
 private:
     struct IR {
@@ -229,6 +257,7 @@ private:
     std::vector<uint32_t> pseudoUni_;
     std::vector<uint32_t> cand_;
     bool hasMedia_ = false;
+    uint8_t userActions_ = 0;
 };
 
 }  // namespace tb

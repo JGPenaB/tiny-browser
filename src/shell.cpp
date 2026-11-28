@@ -168,6 +168,14 @@ struct Page {
     double tFetch = 0, tParse = 0, tSub = 0, tStyle = 0, tLayout = 0;
     std::vector<DevLine> devLines;
     std::unordered_map<const Node*, FormState> fs;  // live values of form controls
+    int formGen = 0;                                 // counts the times a control was checked or unchecked
+    // The user actions the selectors of the page can see (Selectors 4, 10): set for the page in front only.
+    std::vector<const Node*> hoverChain, activeChain;
+    uint8_t userActions = 0;  // StyleEngine::userActions() of the last restyle: the state the rules look at
+    UserState styled;         // the state that restyle computed the styles with
+    int styledFormGen = 0;
+    bool styledFocusEmpty = false;
+    std::string styledUrl;
     bool domDirty = false;                            // scripts changed the tree since the devtools view was built
     std::unique_ptr<ScriptHost::Client> sclient;      // declared before `script` so it outlives it
     std::unique_ptr<ScriptHost> script;               // null for pages without scripts
@@ -262,6 +270,7 @@ public:
 
     // Focused form control in the active page.
     Node* focus = nullptr;
+    bool focusFromKey = false;  // the focus was moved with the keyboard: :focus-visible
     size_t fCaret = 0, fAnchor = 0;
     float fScroll = 0;
     int popup = -1;  // widget index of the open <select> list
@@ -688,7 +697,10 @@ public:
             return p && app.stateOf(*p, n).checked;
         }
         void setFormChecked(Node* n, bool on) override {
-            if (Page* p = page()) app.stateOf(*p, n).checked = on;
+            if (Page* p = page()) {
+                app.stateOf(*p, n).checked = on;
+                p->formGen++;
+            }
         }
         void focusNode(Node* n) override {
             if (&tab != app.cur()) return;
@@ -999,6 +1011,7 @@ public:
 
     void restyle(Page& p, float vw) {
         double t0 = now_ms();
+        userState(p, true);
         StyleEngine se;
         se.add(&ua_sheet(), true);
         if (p.doc->quirks) se.add(&quirks_sheet(), true);
@@ -1031,6 +1044,7 @@ public:
         if (p.script)
             for (auto& [scope, css] : p.script->adoptedStyles()) se.add(sheetFromText(p, css), false, scope);
         se.compute(*p.doc, vw, contentRect().h());
+        p.userActions = se.userActions();
         p.hasMedia = se.hasMedia();
         p.rules = se.ruleCount();
         p.tStyle = now_ms() - t0;
@@ -1040,6 +1054,7 @@ public:
         if (!t.page || !t.page->doc) return;
         Page& p = *t.page;
         float vw = viewportW();
+        if (userState(p, false)) p.layoutW = -1;
         bool widthChanged = std::fabs(p.layoutW - vw) >= 0.5f;
         if (!widthChanged && !p.scrollDirty) return;
         if (p.layoutW < 0 || (p.hasMedia && widthChanged)) restyle(p, vw);
@@ -1081,24 +1096,89 @@ public:
         if (!t.page || !t.page->doc) return;
         size_t h = t.page->url.find('#');
         if (h == std::string::npos) return;
-        std::string frag = percent_decode(t.page->url.substr(h + 1));
-        if (frag.empty()) {
+        if (h + 1 == t.page->url.size()) {
             t.scroll = 0;
             return;
         }
-        std::vector<Node*> st{t.page->doc->root.get()};
+        if (Node* n = fragmentElement(*t.page); n && n->hasBox) {
+            t.scroll = n->by;
+            clampScroll(t);
+        }
+    }
+    // The element the URL's fragment indicates (HTML 7.4.6.3): the first with that id, else the first <a> of that name
+    static Node* fragmentElement(Page& p) {
+        size_t h = p.url.find('#');
+        if (h == std::string::npos || !p.doc) return nullptr;
+        std::string frag = percent_decode(p.url.substr(h + 1));
+        if (frag.empty()) return nullptr;
+        Node* named = nullptr;
+        std::vector<Node*> st{p.doc->root.get()};
         while (!st.empty()) {
             Node* n = st.back();
             st.pop_back();
-            if (n->type == Node::T::Element && (n->id == frag || (n->name == "a" && n->attr("name") && *n->attr("name") == frag))) {
-                if (n->hasBox) {
-                    t.scroll = n->by;
-                    clampScroll(t);
-                }
-                return;
+            if (n->type == Node::T::Element) {
+                if (n->id == frag) return n;
+                if (!named && n->name == "a" && n->attr("name") && *n->attr("name") == frag) named = n;
             }
-            for (auto& k : n->kids) st.push_back(k.get());
+            for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());
         }
+        return named;
+    }
+
+    static std::vector<const Node*> ancestry(const Node* n) {
+        std::vector<const Node*> r;
+        for (; n; n = n->parent) r.push_back(n);
+        return r;
+    }
+    Page* pageOf(const Node* n) {
+        while (n && n->parent) n = n->parent;
+        for (auto& t : tabs)
+            if (t->page && t->page->doc && t->page->doc->root.get() == n) return t->page.get();
+        return nullptr;
+    }
+    // Puts the user-action state of p into g_userState, for its styles and its scripts' selectors. With `styling`,
+    // it is what the styles are about to be computed with; otherwise the answer says whether a state that a rule of
+    // the page looks at has changed since they were, so that they must be computed again.
+    bool userState(Page& p, bool styling) {
+        UserState& u = g_userState;
+        if (!u.checked) {
+            u.checked = [this](const Node* n) {
+                Page* pg = pageOf(n);
+                if (n->name == "input") return pg ? stateOf(*pg, const_cast<Node*>(n)).checked : n->attr("checked") != nullptr;
+                const Node* sel = n->parent;  // an <option>: selected in its <select>
+                if (sel && sel->name == "optgroup") sel = sel->parent;
+                if (!pg || !sel || sel->name != "select") return n->attr("selected") != nullptr;
+                auto opts = select_options(sel);
+                int i = stateOf(*pg, const_cast<Node*>(sel)).sel;
+                return i >= 0 && i < (int)opts.size() && opts[i] == n;
+            };
+            u.valueEmpty = [this](const Node* n) {
+                Page* pg = pageOf(n);
+                return pg ? stateOf(*pg, const_cast<Node*>(n)).value.empty() : !(n->attr("value") && !n->attr("value")->empty());
+            };
+        }
+        bool front = &p == curPage();
+        u.hover = front ? p.hoverChain : std::vector<const Node*>{};
+        u.active = front ? p.activeChain : std::vector<const Node*>{};
+        u.focus = front && focus ? ancestry(focus) : std::vector<const Node*>{};
+        WidgetKind fk = focus ? widget_kind(focus) : WidgetKind::Text;
+        bool textual = fk == WidgetKind::Text || fk == WidgetKind::Password || fk == WidgetKind::TextArea;
+        u.focusVisible = front && focus && (focusFromKey || textual);  // the heuristic of Selectors 4, 10.4
+        u.target = styling ? fragmentElement(p) : p.styled.target;  // looked for again only when the URL changes
+        bool focusEmpty = front && focus && textual && stateOf(p, focus).value.empty();
+        if (styling) {
+            p.styled = u;
+            p.styledFormGen = p.formGen;
+            p.styledFocusEmpty = focusEmpty;
+            p.styledUrl = p.url;
+            return false;
+        }
+        uint8_t uses = p.userActions;
+        return ((uses & StyleEngine::UsesHover) && u.hover != p.styled.hover) ||
+               ((uses & StyleEngine::UsesActive) && u.active != p.styled.active) ||
+               ((uses & StyleEngine::UsesFocus) && (u.focus != p.styled.focus || u.focusVisible != p.styled.focusVisible)) ||
+               ((uses & StyleEngine::UsesFormState) && (p.formGen != p.styledFormGen || focusEmpty != p.styledFocusEmpty)) ||
+               ((uses & StyleEngine::UsesTarget) && p.url != p.styledUrl);
     }
 
     // <meta http-equiv="refresh" content="N; url=...">: the no-script way sites redirect.
@@ -1589,6 +1669,7 @@ public:
             case WidgetKind::Check:
                 focus = n;
                 stateOf(*p, n).checked = !stateOf(*p, n).checked;
+                p->formGen++;
                 if (Tab* t = cur()) {
                     fireEvent(*t, n, "input", true, false);
                     fireEvent(*t, n, "change", true, false);
@@ -1604,6 +1685,7 @@ public:
                             *o.node->attr("name") == *name)
                             stateOf(*p, o.node).checked = false;
                 stateOf(*p, n).checked = true;
+                p->formGen++;
                 if (Tab* t = cur()) {
                     fireEvent(*t, n, "input", true, false);
                     fireEvent(*t, n, "change", true, false);
@@ -2382,6 +2464,11 @@ public:
     // ------------------------------------------------------------------ input
     void onMouseDown(float x, float y, bool middle, bool ctrl) {
         bool wasFocus = addrFocus;
+        focusFromKey = false;
+        if (Page* p = curPage(); p && !middle) {
+            float dx, dy;
+            p->activeChain = (p->userActions & StyleEngine::UsesActive) && toDoc(x, y, dx, dy) ? ancestry(nodeAt(*p, dx, dy)) : std::vector<const Node*>{};
+        }
         if (!addrRect().hit(x, y)) addrFocus = false;
         conFocus = false;
         if (y < kTabH) {
@@ -2591,6 +2678,13 @@ public:
                 l = nullptr;
             }
         }
+        if (Page* p = t ? t->page.get() : nullptr; p && p->doc && (p->userActions & StyleEngine::UsesHover)) {
+            auto chain = toDoc(x, y, dx, dy) ? ancestry(nodeAt(*p, dx, dy)) : std::vector<const Node*>{};
+            if (chain != p->hoverChain) {
+                p->hoverChain = std::move(chain);
+                invalidate();
+            }
+        }
         if (l != hoverLink || dh != devHover) {
             hoverLink = l;
             hoverHref = hrefOf(l);
@@ -2683,6 +2777,7 @@ public:
             i = i < 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n;
             Node* c = p->lo.widgets[i].node;
             if (!c->attr("disabled") && !p->lo.widgets[i].st->hidden) {
+                focusFromKey = true;
                 focusWidget(c, true);
                 break;
             }
@@ -2987,6 +3082,10 @@ public:
                 else goFwd();
                 return TRUE;
             case WM_LBUTTONUP:
+                if (Page* p = curPage(); p && !p->activeChain.empty()) {
+                    p->activeChain.clear();
+                    invalidate();
+                }
                 if (dragSb) {
                     dragSb = false;
                     ReleaseCapture();
@@ -3129,6 +3228,10 @@ int run_screenshot(const std::string& url, const std::wstring& out, int w, int h
             float x = 0, y = 0;
             swscanf_s(arg.c_str(), L"%f,%f", &x, &y);
             app.onMouseDown(x, y, false, false);
+        } else if (op == L"move") {
+            float x = 0, y = 0;
+            swscanf_s(arg.c_str(), L"%f,%f", &x, &y);
+            app.onMouseMove(x, y);
         } else if (op == L"type") {
             for (wchar_t ch : arg) app.onChar(ch);
         } else if (op == L"key") {

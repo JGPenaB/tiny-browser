@@ -1,0 +1,142 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Selectors test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  .hit { color: rgb(255, 0, 0); }
+  /* Selectors 4, 10: the pointer; the box sits where the test's scripted pointer goes */
+  #hov { height: 200px; background-color: rgb(238, 238, 238); }
+  #hov:hover { background-color: rgb(0, 200, 0); }
+  #hov:hover #hovKid { color: rgb(0, 0, 200); }
+  #hov:active { color: rgb(200, 0, 0); }
+  /* Selectors 4, 4.2-4.4: selector lists */
+  #isA:is(.x, .y) { color: rgb(255, 0, 0); }
+  :where(#wh) { color: rgb(0, 128, 0); }
+  .wh { color: rgb(0, 0, 255); }
+  :is(#isSpec, .zz) { color: rgb(1, 2, 3); }
+  .isSpec { color: rgb(9, 9, 9); }
+  #notL:not(.a, .b) { color: rgb(255, 0, 0); }
+  #notM:not(.a, .b) { color: rgb(255, 0, 0); }
+  #forgive:is(:unknown-thing, .f) { color: rgb(255, 0, 0); }
+  #strict:not(:unknown-thing) { color: rgb(255, 0, 0); }
+  #deep:is(div > span) { color: rgb(255, 0, 0); }
+  /* 4.5: :has() with relative selectors */
+  #has1:has(> .c), #has2:has(> .c), #has3:has(.c), #has4:has(+ .d), #has5:has(~ .d), #has6:has(> .a .b), #has7:has(> .a .b) { color: rgb(255, 0, 0); }
+  .pa:has(.c) .k { color: rgb(255, 0, 0); }
+  /* 14.4: of-type */
+  #nt p:nth-of-type(2), #nt span:nth-last-of-type(1), #nt em:only-of-type, #nt p:nth-of-type(odd) b { color: rgb(255, 0, 0); }
+  /* 13: input states */
+  #cb1:checked, #cb2:checked, #o2:checked, #o1:checked { background-color: rgb(255, 0, 0); }
+  #d1:disabled, #fs input:disabled, #b1:enabled, #d1:enabled { background-color: rgb(255, 0, 0); }
+  #legendIn:enabled { background-color: rgb(0, 0, 255); }
+  #rq:required, #op:optional, #rq:optional { background-color: rgb(255, 0, 0); }
+  #ro:read-only, #rw:read-write, #ce:read-write, #plain:read-only, #plain:read-write { background-color: rgb(255, 0, 0); }
+  #ph1:placeholder-shown, #ph2:placeholder-shown { background-color: rgb(255, 0, 0); }
+  #fc:focus, #fcWrap:focus-within { background-color: rgb(255, 0, 0); }
+  /* 7.2 and 9.2 */
+  #ln:lang(en), #lnFr:lang(fr) { color: rgb(255, 0, 0); }
+  #tgt:target { color: rgb(255, 0, 0); }
+</style>
+</head>
+<body>
+<div id="hov">hover me <span id="hovKid">child</span></div>
+<div class="t">
+  <span id="isA" class="y">is</span> <span id="wh" class="wh">where</span> <span id="isSpec" class="isSpec">spec</span>
+  <span id="notL" class="c">notL</span> <span id="notM" class="a">notM</span> <span id="forgive" class="f">forgive</span>
+  <span id="strict">strict</span> <div><span id="deep">deep</span></div>
+</div>
+<div id="has1"><i class="c">c</i></div>
+<div id="has2"><b><i class="c">c</i></b></div>
+<div id="has3"><b><i class="c">c</i></b></div>
+<div id="has4">has4</div><div class="d">d</div>
+<div id="has5">has5</div><div>x</div><div class="d">d</div>
+<div id="has6"><div class="a"><i class="b">b</i></div></div>
+<div class="a"><div id="has7"><i class="b">b</i></div></div>
+<div class="pa"><span class="k" id="k1">k</span><i class="c"></i></div>
+<div id="nt"><p id="p1">p1 <b id="b1st">b</b></p><span id="s1">s1</span><p id="p2">p2</p><span id="s2">s2</span><em id="em">em</em><p id="p3">p3 <b id="b3rd">b</b></p></div>
+<form>
+  <input type="checkbox" id="cb1" checked> <input type="checkbox" id="cb2">
+  <select id="sel"><option id="o1">one</option><option id="o2" selected>two</option></select>
+  <input id="d1" disabled> <button id="b1" type="button">b</button>
+  <fieldset id="fs" disabled><legend><input id="legendIn"></legend><input id="fsIn"></fieldset>
+  <input id="rq" required> <input id="op">
+  <input id="ro" readonly> <input id="rw"> <div id="ce" contenteditable>ce</div> <div id="plain">plain</div>
+  <input id="ph1" placeholder="type"> <input id="ph2" placeholder="type" value="v">
+  <div id="fcWrap"><input id="fc"></div>
+</form>
+<div lang="en-US"><span id="ln">en</span></div><div lang="english"><span id="lnFr">no</span></div>
+<div id="tgt">target</div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var $ = function (id) { return document.getElementById(id); };
+  var red = function (id) { return getComputedStyle($(id)).color === 'rgb(255, 0, 0)'; };
+  var reds = function (ids) { return ids.filter(red).join(); };
+  var isMarked = function (id) { return getComputedStyle($(id)).backgroundColor === 'rgb(255, 0, 0)'; };
+  var marked = function (ids) { return ids.filter(isMarked).join(); };
+
+  eq(':is() with a list', red('isA'), true);
+  eq(':where() counts nothing: a class wins', getComputedStyle($('wh')).color, 'rgb(0, 0, 255)');
+  eq(':is() counts its most specific argument: an id beats a later class', getComputedStyle($('isSpec')).color, 'rgb(1, 2, 3)');
+  eq(':not() with a list', reds(['notL', 'notM']), 'notL');
+  eq(':is() forgives an argument it does not know, :not() does not', reds(['forgive', 'strict']), 'forgive');
+  eq(':is() with a complex selector', red('deep'), true);
+  eq(':has() relative selectors', reds(['has1', 'has2', 'has3', 'has4', 'has5', 'has6', 'has7']), 'has1,has3,has4,has5,has6');
+  eq(':has() in the middle of a selector', red('k1'), true);
+  eq(':nth-of-type, :nth-last-of-type, :only-of-type', reds(['p1', 'p2', 'p3', 's1', 's2', 'em', 'b1st', 'b3rd']), 'p2,s2,em,b1st,b3rd');
+  eq(':checked from the attributes', marked(['cb1', 'cb2', 'o1', 'o2']), 'cb1,o2');
+  eq(':disabled and :enabled', marked(['d1', 'b1', 'fsIn', 'legendIn']), 'd1,b1,fsIn');
+  eq('the first legend of a disabled fieldset is not disabled', getComputedStyle($('legendIn')).backgroundColor, 'rgb(0, 0, 255)');
+  eq(':required and :optional', marked(['rq', 'op']), 'rq,op');
+  eq(':read-only and :read-write', marked(['ro', 'rw', 'ce', 'plain']), 'ro,rw,ce,plain');
+  eq(':placeholder-shown', marked(['ph1', 'ph2']), 'ph1');
+  eq(':lang() matches a prefix up to a hyphen', reds(['ln', 'lnFr']), 'ln');
+  eq('querySelectorAll with :is() and :has()', document.querySelectorAll(':is(#has1, #has2):has(.c), #nt :is(p, span):only-of-type').length, 2);
+  eq('nothing is hovered before the pointer moves', $('hov').matches(':hover'), false);
+
+  $('cb2').checked = true;
+  eq(':checked follows the checkedness a script set', marked(['cb1', 'cb2']), 'cb1,cb2');
+  $('cb1').checked = false;
+  eq('and matches() sees it', [$('cb1').matches(':checked'), $('cb2').matches(':checked')].join(), 'false,true');
+  $('sel').selectedIndex = 0;
+  eq(':checked follows the selected option', marked(['o1', 'o2']), 'o1');
+  $('ph1').value = 'x';
+  eq(':placeholder-shown goes when there is a value', marked(['ph1']), '');
+  $('fc').focus();
+  eq(':focus and :focus-within', marked(['fc', 'fcWrap']), 'fc,fcWrap');
+  eq('matches(:focus)', document.querySelector(':focus') === $('fc'), true);
+  $('fc').blur();
+  eq('and they go with the focus', marked(['fc', 'fcWrap']), '');
+  location.hash = 'tgt';
+  setTimeout(function () { eq(':target is the element the fragment names', red('tgt'), true); }, 30);
+
+  // The scripted pointer (tests/README): the test run moves it over #hov, presses, and moves it away
+  var last = '';
+  setInterval(function () {
+    var s = getComputedStyle($('hov')).backgroundColor + ' ' + getComputedStyle($('hovKid')).color + ' ' + getComputedStyle($('hov')).color;
+    if (s !== last) console.log('HOVER ' + s);
+    last = s;
+  }, 10);
+
+  window.addEventListener('load', function () {
+    setTimeout(function () {
+      document.title = 'Selectors test: ' + pass + ' passed, ' + fail + ' failed';
+      console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+    }, 60);
+  });
+</script>
+</body>
+</html>
