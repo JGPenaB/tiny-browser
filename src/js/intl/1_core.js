@@ -5,21 +5,23 @@
 (function (natives) {
 'use strict';
 var icu = natives.icu, protoFor = natives.protoFor;
-var $Object = Object, $TypeError = TypeError, $RangeError = RangeError, $Number = Number, $String = String, $Array = Array;
-var $Symbol = Symbol, $Map = Map, $WeakMap = WeakMap, $Math = Math;
-var create = $Object.create, defineProperty = $Object.defineProperty, getOwnPropertyNames = $Object.getOwnPropertyNames,
-    setPrototypeOf = $Object.setPrototypeOf, $ObjectCtor = $Object;
+var P = natives.pristine;  // the built-ins as they were before any page script ran (prelude.cpp snapshotIntrinsics)
+var $Object = P.Object.value, $TypeError = P.TypeError.value, $RangeError = P.RangeError.value, $Number = P.Number.value, $String = P.String.value,
+    $Array = P.Array.value;
+var $Symbol = P.Symbol.value, $Map = P.Map.value, $WeakMap = P.WeakMap.value, $Math = P.Math.statics;
+var create = P.Object.statics.create, defineProperty = P.Object.statics.defineProperty, getOwnPropertyNames = P.Object.statics.getOwnPropertyNames,
+    setPrototypeOf = P.Object.statics.setPrototypeOf, getOwnPropertyDescriptor = P.Object.statics.getOwnPropertyDescriptor, $ObjectCtor = $Object;
 var floor = $Math.floor;
-var fnCall = Function.prototype.call;
-var uncurry = fnCall.bind.bind(fnCall);
-var wmGet = uncurry($WeakMap.prototype.get), wmSet = uncurry($WeakMap.prototype.set);
-var mapGet = uncurry($Map.prototype.get), mapSet = uncurry($Map.prototype.set), mapHas = uncurry($Map.prototype.has);
-var strSlice = uncurry($String.prototype.slice), strIndexOf = uncurry($String.prototype.indexOf), charCodeAt = uncurry($String.prototype.charCodeAt),
-    toLowerCase = uncurry($String.prototype.toLowerCase), toUpperCase = uncurry($String.prototype.toUpperCase),
-    strSplit = uncurry($String.prototype.split);
-var arrayPush = uncurry($Array.prototype.push), arraySort = uncurry($Array.prototype.sort), arrayIndexOf = uncurry($Array.prototype.indexOf),
-    arrayJoin = uncurry($Array.prototype.join), arraySlice = uncurry($Array.prototype.slice);
-var symToStringTag = $Symbol.toStringTag;
+var reflectApply = P.Reflect.statics.apply, fnCall = P.Function.proto.call, fnBind = P.Function.proto.bind;
+function uncurry(f) { return reflectApply(fnBind, fnCall, [f]); }  // uncurry(f)(self, ...args) is f.call(self, ...args)
+var wmGet = uncurry(P.WeakMap.proto.get), wmSet = uncurry(P.WeakMap.proto.set);
+var mapGet = uncurry(P.Map.proto.get), mapSet = uncurry(P.Map.proto.set), mapHas = uncurry(P.Map.proto.has);
+var strSlice = uncurry(P.String.proto.slice), strIndexOf = uncurry(P.String.proto.indexOf), charCodeAt = uncurry(P.String.proto.charCodeAt),
+    toLowerCase = uncurry(P.String.proto.toLowerCase), toUpperCase = uncurry(P.String.proto.toUpperCase),
+    strSplit = uncurry(P.String.proto.split);
+var arrayPush = uncurry(P.Array.proto.push), arraySort = uncurry(P.Array.proto.sort), arrayIndexOf = uncurry(P.Array.proto.indexOf),
+    arrayJoin = uncurry(P.Array.proto.join), arraySlice = uncurry(P.Array.proto.slice);
+var symToStringTag = P.Symbol.statics.toStringTag;
 
 function throwRange(message) { throw new $RangeError(message); }
 function throwType(message) { throw new $TypeError(message); }
@@ -52,7 +54,7 @@ function kindOf(x) { var r = isObject(x) ? wmGet(slots, x) : undefined; return r
 function copyAccessors(target, source) {
   var names = getOwnPropertyNames(source);
   for (var i = 0; i < names.length; i++) {
-    var d = $Object.getOwnPropertyDescriptor(source, names[i]);
+    var d = getOwnPropertyDescriptor(source, names[i]);
     defineProperty(target, names[i], { get: d.get, enumerable: false, configurable: true });
   }
 }

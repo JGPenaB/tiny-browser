@@ -494,7 +494,7 @@ var classes = { Duration: Duration, Instant: Instant, PlainDate: PlainDate, Plai
 var classNames = getOwnPropertyNames(classes);
 for (var ci = 0; ci < classNames.length; ci++) {
   var cls = classes[classNames[ci]];
-  setPrototypeOf(cls, Function.prototype);  // `extends Object` only spares the constructors a `this` they never use
+  setPrototypeOf(cls, P.Function.value.prototype);  // `extends Object` only spares the constructors a `this` they never use
   tag(cls.prototype, 'Temporal.' + classNames[ci]);
   hidden(Temporal, classNames[ci], cls);
 }
@@ -514,7 +514,7 @@ natives.info = function (x) {
   return temporalInfo(recordOf(x));
 };
 // Date.prototype.toTemporalInstant (14.1.1): installed by the engine without building Temporal until it is first read
-var dateValueOf = uncurry($Date.prototype.valueOf);
+var dateValueOf = uncurry(P.Date.proto.valueOf);
 natives.toTemporalInstant = {
   toTemporalInstant() {
     var t = dateValueOf(this);

@@ -116,6 +116,39 @@ JSFN(bundleProtoFor) {
     }
     return V(fallback);
 }
+// The built-ins that the bundles build on, as they are before any script runs: for each constructor or namespace,
+// { value, statics, proto } where statics and proto are copies of its own data properties and its prototype's. A
+// bundle is compiled when a page first uses it, after the page may have replaced Array.prototype.sort and the like.
+JSObject* copyOwnData(Vm& vm, Value from, std::vector<Value>& held) {
+    JSObject* out = vm.newObject(nullptr);
+    held.push_back(V(out));
+    if (!from.isObject()) return out;
+    std::vector<PropKey> keys;
+    vm.ownKeys(from.asObject(), keys, true, true, false);
+    for (PropKey k : keys) {
+        PropDesc d;
+        if (vm.getOwnDesc(from.asObject(), k, d) && d.hasValue) vm.defineOwn(out, k, d.value, PF_ALL);
+    }
+    return out;
+}
+void snapshotIntrinsics(Vm& vm) {
+    static const char* names[] = {"Object", "Function", "Array", "String", "Number", "BigInt", "Symbol", "Math", "Map", "WeakMap", "Date",
+                                  "Reflect", "RangeError", "TypeError"};
+    std::vector<Value> held;
+    RootScope keep(vm, held);
+    JSObject* snap = vm.newObject(nullptr);
+    held.push_back(V(snap));
+    for (const char* name : names) {
+        Value ctor = vm.get(V(vm.global), name);
+        JSObject* entry = vm.newObject(nullptr);
+        held.push_back(V(entry));
+        vm.def(entry, "value", ctor, PF_ALL);
+        vm.def(entry, "statics", V(copyOwnData(vm, ctor, held)), PF_ALL);
+        vm.def(entry, "proto", V(copyOwnData(vm, ctor.isObject() ? vm.get(ctor, "prototype") : Value::undef(), held)), PF_ALL);
+        vm.def(snap, name, V(entry), PF_ALL);
+    }
+    vm.pristine = V(snap);
+}
 const std::u16string* joinParts(const char* const* parts, size_t count) {
     std::string joined;
     for (size_t i = 0; i < count; i++) joined += parts[i];
@@ -132,6 +165,7 @@ JSObject* bundleNatives(Vm& vm, Value& slot, const std::u16string* source) {
     vm.defFn(natives, "toPrimitiveNumber", toPrimitiveNumber, 1);
     vm.defFn(natives, "toBigInt", toBigIntNative, 1);
     vm.def(natives, "icu", V(icuNatives(vm)));
+    vm.def(natives, "pristine", vm.pristine);
     vm.defFn(natives, "toLocaleString", temporalToLocaleString, 6);
     vm.defFn(natives, "temporalInfo", temporalInfo, 1);
     auto src = std::shared_ptr<const std::u16string>(source, [](const std::u16string*) {});
@@ -195,6 +229,7 @@ void setupJsBuiltins(Vm& vm) {
     Value make = vm.callFunction(outer, V(vm.global), nullptr, 0, Value::undef(), false);
     vm.call(make, Value::undef(), &keep, 1);
     regexpSnapshot(vm);
+    snapshotIntrinsics(vm);
     vm.defLazy(vm.global, "Temporal", makeTemporal);
     vm.defLazy(vm.global, "Intl", makeIntl);
     vm.defLazy(vm.dateProto, "toTemporalInstant", makeToTemporalInstant);

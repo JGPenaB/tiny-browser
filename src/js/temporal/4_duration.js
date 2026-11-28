@@ -49,7 +49,7 @@ function createDuration(v, newTarget) {
   return o;
 }
 function durationFields(d) { return recordOf(d).v; }
-function negatedDuration(v) { var n = []; for (var i = 0; i < 10; i++) n[i] = -v[i] + 0; return n; }
+function negatedDuration(v) { var n = list(); for (var i = 0; i < 10; i++) n[i] = -v[i] + 0; return n; }
 function durationSign(v) { for (var i = 0; i < 10; i++) { if (v[i] < 0) return -1; if (v[i] > 0) return 1; } return 0; }
 function defaultLargestUnit(v) { for (var i = 0; i < 9; i++) if (v[i] !== 0) return i; return NANOSECOND; }
 function toInternalDuration(v) {
@@ -95,7 +95,7 @@ function toDurationFields(item) {
     if (typeof item !== 'string') throwType('A duration must be an object or a string');
     return durationFields(parseDurationString(item));
   }
-  var partial = toPartialDuration(item), v = [];
+  var partial = toPartialDuration(item), v = list();
   for (var i = 0; i < 10; i++) v[i] = partial[i] === undefined ? 0 : partial[i];
   if (!isValidDuration(v)) throwRange('The duration is out of range');
   return v;

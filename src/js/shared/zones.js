@@ -3,7 +3,7 @@
 //
 // The available named time zones are those of the IANA database as ICU has them, minus ICU's own legacy names.
 // Each record is { id, primary }: id is the name with its IANA case, primary the zone it is a link to (11.1.1).
-var ZONES, ZONE_LIST = [];
+var ZONES, ZONE_LIST = list();
 var UTC_NAMES = ['UTC', 'Etc/UTC', 'Etc/GMT', 'GMT', 'Etc/Universal', 'Etc/Zulu', 'Etc/UCT', 'UCT', 'Universal', 'Zulu', 'Etc/Greenwich',
                  'Greenwich', 'GMT0', 'GMT+0', 'GMT-0', 'Etc/GMT0', 'Etc/GMT+0', 'Etc/GMT-0'];
 // Java's three-letter names, which ICU accepts but the IANA database does not have
@@ -56,7 +56,7 @@ function icuZone(timeZone) {
 }
 // AvailablePrimaryTimeZoneIdentifiers (ECMA-402 6.5.3), sorted
 function primaryZoneIds() {
-  var seen = new $Map(), out = [];
+  var seen = new $Map(), out = list();
   zoneTable();
   for (var i = 0; i < ZONE_LIST.length; i++) {
     var primary = namedZone(ZONE_LIST[i].id).primary;

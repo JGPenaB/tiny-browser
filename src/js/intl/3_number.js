@@ -29,7 +29,7 @@ function numberingSystemData(locale) {
 }
 // The constructors of 4.3 Note 1 that may be called as functions (NumberFormat, DateTimeFormat): the object made is
 // stored on `this` when `this` is one of theirs
-var getPrototypeOf = $Object.getPrototypeOf;
+var getPrototypeOf = P.Object.statics.getPrototypeOf;
 function ordinaryHasInstance(ctor, o) {
   if (!isObject(o)) return false;
   var proto = ctor.prototype;
@@ -51,7 +51,7 @@ function unwrapLegacy(x, kind, ctor) {
 function defineMethods(proto, methods) {
   var names = getOwnPropertyNames(methods);
   for (var i = 0; i < names.length; i++) {
-    var d = $Object.getOwnPropertyDescriptor(methods, names[i]);
+    var d = getOwnPropertyDescriptor(methods, names[i]);
     if (d.get !== undefined) defineProperty(proto, names[i], { get: d.get, enumerable: false, configurable: true });
     else defineProperty(proto, names[i], { value: d.value, writable: true, enumerable: false, configurable: true });
   }
@@ -71,7 +71,7 @@ function setUpConstructor(ctor, methods) {
 
 // ---------------------------------------------------------------- Intl mathematical values (16.5.15)
 // { kind: 'finite' | 'nan' | 'inf', negative, decimal } where decimal is what ICU is given: "-12.5e+3", "NaN", ...
-var strTrim = uncurry($String.prototype.trim), $BigInt = BigInt;
+var strTrim = uncurry(P.String.proto.trim), $BigInt = P.BigInt.value;
 function mathematicalValue(decimal, negative) { return record({ kind: 'finite', negative: negative, decimal: decimal }); }
 var NAN_VALUE = { kind: 'nan', negative: false, decimal: 'NaN' };
 function decimalLiteral(s) {  // StrUnsignedDecimalLiteral without Infinity: digits, a point, an exponent

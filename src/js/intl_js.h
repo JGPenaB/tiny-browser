@@ -11,21 +11,23 @@ R"JS(// Intl (ECMA-402, https://tc39.es/ecma402/): written in JavaScript on top 
 (function (natives) {
 'use strict';
 var icu = natives.icu, protoFor = natives.protoFor;
-var $Object = Object, $TypeError = TypeError, $RangeError = RangeError, $Number = Number, $String = String, $Array = Array;
-var $Symbol = Symbol, $Map = Map, $WeakMap = WeakMap, $Math = Math;
-var create = $Object.create, defineProperty = $Object.defineProperty, getOwnPropertyNames = $Object.getOwnPropertyNames,
-    setPrototypeOf = $Object.setPrototypeOf, $ObjectCtor = $Object;
+var P = natives.pristine;  // the built-ins as they were before any page script ran (prelude.cpp snapshotIntrinsics)
+var $Object = P.Object.value, $TypeError = P.TypeError.value, $RangeError = P.RangeError.value, $Number = P.Number.value, $String = P.String.value,
+    $Array = P.Array.value;
+var $Symbol = P.Symbol.value, $Map = P.Map.value, $WeakMap = P.WeakMap.value, $Math = P.Math.statics;
+var create = P.Object.statics.create, defineProperty = P.Object.statics.defineProperty, getOwnPropertyNames = P.Object.statics.getOwnPropertyNames,
+    setPrototypeOf = P.Object.statics.setPrototypeOf, getOwnPropertyDescriptor = P.Object.statics.getOwnPropertyDescriptor, $ObjectCtor = $Object;
 var floor = $Math.floor;
-var fnCall = Function.prototype.call;
-var uncurry = fnCall.bind.bind(fnCall);
-var wmGet = uncurry($WeakMap.prototype.get), wmSet = uncurry($WeakMap.prototype.set);
-var mapGet = uncurry($Map.prototype.get), mapSet = uncurry($Map.prototype.set), mapHas = uncurry($Map.prototype.has);
-var strSlice = uncurry($String.prototype.slice), strIndexOf = uncurry($String.prototype.indexOf), charCodeAt = uncurry($String.prototype.charCodeAt),
-    toLowerCase = uncurry($String.prototype.toLowerCase), toUpperCase = uncurry($String.prototype.toUpperCase),
-    strSplit = uncurry($String.prototype.split);
-var arrayPush = uncurry($Array.prototype.push), arraySort = uncurry($Array.prototype.sort), arrayIndexOf = uncurry($Array.prototype.indexOf),
-    arrayJoin = uncurry($Array.prototype.join), arraySlice = uncurry($Array.prototype.slice);
-var symToStringTag = $Symbol.toStringTag;
+var reflectApply = P.Reflect.statics.apply, fnCall = P.Function.proto.call, fnBind = P.Function.proto.bind;
+function uncurry(f) { return reflectApply(fnBind, fnCall, [f]); }  // uncurry(f)(self, ...args) is f.call(self, ...args)
+var wmGet = uncurry(P.WeakMap.proto.get), wmSet = uncurry(P.WeakMap.proto.set);
+var mapGet = uncurry(P.Map.proto.get), mapSet = uncurry(P.Map.proto.set), mapHas = uncurry(P.Map.proto.has);
+var strSlice = uncurry(P.String.proto.slice), strIndexOf = uncurry(P.String.proto.indexOf), charCodeAt = uncurry(P.String.proto.charCodeAt),
+    toLowerCase = uncurry(P.String.proto.toLowerCase), toUpperCase = uncurry(P.String.proto.toUpperCase),
+    strSplit = uncurry(P.String.proto.split);
+var arrayPush = uncurry(P.Array.proto.push), arraySort = uncurry(P.Array.proto.sort), arrayIndexOf = uncurry(P.Array.proto.indexOf),
+    arrayJoin = uncurry(P.Array.proto.join), arraySlice = uncurry(P.Array.proto.slice);
+var symToStringTag = P.Symbol.statics.toStringTag;
 
 function throwRange(message) { throw new $RangeError(message); }
 function throwType(message) { throw new $TypeError(message); }
@@ -58,7 +60,7 @@ function kindOf(x) { var r = isObject(x) ? wmGet(slots, x) : undefined; return r
 function copyAccessors(target, source) {
   var names = getOwnPropertyNames(source);
   for (var i = 0; i < names.length; i++) {
-    var d = $Object.getOwnPropertyDescriptor(source, names[i]);
+    var d = getOwnPropertyDescriptor(source, names[i]);
     defineProperty(target, names[i], { get: d.get, enumerable: false, configurable: true });
   }
 }
@@ -268,7 +270,8 @@ function canonicalizeLanguageId(id) {
       if (script !== undefined) { id.script = toLowerCase(script.replacement); changed = true; continue; }
     }
     if (id.region !== undefined) {
-      var region = data.territory[toUpperCase(id.region)];
+)JS",
+R"JS(      var region = data.territory[toUpperCase(id.region)];
       if (region !== undefined) {
         var choices = strSplit(region.replacement, ' '), pick = choices[0];
         if (choices.length > 1) {
@@ -276,8 +279,7 @@ function canonicalizeLanguageId(id) {
           for (var c = 0; c < choices.length; c++) if (likely !== undefined && toLowerCase(choices[c]) === likely) pick = choices[c];
         }
         id.region = toLowerCase(pick);
-)JS",
-R"JS(        changed = true;
+        changed = true;
         continue;
       }
     }
@@ -524,7 +526,7 @@ function supportedLocalesOf(locales, options) { return filterLocales(canonicaliz
 //
 // The available named time zones are those of the IANA database as ICU has them, minus ICU's own legacy names.
 // Each record is { id, primary }: id is the name with its IANA case, primary the zone it is a link to (11.1.1).
-var ZONES, ZONE_LIST = [];
+var ZONES, ZONE_LIST = list();
 var UTC_NAMES = ['UTC', 'Etc/UTC', 'Etc/GMT', 'GMT', 'Etc/Universal', 'Etc/Zulu', 'Etc/UCT', 'UCT', 'Universal', 'Zulu', 'Etc/Greenwich',
                  'Greenwich', 'GMT0', 'GMT+0', 'GMT-0', 'Etc/GMT0', 'Etc/GMT+0', 'Etc/GMT-0'];
 // Java's three-letter names, which ICU accepts but the IANA database does not have
@@ -561,7 +563,8 @@ function namedZone(name) {
   var record = mapGet(zoneTable(), toLowerCase(name));
   if (record !== undefined && record.primary === undefined) {
     var canonical = icu.tzCanonical(record.id);
-    if (canonical === undefined) canonical = record.id;
+)JS",
+R"JS(    if (canonical === undefined) canonical = record.id;
     if (canonical === 'Etc/UTC' || canonical === 'Etc/GMT') canonical = 'UTC';
     var renamed = IANA_PRIMARY[canonical];
     record.primary = renamed !== undefined ? renamed : canonical;
@@ -572,13 +575,12 @@ function namedZone(name) {
 function icuZone(timeZone) {
   var primary = namedZone(timeZone).primary;
   var keys = getOwnPropertyNames(IANA_PRIMARY);
-)JS",
-R"JS(  for (var i = 0; i < keys.length; i++) if (IANA_PRIMARY[keys[i]] === primary) return keys[i];
+  for (var i = 0; i < keys.length; i++) if (IANA_PRIMARY[keys[i]] === primary) return keys[i];
   return primary;
 }
 // AvailablePrimaryTimeZoneIdentifiers (ECMA-402 6.5.3), sorted
 function primaryZoneIds() {
-  var seen = new $Map(), out = [];
+  var seen = new $Map(), out = list();
   zoneTable();
   for (var i = 0; i < ZONE_LIST.length; i++) {
     var primary = namedZone(ZONE_LIST[i].id).primary;
@@ -841,12 +843,12 @@ class Locale extends $Object {
 }
 LocaleProto = Locale.prototype;
 
-// ---------------------------------------------------------------- supportedValuesOf (8.3.2)
+)JS",
+R"JS(// ---------------------------------------------------------------- supportedValuesOf (8.3.2)
 var UNITS = ['acre', 'bit', 'byte', 'celsius', 'centimeter', 'day', 'degree', 'fahrenheit', 'fluid-ounce', 'foot', 'gallon', 'gigabit',
              'gigabyte', 'gram', 'hectare', 'hour', 'inch', 'kilobit', 'kilobyte', 'kilogram', 'kilometer', 'liter', 'megabit', 'megabyte',
              'meter', 'microsecond', 'mile', 'mile-scandinavian', 'milliliter', 'millimeter', 'millisecond', 'minute', 'month',
-)JS",
-R"JS(             'nanosecond', 'ounce', 'percent', 'petabyte', 'pound', 'second', 'stone', 'terabit', 'terabyte', 'week', 'yard', 'year'];
+             'nanosecond', 'ounce', 'percent', 'petabyte', 'pound', 'second', 'stone', 'terabit', 'terabyte', 'week', 'yard', 'year'];
 function typeNames(legacy) {  // the BCP 47 types of a key, as ICU lists them
   var map = keyTypeData().typeMap[legacy], names = getOwnPropertyNames(map), out = list();
   for (var i = 0; i < names.length; i++) {
@@ -930,7 +932,7 @@ function numberingSystemData(locale) {
 }
 // The constructors of 4.3 Note 1 that may be called as functions (NumberFormat, DateTimeFormat): the object made is
 // stored on `this` when `this` is one of theirs
-var getPrototypeOf = $Object.getPrototypeOf;
+var getPrototypeOf = P.Object.statics.getPrototypeOf;
 function ordinaryHasInstance(ctor, o) {
   if (!isObject(o)) return false;
   var proto = ctor.prototype;
@@ -952,7 +954,7 @@ function unwrapLegacy(x, kind, ctor) {
 function defineMethods(proto, methods) {
   var names = getOwnPropertyNames(methods);
   for (var i = 0; i < names.length; i++) {
-    var d = $Object.getOwnPropertyDescriptor(methods, names[i]);
+    var d = getOwnPropertyDescriptor(methods, names[i]);
     if (d.get !== undefined) defineProperty(proto, names[i], { get: d.get, enumerable: false, configurable: true });
     else defineProperty(proto, names[i], { value: d.value, writable: true, enumerable: false, configurable: true });
   }
@@ -972,7 +974,7 @@ function setUpConstructor(ctor, methods) {
 
 // ---------------------------------------------------------------- Intl mathematical values (16.5.15)
 // { kind: 'finite' | 'nan' | 'inf', negative, decimal } where decimal is what ICU is given: "-12.5e+3", "NaN", ...
-var strTrim = uncurry($String.prototype.trim), $BigInt = BigInt;
+var strTrim = uncurry(P.String.proto.trim), $BigInt = P.BigInt.value;
 function mathematicalValue(decimal, negative) { return record({ kind: 'finite', negative: negative, decimal: decimal }); }
 var NAN_VALUE = { kind: 'nan', negative: false, decimal: 'NaN' };
 function decimalLiteral(s) {  // StrUnsignedDecimalLiteral without Infinity: digits, a point, an exponent
@@ -1100,7 +1102,8 @@ function isSpecialText(s) { return s === 'NaN' || s === '∞' || strIndexOf(s, '
 function partsArray(parts) {
   var out = [];
   for (var i = 0; i < parts.length; i++) {
-    var o = {};
+)JS",
+R"JS(    var o = {};
     createDataProperty(o, 'type', parts[i].type);
     createDataProperty(o, 'value', parts[i].value);
     if (parts[i].source !== undefined) createDataProperty(o, 'source', parts[i].source);
@@ -1111,8 +1114,7 @@ function partsArray(parts) {
 
 // ---------------------------------------------------------------- digit options (16.1.2)
 function defaultNumberOption(value, minimum, maximum, fallback) {
-)JS",
-R"JS(  if (value === undefined) return fallback;
+  if (value === undefined) return fallback;
   value = +value;
   if (value !== value || value < minimum || value > maximum) throwRange('A number option is out of range');
   return floor(value);
@@ -1332,7 +1334,8 @@ function withHourLetter(pattern, letter) {
   var out = '', quoted = false;
   for (var i = 0; i < pattern.length; i++) {
     var c = pattern[i];
-    if (c === "'") quoted = !quoted;
+)JS",
+R"JS(    if (c === "'") quoted = !quoted;
     out += !quoted && (c === 'h' || c === 'H' || c === 'K' || c === 'k') ? letter : c;
   }
   return out;
@@ -1343,8 +1346,7 @@ function componentsOfPattern(pattern) {
   var text = function (n) { return n === 4 ? 'long' : n === 5 ? 'narrow' : 'short'; };
   for (var i = 0; i < fields.length; i++) {
     var c = fields[i][0], n = fields[i][1];
-)JS",
-R"JS(    if (c === 'E' || c === 'c' || c === 'e') r.weekday = n === 6 ? 'short' : text(n);
+    if (c === 'E' || c === 'c' || c === 'e') r.weekday = n === 6 ? 'short' : text(n);
     else if (c === 'G') r.era = text(n);
     else if (c === 'y' || c === 'Y' || c === 'u' || c === 'U' || c === 'r') r.year = n === 2 ? '2-digit' : 'numeric';
     else if (c === 'M' || c === 'L') r.month = n === 1 ? 'numeric' : n === 2 ? '2-digit' : text(n);
@@ -1520,7 +1522,7 @@ function createDateTimeFormat(newTarget, locales, options, required, defaults, t
   wmSet(slots, o, r);
   return o;
 }
-var arrayConcat = uncurry($Array.prototype.concat);
+var arrayConcat = uncurry(P.Array.proto.concat);
 // A DateTime Format Record: the ICU pattern, the skeleton its ranges are made from, and the components it shows
 function formatRecord(pattern, skeleton) {
   return record({ pattern: pattern, skeleton: removeLetters(skeleton, 'ab'), components: componentsOfPattern(pattern) });
@@ -1577,7 +1579,8 @@ function timeClip(t) {
 }
 // ToDateTimeFormattable (Temporal 15.6.11): a Temporal object as what the Temporal parts say of it, else a Number
 var temporalInfo = natives.temporalInfo;
-function toFormattable(value) {
+)JS",
+R"JS(function toFormattable(value) {
   var info = isObject(value) ? temporalInfo(value) : undefined;
   return info !== undefined ? info : +value;
 }
@@ -1586,8 +1589,7 @@ function daysFromCivil(y, m, d) {  // days since 1970-01-01 of a proleptic Grego
   var era = floor(y / 400), yoe = y - era * 400, mp = (m + 9) % 12;
   return era * 146097 + yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + floor((153 * mp + 2) / 5) + d - 1 - 719468;
 }
-)JS",
-R"JS(function utcMs(info, hour, minute, second, ms) {
+function utcMs(info, hour, minute, second, ms) {
   return daysFromCivil(info.year, info.month, info.day) * 86400000 + ((hour * 60 + minute) * 60 + second) * 1000 + ms;
 }
 // HandleDateTimeValue (Temporal 15.6.22): { format, ms, plain }
@@ -1621,7 +1623,7 @@ function handleDateTimeValue(r, x) {
   if (kind === 'Instant') return record({ format: r.instant, ms: x.epochMs, plain: false });
   throwType('A ZonedDateTime cannot be formatted here: use its toLocaleString');
 }
-var $Date = Date;
+var dateNow = P.Date.statics.now;
 // The ICU date field ids (UDateFormatField) as part types
 var DATE_FIELDS = ['era', 'year', 'month', 'day', 'hour', 'hour', 'minute', 'second', 'fractionalSecond', 'weekday', 'literal', 'literal',
                    'literal', 'literal', 'dayPeriod', 'hour', 'hour', 'timeZoneName', 'year', 'weekday', 'year', 'literal', 'literal',
@@ -1666,7 +1668,7 @@ function dateRange(r, start, end, parts) {
   if (!parts) return raw;
   return partsArray(dateParts(raw, true));
 }
-function formattableOrNow(date) { return date === undefined ? $Date.now() : toFormattable(date); }
+function formattableOrNow(date) { return date === undefined ? dateNow() : toFormattable(date); }
 function dateTimeFormatOf(x) { return slotOf(unwrapLegacy(x, 'DateTimeFormat', DateTimeFormat), 'DateTimeFormat'); }
 
 var DateTimeFormatProto;
@@ -1830,14 +1832,14 @@ function partitionRelativeTime(r, value, unit) {
   unit = singularRelativeTimeUnit(toString(unit));
   if (value !== value || value === Infinity || value === -Infinity) throwRange('A relative time must be a finite number');
   var locale = toIcuId(r.dataLocale);
-  var fields = r.style !== 'long' ? icu.resource('', locale, 'fields/' + unit + '-' + r.style) : undefined;
+)JS",
+R"JS(  var fields = r.style !== 'long' ? icu.resource('', locale, 'fields/' + unit + '-' + r.style) : undefined;
   if (fields === undefined) fields = icu.resource('', locale, 'fields/' + unit);
   if (r.numeric === 'auto' && fields.relative !== undefined) {
     var literal = fields.relative[`${value}`];
     if (literal !== undefined) return [record({ type: 'literal', value: literal, unit: undefined })];
   }
-)JS",
-R"JS(  var past = value < 0 || (value === 0 && 1 / value < 0), magnitude = past ? -value : value;
+  var past = value < 0 || (value === 0 && 1 / value < 0), magnitude = past ? -value : value;
   var x = toIntlMathematicalValue(magnitude);
   var numberParts = toParts(icu.numberFormat(r.numberFormat.dataLocale, r.numberFormat.skeleton, x.decimal, true), x, false, 'decimal');
   var category = icu.pluralSelect(r.pluralRules.dataLocale, false, r.pluralRules.skeleton, x.decimal);
@@ -2016,7 +2018,7 @@ defineMethods(SegmentsProto, {
   } }[iteratorSymbol];
   defineProperty(SegmentsProto, iteratorSymbol, { value: f, writable: true, enumerable: false, configurable: true });
 })();
-SegmentIteratorProto = create(getPrototypeOf(getPrototypeOf([][iteratorSymbol]())));
+SegmentIteratorProto = create(getPrototypeOf(getPrototypeOf(invoke(P.Array.proto[iteratorSymbol], []))));  // %IteratorPrototype%
 defineMethods(SegmentIteratorProto, {
   next() {
     var it = slotOf(this, 'SegmentIterator'), s = it.segments, result = {};
@@ -2047,7 +2049,7 @@ var classes = { DisplayNames: DisplayNames, ListFormat: ListFormat, Locale: Loca
 var classNames = getOwnPropertyNames(classes);
 for (var ci = 0; ci < classNames.length; ci++) {
   var cls = classes[classNames[ci]];
-  setPrototypeOf(cls, Function.prototype);  // `extends Object` only spares the constructors a `this` they never use
+  setPrototypeOf(cls, P.Function.value.prototype);  // `extends Object` only spares the constructors a `this` they never use
   tag(cls.prototype, 'Intl.' + classNames[ci]);
   hidden(Intl, classNames[ci], cls);
 }

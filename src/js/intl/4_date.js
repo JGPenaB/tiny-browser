@@ -215,7 +215,7 @@ function createDateTimeFormat(newTarget, locales, options, required, defaults, t
   wmSet(slots, o, r);
   return o;
 }
-var arrayConcat = uncurry($Array.prototype.concat);
+var arrayConcat = uncurry(P.Array.proto.concat);
 // A DateTime Format Record: the ICU pattern, the skeleton its ranges are made from, and the components it shows
 function formatRecord(pattern, skeleton) {
   return record({ pattern: pattern, skeleton: removeLetters(skeleton, 'ab'), components: componentsOfPattern(pattern) });
@@ -315,7 +315,7 @@ function handleDateTimeValue(r, x) {
   if (kind === 'Instant') return record({ format: r.instant, ms: x.epochMs, plain: false });
   throwType('A ZonedDateTime cannot be formatted here: use its toLocaleString');
 }
-var $Date = Date;
+var dateNow = P.Date.statics.now;
 // The ICU date field ids (UDateFormatField) as part types
 var DATE_FIELDS = ['era', 'year', 'month', 'day', 'hour', 'hour', 'minute', 'second', 'fractionalSecond', 'weekday', 'literal', 'literal',
                    'literal', 'literal', 'dayPeriod', 'hour', 'hour', 'timeZoneName', 'year', 'weekday', 'year', 'literal', 'literal',
@@ -360,7 +360,7 @@ function dateRange(r, start, end, parts) {
   if (!parts) return raw;
   return partsArray(dateParts(raw, true));
 }
-function formattableOrNow(date) { return date === undefined ? $Date.now() : toFormattable(date); }
+function formattableOrNow(date) { return date === undefined ? dateNow() : toFormattable(date); }
 function dateTimeFormatOf(x) { return slotOf(unwrapLegacy(x, 'DateTimeFormat', DateTimeFormat), 'DateTimeFormat'); }
 
 var DateTimeFormatProto;

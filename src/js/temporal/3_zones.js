@@ -44,27 +44,27 @@ function getISODateTimeFor(timeZone, epochNs) {
 // GetPossibleEpochNanoseconds (11.1.13). For a named zone the candidates are the wall time less the offsets in force
 // a day before and a day after it; a candidate counts if the zone really has that offset then.
 function getPossibleEpochNs(timeZone, dt) {
-  var t = dt.time, list;
+  var t = dt.time, possible;
   if (isSign(timeZone, 0) || isUTC(timeZone)) {
     var offsetMinutes = isSign(timeZone, 0) ? parseUTCOffsetNs(timeZone) / 6e10 : 0;
     var balanced = balanceISODateTime(dt.date.year, dt.date.month, dt.date.day, t.hour, t.minute - offsetMinutes, t.second, t.millisecond,
                                       t.microsecond, t.nanosecond);
     checkISODaysRange(balanced.date);
-    list = [utcEpochNs(balanced.date, balanced.time)];
+    possible = [utcEpochNs(balanced.date, balanced.time)];
   } else {
     checkISODaysRange(dt.date);
     var wall = utcEpochNs(dt.date, dt.time);
     var before = getOffsetNsFor(timeZone, wall - nsPerDay), after = getOffsetNsFor(timeZone, wall + nsPerDay);
     var offsets = before === after ? [before] : [before, after];
-    list = [];
+    possible = list();
     for (var i = 0; i < offsets.length; i++) {
       var candidate = wall - $BigInt(offsets[i]);
-      if (getOffsetNsFor(timeZone, candidate) === offsets[i]) arrayPush(list, candidate);
+      if (getOffsetNsFor(timeZone, candidate) === offsets[i]) arrayPush(possible, candidate);
     }
-    if (list.length === 2 && list[0] > list[1]) list = [list[1], list[0]];
+    if (possible.length === 2 && possible[0] > possible[1]) possible = [possible[1], possible[0]];
   }
-  for (var j = 0; j < list.length; j++) if (!isValidEpochNs(list[j])) throwRange('The date and time are out of range');
-  return list;
+  for (var j = 0; j < possible.length; j++) if (!isValidEpochNs(possible[j])) throwRange('The date and time are out of range');
+  return possible;
 }
 // DisambiguatePossibleEpochNanoseconds (11.1.12)
 function disambiguate(possible, timeZone, dt, disambiguation) {
@@ -176,7 +176,7 @@ function convertField(name, value) {
 }
 // PrepareCalendarFields (12.3.3); required is 'partial' or a list of field names
 function prepareCalendarFields(calendar, fields, calendarNames, otherNames, required) {
-  var names = [], i;
+  var names = list(), i;
   for (i = 0; i < calendarNames.length; i++) arrayPush(names, calendarNames[i]);
   for (i = 0; i < otherNames.length; i++) arrayPush(names, otherNames[i]);
   arraySort(names);

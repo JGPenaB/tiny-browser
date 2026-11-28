@@ -146,7 +146,7 @@ function parseTimeZoneIdentifierAt(s, i) {
 // TimeZoneAnnotation? Annotations? up to the end of the string; annotations collect into r.annotations
 function parseAnnotations(s, i, r, allowTimeZone) {
   var j = i, first = true;
-  r.annotations = [];
+  r.annotations = list();
   while (charAt(s, j) === '[') {
     var k = j + 1, critical = false;
     if (charAt(s, k) === '!') { critical = true; k++; }

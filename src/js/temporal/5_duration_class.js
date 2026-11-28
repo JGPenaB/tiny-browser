@@ -58,7 +58,7 @@ function durationGetter(i) { return function () { return slotOf(this, 'Duration'
 
 class Duration extends $Object {
   constructor() {
-    var a = arguments, v = [];
+    var a = arguments, v = list();
     for (var i = 0; i < 10; i++) v[i] = a[i] === undefined ? 0 : toIntegerIfIntegral(a[i]);
     return createDuration(v, new.target);
   }
@@ -102,12 +102,12 @@ class Duration extends $Object {
   get sign() { return durationSign(slotOf(this, 'Duration').v); }
   get blank() { return durationSign(slotOf(this, 'Duration').v) === 0; }
   with(temporalDurationLike) {
-    var v = slotOf(this, 'Duration').v, partial = toPartialDuration(temporalDurationLike), w = [];
+    var v = slotOf(this, 'Duration').v, partial = toPartialDuration(temporalDurationLike), w = list();
     for (var i = 0; i < 10; i++) w[i] = partial[i] === undefined ? v[i] : partial[i];
     return createDuration(w);
   }
   negated() { return createDuration(negatedDuration(slotOf(this, 'Duration').v)); }
-  abs() { var v = slotOf(this, 'Duration').v, w = []; for (var i = 0; i < 10; i++) w[i] = abs(v[i]); return createDuration(w); }
+  abs() { var v = slotOf(this, 'Duration').v, w = list(); for (var i = 0; i < 10; i++) w[i] = abs(v[i]); return createDuration(w); }
   add(other) { return addDurations('add', slotOf(this, 'Duration').v, other); }
   subtract(other) { return addDurations('subtract', slotOf(this, 'Duration').v, other); }
   round(roundTo) {

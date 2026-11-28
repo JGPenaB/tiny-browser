@@ -7,23 +7,27 @@
 (function (natives) {
 'use strict';
 var icu = natives.icu, protoFor = natives.protoFor, toPrimitiveString = natives.toPrimitiveString, toBigIntNative = natives.toBigInt;
-var $Object = Object, $TypeError = TypeError, $RangeError = RangeError, $BigInt = BigInt, $Number = Number, $String = String;
-var $Symbol = Symbol, $Map = Map, $WeakMap = WeakMap, $Math = Math, $Date = Date;
-var create = $Object.create, defineProperty = $Object.defineProperty, getOwnPropertyDescriptor = $Object.getOwnPropertyDescriptor,
-    getOwnPropertyNames = $Object.getOwnPropertyNames, setPrototypeOf = $Object.setPrototypeOf;
+var P = natives.pristine;  // the built-ins as they were before any page script ran (prelude.cpp snapshotIntrinsics)
+var $Object = P.Object.value, $TypeError = P.TypeError.value, $RangeError = P.RangeError.value, $BigInt = P.BigInt.value, $Number = P.Number.value,
+    $String = P.String.value;
+var $Symbol = P.Symbol.value, $Map = P.Map.value, $WeakMap = P.WeakMap.value, $Math = P.Math.statics, $Date = P.Date.value;
+var create = P.Object.statics.create, defineProperty = P.Object.statics.defineProperty, getOwnPropertyDescriptor = P.Object.statics.getOwnPropertyDescriptor,
+    getOwnPropertyNames = P.Object.statics.getOwnPropertyNames, setPrototypeOf = P.Object.statics.setPrototypeOf;
 var floor = $Math.floor, trunc = $Math.trunc, abs = $Math.abs, max = $Math.max, min = $Math.min, pow = $Math.pow;
-var isFinite = $Number.isFinite, isInteger = $Number.isInteger, dateNow = $Date.now;
-var fnCall = Function.prototype.call;
-var uncurry = fnCall.bind.bind(fnCall);
-var wmGet = uncurry($WeakMap.prototype.get), wmSet = uncurry($WeakMap.prototype.set);
-var mapGet = uncurry($Map.prototype.get), mapSet = uncurry($Map.prototype.set), mapHas = uncurry($Map.prototype.has);
-var strSlice = uncurry($String.prototype.slice), strIndexOf = uncurry($String.prototype.indexOf), charCodeAt = uncurry($String.prototype.charCodeAt),
-    toLowerCase = uncurry($String.prototype.toLowerCase), padStart = uncurry($String.prototype.padStart), strRepeat = uncurry($String.prototype.repeat);
-var arrayPush = uncurry(Array.prototype.push), arraySort = uncurry(Array.prototype.sort), arrayIndexOf = uncurry(Array.prototype.indexOf),
-    arrayJoin = uncurry(Array.prototype.join);
-var bigToString = uncurry($BigInt.prototype.toString), numToString = uncurry($Number.prototype.toString);
-var symToStringTag = $Symbol.toStringTag;
+var isFinite = P.Number.statics.isFinite, isInteger = P.Number.statics.isInteger, dateNow = P.Date.statics.now;
+var reflectApply = P.Reflect.statics.apply, fnCall = P.Function.proto.call, fnBind = P.Function.proto.bind;
+function uncurry(f) { return reflectApply(fnBind, fnCall, [f]); }  // uncurry(f)(self, ...args) is f.call(self, ...args)
+var wmGet = uncurry(P.WeakMap.proto.get), wmSet = uncurry(P.WeakMap.proto.set);
+var mapGet = uncurry(P.Map.proto.get), mapSet = uncurry(P.Map.proto.set), mapHas = uncurry(P.Map.proto.has);
+var strSlice = uncurry(P.String.proto.slice), strIndexOf = uncurry(P.String.proto.indexOf), charCodeAt = uncurry(P.String.proto.charCodeAt),
+    toLowerCase = uncurry(P.String.proto.toLowerCase), padStart = uncurry(P.String.proto.padStart), strRepeat = uncurry(P.String.proto.repeat);
+var arrayPush = uncurry(P.Array.proto.push), arraySort = uncurry(P.Array.proto.sort), arrayIndexOf = uncurry(P.Array.proto.indexOf),
+    arrayJoin = uncurry(P.Array.proto.join);
+var bigToString = uncurry(P.BigInt.proto.toString), numToString = uncurry(P.Number.proto.toString);
+var symToStringTag = P.Symbol.statics.toStringTag;
 
+// An array for the engine's own use: with no prototype, writes to it cannot reach setters a page put on Array.prototype
+function list() { var a = []; setPrototypeOf(a, null); return a; }
 function throwRange(message) { throw new $RangeError(message); }
 function throwType(message) { throw new $TypeError(message); }
 function isObject(x) { return (typeof x === 'object' && x !== null) || typeof x === 'function'; }

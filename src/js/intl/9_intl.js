@@ -12,7 +12,7 @@ var classes = { DisplayNames: DisplayNames, ListFormat: ListFormat, Locale: Loca
 var classNames = getOwnPropertyNames(classes);
 for (var ci = 0; ci < classNames.length; ci++) {
   var cls = classes[classNames[ci]];
-  setPrototypeOf(cls, Function.prototype);  // `extends Object` only spares the constructors a `this` they never use
+  setPrototypeOf(cls, P.Function.value.prototype);  // `extends Object` only spares the constructors a `this` they never use
   tag(cls.prototype, 'Intl.' + classNames[ci]);
   hidden(Intl, classNames[ci], cls);
 }

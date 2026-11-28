@@ -587,6 +587,7 @@ struct RealmFields {
     Value moduleHost;  // the module loader's `host` object: the embedder's resolve and fetch functions live on it
     // once Temporal or Intl is built: the object its JavaScript filled in (prelude.cpp bundleNatives)
     Value temporalNatives, intlNatives;
+    Value pristine;  // the built-ins as they were before any script ran (prelude.cpp snapshotIntrinsics)
     struct PropWatch {  // one property of RegExp.prototype as the engine made it (regexp.cpp)
         PropKey key;
         uint64_t value;

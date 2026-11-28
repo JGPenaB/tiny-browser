@@ -219,7 +219,7 @@ function timeGetters(timeOf) {
 
 class PlainTime extends $Object {
   constructor() {
-    var a = arguments, v = [];
+    var a = arguments, v = list();
     for (var i = 0; i < 6; i++) v[i] = a[i] === undefined ? 0 : toIntegerWithTruncation(a[i]);
     if (!isValidTime(v[0], v[1], v[2], v[3], v[4], v[5])) throwRange('The time does not exist');
     return createPlainTime(time(v[0], v[1], v[2], v[3], v[4], v[5]), new.target);
@@ -349,7 +349,7 @@ function addDurationToDateTime(operation, r, like, options) {
 
 class PlainDateTime extends $Object {
   constructor(isoYear, isoMonth, isoDay) {
-    var y = toIntegerWithTruncation(isoYear), mo = toIntegerWithTruncation(isoMonth), d = toIntegerWithTruncation(isoDay), a = arguments, t = [];
+    var y = toIntegerWithTruncation(isoYear), mo = toIntegerWithTruncation(isoMonth), d = toIntegerWithTruncation(isoDay), a = arguments, t = list();
     for (var i = 0; i < 6; i++) t[i] = a[i + 3] === undefined ? 0 : toIntegerWithTruncation(a[i + 3]);
     var calendar = a[9];
     if (calendar === undefined) calendar = 'iso8601';

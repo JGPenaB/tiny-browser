@@ -294,7 +294,7 @@ defineMethods(SegmentsProto, {
   } }[iteratorSymbol];
   defineProperty(SegmentsProto, iteratorSymbol, { value: f, writable: true, enumerable: false, configurable: true });
 })();
-SegmentIteratorProto = create(getPrototypeOf(getPrototypeOf([][iteratorSymbol]())));
+SegmentIteratorProto = create(getPrototypeOf(getPrototypeOf(invoke(P.Array.proto[iteratorSymbol], []))));  // %IteratorPrototype%
 defineMethods(SegmentIteratorProto, {
   next() {
     var it = slotOf(this, 'SegmentIterator'), s = it.segments, result = {};

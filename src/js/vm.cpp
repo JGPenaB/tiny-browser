@@ -503,7 +503,7 @@ static void markRealm(Gc& g, RealmFields& r) {
     for (JSObject* p : r.intrinsicProtos) g.mark(p);
     for (Value v : r.typedCtors) g.mark(v);
     for (Value v : {r.arrayBufferCtor, r.sharedBufferCtor, r.throwTypeError, r.arrayCtorValue, r.arraySpeciesGetter, r.arrayValuesFn, r.arrayIterNextFn,
-                    r.evalFn, r.importHook, r.moduleHost, r.temporalNatives, r.intlNatives, r.regexpLastInput, r.regexpCtor, r.promiseCtor, r.suppressedErrorCtor})
+                    r.evalFn, r.importHook, r.moduleHost, r.temporalNatives, r.intlNatives, r.pristine, r.regexpLastInput, r.regexpCtor, r.promiseCtor, r.suppressedErrorCtor})
         g.mark(v);
 }
 
