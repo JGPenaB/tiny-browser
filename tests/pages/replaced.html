@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Replaced elements test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  .box { width: 200px; background: #f3f3f3; margin-bottom: 8px; }
+  #a { width: 40px; border: 2px solid #c00; padding: 3px; background: #fc0; }
+  #b { box-sizing: border-box; width: 50px; border: 5px solid #06c; }
+  #c { padding: 4px; border: 1px solid #000; background: #9f9; }
+  #d { display: block; width: 50%; border: 2px solid #090; }
+  #e { max-width: 100%; border: 1px solid #000; }
+  #f { width: 60px; height: 60px; border-radius: 50%; border: 3px solid #f0f; }
+  #g { width: 40px; box-shadow: 4px 4px 0 #888; }
+</style>
+</head>
+<body>
+<p>CSS 2 box model for replaced elements: pictures and canvases have padding, borders, backgrounds and shadows around
+their content. By eye: #f is a round picture with a magenta ring; #g has a grey shadow.</p>
+<div class="box"><img id="a" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII="> <img id="b" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII="> <canvas id="c" width="4" height="2"></canvas></div>
+<div class="box"><img id="d" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII="></div>
+<div class="box" style="width: 30px"><img id="e" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII=" width="40"></div>
+<div class="box"><img id="f" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII="> <img id="g" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII="></div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  function size(id) { var r = document.getElementById(id).getBoundingClientRect(); return Math.round(r.width) + 'x' + Math.round(r.height); }
+  window.addEventListener('load', function () {
+    eq('width is the content box; padding and border go around it, and the height keeps the ratio', size('a'), '50x30');
+    eq('box-sizing: border-box takes the border out of the width', size('b'), '50x30');
+    eq('a canvas has padding and borders around its bitmap size', size('c'), '14x12');
+    eq('a percentage width of a block picture is of the content box', size('d'), '104x54');
+    eq('max-width: 100% bounds the content box', size('e'), '32x17');
+    eq('a round picture keeps its box', size('f'), '66x66');
+    document.title = 'Replaced elements test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

@@ -48,7 +48,7 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html`, `animations.html` and `webgl.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html`, `animations.html`, `webgl.html` and `replaced.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`), as does `navigation.html` (the Navigation API). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
@@ -98,7 +98,8 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    trigonometric and exponential ones; percentages resolved when the basis is known; `tests/pages/values.html`), and web fonts (`@font-face`
    with TrueType, OpenType, WOFF and WOFF2 files unpacked by DirectWrite, variable fonts at each weight, the faces
    whose `unicode-range` covers Latin; `tests/pages/fonts.html` uses a Windows font by its file URL), and
-   `position: sticky` against the viewport (`tests/pages/sticky.html`), and CSS Animations and Transitions of
+   `position: sticky` against the viewport (`tests/pages/sticky.html`), padding, borders, backgrounds and shadows
+   around pictures and canvases, whose rounded corners trim the picture (`tests/pages/replaced.html`), and CSS Animations and Transitions of
    `opacity` and `transform` (`@keyframes`, the `animation-*` and `transition-*` properties, timing functions, fill
    modes, directions, the four events; run when painting, as a compositor would; `tests/pages/animations.html`), and the colour functions of
    `filter` (grayscale, sepia, saturate, hue-rotate, invert, brightness, contrast, opacity; pictures through a colour
@@ -131,7 +132,7 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    pixel arrays against the sizes they must hold, new buffers, textures and renderbuffers hold zeros, and a picture from
    another origin cannot become a texture (pictures are not fetched with CORS yet, so that means any).
    `tests/pages/webgl.html` (41 checks, compared with a reference browser). Not there yet: WebGL 2, the 2D canvas
-   context, `toDataURL`, context loss, antialiasing, and replaced elements (pictures, canvases) have no borders or padding of their own. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
+   context, `toDataURL`, context loss, antialiasing. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
    `getComputedStyle` returns resolved values (CSSOM), `max-height` and `min-height` bound a box as CSS 2 section 10.7
    says, column flex containers shrink their items and flex containers size themselves to their items (Flexbox 9.7
    and 9.9), `overflow: auto` boxes scroll with the wheel and `scrollTop`, fixed boxes stay in the viewport, and

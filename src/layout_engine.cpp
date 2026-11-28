@@ -102,6 +102,7 @@ struct Item {
     int img = -1;
     int svg = -1;              // Image: an svg element, LayoutOut::svgs[svg]
     float aspect = 0;          // Image of an svg: its viewBox width / height, 0 when it has none
+    float edge[4] = {};        // Image: border plus padding on each side (top right bottom left), inside w and h
     std::shared_ptr<Box> box;  // Atomic: inline-block / inline-flex
     Mark m0, m1;
 };
@@ -604,6 +605,28 @@ void addText(Box& b, const std::string& utf8, const Style* st, Node* link, Node*
     }
 }
 
+// The box-shadow list a box paints (null for none), with currentcolor turned into the element's colour
+static std::shared_ptr<const Shadows> boxShadows(const Style& s) {
+    if (!s.boxShadow) return nullptr;
+    auto list = std::make_shared<Shadows>(*s.boxShadow);
+    for (auto& sh : *list) {
+        if (sh.currentColor) sh.c = s.color;
+        sh.c = faded(sh.c, s);
+    }
+    return list;
+}
+// The border and padding around a replaced element's content on each side, top right bottom left (CSS 2, 8.1). A
+// percentage padding counts as 0.
+static void replacedEdges(const Style* s, float e[4]) {
+    for (int i = 0; i < 4; ++i) e[i] = s->border[i] + std::max(0.f, s->padding[i].resolve(0));
+}
+// The content size a replaced element's own width or height gives, -1 for none: what `width: 100px` leaves for the
+// content after `box-sizing: border-box` takes the edges out
+static float replacedSize(const Style* s, const Len& l, float edges) {
+    if (l.u != Len::Px) return -1;
+    return s->borderBox ? std::max(0.f, l.v - edges) : l.v;
+}
+
 void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color bg) {
     if (n->type == Node::T::Text) {
         addText(b, n->text, st, link, inl, bg);
@@ -638,7 +661,9 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
         }
         const ImageRes* im = (idx >= 0 && c.in.images && idx < (int)c.in.images->size()) ? &(*c.in.images)[idx] : nullptr;
         if (im && im->w == 0) im = nullptr;
-        float w = s->width.u == Len::Px ? s->width.v : -1, h = s->height.u == Len::Px ? s->height.v : -1;
+        replacedEdges(s, it.edge);
+        float eH = it.edge[1] + it.edge[3], eV = it.edge[0] + it.edge[2];
+        float w = replacedSize(s, s->width, eH), h = replacedSize(s, s->height, eV);
         if (im) {
             if (w < 0 && h < 0) {
                 w = (float)im->w;
@@ -657,15 +682,15 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
                 return;
             }
             it.k = Item::Image;
-            it.w = std::max(0.f, w);
-            it.h = std::max(0.f, h);
+            it.w = std::max(0.f, w) + eH;
+            it.h = std::max(0.f, h) + eV;
             it.img = -2;
             b.items.push_back(std::move(it));
             return;
         }
         it.k = Item::Image;
-        it.w = w;
-        it.h = h;
+        it.w = w + eH;
+        it.h = h + eV;
         it.img = im ? idx : -1;
         b.items.push_back(std::move(it));
         return;
@@ -730,7 +755,9 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
     if (nm == "canvas") {
         // A replaced element whose natural size is its bitmap's (HTML 4.12.5), with what a context drew as its picture
         float nw = (float)canvas_dimension(n, false), nh = (float)canvas_dimension(n, true);
-        float w = s->width.u == Len::Px ? s->width.v : -1, h = s->height.u == Len::Px ? s->height.v : -1;
+        replacedEdges(s, it.edge);
+        float eH = it.edge[1] + it.edge[3], eV = it.edge[0] + it.edge[2];
+        float w = replacedSize(s, s->width, eH), h = replacedSize(s, s->height, eV);
         if (w < 0 && h < 0) {
             w = nw;
             h = nh;
@@ -744,8 +771,8 @@ void walk(Ctx& c, Box& b, Node* n, const Style* st, Node* link, Node* inl, Color
             if (f != c.in.imgNode->end()) idx = f->second;
         }
         it.k = Item::Image;
-        it.w = w;
-        it.h = h;
+        it.w = w + eH;
+        it.h = h + eV;
         it.img = idx;
         b.items.push_back(std::move(it));
         return;
@@ -1520,27 +1547,58 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                 float iy = baseline - baseOf(it);
                 if (!it.st->hidden) {
                     if (it.k == Item::Image) {
-                        if (!it.st->bg.transparent()) {
-                            DItem bgd;
-                            bgd.k = DItem::K::Rect;
-                            bgd.x = fx;
-                            bgd.y = iy;
-                            bgd.w = it.w;
-                            bgd.h = it.h;
-                            bgd.c = faded(it.st->bg, *it.st);
-                            push(c, std::move(bgd));
+                        const Style& is = *it.st;
+                        std::shared_ptr<const Shadows> shadows = boxShadows(is);
+                        bool borders = is.border[0] > 0 || is.border[1] > 0 || is.border[2] > 0 || is.border[3] > 0;
+                        if (!is.bg.transparent() || borders || shadows) {
+                            DItem deco;
+                            deco.k = DItem::K::Box;
+                            deco.x = fx;
+                            deco.y = iy;
+                            deco.w = it.w;
+                            deco.h = it.h;
+                            deco.c = faded(is.bg, is);
+                            deco.radius = is.radius;
+                            deco.shadows = shadows;
+                            deco.shadowParts = 3;
+                            for (int k = 0; k < 4; ++k) {
+                                deco.bw[k] = is.border[k];
+                                deco.bc[k] = faded(is.borderColor[k], is);
+                            }
+                            push(c, std::move(deco));
+                        }
+                        // the content box; rounded corners trim the picture (CSS Backgrounds 3, 5.3)
+                        float cx = fx + it.edge[3], cy = iy + it.edge[0];
+                        float cw = std::max(0.f, it.w - it.edge[1] - it.edge[3]), ch = std::max(0.f, it.h - it.edge[0] - it.edge[2]);
+                        float inner = is.radius - std::max(it.edge[0], it.edge[3]);
+                        if (inner > 0) {
+                            auto shape = std::make_shared<ClipShape>();
+                            shape->round = Len{Len::Px, inner};
+                            DItem clip;
+                            clip.k = DItem::K::PushClip;
+                            clip.shape = std::move(shape);
+                            clip.x = cx;
+                            clip.y = cy;
+                            clip.w = cw;
+                            clip.h = ch;
+                            push(c, std::move(clip));
                         }
                         DItem d;
                         d.k = it.svg >= 0 ? DItem::K::Svg : DItem::K::Image;
                         d.objectFit = it.st->objectFit;
                         d.objectPos[0] = it.st->objectPos[0];
                         d.objectPos[1] = it.st->objectPos[1];
-                        d.x = fx;
-                        d.y = iy;
-                        d.w = it.w;
-                        d.h = it.h;
+                        d.x = cx;
+                        d.y = cy;
+                        d.w = cw;
+                        d.h = ch;
                         d.img = it.svg >= 0 ? it.svg : it.img;
                         push(c, std::move(d));
+                        if (inner > 0) {
+                            DItem pop;
+                            pop.k = DItem::K::PopClip;
+                            push(c, std::move(pop));
+                        }
                     } else {
                         c.out.widgets.push_back({it.node, fx, iy, it.w, it.h, it.st, (int16_t)std::clamp(c.layer, -30000, 30000)});
                         DItem d;
@@ -1665,14 +1723,16 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                 if ((it.k == Item::Image || it.k == Item::Widget) && it.st) {
                     // Percentage sizes and max-width are relative to the line box.
                     float ow = it.w, oh = it.h;
-                    if (it.st->width.u == Len::Pct) it.w = it.st->width.resolve(avail);
-                    if (it.st->maxWidth.u == Len::Pct || it.st->maxWidth.u == Len::Px) it.w = std::min(it.w, it.st->maxWidth.resolve(avail));
+                    float eH = it.edge[1] + it.edge[3], eV = it.edge[0] + it.edge[2], outer = it.st->borderBox ? 0 : eH;
+                    if (it.st->width.u == Len::Pct) it.w = it.st->width.resolve(avail) + outer;
+                    if (it.st->maxWidth.u == Len::Pct || it.st->maxWidth.u == Len::Px) it.w = std::min(it.w, it.st->maxWidth.resolve(avail) + outer);
                     if (b.fillItem && avail > 0) {
                         WidgetKind wk = it.k == Item::Widget ? widget_kind(it.node) : WidgetKind::None;
                         if (wk != WidgetKind::Check && wk != WidgetKind::Radio) it.w = avail;
                     }
-                    if (it.k == Item::Image && it.w != ow && ow > 0 && it.st->height.u != Len::Px) it.h = oh * it.w / ow;
-                    if (it.k == Item::Image && it.st->height.u == Len::Pct && c.lineBlockH >= 0) it.h = it.st->height.resolve(c.lineBlockH);
+                    if (it.k == Item::Image && it.w != ow && ow > eH && it.st->height.u != Len::Px) it.h = (oh - eV) * (it.w - eH) / (ow - eH) + eV;
+                    if (it.k == Item::Image && it.st->height.u == Len::Pct && c.lineBlockH >= 0)
+                        it.h = it.st->height.resolve(c.lineBlockH) + (it.st->borderBox ? 0 : eV);
                     if (it.svg >= 0) {
                         if (it.st->width.u == Len::Auto && !b.fillItem) it.w = it.st->height.definite() && it.h >= 0 && it.aspect > 0 ? it.h * it.aspect : avail;
                         if (it.h < 0) it.h = it.aspect > 0 ? it.w / it.aspect : 150;
@@ -2458,7 +2518,9 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         // Block-level replaced element: the box hugs the image/control so auto margins can centre it.
         intrinsic(c, b);
         edges(b, cw);
-        float want = s->width.u == Len::Pct ? s->width.resolve(cw) : b.maxW - b.m[1] - b.m[3];
+        float e[4];
+        replacedEdges(s, e);
+        float want = s->width.u == Len::Pct ? s->width.resolve(cw) + (s->borderBox ? 0 : e[1] + e[3]) : b.maxW - b.m[1] - b.m[3];
         if (s->maxWidth.definite()) want = std::min(want, s->maxWidth.resolve(cw));
         if (want < contentW) {
             contentW = want;
@@ -2487,15 +2549,7 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         shapeIdx = push(c, std::move(d));
     }
     bool layers = own && !b.replaced && !s->hidden && s->bgImages && !s->bgImages->images.empty();
-    std::shared_ptr<const Shadows> shadows;
-    if (own && !s->hidden && s->boxShadow) {  // currentcolor becomes the element's colour
-        auto list = std::make_shared<Shadows>(*s->boxShadow);
-        for (auto& sh : *list) {
-            if (sh.currentColor) sh.c = s->color;
-            sh.c = faded(sh.c, *s);
-        }
-        shadows = std::move(list);
-    }
+    std::shared_ptr<const Shadows> shadows = own && !s->hidden ? boxShadows(*s) : nullptr;
     if (own && !b.replaced && !s->hidden &&
         (!s->bg.transparent() || layers || shadows || b.b[0] > 0 || b.b[1] > 0 || b.b[2] > 0 || b.b[3] > 0)) {
         DItem d;
