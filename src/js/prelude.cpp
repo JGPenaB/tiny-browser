@@ -68,6 +68,7 @@ JSFN(arrayCreate) {
 }
 
 JSFN(toPrimitiveString) { return ci.vm.toPrimitive(ci.arg(0), 2); }
+JSFN(toPrimitiveNumber) { return ci.vm.toPrimitive(ci.arg(0), 1); }
 JSFN(toBigIntNative) { return V(ci.vm.toBigInt(ci.arg(0))); }
 
 // Temporal is large and most scripts never use it, so it is compiled the first time something of it is used: the
@@ -85,6 +86,7 @@ JSObject* bundleNatives(Vm& vm, Value& slot, const std::u16string* source) {
     slot = V(natives);
     vm.defFn(natives, "protoFor", protoFor, 2);
     vm.defFn(natives, "toPrimitiveString", toPrimitiveString, 1);
+    vm.defFn(natives, "toPrimitiveNumber", toPrimitiveNumber, 1);
     vm.defFn(natives, "toBigInt", toBigIntNative, 1);
     vm.def(natives, "icu", V(icuNatives(vm)));
     auto src = std::shared_ptr<const std::u16string>(source, [](const std::u16string*) {});
@@ -103,6 +105,17 @@ JSObject* intlNatives(Vm& vm) {
     static const std::u16string* source = joinParts(kIntlJsParts, std::size(kIntlJsParts));
     return bundleNatives(vm, vm.intlNatives, source);
 }
+}  // namespace
+
+Value callIntl(Vm& vm, const char* name, std::initializer_list<Value> args) {
+    std::vector<Value> held(args);
+    RootScope keep(vm, held);
+    Value fn = vm.get(V(intlNatives(vm)), name);
+    return vm.call(fn, Value::undef(), held.data(), (int)held.size());
+}
+
+namespace {
+
 JSFN(makeIntl) { return ci.vm.get(V(intlNatives(ci.vm)), "intl"); }
 JSFN(makeTemporal) { return ci.vm.get(V(temporalNatives(ci.vm)), "temporal"); }
 JSFN(makeToTemporalInstant) { return ci.vm.get(V(temporalNatives(ci.vm)), "toTemporalInstant"); }

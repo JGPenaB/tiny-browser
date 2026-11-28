@@ -26,6 +26,10 @@ function throwType(message) { throw new $TypeError(message); }
 function toObject(v) { if (v === undefined || v === null) throwType('Cannot convert undefined or null to object'); return $ObjectCtor(v); }
 function isObject(x) { return (typeof x === 'object' && x !== null) || typeof x === 'function'; }
 function toString(x) { if (typeof x === 'symbol') throwType('Cannot convert a Symbol value to a string'); return `${x}`; }
+// Records the engine keeps for itself have no prototype, so a setter a page puts on Object.prototype never sees them
+function record(o) { setPrototypeOf(o, null); return o; }
+// CreateDataPropertyOrThrow, for the objects handed to the page
+function createDataProperty(o, key, value) { defineProperty(o, key, { value: value, writable: true, enumerable: true, configurable: true }); }
 function contains(list, x) { return arrayIndexOf(list, x) >= 0; }
 // An array made by the engine for its own use: index writes cannot reach setters on Array.prototype
 function list() { var a = []; setPrototypeOf(a, null); return a; }
@@ -112,7 +116,7 @@ function parseTag(tag) {
   if (tag.length === 0 || !allOf(tag, function (c) { return isAlnumCode(c) || c === 45; })) return undefined;
   var parts = strSplit(toLowerCase(tag), '-');
   for (var p = 0; p < parts.length; p++) if (parts[p].length === 0 || parts[p].length > 8) return undefined;
-  var result = { extensions: list(), privateUse: undefined };
+  var result = record({ extensions: list(), privateUse: undefined });
   var i = parseLanguageId(parts, 0, result);
   if (i < 0) return undefined;
   var singletons = list();
@@ -136,7 +140,7 @@ function parseTag(tag) {
     else if (singleton === 't') ext = parseTransformedExtension(sub);
     else {
       for (var k = 0; k < sub.length; k++) if (!isAlnum(sub[k], 2, 8)) return undefined;
-      ext = { singleton: singleton, value: arrayJoin(sub, '-') };
+      ext = record({ singleton: singleton, value: arrayJoin(sub, '-') });
     }
     if (ext === undefined) return undefined;
     push(result.extensions, ext);
@@ -145,7 +149,7 @@ function parseTag(tag) {
 }
 function isUKey(s) { return s.length === 2 && isAlnumCode(charCodeAt(s, 0)) && isAlphaCode(charCodeAt(s, 1)); }
 function parseUnicodeExtension(sub) {
-  var ext = { singleton: 'u', attributes: list(), keywords: list() }, i = 0;
+  var ext = record({ singleton: 'u', attributes: list(), keywords: list() }), i = 0;
   while (i < sub.length && isAlnum(sub[i], 3, 8)) push(ext.attributes, sub[i++]);
   while (i < sub.length) {
     if (!isUKey(sub[i])) return undefined;
@@ -157,9 +161,9 @@ function parseUnicodeExtension(sub) {
 }
 function isTKey(s) { return s.length === 2 && isAlphaCode(charCodeAt(s, 0)) && isDigitCode(charCodeAt(s, 1)); }
 function parseTransformedExtension(sub) {
-  var ext = { singleton: 't', tlang: undefined, fields: list() }, i = 0;
+  var ext = record({ singleton: 't', tlang: undefined, fields: list() }), i = 0;
   if (isLanguageSubtag(sub[0])) {
-    ext.tlang = {};
+    ext.tlang = record({});
     i = parseLanguageId(sub, 0, ext.tlang);
     if (i < 0) return undefined;
   }
@@ -473,7 +477,7 @@ function resolveLocale(requested, options, relevantKeys, localeData) {
   if (match === undefined) match = { locale: defaultLocale(), extension: undefined };
   var foundLocale = match.locale, data = localeData === undefined ? undefined : localeData(foundLocale);
   var ufields = match.extension === undefined ? list() : match.extension.keywords;
-  var retained = list(), result = { dataLocale: foundLocale, localeData: data };
+  var retained = list(), result = record({ dataLocale: foundLocale, localeData: data });
   for (var i = 0; i < relevantKeys.length; i++) {
     var key = relevantKeys[i], supported = data[key], value = supported[0], retainedField;
     for (var j = 0; j < ufields.length; j++) {

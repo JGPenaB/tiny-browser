@@ -25,14 +25,14 @@ function updateLanguageId(tag, options) {
       push(seen, subtags[i]);
     }
   }
-  var rest = { language: '', script: undefined, region: undefined, variants: list(), extensions: parsed.extensions, privateUse: parsed.privateUse };
+  var rest = record({ language: '', script: undefined, region: undefined, variants: list(), extensions: parsed.extensions, privateUse: parsed.privateUse });
   var newTag = language + (script !== undefined ? '-' + script : '') + (region !== undefined ? '-' + region : '') + (variants !== undefined ? '-' + variants : '');
   return newTag + strSlice(tagString(rest), 0);
 }
 // MakeLocaleRecord (15.1.3)
 function makeLocaleRecord(tag, opt) {
   var parsed = parseTag(tag), ext = unicodeExtensionOf(parsed);
-  var attributes = ext === undefined ? list() : ext.attributes, ufields = list(), result = {}, i;
+  var attributes = ext === undefined ? list() : ext.attributes, ufields = list(), result = record({}), i;
   if (ext !== undefined) for (i = 0; i < ext.keywords.length; i++) push(ufields, [ext.keywords[i][0], ext.keywords[i][1]]);
   for (i = 0; i < LOCALE_KEYS.length; i++) {
     var key = LOCALE_KEYS[i], field, value;
@@ -59,7 +59,7 @@ function createLocale(tag, options, newTarget) {
   if (!isWellFormedLanguageTag(tag)) throwRange(tag + ' is not a well-formed language tag');
   tag = canonicalizeLocaleId(tag);
   tag = updateLanguageId(tag, options);
-  var opt = {};
+  var opt = record({});
   opt.ca = getOption(options, 'calendar', 'string', undefined, undefined); checkType(opt.ca);
   opt.co = getOption(options, 'collation', 'string', undefined, undefined); checkType(opt.co);
   var fw = getOption(options, 'firstDayOfWeek', 'string', undefined, undefined);
@@ -243,11 +243,11 @@ class Locale extends $Object {
   getHourCycles() { return hourCyclesOfLocale(localeOf(this)); }
   getNumberingSystems() { return numberingSystemsOfLocale(localeOf(this)); }
   getTimeZones() { return timeZonesOfLocale(localeOf(this)); }
-  getTextInfo() { var info = {}; info.direction = textDirectionOfLocale(localeOf(this)); return info; }
+  getTextInfo() { var info = {}; createDataProperty(info, 'direction', textDirectionOfLocale(localeOf(this))); return info; }
   getWeekInfo() {
     var w = weekInfoOfLocale(localeOf(this)), info = {};
-    info.firstDay = w.firstDay;
-    info.weekend = toArray(w.weekend);
+    createDataProperty(info, 'firstDay', w.firstDay);
+    createDataProperty(info, 'weekend', toArray(w.weekend));
     return info;
   }
 }

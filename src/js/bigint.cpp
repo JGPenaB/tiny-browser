@@ -370,7 +370,7 @@ JSFN(bigintToString) {
     }
     return vm.strv(bigToString(b, (int)radix));
 }
-JSFN(bigintToLocaleString) { return ci.vm.strv(bigToString(thisBigInt(ci), 10)); }
+JSFN(bigintToLocaleString) { return callIntl(ci.vm, "numberToLocaleString", {V(thisBigInt(ci)), ci.arg(0), ci.arg(1)}); }  // ECMA-402 20.3.1
 JSFN(bigintValueOf) { return V(thisBigInt(ci)); }
 
 }  // namespace

@@ -35,6 +35,8 @@ Value runIndirectEval(Vm& vm, FuncProto* code);
 void setupProxy(Vm& vm);
 void setupBigInt(Vm& vm);
 void setupJsBuiltins(Vm& vm);
+// Calls one of the functions the Intl bundle leaves on its natives object (src/js/intl), building Intl first if needed
+Value callIntl(Vm& vm, const char* name, std::initializer_list<Value> args);
 // File name of the built-ins written in JavaScript: their functions print as native code.
 constexpr const char* kBuiltinFile = "<builtins>";
 void setupArrayMethods(Vm& vm, JSObject* proto, JSNative* ctor);

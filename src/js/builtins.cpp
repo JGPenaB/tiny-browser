@@ -1100,22 +1100,8 @@ JSFN(numberToExponential) {
     roundDigits(digits, point, (int)fd + 1);
     return vm.strv(sign + exponentText(digits, point - 1));
 }
-JSFN(numberToLocaleString) {
-    Vm& vm = ci.vm;
-    double d = thisNumber(ci);
-    if (!std::isfinite(d)) return V(vm.numberToString(d));
-    char buf[512];
-    snprintf(buf, sizeof buf, "%.3f", std::fabs(d));
-    std::string s = buf, frac = s.substr(s.find('.') + 1), ip = s.substr(0, s.find('.'));
-    while (!frac.empty() && frac.back() == '0') frac.pop_back();
-    std::string out;
-    for (size_t i = 0; i < ip.size(); ++i) {
-        if (i && (ip.size() - i) % 3 == 0) out += ',';
-        out += ip[i];
-    }
-    if (!frac.empty()) out += "." + frac;
-    if (d < 0 && out != "0") out.insert(out.begin(), '-');
-    return vm.strv(out);
+JSFN(numberToLocaleString) {  // ECMA-402 20.2.1: through Intl.NumberFormat
+    return callIntl(ci.vm, "numberToLocaleString", {Value::num(thisNumber(ci)), ci.arg(0), ci.arg(1)});
 }
 JSFN(numberIsInteger) {
     Value v = ci.arg(0);

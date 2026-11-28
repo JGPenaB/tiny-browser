@@ -3,6 +3,7 @@
 // natives made here. Only plain data crosses the bridge: strings, numbers and arrays.
 #include "builtins.h"
 #include "icu_bridge.h"
+#include <windows.h>
 #include <icu.h>
 #include <cstring>
 #include <unordered_map>
@@ -11,6 +12,7 @@ namespace tb::js {
 namespace {
 
 std::u16string fromUChars(const UChar* s, int32_t n) { return std::u16string((const char16_t*)s, (size_t)n); }
+std::u16string fromAsciiKey(const std::string& s) { return std::u16string(s.begin(), s.end()); }
 std::string toAscii(const std::u16string& s) {  // locale ids and resource keys are ASCII
     std::string out;
     out.reserve(s.size());
@@ -229,6 +231,198 @@ JSFN(defaultTimeZone) {
     return U_FAILURE(err) ? Value::undef() : V(ci.vm.str(fromUChars(out, n)));
 }
 
+// ---------------------------------------------------------------- formatted values
+// ICU functions newer than the Windows SDK's icu.h and icu.lib, looked up in icu.dll by name (ICU 68 and later)
+struct UNumberRangeFormatter;
+struct UFormattedNumberRange;
+template <class F>
+F icuFunction(const char* name) {
+    static HMODULE icu = GetModuleHandleW(L"icu.dll");
+    return icu ? (F)GetProcAddress(icu, name) : nullptr;
+}
+std::u16string ustring(Vm& vm, Value v) { return vm.toString(v)->s; }
+// A formatted string as text, or with parts: [text, category, field, start, end, ...] for every field ICU reports
+Value formattedValue(Vm& vm, const UFormattedValue* value, bool parts, UErrorCode& err) {
+    int32_t n = 0;
+    const UChar* s = ufmtval_getString(value, &n, &err);
+    if (U_FAILURE(err)) return Value::undef();
+    JSString* text = vm.str(fromUChars(s, n));
+    if (!parts) return V(text);
+    JSArray* a = vm.newArray();
+    std::vector<Value> held{V(a)};
+    RootScope keep(vm, held);
+    a->elems.push_back(V(text));
+    UConstrainedFieldPosition* pos = ucfpos_open(&err);
+    while (U_SUCCESS(err) && ufmtval_nextPosition(value, pos, &err)) {
+        int32_t start = 0, end = 0;
+        ucfpos_getIndexes(pos, &start, &end, &err);
+        a->elems.push_back(Value::num(ucfpos_getCategory(pos, &err)));
+        a->elems.push_back(Value::num(ucfpos_getField(pos, &err)));
+        a->elems.push_back(Value::num(start));
+        a->elems.push_back(Value::num(end));
+    }
+    ucfpos_close(pos);
+    return V(a);
+}
+// Formatters are slow to make and pages make the same few again and again: they are kept, by locale and skeleton.
+template <class T, void (*Close)(T*)>
+struct FormatterCache {
+    std::unordered_map<std::u16string, T*> map;
+    ~FormatterCache() { for (auto& e : map) if (e.second) Close(e.second); }
+    T* find(const std::u16string& key) { auto it = map.find(key); return it == map.end() ? nullptr : it->second; }
+    void put(const std::u16string& key, T* f) {
+        if (map.size() >= 256) {  // a page that makes formatters without end: start over
+            for (auto& e : map) if (e.second) Close(e.second);
+            map.clear();
+        }
+        map[key] = f;
+    }
+};
+void closeNumberRangeFormatter(UNumberRangeFormatter* f) {
+    if (auto close = icuFunction<void (*)(UNumberRangeFormatter*)>("unumrf_close")) close(f);
+}
+UNumberFormatter* numberFormatter(const std::string& locale, const std::u16string& skeleton, UErrorCode& err) {
+    thread_local FormatterCache<UNumberFormatter, unumf_close> cache;
+    std::u16string key = fromAsciiKey(locale) + u'|' + skeleton;
+    if (UNumberFormatter* f = cache.find(key)) return f;
+    UNumberFormatter* f = unumf_openForSkeletonAndLocale((const UChar*)skeleton.data(), (int32_t)skeleton.size(), locale.c_str(), &err);
+    if (U_FAILURE(err)) return nullptr;
+    cache.put(key, f);
+    return f;
+}
+// numberFormat(locale, skeleton, decimal, parts): decimal is a number as a decimal string ("-1.5e+21", "NaN", "-Infinity")
+JSFN(numberFormat) {
+    Vm& vm = ci.vm;
+    UErrorCode err = U_ZERO_ERROR;
+    UNumberFormatter* f = numberFormatter(toAscii(ustring(vm, ci.arg(0))), ustring(vm, ci.arg(1)), err);
+    if (!f) vm.throwError(Err::RangeError, "The number format cannot be made");
+    std::string decimal = toAscii(ustring(vm, ci.arg(2)));
+    UFormattedNumber* result = unumf_openResult(&err);
+    unumf_formatDecimal(f, decimal.c_str(), (int32_t)decimal.size(), result, &err);
+    Value v = formattedValue(vm, unumf_resultAsValue(result, &err), vm.toBool(ci.arg(3)), err);
+    unumf_closeResult(result);
+    if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The number cannot be formatted");
+    return v;
+}
+// numberFormatRange(locale, skeleton, start, end, parts): as numberFormat, for a range; with parts, the range spans are
+// fields of category UFIELD_CATEGORY_NUMBER_RANGE_SPAN
+JSFN(numberFormatRange) {
+    Vm& vm = ci.vm;
+    using Open = UNumberRangeFormatter* (*)(const UChar*, int32_t, int, int, const char*, UParseError*, UErrorCode*);
+    using OpenResult = UFormattedNumberRange* (*)(UErrorCode*);
+    using Format = void (*)(const UNumberRangeFormatter*, const char*, int32_t, const char*, int32_t, UFormattedNumberRange*, UErrorCode*);
+    using AsValue = const UFormattedValue* (*)(const UFormattedNumberRange*, UErrorCode*);
+    using CloseResult = void (*)(UFormattedNumberRange*);
+    static Open open = icuFunction<Open>("unumrf_openForSkeletonWithCollapseAndIdentityFallback");
+    static OpenResult openResult = icuFunction<OpenResult>("unumrf_openResult");
+    static Format format = icuFunction<Format>("unumrf_formatDecimalRange");
+    static AsValue asValue = icuFunction<AsValue>("unumrf_resultAsValue");
+    static CloseResult closeResult = icuFunction<CloseResult>("unumrf_closeResult");
+    if (!open || !openResult || !format || !asValue || !closeResult) vm.throwError(Err::RangeError, "This version of Windows cannot format number ranges");
+    thread_local FormatterCache<UNumberRangeFormatter, closeNumberRangeFormatter> cache;
+    std::string locale = toAscii(ustring(vm, ci.arg(0)));
+    std::u16string skeleton = ustring(vm, ci.arg(1));
+    std::u16string key = fromAsciiKey(locale) + u'|' + skeleton;
+    UErrorCode err = U_ZERO_ERROR;
+    UNumberRangeFormatter* f = cache.find(key);
+    if (!f) {
+        UParseError perr;
+        f = open((const UChar*)skeleton.data(), (int32_t)skeleton.size(), 0 /* UNUM_RANGE_COLLAPSE_AUTO */,
+                 2 /* UNUM_IDENTITY_FALLBACK_APPROXIMATELY */, locale.c_str(), &perr, &err);
+        if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The number format cannot be made");
+        cache.put(key, f);
+    }
+    std::string start = toAscii(ustring(vm, ci.arg(2))), end = toAscii(ustring(vm, ci.arg(3)));
+    UFormattedNumberRange* result = openResult(&err);
+    format(f, start.c_str(), (int32_t)start.size(), end.c_str(), (int32_t)end.size(), result, &err);
+    Value v = formattedValue(vm, asValue(result, &err), vm.toBool(ci.arg(4)), err);
+    closeResult(result);
+    if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The numbers cannot be formatted");
+    return v;
+}
+// currencyDigits(code): the minor unit digits of an ISO 4217 currency
+JSFN(currencyDigits) {
+    std::u16string code = ustring(ci.vm, ci.arg(0));
+    UErrorCode err = U_ZERO_ERROR;
+    int32_t digits = ucurr_getDefaultFractionDigits((const UChar*)code.c_str(), &err);
+    return Value::num(U_FAILURE(err) ? 2 : digits);
+}
+// ---------------------------------------------------------------- plural rules
+UPluralRules* pluralRules(const std::string& locale, bool ordinal) {
+    thread_local FormatterCache<UPluralRules, uplrules_close> cache;
+    std::u16string key = fromAsciiKey(locale) + (ordinal ? u"|o" : u"|c");
+    if (UPluralRules* r = cache.find(key)) return r;
+    UErrorCode err = U_ZERO_ERROR;
+    UPluralRules* r = uplrules_openForType(locale.c_str(), ordinal ? UPLURAL_TYPE_ORDINAL : UPLURAL_TYPE_CARDINAL, &err);
+    if (U_FAILURE(err)) return nullptr;
+    cache.put(key, r);
+    return r;
+}
+// pluralSelect(locale, ordinal, skeleton, decimal): the plural category of the number as the skeleton formats it
+JSFN(pluralSelect) {
+    Vm& vm = ci.vm;
+    std::string locale = toAscii(ustring(vm, ci.arg(0)));
+    UPluralRules* rules = pluralRules(locale, vm.toBool(ci.arg(1)));
+    UErrorCode err = U_ZERO_ERROR;
+    UNumberFormatter* f = numberFormatter(locale, ustring(vm, ci.arg(2)), err);
+    if (!rules || !f) vm.throwError(Err::RangeError, "The plural rules cannot be made");
+    std::string decimal = toAscii(ustring(vm, ci.arg(3)));
+    UFormattedNumber* result = unumf_openResult(&err);
+    unumf_formatDecimal(f, decimal.c_str(), (int32_t)decimal.size(), result, &err);
+    UChar keyword[32];
+    int32_t n = uplrules_selectFormatted(rules, result, keyword, 32, &err);
+    unumf_closeResult(result);
+    return U_FAILURE(err) ? V(vm.str(std::string_view("other"))) : V(vm.str(fromUChars(keyword, n)));
+}
+// pluralSelectRange(locale, ordinal, skeleton, start, end)
+JSFN(pluralSelectRange) {
+    Vm& vm = ci.vm;
+    using SelectForRange = int32_t (*)(const UPluralRules*, const UFormattedNumberRange*, UChar*, int32_t, UErrorCode*);
+    static SelectForRange select = icuFunction<SelectForRange>("uplrules_selectForRange");
+    using Open = UNumberRangeFormatter* (*)(const UChar*, int32_t, int, int, const char*, UParseError*, UErrorCode*);
+    using OpenResult = UFormattedNumberRange* (*)(UErrorCode*);
+    using Format = void (*)(const UNumberRangeFormatter*, const char*, int32_t, const char*, int32_t, UFormattedNumberRange*, UErrorCode*);
+    using CloseResult = void (*)(UFormattedNumberRange*);
+    static Open open = icuFunction<Open>("unumrf_openForSkeletonWithCollapseAndIdentityFallback");
+    static OpenResult openResult = icuFunction<OpenResult>("unumrf_openResult");
+    static Format format = icuFunction<Format>("unumrf_formatDecimalRange");
+    static CloseResult closeResult = icuFunction<CloseResult>("unumrf_closeResult");
+    std::string locale = toAscii(ustring(vm, ci.arg(0)));
+    UPluralRules* rules = pluralRules(locale, vm.toBool(ci.arg(1)));
+    if (!select || !open || !openResult || !format || !closeResult || !rules) return V(vm.str(std::string_view("other")));
+    std::u16string skeleton = ustring(vm, ci.arg(2));
+    UErrorCode err = U_ZERO_ERROR;
+    UParseError perr;
+    UNumberRangeFormatter* f = open((const UChar*)skeleton.data(), (int32_t)skeleton.size(), 0, 2, locale.c_str(), &perr, &err);
+    std::string start = toAscii(ustring(vm, ci.arg(3))), end = toAscii(ustring(vm, ci.arg(4)));
+    UFormattedNumberRange* result = openResult(&err);
+    if (f) format(f, start.c_str(), (int32_t)start.size(), end.c_str(), (int32_t)end.size(), result, &err);
+    UChar keyword[32];
+    int32_t n = U_SUCCESS(err) ? select(rules, result, keyword, 32, &err) : 0;
+    closeResult(result);
+    if (f) closeNumberRangeFormatter(f);
+    return U_FAILURE(err) ? V(vm.str(std::string_view("other"))) : V(vm.str(fromUChars(keyword, n)));
+}
+// pluralKeywords(locale, ordinal): the categories the locale's rules use
+JSFN(pluralKeywords) {
+    Vm& vm = ci.vm;
+    UPluralRules* rules = pluralRules(toAscii(ustring(vm, ci.arg(0))), vm.toBool(ci.arg(1)));
+    JSArray* a = vm.newArray();
+    std::vector<Value> held{V(a)};
+    RootScope keep(vm, held);
+    if (!rules) return V(a);
+    UErrorCode err = U_ZERO_ERROR;
+    UEnumeration* e = uplrules_getKeywords(rules, &err);
+    int32_t n = 0;
+    while (U_SUCCESS(err)) {
+        const char* s = uenum_next(e, &n, &err);
+        if (!s) break;
+        a->elems.push_back(V(vm.str(std::string_view(s, n))));
+    }
+    uenum_close(e);
+    return V(a);
+}
+
 }  // namespace
 
 JSObject* icuNatives(Vm& vm) {
@@ -244,6 +438,12 @@ JSObject* icuNatives(Vm& vm) {
     vm.defFn(o, "tzOffset", tzOffset, 2);
     vm.defFn(o, "tzTransition", tzTransition, 3);
     vm.defFn(o, "defaultTimeZone", defaultTimeZone, 0);
+    vm.defFn(o, "numberFormat", numberFormat, 4);
+    vm.defFn(o, "numberFormatRange", numberFormatRange, 5);
+    vm.defFn(o, "currencyDigits", currencyDigits, 1);
+    vm.defFn(o, "pluralSelect", pluralSelect, 4);
+    vm.defFn(o, "pluralSelectRange", pluralSelectRange, 5);
+    vm.defFn(o, "pluralKeywords", pluralKeywords, 2);
     return o;
 }
 

@@ -7,13 +7,20 @@ function method(name, fn, length) {  // a built-in function: no prototype, not a
   defineProperty(f, 'length', { value: length, writable: false, enumerable: false, configurable: true });
   return f;
 }
-var classes = { Locale: Locale };
+var classes = { Locale: Locale, PluralRules: PluralRules };
 var classNames = getOwnPropertyNames(classes);
 for (var ci = 0; ci < classNames.length; ci++) {
   var cls = classes[classNames[ci]];
   setPrototypeOf(cls, Function.prototype);  // `extends Object` only spares the constructors a `this` they never use
   tag(cls.prototype, 'Intl.' + classNames[ci]);
   hidden(Intl, classNames[ci], cls);
+}
+// the constructors written as functions, because they may also be called as functions (4.3 Note 1)
+var functions = { NumberFormat: NumberFormat };
+var functionNames = getOwnPropertyNames(functions);
+for (var fi = 0; fi < functionNames.length; fi++) {
+  tag(functions[functionNames[fi]].prototype, 'Intl.' + functionNames[fi]);
+  hidden(Intl, functionNames[fi], functions[functionNames[fi]]);
 }
 hidden(Intl, 'getCanonicalLocales', method('getCanonicalLocales', function (locales) { return toArray(canonicalizeLocaleList(locales)); }, 1));
 hidden(Intl, 'supportedValuesOf', method('supportedValuesOf', supportedValuesOf, 1));
