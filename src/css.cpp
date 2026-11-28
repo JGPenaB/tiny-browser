@@ -717,11 +717,17 @@ bool parse_compound(std::string_view s, size_t& i, Compound& c, uint32_t& spec) 
                 c.pseudos.push_back(std::move(hp));
                 continue;
             }
-            if (elem || in(name, {"before", "after", "first-line", "first-letter", "selection", "placeholder", "marker",
-                                  "backdrop", "file-selector-button"})) {
+            if ((name == "before" || name == "after") && arg.empty()) {  // CSS 2 12.1, CSS Pseudo-Elements 4: with one colon or two
+                if (c.pseudoElement) c.never = true;
+                c.pseudoElement = name == "before" ? 1 : 2;
+                spec += 1;
+                continue;
+            }
+            if (elem || in(name, {"first-line", "first-letter", "selection", "placeholder", "marker", "backdrop", "file-selector-button"})) {
                 c.never = true;
                 continue;
             }
+            if (c.pseudoElement) c.never = true;  // a pseudo-class after a pseudo-element is not supported
             spec += 1 << 10;
             Pseudo p;
             if (name == "first-child")
@@ -777,6 +783,7 @@ bool parse_selector(std::string_view s, Selector& out) {
     while (true) {
         Compound c;
         if (!parse_compound(s, i, c, out.spec)) return false;
+        if (!out.parts.empty() && out.parts.back().pseudoElement) return false;  // a pseudo-element ends a selector
         out.parts.push_back(std::move(c));
         size_t before = i;
         while (i < s.size() && isws(s[i])) ++i;
@@ -1492,7 +1499,9 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
     const float fs = s.fontSize;
     auto T = tokens(lv);
 
-    if (prop == "display") {
+    if (prop == "content") {
+        s.content = std::string(trim(val));
+    } else if (prop == "display") {
         Display d;
         if (parse_display(lv, d)) s.display = d;
     } else if (prop == "color") {
@@ -1942,6 +1951,10 @@ void StyleEngine::build(float vw) {
     byClass_.clear();
     byTag_.clear();
     uni_.clear();
+    pseudoById_.clear();
+    pseudoByClass_.clear();
+    pseudoByTag_.clear();
+    pseudoUni_.clear();
     hasMedia_ = false;
     uint32_t order = 1;
     for (auto& [sh, ua, scope] : sheets_) {
@@ -1955,14 +1968,15 @@ void StyleEngine::build(float vw) {
             uint32_t idx = (uint32_t)all_.size() - 1;
             const Compound& last = r.sel.parts.back();
             if (last.never) continue;
+            bool gen = last.pseudoElement != 0;
             if (!last.id.empty())
-                byId_[last.id].push_back(idx);
+                (gen ? pseudoById_ : byId_)[last.id].push_back(idx);
             else if (!last.classes.empty())
-                byClass_[last.classes[0]].push_back(idx);
+                (gen ? pseudoByClass_ : byClass_)[last.classes[0]].push_back(idx);
             else if (!last.tag.empty())
-                byTag_[last.tag].push_back(idx);
+                (gen ? pseudoByTag_ : byTag_)[last.tag].push_back(idx);
             else
-                uni_.push_back(idx);
+                (gen ? pseudoUni_ : uni_).push_back(idx);
         }
     }
 }
@@ -1987,7 +2001,7 @@ void StyleEngine::computeTree(Node* e, const Style& parent) {
     if (e->shadow)  // children no slot takes are not rendered: FlatKids leaves them out, and they keep no style
         for (auto& k : e->kids) k->style.reset();
     for (Node* k : FlatKids(e))
-        if (k->type == Node::T::Element) computeTree(k, *e->style);
+        if (k->type == Node::T::Element && k != e->before.get() && k != e->after.get()) computeTree(k, *e->style);
 }
 
 void StyleEngine::computeElem(Node* e, const Style& parent) {
@@ -2069,10 +2083,154 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
         else if (s->display == Display::InlineFlex) s->display = Display::Flex;
     }
     e->style = std::move(s);
+
+    // ::before and ::after (CSS 2 12.1): their rules cascade like the element's own, over its style
+    e->before.reset();
+    e->after.reset();
+    if (pseudoById_.empty() && pseudoByClass_.empty() && pseudoByTag_.empty() && pseudoUni_.empty()) return;
+    if (e->style->display == Display::None || replaced_like(e)) return;
+    cand_.clear();
+    if (!e->id.empty()) addAll(pseudoById_, e->id);
+    for (auto& c : e->classes) addAll(pseudoByClass_, c);
+    addAll(pseudoByTag_, e->name);
+    cand_.insert(cand_.end(), pseudoUni_.begin(), pseudoUni_.end());
+    if (cand_.empty()) return;
+    std::sort(cand_.begin(), cand_.end());
+    cand_.erase(std::unique(cand_.begin(), cand_.end()), cand_.end());
+    Cascade P[3];
+    for (uint32_t idx : cand_) {
+        const IR& ir = all_[idx];
+        int role = ir.ua || ir.scope == own ? 0 : asHost && ir.scope == asHost ? 1 : asSlotted && ir.scope == asSlotted ? 2 : -1;
+        if (role < 0) continue;
+        g_selectorScope = ir.ua ? own : ir.scope;
+        g_scopeRole = role;
+        bool hit = match_at(ir.r->sel, (int)ir.r->sel.parts.size() - 1, e);
+        g_selectorScope = nullptr;
+        g_scopeRole = 0;
+        if (!hit) continue;
+        for (const Decl& d : *ir.r->decls) {
+            int lvl = d.important ? (ir.ua ? 5 : 3) : (ir.ua ? 0 : 1);
+            P[ir.r->sel.parts.back().pseudoElement].push_back({key(lvl, role ? 0 : ir.r->sel.spec, role ? 0 : ir.order), &d});
+        }
+    }
+    for (uint8_t kind = 1; kind <= 2; ++kind)
+        if (!P[kind].empty()) computePseudo(e, kind, P[kind]);
+}
+
+namespace {
+// A CSS string token's value: the quotes taken off and the escapes resolved (CSS Syntax 3, 4.3.5 and 4.3.7)
+std::string css_string_value(std::string_view s, size_t& i) {
+    char q = s[i++];
+    std::string out;
+    while (i < s.size() && s[i] != q) {
+        char ch = s[i++];
+        if (ch != '\\') { out += ch; continue; }
+        if (i >= s.size()) break;
+        if (s[i] == '\n') { ++i; continue; }
+        int n = 0;
+        uint32_t cp = 0;
+        while (n < 6 && i < s.size() && isxdigit((unsigned char)s[i])) {
+            cp = cp * 16 + (uint32_t)(isdigit((unsigned char)s[i]) ? s[i] - '0' : (tolower(s[i]) - 'a' + 10));
+            ++i;
+            ++n;
+        }
+        if (n == 0) { out += s[i++]; continue; }
+        if (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n')) ++i;
+        if (cp == 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+        if (cp < 0x80) out += (char)cp;
+        else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 63)); }
+        else if (cp < 0x10000) { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 63)); out += (char)(0x80 | (cp & 63)); }
+        else {
+            out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 63));
+            out += (char)(0x80 | ((cp >> 6) & 63)); out += (char)(0x80 | (cp & 63));
+        }
+    }
+    if (i < s.size()) ++i;
+    return out;
+}
+// The text `content` generates for an element's ::before or ::after (CSS Generated Content 3, 1.1), or false when it
+// generates no box: none, normal, or a value this engine cannot read. Counters are not kept yet; they make no text.
+bool generated_text(const Node* e, std::string_view v, std::string& out) {
+    std::string_view t = trim(v);
+    std::string lv = lower(t);
+    if (lv.empty() || lv == "none" || lv == "normal") return false;
+    size_t i = 0;
+    while (i < t.size()) {
+        if (isws(t[i])) { ++i; continue; }
+        if (t[i] == '"' || t[i] == '\'') { out += css_string_value(t, i); continue; }
+        if (t[i] == '/') break;  // alternative text for speech follows
+        size_t st = i;
+        while (i < t.size() && (isalnum((unsigned char)t[i]) || t[i] == '-' || t[i] == '_')) ++i;
+        std::string word = lower(t.substr(st, i - st));
+        if (i < t.size() && t[i] == '(') {
+            size_t close = t.find(')', i);
+            if (close == std::string_view::npos) return false;
+            std::string arg(trim(t.substr(i + 1, close - i - 1)));
+            i = close + 1;
+            if (word == "attr") {
+                if (auto a = e->attr(lower(arg))) out += *a;
+            } else if (word != "counter" && word != "counters" && word != "url" && word != "image-set" && word != "linear-gradient")
+                return false;
+            continue;
+        }
+        if (word == "open-quote") out += "\xE2\x80\x9C";
+        else if (word == "close-quote") out += "\xE2\x80\x9D";
+        else if (word == "no-open-quote" || word == "no-close-quote") {
+        } else
+            return false;
+        if (i == st) ++i;
+    }
+    return true;
+}
+}  // namespace
+
+void StyleEngine::computePseudo(Node* e, uint8_t kind, Cascade& L) {
+    std::stable_sort(L.begin(), L.end(), [](auto& a, auto& b) { return a.first < b.first; });
+    const Style& parent = *e->style;
+    auto s = std::make_unique<Style>();
+    inherit(*s, parent);
+    for (auto& p : L)
+        if (p.second->prop.size() > 2 && p.second->prop[0] == '-' && p.second->prop[1] == '-') {
+            auto m = s->vars ? std::make_shared<VarMap>(*s->vars) : std::make_shared<VarMap>();
+            (*m)[p.second->prop] = p.second->val;
+            s->vars = std::move(m);
+        }
+    for (auto& p : L)
+        if (istarts(p.second->prop, "font")) apply(*s, parent, p.second->prop, p.second->val);
+    for (auto& p : L) {
+        const std::string& pr = p.second->prop;
+        if (!istarts(pr, "font") && !(pr.size() > 1 && pr[0] == '-' && pr[1] == '-')) apply(*s, parent, pr, p.second->val);
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (s->borderStyle[i] == 0) s->border[i] = 0;
+        if (s->borderColor[i].a < 0) s->borderColor[i] = s->color;
+    }
+    if (s->opacity0 && !s->animated) s->hidden = true;
+    s->alpha = parent.alpha * (s->opacity0 ? 1.f : s->opacity);
+    if (s->position == 2 || s->position == 3) {
+        if (s->display == Display::Inline || s->display == Display::InlineBlock) s->display = Display::Block;
+        else if (s->display == Display::InlineFlex) s->display = Display::Flex;
+    }
+    std::string text;
+    if (s->display == Display::None || !generated_text(e, s->content, text)) return;
+    auto box = std::make_unique<Node>();
+    box->type = Node::T::Element;
+    box->name = kind == 1 ? "::before" : "::after";
+    box->parent = e;
+    box->style = std::move(s);
+    if (!text.empty()) {
+        auto t = std::make_unique<Node>();
+        t->type = Node::T::Text;
+        t->text = std::move(text);
+        box->append(std::move(t));
+    }
+    (kind == 1 ? e->before : e->after) = std::move(box);
 }
 
 // Selector access for the scripting layer (querySelector, matches, closest).
 bool selector_parse(std::string_view text, Selector& out) { return parse_selector(text, out) && !out.parts.empty(); }
-bool selector_matches(const Selector& s, const Node* e) { return !s.parts.empty() && match_at(s, (int)s.parts.size() - 1, e); }
+bool selector_matches(const Selector& s, const Node* e) {  // a pseudo-element is never an element the DOM can give
+    return !s.parts.empty() && !s.parts.back().pseudoElement && match_at(s, (int)s.parts.size() - 1, e);
+}
 
 }  // namespace tb

@@ -76,7 +76,8 @@ static void flatten_into(const Node* from, std::vector<Node*>& out, int depth) {
     }
 }
 FlatKids::FlatKids(const Node* n) {
-    if (g_shadowRoots == 0) {
+    bool generated = n->before || n->after;
+    if (g_shadowRoots == 0 && !generated) {
         plain_ = &n->kids;
         return;
     }
@@ -84,11 +85,15 @@ FlatKids::FlatKids(const Node* n) {
     bool hasSlot = false;
     for (auto& k : from->kids)
         if (k->type == Node::T::Element && k->name == "slot") hasSlot = true;
-    if (!hasSlot || !(n->shadow || shadow_root_of(from->kids[0].get()))) {
+    if (!generated && (!hasSlot || !(n->shadow || shadow_root_of(from->kids[0].get())))) {
         plain_ = &from->kids;
         return;
     }
-    flatten_into(from, mixed_, 0);
+    if (n->before) mixed_.push_back(n->before.get());
+    if (hasSlot && (n->shadow || shadow_root_of(from->kids[0].get()))) flatten_into(from, mixed_, 0);
+    else
+        for (auto& k : from->kids) mixed_.push_back(k.get());
+    if (n->after) mixed_.push_back(n->after.get());
     if (mixed_.empty()) plain_ = nullptr;
 }
 

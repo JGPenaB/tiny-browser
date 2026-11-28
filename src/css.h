@@ -95,6 +95,9 @@ struct Style {
     float flexGrow = 0, flexShrink = 1;
     Len flexBasis;
 
+    // `content` as written (CSS Generated Content 3); it applies to ::before and ::after, which layout makes boxes for
+    std::string content;
+
     float lh() const { return lhPx >= 0 ? lhPx : lhFactor * fontSize; }
 };
 
@@ -115,6 +118,7 @@ struct Compound {
     std::vector<AttrSel> attrs;
     std::vector<Pseudo> pseudos;
     bool never = false;
+    uint8_t pseudoElement = 0;  // ::before 1, ::after 2 (CSS Pseudo-Elements 4): only on the last compound of a selector
 };
 struct Selector {
     std::vector<Compound> parts;
@@ -178,11 +182,16 @@ private:
     void build(float vw);
     void computeTree(Node* e, const Style& parent);
     void computeElem(Node* e, const Style& parent);
+    using Cascade = std::vector<std::pair<uint64_t, const Decl*>>;
+    void computePseudo(Node* e, uint8_t kind, Cascade& L);
 
     std::vector<Added> sheets_;
     std::vector<IR> all_;
     std::unordered_map<std::string, std::vector<uint32_t>> byId_, byClass_, byTag_;
     std::vector<uint32_t> uni_;
+    // the rules for ::before and ::after, indexed the same way
+    std::unordered_map<std::string, std::vector<uint32_t>> pseudoById_, pseudoByClass_, pseudoByTag_;
+    std::vector<uint32_t> pseudoUni_;
     std::vector<uint32_t> cand_;
     bool hasMedia_ = false;
 };

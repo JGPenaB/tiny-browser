@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Generated content test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 16px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  /* CSS 2 12.1 and CSS Generated Content 3 */
+  .star::before { content: "***"; }
+  .tail:after { content: "!!!"; }
+  .gone::before { content: none; }
+  .normal::before { content: normal; }
+  .label::before { content: attr(data-label); }
+  .bullet::before { content: "\2022"; }
+  .big::before { content: "x"; font-size: 40px; }
+  .lines::after { content: "second line"; display: block; }
+  .hidden::before { content: "***"; display: none; }
+  .quoted::before { content: open-quote; }
+  .quoted::after { content: close-quote; }
+  .twice::before { content: "a" "b" "c"; }
+  .wide::before { content: ""; display: inline-block; width: 50px; height: 10px; }
+  .boxed::before { content: ""; display: block; height: 30px; }
+</style>
+</head>
+<body>
+<p><span id="plain">x</span> <span id="star" class="star">x</span> <span id="literalStar">***x</span></p>
+<p><span id="tail" class="tail">x</span> <span id="literalTail">x!!!</span></p>
+<p><span id="gone" class="gone">x</span> <span id="normal" class="normal">x</span> <span id="hidden" class="hidden">x</span></p>
+<p><span id="label" class="label" data-label="abcd">x</span> <span id="literalLabel">abcdx</span></p>
+<p><span id="bullet" class="bullet">x</span> <span id="literalBullet">&#x2022;x</span></p>
+<p><span id="quoted" class="quoted">x</span> <span id="literalQuoted">&#x201C;x&#x201D;</span></p>
+<p><span id="twice" class="twice">x</span> <span id="literalTwice">abcx</span></p>
+<p style="white-space: nowrap"><span id="wide" class="wide">x</span></p>
+<div id="plainBlock">one line</div>
+<div id="lines" class="lines">one line</div>
+<div id="boxed" class="boxed">one line</div>
+<div id="smallLine"><span>x</span></div>
+<div id="big"><span class="big">x</span></div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var $ = function (id) { return document.getElementById(id); };
+  var px = function (v) { return Math.round(v); };
+  var widthOf = function (id) { return px($(id).getBoundingClientRect().width); };
+  var heightOf = function (id) { return px($(id).getBoundingClientRect().height); };
+
+  eq('::before puts its text before the content', widthOf('star'), widthOf('literalStar'));
+  eq('::after with one colon puts its text after the content', widthOf('tail'), widthOf('literalTail'));
+  eq('content: none makes no box', widthOf('gone'), widthOf('plain'));
+  eq('content: normal on ::before makes no box', widthOf('normal'), widthOf('plain'));
+  eq('display: none makes no box', widthOf('hidden'), widthOf('plain'));
+  eq('attr() gives the value of the attribute', widthOf('label'), widthOf('literalLabel'));
+  eq('a CSS escape gives its character', widthOf('bullet'), widthOf('literalBullet'));
+  eq('open-quote and close-quote give quotation marks', widthOf('quoted'), widthOf('literalQuoted'));
+  eq('strings in a row are joined', widthOf('twice'), widthOf('literalTwice'));
+  eq('an empty inline-block ::before has its own width', widthOf('wide'), widthOf('plain') + 50);
+  eq('a block ::after is a line of its own', heightOf('lines'), 2 * heightOf('plainBlock'));
+  eq('an empty block ::before still has its height', heightOf('boxed'), heightOf('plainBlock') + 30);
+  log('::before has its own font size, which makes its line taller', heightOf('big') > 2 * heightOf('smallLine'), heightOf('big') + ' and ' + heightOf('smallLine'));
+  eq('generated text is not in the DOM', $('star').textContent + $('star').childNodes.length, 'x1');
+  eq('querySelector finds no pseudo-element', document.querySelector('.star::before'), null);
+  eq('matches() is false for a pseudo-element', $('star').matches('.star::before'), false);
+
+  window.addEventListener('load', function () {
+    document.title = 'Generated content test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

@@ -68,8 +68,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 1. **Milestone 1 (done):** static HTML/CSS rendering on the GPU, tabs, history, bookmarks, DPAPI vault, devtools.
 2. **Milestone 2 (mostly done):** flexbox, inline-block, positioning, overflow clipping, rounded corners, interactive forms with
-   GET/POST, own cookie jar, password save + autofill, meta refresh. Still open: floats, grid, background images, SVG text, gradients, clip paths and masks,
-   `::before`/`::after`, `:hover`, find-in-page, zoom, downloads, text selection.
+   GET/POST, own cookie jar, password save + autofill, meta refresh, `::before` and `::after` with `content` (strings, escapes,
+   `attr()`, quotes; `tests/pages/generated.html`). Still open: floats, grid, background images, SVG text, gradients, clip
+   paths and masks, counters, `:hover`, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
@@ -100,7 +101,7 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 
 `python tests/run_test262.py [path filter ...] [--jobs N] [--save name]` runs the ECMAScript conformance suite (test262,
 cloned into the git-ignored `third_party/test262`; the script's header has the command) and writes the failures to
-`out/test262-<name>.txt`. Sixteenth full run, 2026-11-28: 48,514 of 48,803 tests pass (99.4%), Temporal's 4,616
+`out/test262-<name>.txt`. Seventeenth full run, 2026-11-28: 48,522 of 48,803 tests pass (99.4%), Temporal's 4,616
 included. Every test of ECMA-262 itself passes.
 
 What the engine covers: the whole core language with its early errors (classes with private members and static
