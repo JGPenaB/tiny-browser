@@ -1039,23 +1039,37 @@ bool parse_url_token(std::string_view raw, std::string& out) {
     out = std::string(in);
     return true;
 }
-bool parse_stops(const std::vector<std::string_view>& args, size_t first, float fs, std::vector<GradientStop>& out) {
+// angular: the positions are angles or percentages of a turn (a conic gradient's), kept as percentages
+bool parse_stops(const std::vector<std::string_view>& args, size_t first, float fs, std::vector<GradientStop>& out, bool angular = false) {
+    auto position = [&](const std::string& t, Len& l) {
+        if (!angular) return parse_len(t, fs, l, false);
+        double rad;
+        float v;
+        std::string_view u;
+        if (parse_num(t, v, u) && u == "%") {
+            l = {Len::Pct, v};
+            return true;
+        }
+        if (!parse_angle(t, rad)) return false;
+        l = {Len::Pct, (float)(rad * 50 / 3.14159265358979323846)};
+        return true;
+    };
     for (size_t i = first; i < args.size(); ++i) {
         auto T = tokens(trim(args[i]));
         if (T.empty()) return false;
         Color c;
         if (!parse_color(T[0], c)) {
             Len hint;  // a colour hint (CSS Images 4, 3.5.3) between two stops: the midpoint is not moved
-            if (T.size() == 1 && parse_len(T[0], fs, hint, false)) continue;
+            if (T.size() == 1 && position(T[0], hint)) continue;
             return false;
         }
         GradientStop st;
         st.c = c;
-        if (T.size() >= 2 && !parse_len(T[1], fs, st.pos, false)) return false;
+        if (T.size() >= 2 && !position(T[1], st.pos)) return false;
         out.push_back(st);
         if (T.size() == 3) {  // a stop with two positions is two stops of the same colour
             GradientStop second = st;
-            if (!parse_len(T[2], fs, second.pos, false)) return false;
+            if (!position(T[2], second.pos)) return false;
             out.push_back(second);
         }
     }
@@ -1197,11 +1211,27 @@ bool parse_gradient(std::string_view raw, float fs, BgImage& g) {
         return parse_stops(parts, first, fs, g.stops);
     }
     if (!(args = strip_fn(t, "conic-gradient")).empty()) {
-        g.k = BgImage::Conic;  // painted as its first colour: Direct2D has no conic gradients
+        // CSS Images 4, 3.3: conic-gradient([from <angle>]? [at <position>]?, <angular-color-stop-list>)
+        g.k = BgImage::Conic;
+        g.angle = 0;
         auto parts = split_top(args, ',');
-        Color probe;
-        auto T = tokens(trim(parts[0]));
-        return parse_stops(parts, !T.empty() && !parse_color(T[0], probe) ? 1 : 0, fs, g.stops);
+        auto T = tokens(lower(trim(parts[0])));
+        size_t first = 0;
+        if (!T.empty() && (T[0] == "from" || T[0] == "at")) {
+            first = 1;
+            size_t i = 0;
+            if (T[0] == "from") {
+                double rad;
+                if (T.size() < 2 || !parse_angle(T[1], rad)) return false;
+                g.angle = (float)(rad * 180 / 3.14159265358979323846);
+                i = 2;
+            }
+            if (i < T.size()) {
+                if (T[i] != "at") return false;
+                if (!parse_position(std::vector<std::string>(T.begin() + i + 1, T.end()), fs, g.cx, g.cy)) return false;
+            }
+        }
+        return parse_stops(parts, first, fs, g.stops, true);
     }
     return false;
 }

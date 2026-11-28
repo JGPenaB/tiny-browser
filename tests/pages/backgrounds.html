@@ -21,6 +21,10 @@
   #rounded { border-radius: 30px; background: linear-gradient(135deg, #08f, #f08); }
   #img { background: url(tile.png) 3px 3px; }
   #imgOnce { background: url("tile.png") no-repeat right 10px bottom 10px / 40px 40px, #ffd; }
+  #conic { background: conic-gradient(red, yellow, lime, aqua, blue, magenta, red); }
+  #conicAt { background: conic-gradient(from 90deg at 25% 75%, #08f 0 25%, #fff 0 50%, #f80 0); }
+  #checker { background: conic-gradient(#000 25%, #fff 0 50%, #000 0 75%, #fff 0) 0 0 / 30px 30px; }
+  #rconic { background: repeating-conic-gradient(#fc0 0 15deg, #333 0 30deg); }
 </style>
 </head>
 <body>
@@ -38,5 +42,9 @@
 <div class="b" id="rounded">blue to pink, round corners</div>
 <div class="b" id="img">red squares every 10px, from 3px in</div>
 <div class="b" id="imgOnce">one red square, 10px from the bottom right</div>
+<div class="b" id="conic">a colour wheel around the centre, red at the top</div>
+<div class="b" id="conicAt">blue, white and orange quarters turning from the right of a point low on the left</div>
+<div class="b" id="checker">a black and white checkerboard of 15px squares</div>
+<div class="b" id="rconic">yellow and black rays from the centre</div>
 </body>
 </html>

@@ -71,7 +71,7 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 1. **Milestone 1 (done):** static HTML/CSS rendering on the GPU, tabs, history, bookmarks, DPAPI vault, devtools.
 2. **Milestone 2 (mostly done):** flexbox, inline-block, positioning, overflow clipping, rounded corners, interactive forms with
    GET/POST, own cookie jar, password save + autofill, meta refresh, `::before` and `::after` with `content` (strings, escapes,
-   `attr()`, quotes; `tests/pages/generated.html`), background images and gradients in layers (linear, radial and
+   `attr()`, quotes; `tests/pages/generated.html`), background images and gradients in layers (linear, radial, conic and
    repeating; position, size, repeat, origin, clip; `tests/pages/backgrounds.html` is checked by eye), floats with
    `clear` and block formatting contexts (CSS 2 9.5; `tests/pages/floats.html`), the Selectors 4 pseudo-classes: `:is()`,
    `:where()`, `:not()` and `:has()` with selector lists, the of-type ones, `:hover`, `:active`, `:focus`,
@@ -81,7 +81,7 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    `<ol start>` and `<li value>` as the HTML hints; `tests/pages/counters.html`), and grid layout (CSS Grid 1: track lists with `fr`, `minmax()`, `fit-content()`,
    `repeat()` including `auto-fill` and `auto-fit`, named lines and areas, the `grid-template` and `grid` shorthands,
    line, span and area placement, auto-placement by rows or columns, sparse or dense, implicit tracks, the track
-   sizing algorithm, and box alignment of tracks and items; `tests/pages/grid.html`). Still open: subgrid, conic gradients, SVG text, clip paths and masks, find-in-page, zoom, downloads, text selection.
+   sizing algorithm, and box alignment of tracks and items; `tests/pages/grid.html`). Still open: subgrid, SVG text, clip paths and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),

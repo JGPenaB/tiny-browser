@@ -53,6 +53,10 @@ struct BgPaint {
     int img = -1;            // the picture of a url() image: an index into the page's images, -1 while it has not come
     float b[4] = {}, p[4] = {};  // the box's border and padding widths, for the origin and clip boxes
     float radius = 0;        // its rounded corners, which the background is clipped to
+    // a conic gradient's tile, drawn on the CPU (Direct2D has no conic gradients) and kept while its size stays
+    mutable Microsoft::WRL::ComPtr<ID2D1Bitmap> conic;
+    mutable float conicW = 0, conicH = 0;
+    mutable uint64_t conicGen = 0;
 };
 
 struct LinkArea {

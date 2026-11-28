@@ -29,12 +29,12 @@ struct BgImage {  // none, a picture, or a gradient (CSS Images 3, section 3)
     enum K : uint8_t { None, Url, Linear, Radial, Conic } k = None;
     bool repeating = false;
     std::string url;
-    float angle = 180;     // linear: degrees clockwise from "to top"
+    float angle = 180;     // linear: degrees clockwise from "to top"; conic: where it starts, clockwise from the top
     uint8_t toCorner = 0;  // linear "to" a corner: 1 top, 2 right, 4 bottom, 8 left (0: the angle says)
     bool circle = false;   // radial
     uint8_t extent = 0;    // radial: 0 farthest-corner, 1 closest-side, 2 closest-corner, 3 farthest-side, 4 rx and ry
-    Len rx, ry, cx{Len::Pct, 50}, cy{Len::Pct, 50};
-    std::vector<GradientStop> stops;
+    Len rx, ry, cx{Len::Pct, 50}, cy{Len::Pct, 50};  // radial and conic: the centre
+    std::vector<GradientStop> stops;  // conic: positions as percentages of a turn
 };
 struct BgPos {
     Len x{Len::Pct, 0}, y{Len::Pct, 0};  // a percentage aligns that point of the image with that point of the area

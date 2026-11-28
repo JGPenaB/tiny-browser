@@ -57,12 +57,75 @@ Microsoft::WRL::ComPtr<ID2D1GradientStopCollection> stopCollection(ID2D1RenderTa
     rt->CreateGradientStopCollection(s.data(), (UINT32)s.size(), D2D1_GAMMA_2_2, repeating ? D2D1_EXTEND_MODE_WRAP : D2D1_EXTEND_MODE_CLAMP, &coll);
     return coll;
 }
-// A brush that paints the gradient of one tile whose top left corner is at the origin
-Microsoft::WRL::ComPtr<ID2D1Brush> gradientBrush(ID2D1RenderTarget* rt, const BgImage& g, float w, float h, float alpha, Color& solid) {
+// A conic gradient's tile of w by h (CSS Images 4, 3.3) as a bitmap: each pixel takes the colour at its angle around
+// the centre, clockwise from the start angle, the stops mixed with premultiplied alpha
+Microsoft::WRL::ComPtr<ID2D1Bitmap> conicBitmap(ID2D1RenderTarget* rt, const BgImage& g, float w, float h, int pw, int ph) {
+    auto stops = resolveStops(g.stops, 360);
+    float first = stops.front().first, last = stops.back().first, period = last - first;
+    float cx = g.cx.resolve(w), cy = g.cy.resolve(h);
+    std::vector<uint8_t> px((size_t)pw * ph * 4);
+    const double kPi = 3.14159265358979323846;
+    for (int y = 0; y < ph; ++y)
+        for (int x = 0; x < pw; ++x) {
+            double dx = (x + 0.5) * w / pw - cx, dy = (y + 0.5) * h / ph - cy;
+            float a = (float)std::fmod(std::atan2(dx, -dy) * 180 / kPi - g.angle + 720.0, 360.0);
+            if (g.repeating && period > 1e-3f) a = first + std::fmod(std::fmod(a - first, period) + period, period);
+            Color c0 = stops.front().second, c1 = c0;
+            float t = 0;
+            if (a >= last) c0 = c1 = stops.back().second;
+            else if (a > first)
+                for (size_t i = 1; i < stops.size(); ++i)
+                    if (a <= stops[i].first) {
+                        c0 = stops[i - 1].second;
+                        c1 = stops[i].second;
+                        float span = stops[i].first - stops[i - 1].first;
+                        t = span > 0 ? (a - stops[i - 1].first) / span : 1;
+                        break;
+                    }
+            float al = c0.a + (c1.a - c0.a) * t;
+            auto channel = [&](float v0, float v1) { return (uint8_t)std::lround(std::clamp(v0 * c0.a + (v1 * c1.a - v0 * c0.a) * t, 0.f, 1.f) * 255); };
+            uint8_t* p = &px[((size_t)y * pw + x) * 4];
+            p[0] = channel(c0.b, c1.b);
+            p[1] = channel(c0.g, c1.g);
+            p[2] = channel(c0.r, c1.r);
+            p[3] = (uint8_t)std::lround(std::clamp(al, 0.f, 1.f) * 255);
+        }
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> bmp;
+    D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    rt->CreateBitmap(D2D1::SizeU(pw, ph), px.data(), pw * 4, bp, &bmp);
+    return bmp;
+}
+
+// A brush that paints the gradient of one tile whose top left corner is at the origin; `base` is the transform the
+// brush needs before it is moved to a tile
+Microsoft::WRL::ComPtr<ID2D1Brush> gradientBrush(ID2D1RenderTarget* rt, const BgImage& g, float w, float h, float alpha, Color& solid,
+                                                 const BgPaint& paint, uint64_t gen, D2D1::Matrix3x2F& base) {
     Microsoft::WRL::ComPtr<ID2D1Brush> brush;
+    base = D2D1::Matrix3x2F::Identity();
     if (g.stops.empty()) return brush;
-    if (g.k == BgImage::Conic || (g.stops.size() == 1)) {
+    if (g.stops.size() == 1) {
         solid = g.stops[0].c;
+        return brush;
+    }
+    if (g.k == BgImage::Conic) {
+        float dpiX, dpiY;
+        rt->GetDpi(&dpiX, &dpiY);
+        int pw = std::clamp((int)std::ceil(w * dpiX / 96), 1, 1024), ph = std::clamp((int)std::ceil(h * dpiY / 96), 1, 1024);
+        if (!paint.conic || paint.conicGen != gen || paint.conicW != w || paint.conicH != h) {
+            paint.conic = conicBitmap(rt, g, w, h, pw, ph);
+            paint.conicW = w;
+            paint.conicH = h;
+            paint.conicGen = gen;
+        }
+        if (!paint.conic) return brush;
+        Microsoft::WRL::ComPtr<ID2D1BitmapBrush> bb;
+        rt->CreateBitmapBrush(paint.conic.Get(),
+                              D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR),
+                              &bb);
+        if (!bb) return brush;
+        bb->SetOpacity(alpha);
+        base = D2D1::Matrix3x2F::Scale(w / pw, h / ph);
+        brush = bb;
         return brush;
     }
     const double kPi = 3.14159265358979323846;
@@ -216,7 +279,8 @@ void paint_background(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIt
         }
     } else {
         Color solid{};
-        auto brush = gradientBrush(rt, image, tw, th, alpha, solid);
+        D2D1::Matrix3x2F base;
+        auto brush = gradientBrush(rt, image, tw, th, alpha, solid, p, gen, base);
         if (!brush && solid.a > 0) {
             br->SetColor(D2D1::ColorF(solid.r, solid.g, solid.b, solid.a * alpha));
             rt->FillRectangle(D2D1::RectF(x0, y0, x1, y1), br);
@@ -228,7 +292,7 @@ void paint_background(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIt
                 for (float xx = fx; xx < x1 && count < 4000; xx += tw, ++count) {
                     float a0 = std::max(x0, xx), b0 = std::max(y0, yy), a1 = std::min(x1, xx + tw), b1 = std::min(y1, yy + th);
                     if (a1 > a0 && b1 > b0) {
-                        brush->SetTransform(D2D1::Matrix3x2F::Translation(xx, yy));
+                        brush->SetTransform(base * D2D1::Matrix3x2F::Translation(xx, yy));
                         rt->FillRectangle(D2D1::RectF(a0, b0, a1, b1), brush.Get());
                     }
                     if (!repeatX) break;
