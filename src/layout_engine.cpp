@@ -2351,6 +2351,14 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         int L = s->position == 0 || s->zAuto ? 1 : (s->zIndex >= 0 ? s->zIndex + 1 : s->zIndex);
         c.layer = L < 0 ? L : std::max(c.layer, L);
     }
+    bool filtered = own && s->filter && &b != c.root;
+    if (filtered) {  // a filter makes a stacking context (Filter Effects 1, 4)
+        if (s->position == 0 && !transformed && !animated) c.layer = std::max(c.layer, 1);
+        DItem d;
+        d.k = DItem::K::PushFilter;
+        d.filter = s->filter;
+        push(c, std::move(d));
+    }
     size_t animIdx = SIZE_MAX;
     if (animated) {
         auto paint = std::make_shared<AnimPaint>();
@@ -2699,6 +2707,11 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         pop.k = DItem::K::PopAnim;
         push(c, std::move(pop));
     }
+    if (filtered) {
+        DItem pop;
+        pop.k = DItem::K::PopFilter;
+        push(c, std::move(pop));
+    }
     c.layer = savedLayer;
 }
 
@@ -2712,8 +2725,12 @@ void sortRange(std::vector<DItem>& src, size_t a, size_t e, std::vector<DItem>& 
     bool mixed = false;
     for (size_t i = a; i < e;) {
         size_t j = i + 1;
-        auto opens = [&](size_t at) { return src[at].k == DItem::K::PushClip || src[at].k == DItem::K::PushTransform || src[at].k == DItem::K::PushAnim; };
-        auto closes = [&](size_t at) { return src[at].k == DItem::K::PopClip || src[at].k == DItem::K::PopTransform || src[at].k == DItem::K::PopAnim; };
+        auto opens = [&](size_t at) {
+            return src[at].k == DItem::K::PushClip || src[at].k == DItem::K::PushTransform || src[at].k == DItem::K::PushAnim || src[at].k == DItem::K::PushFilter;
+        };
+        auto closes = [&](size_t at) {
+            return src[at].k == DItem::K::PopClip || src[at].k == DItem::K::PopTransform || src[at].k == DItem::K::PopAnim || src[at].k == DItem::K::PopFilter;
+        };
         if (opens(i)) {  // a clip or a transform and what it holds stay together, sorted inside
             int depth = 0;
             for (j = i; j < e; ++j) {
@@ -2728,11 +2745,13 @@ void sortRange(std::vector<DItem>& src, size_t a, size_t e, std::vector<DItem>& 
     }
     if (mixed) std::stable_sort(units.begin(), units.end(), [](const U& x, const U& y) { return x.layer < y.layer; });
     for (auto& u : units) {
-        bool group = src[u.a].k == DItem::K::PushClip || src[u.a].k == DItem::K::PushTransform || src[u.a].k == DItem::K::PushAnim;
+        bool group = src[u.a].k == DItem::K::PushClip || src[u.a].k == DItem::K::PushTransform || src[u.a].k == DItem::K::PushAnim ||
+                     src[u.a].k == DItem::K::PushFilter;
         if (u.e - u.a < 2 || !group) {
             for (size_t i = u.a; i < u.e; ++i) dst.push_back(std::move(src[i]));
         } else {
-            bool closed = src[u.e - 1].k == DItem::K::PopClip || src[u.e - 1].k == DItem::K::PopTransform || src[u.e - 1].k == DItem::K::PopAnim;
+            bool closed = src[u.e - 1].k == DItem::K::PopClip || src[u.e - 1].k == DItem::K::PopTransform || src[u.e - 1].k == DItem::K::PopAnim ||
+                          src[u.e - 1].k == DItem::K::PopFilter;
             dst.push_back(std::move(src[u.a]));
             sortRange(src, u.a + 1, closed ? u.e - 1 : u.e, dst);
             if (closed) dst.push_back(std::move(src[u.e - 1]));

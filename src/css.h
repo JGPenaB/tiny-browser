@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <array>
 #include <functional>
 #include <unordered_map>
 
@@ -277,6 +278,9 @@ struct Style {
     // Grid container and grid item
     std::shared_ptr<const GridTemplate> grid;  // null: no templates, auto tracks, rows filled first
     std::shared_ptr<const ClipShape> clipPath;  // null: none
+    // filter (Filter Effects 1, 12): its colour functions as one 4 by 5 matrix, row by row (R' = m0 R + m1 G + m2 B
+    // + m3 A + m4 and so on), applied to non-premultiplied sRGB; null for none. blur() and drop-shadow() are left out.
+    std::shared_ptr<const std::array<float, 20>> filter;
     std::shared_ptr<const Shadows> boxShadow, textShadow;  // null: none; text-shadow is inherited
     // outline (CSS UI 4, 4): style 0 none, 1 drawn (solid, dashed and the rest are drawn solid), 2 auto
     uint8_t outlineStyle = 0;

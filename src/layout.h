@@ -31,7 +31,9 @@ struct DItem {
     // Background paints one layer of a background image (bg) in the clip box x y w h.
     // PushAnim..PopAnim: an element whose opacity or transform animations and transitions run (anim), worked out
     // when painting; x y w h is its border box.
-    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform, Svg, Background, PushAnim, PopAnim };
+    // PushFilter..PopFilter: the colours of everything between go through the matrix of a filter (Style::filter).
+    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform, Svg, Background, PushAnim, PopAnim,
+                             PushFilter, PopFilter };
     K k = K::Rect;
     int16_t layer = 0;  // paint layer: 0 = normal flow, >0 positioned (z-index + 1), <0 behind
     float x = 0, y = 0, w = 0, h = 0;
@@ -46,6 +48,7 @@ struct DItem {
     // its borders bw); Text: the text-shadow. Their colours are resolved.
     std::shared_ptr<const Shadows> shadows;
     std::shared_ptr<const struct AnimPaint> anim;
+    std::shared_ptr<const std::array<float, 20>> filter;
     uint8_t shadowParts = 0;  // Box: 1 the outer shadows, 2 the inset ones
     uint8_t objectFit = 0;    // Image: Style::objectFit, with objectPos where the picture goes in the box
     Len objectPos[2];

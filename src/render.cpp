@@ -1,12 +1,27 @@
 // GPU painter: walks the display list and issues Direct2D draw calls.
 #include <cmath>
 
+#include <d2d1_1.h>
+#include <d2d1effects.h>
+
 #include "layout.h"
 #include "anim.h"
 
 namespace tb {
 
-static inline D2D1_COLOR_F cf(const Color& c) { return D2D1::ColorF(c.r, c.g, c.b, c.a); }
+// The filter in force while painting (Style::filter), or null: every colour drawn goes through it
+static const std::array<float, 20>* g_colorFilter = nullptr;
+static Color filtered(const Color& c) {
+    if (!g_colorFilter) return c;
+    const auto& m = *g_colorFilter;
+    float v[4] = {c.r, c.g, c.b, c.a}, o[4];
+    for (int i = 0; i < 4; ++i) o[i] = std::clamp(m[i * 5] * v[0] + m[i * 5 + 1] * v[1] + m[i * 5 + 2] * v[2] + m[i * 5 + 3] * v[3] + m[i * 5 + 4], 0.f, 1.f);
+    return {o[0], o[1], o[2], o[3]};
+}
+static inline D2D1_COLOR_F cf(const Color& c) {
+    Color f = filtered(c);
+    return D2D1::ColorF(f.r, f.g, f.b, f.a);
+}
 
 // ---------------------------------------------------------------- background layers (CSS Backgrounds 3, 3.3-3.9)
 namespace {
@@ -53,7 +68,7 @@ Microsoft::WRL::ComPtr<ID2D1GradientStopCollection> stopCollection(ID2D1RenderTa
                                                                  float from, float to, bool repeating, float alpha) {
     std::vector<D2D1_GRADIENT_STOP> s;
     float span = to - from;
-    for (auto& [p, c] : stops) s.push_back({span > 0 ? (p - from) / span : 0.f, D2D1::ColorF(c.r, c.g, c.b, c.a * alpha)});
+    for (auto& [p, c] : stops) s.push_back({span > 0 ? (p - from) / span : 0.f, cf(Color{c.r, c.g, c.b, c.a * alpha})});
     Microsoft::WRL::ComPtr<ID2D1GradientStopCollection> coll;
     rt->CreateGradientStopCollection(s.data(), (UINT32)s.size(), D2D1_GAMMA_2_2, repeating ? D2D1_EXTEND_MODE_WRAP : D2D1_EXTEND_MODE_CLAMP, &coll);
     return coll;
@@ -336,7 +351,7 @@ void paint_background(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIt
         D2D1::Matrix3x2F base;
         auto brush = gradientBrush(rt, image, tw, th, alpha, solid, p, gen, base);
         if (!brush && solid.a > 0) {
-            br->SetColor(D2D1::ColorF(solid.r, solid.g, solid.b, solid.a * alpha));
+            br->SetColor(cf(Color{solid.r, solid.g, solid.b, solid.a * alpha}));
             rt->FillRectangle(D2D1::RectF(x0, y0, x1, y1), br);
         } else if (brush) {
             // the tiles the covered area meets, each painted with the brush moved to its corner
@@ -448,7 +463,7 @@ void paintBoxShadows(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIte
             D2D1_RECT_F shape = grow(D2D1::RectF(box.left + s.dx, box.top + s.dy, box.right + s.dx, box.bottom + s.dy), s.spread);
             if (shape.right <= shape.left || shape.bottom <= shape.top) continue;
             int n = blurLayers(s.blur);
-            br->SetColor(D2D1::ColorF(s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n)));
+            br->SetColor(cf(Color{s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n)}));
             for (int i = 0; i < n; ++i) {
                 float e = layerGrowth(s.blur, i, n);
                 D2D1_RECT_F r = grow(shape, e);
@@ -475,7 +490,7 @@ void paintBoxShadows(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIte
         float reach = std::fabs(s.dx) + std::fabs(s.dy) + std::fabs(s.spread) + 2 * s.blur + 2;
         auto outer = roundedGeometry(f.Get(), grow(pad, reach), 0);
         int n = blurLayers(s.blur);
-        br->SetColor(D2D1::ColorF(s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n)));
+        br->SetColor(cf(Color{s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n)}));
         for (int i = 0; i < n; ++i) {
             float e = -layerGrowth(s.blur, i, n);  // the faintest layer has the largest hole
             D2D1_RECT_F h = grow(hole, -e);
@@ -498,7 +513,7 @@ void paintTextShadows(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIt
         // a blurred shadow: the text drawn faintly in the middle and round two circles inside the blur radius, which
         // spreads it about as far as the blur does and fades it outwards
         int n = s.blur < 0.5f ? 1 : 17;
-        br->SetColor(D2D1::ColorF(s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n) * (n > 1 ? 0.6f : 1.f)));
+        br->SetColor(cf(Color{s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n) * (n > 1 ? 0.6f : 1.f)}));
         for (int i = 0; i < n; ++i) {
             float ox = 0, oy = 0;
             if (i > 0) {
@@ -515,9 +530,33 @@ bool paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
                  float y0, float y1, uint64_t gen, WidgetPainter* wp) {
     std::vector<bool> clips;  // the open clips, innermost last: a clip-path layer (true) or a rectangle
     std::vector<bool> animLayers;  // the open PushAnims: whether each pushed an opacity layer
+    std::vector<std::array<float, 20>> filters;  // the open PushFilters, each composed with the ones around it
+    g_colorFilter = nullptr;
     bool running = false;
     std::vector<D2D1_MATRIX_3X2_F> outer;  // the transforms in force around each open PushTransform
     for (auto& it : lo.items) {
+        if (it.k == DItem::K::PushFilter && it.filter) {
+            std::array<float, 20> m = *it.filter;
+            if (!filters.empty()) {  // this one after the one around it
+                const auto& outerM = filters.back();
+                std::array<float, 20> r{};
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 5; ++j) {
+                        float sum = 0;
+                        for (int k = 0; k < 4; ++k) sum += m[i * 5 + k] * outerM[k * 5 + j];
+                        r[i * 5 + j] = sum + (j == 4 ? m[i * 5 + 4] : 0);
+                    }
+                m = r;
+            }
+            filters.push_back(m);
+            g_colorFilter = &filters.back();
+            continue;
+        }
+        if (it.k == DItem::K::PopFilter) {
+            if (!filters.empty()) filters.pop_back();
+            g_colorFilter = filters.empty() ? nullptr : &filters.back();
+            continue;
+        }
         if (it.k == DItem::K::PushAnim && it.anim) {  // opacity and transform as the animations have them now
             const AnimPaint& a = *it.anim;
             float opacity;
@@ -631,7 +670,27 @@ bool paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
                         rt->CreateBitmap(D2D1::SizeU(im.w, im.h), im.px.data(), im.w * 4, bp, &im.bmp);
                         im.gen = gen;
                     }
-                    if (im.bmp && it.objectFit == 0) rt->DrawBitmap(im.bmp.Get(), r, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    Microsoft::WRL::ComPtr<ID2D1DeviceContext> dc;
+                    if (im.bmp && g_colorFilter && it.objectFit == 0 && SUCCEEDED(rt->QueryInterface(IID_PPV_ARGS(&dc)))) {
+                        // the picture through the filter's colour matrix (D2D's is applied to a row vector: transposed)
+                        Microsoft::WRL::ComPtr<ID2D1Effect> fx;
+                        if (SUCCEEDED(dc->CreateEffect(CLSID_D2D1ColorMatrix, &fx))) {
+                            const auto& m = *g_colorFilter;
+                            D2D1_MATRIX_5X4_F cm;
+                            float* out = &cm._11;
+                            for (int row = 0; row < 5; ++row)
+                                for (int col = 0; col < 4; ++col) out[row * 4 + col] = m[col * 5 + row];
+                            fx->SetInput(0, im.bmp.Get());
+                            fx->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, cm);
+                            D2D1_SIZE_F size = im.bmp->GetSize();
+                            D2D1_MATRIX_3X2_F was;
+                            dc->GetTransform(&was);
+                            dc->SetTransform(D2D1::Matrix3x2F::Scale(it.w / size.width, it.h / size.height) * D2D1::Matrix3x2F::Translation(it.x, it.y) *
+                                             *D2D1::Matrix3x2F::ReinterpretBaseType(&was));
+                            dc->DrawImage(fx.Get(), D2D1_INTERPOLATION_MODE_LINEAR);
+                            dc->SetTransform(was);
+                        }
+                    } else if (im.bmp && it.objectFit == 0) rt->DrawBitmap(im.bmp.Get(), r, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                     else if (im.bmp) {  // object-fit and object-position (CSS Images 3, 5.5-5.6), clipped to the box
                         float sx = it.w / im.w, sy = it.h / im.h, k = 1;
                         switch (it.objectFit) {
@@ -665,6 +724,7 @@ bool paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
     for (; !animLayers.empty(); animLayers.pop_back())
         if (animLayers.back()) rt->PopLayer();
     if (!outer.empty()) rt->SetTransform(outer.front());
+    g_colorFilter = nullptr;
     return running;
 }
 

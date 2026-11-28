@@ -45,4 +45,4 @@ add_executable(tinybrowser WIN32
 target_compile_definitions(tinybrowser PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(tinybrowser PRIVATE /W3 /utf-8 /permissive- /EHsc /MP $<$<CONFIG:Release>:/O2 /GL /Gy>)
 target_link_options(tinybrowser PRIVATE /STACK:67108864 $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
-target_link_libraries(tinybrowser PRIVATE d3d11 dxgi d2d1 dwrite windowscodecs winhttp crypt32 bcrypt ole32 user32 gdi32 shell32 icu)
+target_link_libraries(tinybrowser PRIVATE d3d11 dxgi d2d1 dxguid dwrite windowscodecs winhttp crypt32 bcrypt ole32 user32 gdi32 shell32 icu)

@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Filters test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; }
+  /* Filter Effects 1, 12: the colour functions. Checked by eye: each box says what it should show */
+  .cell { display: inline-block; width: 150px; margin: 6px; vertical-align: top; font-size: 12px; }
+  .b { height: 60px; background: linear-gradient(90deg, #e33, #3c3, #33e); border: 3px solid #fc0; color: #fff; font-weight: bold; padding: 4px; }
+  .b img { width: 24px; height: 24px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<div class="cell"><div class="b">red green blue <img src="tile.png"></div>no filter</div>
+<div class="cell"><div class="b" style="filter: grayscale(1)">grey <img src="tile.png"></div>grayscale: all grey</div>
+<div class="cell"><div class="b" style="filter: sepia(1)">sepia <img src="tile.png"></div>sepia: browns</div>
+<div class="cell"><div class="b" style="filter: invert(1)">inverted <img src="tile.png"></div>invert: cyan, magenta, yellow</div>
+<div class="cell"><div class="b" style="filter: hue-rotate(120deg)">rotated <img src="tile.png"></div>hue-rotate: green, blue, red</div>
+<div class="cell"><div class="b" style="filter: brightness(0.4)">darker <img src="tile.png"></div>brightness: much darker</div>
+<div class="cell"><div class="b" style="filter: contrast(0.3)">flat <img src="tile.png"></div>contrast: washed out towards grey</div>
+<div class="cell"><div class="b" style="filter: saturate(0.2)">dull <img src="tile.png"></div>saturate: nearly grey</div>
+<div class="cell"><div class="b" style="filter: opacity(0.3)">faint <img src="tile.png"></div>opacity: faint</div>
+<div class="cell"><div class="b" style="filter: grayscale(1) invert(1)">both <img src="tile.png"></div>grey, then inverted</div>
+</body>
+</html>

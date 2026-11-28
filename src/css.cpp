@@ -2755,6 +2755,7 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
     else if (p == "justify-items") d.justifyItems = s.justifyItems;
     else if (p == "justify-self") d.justifySelf = s.justifySelf;
     else if (p == "clip-path") d.clipPath = s.clipPath;
+    else if (p == "filter") d.filter = s.filter;
     else if (istarts(p, "animation")) {
         d.animLists = s.animLists;
         d.animated = s.animated;
@@ -3319,6 +3320,81 @@ bool parse_shadows(std::string_view v, float fs, bool box, std::shared_ptr<const
     return true;
 }
 
+// filter (Filter Effects 1, 12.2): the colour functions, each a matrix, multiplied in the order they come.
+// blur() and drop-shadow() are taken (the declaration stays valid) but do nothing here; url() filters neither.
+bool parse_filter(std::string_view v, std::shared_ptr<const std::array<float, 20>>& out) {
+    std::string l = lower(trim(v));
+    if (l == "none") {
+        out = nullptr;
+        return true;
+    }
+    std::array<float, 20> m{1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0};
+    bool any = false;
+    for (auto& t : tokens(l)) {
+        size_t open = t.find('(');
+        if (open == std::string::npos || t.back() != ')') return false;
+        std::string fn = t.substr(0, open), arg = std::string(trim(std::string_view(t).substr(open + 1, t.size() - open - 2)));
+        float a = 1;
+        std::string_view u;
+        if (fn == "hue-rotate") {
+            double rad = 0;
+            if (!arg.empty() && !parse_angle(arg, rad)) return false;
+            a = (float)rad;
+        } else if (fn == "blur" || fn == "drop-shadow" || fn == "url") {
+            continue;
+        } else if (!arg.empty()) {
+            if (!parse_num(arg, a, u) || (!u.empty() && u != "%") || a < 0) return false;
+            if (u == "%") a /= 100;
+        }
+        std::array<float, 20> f{1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0};
+        auto rgb = [&](std::initializer_list<float> nine) {
+            auto it = nine.begin();
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) f[r * 5 + c] = *it++;
+        };
+        if (fn == "grayscale") {
+            float k = 1 - std::min(a, 1.f);
+            rgb({0.2126f + 0.7874f * k, 0.7152f - 0.7152f * k, 0.0722f - 0.0722f * k, 0.2126f - 0.2126f * k, 0.7152f + 0.2848f * k,
+                 0.0722f - 0.0722f * k, 0.2126f - 0.2126f * k, 0.7152f - 0.7152f * k, 0.0722f + 0.9278f * k});
+        } else if (fn == "sepia") {
+            float k = 1 - std::min(a, 1.f);
+            rgb({0.393f + 0.607f * k, 0.769f - 0.769f * k, 0.189f - 0.189f * k, 0.349f - 0.349f * k, 0.686f + 0.314f * k,
+                 0.168f - 0.168f * k, 0.272f - 0.272f * k, 0.534f - 0.534f * k, 0.131f + 0.869f * k});
+        } else if (fn == "saturate") {
+            rgb({0.213f + 0.787f * a, 0.715f - 0.715f * a, 0.072f - 0.072f * a, 0.213f - 0.213f * a, 0.715f + 0.285f * a,
+                 0.072f - 0.072f * a, 0.213f - 0.213f * a, 0.715f - 0.715f * a, 0.072f + 0.928f * a});
+        } else if (fn == "hue-rotate") {
+            float c = std::cos(a), s = std::sin(a);
+            rgb({0.213f + c * 0.787f - s * 0.213f, 0.715f - c * 0.715f - s * 0.715f, 0.072f - c * 0.072f + s * 0.928f,
+                 0.213f - c * 0.213f + s * 0.143f, 0.715f + c * 0.285f + s * 0.140f, 0.072f - c * 0.072f - s * 0.283f,
+                 0.213f - c * 0.213f - s * 0.787f, 0.715f - c * 0.715f + s * 0.715f, 0.072f + c * 0.928f + s * 0.072f});
+        } else if (fn == "invert") {
+            float k = std::min(a, 1.f);
+            for (int r = 0; r < 3; ++r) f[r * 5 + r] = 1 - 2 * k, f[r * 5 + 4] = k;
+        } else if (fn == "brightness") {
+            for (int r = 0; r < 3; ++r) f[r * 5 + r] = a;
+        } else if (fn == "contrast") {
+            for (int r = 0; r < 3; ++r) f[r * 5 + r] = a, f[r * 5 + 4] = 0.5f - 0.5f * a;
+        } else if (fn == "opacity") {
+            f[18] = std::min(a, 1.f);
+        } else
+            return false;
+        // f after m: rows of f times the columns of m, the constant column carried along
+        std::array<float, 20> r{};
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 5; ++j) {
+                float sum = 0;
+                for (int k = 0; k < 4; ++k) sum += f[i * 5 + k] * m[k * 5 + j];
+                r[i * 5 + j] = sum + (j == 4 ? f[i * 5 + 4] : 0);
+            }
+        }
+        m = r;
+        any = true;
+    }
+    out = any ? std::make_shared<const std::array<float, 20>>(m) : nullptr;
+    return true;
+}
+
 // clip-path (CSS Masking 1, 3.1): none, or a basic shape and a reference box in either order. A url() to an SVG
 // clipPath is not kept: it clips nothing.
 bool parse_clip_path(std::string_view v, float fs, std::shared_ptr<const ClipShape>& out) {
@@ -3438,6 +3514,9 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
     } else if (prop == "outline-offset") {
         Len len;
         if (parse_len(lv, fs, len, false) && len.u == Len::Px) s.outlineOffset = len.v;
+    } else if (prop == "filter" || prop == "-webkit-filter") {
+        std::shared_ptr<const std::array<float, 20>> f;
+        if (parse_filter(val, f)) s.filter = std::move(f);
     } else if (prop == "clip-path" || prop == "-webkit-clip-path") {
         std::shared_ptr<const ClipShape> shape;
         if (parse_clip_path(val, fs, shape)) s.clipPath = std::move(shape);

@@ -99,7 +99,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    whose `unicode-range` covers Latin; `tests/pages/fonts.html` uses a Windows font by its file URL), and
    `position: sticky` against the viewport (`tests/pages/sticky.html`), and CSS Animations and Transitions of
    `opacity` and `transform` (`@keyframes`, the `animation-*` and `transition-*` properties, timing functions, fill
-   modes, directions, the four events; run when painting, as a compositor would; `tests/pages/animations.html`). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
+   modes, directions, the four events; run when painting, as a compositor would; `tests/pages/animations.html`), and the colour functions of
+   `filter` (grayscale, sepia, saturate, hue-rotate, invert, brightness, contrast, opacity; pictures through a colour
+   matrix effect; `tests/pages/filters.html`, checked by eye; blur() and drop-shadow() still do nothing). Still open: subgrid, filter blur() and drop-shadow(), SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
