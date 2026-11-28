@@ -119,8 +119,9 @@ function systemTimeZone() {
 
 // ---------------------------------------------------------------- calendars (12)
 function canonicalizeCalendar(id) {
-  if (toLowerCase(id) !== 'iso8601') throwRange('Unknown calendar ' + id);
-  return 'iso8601';
+  id = toLowerCase(id);
+  if (arrayIndexOf(CALENDARS, id) < 0) throwRange('Unknown calendar ' + id);
+  return id === 'islamicc' ? 'islamic-civil' : id === 'ethiopic-amete-alem' ? 'ethioaa' : id;  // CanonicalizeUValue("ca", id)
 }
 // ParseTemporalCalendarString (13.36)
 function parseCalendarString(s) {
@@ -179,8 +180,9 @@ function prepareCalendarFields(calendar, fields, calendarNames, otherNames, requ
   var names = list(), i;
   for (i = 0; i < calendarNames.length; i++) arrayPush(names, calendarNames[i]);
   for (i = 0; i < otherNames.length; i++) arrayPush(names, otherNames[i]);
+  if (arrayIndexOf(calendarNames, 'year') >= 0 && calendarSupportsEra(calendar)) { arrayPush(names, 'era'); arrayPush(names, 'eraYear'); }  // CalendarExtraFields
   arraySort(names);
-  var result = {}, any = false;
+  var result = create(null), any = false;
   for (i = 0; i < names.length; i++) {
     var name = names[i], value = fields[name];
     if (value !== undefined) {
@@ -194,26 +196,38 @@ function prepareCalendarFields(calendar, fields, calendarNames, otherNames, requ
   if (required === 'partial' && !any) throwType('At least one field is required');
   return result;
 }
-// ISODateToFields (13.42); type is 'date', 'year-month' or 'month-day'
-function isoDateToFields(date, type) {
-  var f = { monthCode: monthCode(date.month) };
-  if (type !== 'year-month') f.day = date.day;
-  if (type !== 'month-day') f.year = date.year;
+// ISODateToFields (13.42); type is 'date', 'year-month' or 'month-day'. The year is the calendar's arithmetic year.
+function isoDateToFields(calendar, date, type) {
+  var c = calendarDate(calendar, date), f = create(null);
+  f.monthCode = c.monthCode;
+  if (type !== 'year-month') f.day = c.day;
+  if (type !== 'month-day') f.year = c.year;
   return f;
 }
-// CalendarMergeFields (12.3.5) for the ISO calendar: a month or month code given replaces both
-function mergeFields(fields, additional) {
-  var merged = {};
-  for (var i = 0; i < FIELD_ORDER.length; i++) {
-    var key = FIELD_ORDER[i];
-    var ignored = additional[key] !== undefined || (key === 'month' && additional.monthCode !== undefined) || (key === 'monthCode' && additional.month !== undefined);
-    if (fields[key] !== undefined && !ignored) merged[key] = fields[key];
+// CalendarMergeFields (12.3.5): a field given replaces the fields it could conflict with (CalendarFieldKeysToIgnore)
+function mergeFields(calendar, fields, additional) {
+  var ignored = create(null), merged = create(null), i, key;
+  for (i = 0; i < FIELD_ORDER.length; i++) {
+    key = FIELD_ORDER[i];
+    if (additional[key] === undefined) continue;
+    ignored[key] = true;
+    if (key === 'month') ignored.monthCode = true;
+    if (key === 'monthCode') ignored.month = true;
+    if (calendar !== 'iso8601') {  // NonISOFieldKeysToIgnore (proposal 4.1.23)
+      if ((key === 'era' || key === 'eraYear' || key === 'year') && calendarSupportsEra(calendar)) ignored.era = ignored.eraYear = ignored.year = true;
+      if ((key === 'day' || key === 'month' || key === 'monthCode') && calendar === 'japanese') ignored.era = ignored.eraYear = true;
+    }
+  }
+  for (i = 0; i < FIELD_ORDER.length; i++) {
+    key = FIELD_ORDER[i];
+    if (fields[key] !== undefined && ignored[key] !== true) merged[key] = fields[key];
     if (additional[key] !== undefined) merged[key] = additional[key];
   }
   return merged;
 }
-// CalendarResolveFields (12.3.31) for the ISO calendar; type is 'date', 'year-month' or 'month-day'
-function resolveFields(fields, type) {
+// CalendarResolveFields (12.3.31); type is 'date', 'year-month' or 'month-day'
+function resolveFields(calendar, fields, type) {
+  if (calendar !== 'iso8601') return nonIsoResolveFields(calendar, fields, type);
   if (type !== 'month-day' && fields.year === undefined) throwType('year is required');
   if (type !== 'year-month' && fields.day === undefined) throwType('day is required');
   if (fields.month === undefined && fields.monthCode === undefined) throwType('month or monthCode is required');
@@ -226,25 +240,27 @@ function resolveFields(fields, type) {
   }
 }
 function calendarDateFromFields(calendar, fields, overflow) {
-  resolveFields(fields, 'date');
-  var result = regulateISODate(fields.year, fields.month, fields.day, overflow);
+  resolveFields(calendar, fields, 'date');
+  var result = calendar === 'iso8601' ? regulateISODate(fields.year, fields.month, fields.day, overflow) : nonIsoCalendarDateToISO(calendar, fields, overflow);
   if (!isoDateWithinLimits(result)) throwRange('The date is out of range');
   return result;
 }
 function calendarYearMonthFromFields(calendar, fields, overflow) {
   fields.day = 1;
-  resolveFields(fields, 'year-month');
-  var result = regulateISODate(fields.year, fields.month, fields.day, overflow);
+  resolveFields(calendar, fields, 'year-month');
+  var result = calendar === 'iso8601' ? regulateISODate(fields.year, fields.month, fields.day, overflow) : nonIsoCalendarDateToISO(calendar, fields, overflow);
   if (!isoYearMonthWithinLimits(result)) throwRange('The month is out of range');
   return result;
 }
 function calendarMonthDayFromFields(calendar, fields, overflow) {
-  resolveFields(fields, 'month-day');
+  resolveFields(calendar, fields, 'month-day');
+  if (calendar !== 'iso8601') return nonIsoMonthDayToISOReferenceDate(calendar, fields, overflow);
   var result = regulateISODate(fields.year === undefined ? 1972 : fields.year, fields.month, fields.day, overflow);
   return isoDate(1972, result.month, result.day);
 }
 // CalendarDateAdd (12.3.7)
 function calendarDateAdd(calendar, date, d, overflow) {
+  if (calendar !== 'iso8601') return nonIsoDateAdd(calendar, date, d, overflow);
   var ym = balanceISOYearMonth(date.year + d.years, date.month + d.months);
   var result = addDaysToISODate(regulateISODate(ym.year, ym.month, date.day, overflow), d.days + 7 * d.weeks);
   if (!isoDateWithinLimits(result)) throwRange('The date is out of range');
@@ -269,6 +285,7 @@ function isoDateSurpasses(sign, base, other, years, months, weeks, days) {
 }
 // CalendarDateUntil (12.3.9). The loops of the proposal are run here with a first guess, then corrected by single steps.
 function calendarDateUntil(calendar, one, two, largestUnit) {
+  if (calendar !== 'iso8601') return nonIsoDateUntil(calendar, one, two, largestUnit);
   var sign = -compareISODate(one, two);
   if (sign === 0) return dateDuration(0, 0, 0, 0);
   var years = 0, months = 0, weeks = 0, days;
@@ -289,4 +306,3 @@ function calendarDateUntil(calendar, one, two, largestUnit) {
   if (largestUnit === WEEK) { weeks = trunc(total / 7); days = total - weeks * 7; } else days = total;
   return dateDuration(years, months, weeks + 0, days + 0);
 }
-function calendarISOToDate(date) { return date; }

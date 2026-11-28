@@ -28,24 +28,25 @@ function toPlainDate(item, options) {
   getOverflowOption(getOptionsObject(options));
   return createPlainDate(isoDate(parsed.year, parsed.month, parsed.day), cal);
 }
-function dateGetters(dateOf) {
-  // the calendar date properties shared by PlainDate, PlainDateTime and ZonedDateTime
+function dateGetters(of) {  // of(x) gives the record of x: its ISO date and its calendar
+  var c = function (x) { var r = of(x); return calendarDate(r.calendar, r.date); };
   return {
-    get era() { dateOf(this); return undefined; },
-    get eraYear() { dateOf(this); return undefined; },
-    get year() { return dateOf(this).year; },
-    get month() { return dateOf(this).month; },
-    get monthCode() { return monthCode(dateOf(this).month); },
-    get day() { return dateOf(this).day; },
-    get dayOfWeek() { return dayOfWeek(dateOf(this)); },
-    get dayOfYear() { return dayOfYear(dateOf(this)); },
-    get weekOfYear() { return weekOfYear(dateOf(this)).week; },
-    get yearOfWeek() { return weekOfYear(dateOf(this)).year; },
-    get daysInWeek() { dateOf(this); return 7; },
-    get daysInMonth() { var d = dateOf(this); return daysInMonth(d.year, d.month); },
-    get daysInYear() { return daysInYear(dateOf(this).year); },
-    get monthsInYear() { dateOf(this); return 12; },
-    get inLeapYear() { return isLeapYear(dateOf(this).year); }
+    get era() { return c(this).era; },
+    get eraYear() { return c(this).eraYear; },
+    get year() { return c(this).year; },
+    get month() { return c(this).month; },
+    get monthCode() { return c(this).monthCode; },
+    get day() { return c(this).day; },
+    get dayOfWeek() { return dayOfWeek(of(this).date); },
+    get dayOfYear() { return c(this).dayOfYear; },
+    // only ISO 8601 has a week numbering that does not depend on the locale (proposal 4.1.14, Note 5)
+    get weekOfYear() { var r = of(this); return r.calendar === 'iso8601' ? weekOfYear(r.date).week : undefined; },
+    get yearOfWeek() { var r = of(this); return r.calendar === 'iso8601' ? weekOfYear(r.date).year : undefined; },
+    get daysInWeek() { of(this); return 7; },
+    get daysInMonth() { return c(this).daysInMonth; },
+    get daysInYear() { return c(this).daysInYear; },
+    get monthsInYear() { return c(this).monthsInYear; },
+    get inLeapYear() { return c(this).inLeapYear; }
   };
 }
 function differenceTemporalPlainDate(operation, r, other, options) {
@@ -95,20 +96,20 @@ class PlainDate extends $Object {
   get calendarId() { return slotOf(this, 'PlainDate').calendar; }
   toPlainYearMonth() {
     var r = slotOf(this, 'PlainDate');
-    return createPlainYearMonth(calendarYearMonthFromFields(r.calendar, isoDateToFields(r.date, 'date'), 'constrain'), r.calendar);
+    return createPlainYearMonth(calendarYearMonthFromFields(r.calendar, isoDateToFields(r.calendar, r.date, 'date'), 'constrain'), r.calendar);
   }
   toPlainMonthDay() {
     var r = slotOf(this, 'PlainDate');
-    return createPlainMonthDay(calendarMonthDayFromFields(r.calendar, isoDateToFields(r.date, 'date'), 'constrain'), r.calendar);
+    return createPlainMonthDay(calendarMonthDayFromFields(r.calendar, isoDateToFields(r.calendar, r.date, 'date'), 'constrain'), r.calendar);
   }
   add(temporalDurationLike) { return addDurationToDate('add', slotOf(this, 'PlainDate'), temporalDurationLike, arguments[1]); }
   subtract(temporalDurationLike) { return addDurationToDate('subtract', slotOf(this, 'PlainDate'), temporalDurationLike, arguments[1]); }
   with(temporalDateLike) {
     var r = slotOf(this, 'PlainDate');
     if (!isPartialTemporalObject(temporalDateLike)) throwType('with() needs a partial date object');
-    var fields = isoDateToFields(r.date, 'date');
+    var fields = isoDateToFields(r.calendar, r.date, 'date');
     var partial = prepareCalendarFields(r.calendar, temporalDateLike, ['year', 'month', 'monthCode', 'day'], [], 'partial');
-    fields = mergeFields(fields, partial);
+    fields = mergeFields(r.calendar, fields, partial);
     var overflow = getOverflowOption(getOptionsObject(arguments[1]));
     return createPlainDate(calendarDateFromFields(r.calendar, fields, overflow), r.calendar);
   }
@@ -152,7 +153,7 @@ class PlainDate extends $Object {
   valueOf() { throwType('Use Temporal.PlainDate.compare to compare dates'); }
 }
 PlainDateProto = PlainDate.prototype;
-copyAccessors(PlainDateProto, dateGetters(plainDateOf));
+copyAccessors(PlainDateProto, dateGetters(function (x) { return slotOf(x, 'PlainDate'); }));
 
 // ---------------------------------------------------------------- Temporal.PlainTime (4)
 function createPlainTime(t, newTarget) {
@@ -368,10 +369,10 @@ class PlainDateTime extends $Object {
   with(temporalDateTimeLike) {
     var r = plainDateTimeOf(this);
     if (!isPartialTemporalObject(temporalDateTimeLike)) throwType('with() needs a partial date-time object');
-    var fields = isoDateToFields(r.date, 'date');
+    var fields = isoDateToFields(r.calendar, r.date, 'date');
     for (var i = 0; i < 6; i++) fields[TIME_FIELDS[i]] = r.time[TIME_FIELDS[i]];
     var partial = prepareCalendarFields(r.calendar, temporalDateTimeLike, ['year', 'month', 'monthCode', 'day'], TIME_FIELDS, 'partial');
-    fields = mergeFields(fields, partial);
+    fields = mergeFields(r.calendar, fields, partial);
     var overflow = getOverflowOption(getOptionsObject(arguments[1]));
     return createPlainDateTime(interpretDateTimeFields(r.calendar, fields, overflow), r.calendar);
   }
@@ -432,5 +433,5 @@ class PlainDateTime extends $Object {
   toPlainTime() { return createPlainTime(plainDateTimeOf(this).time); }
 }
 PlainDateTimeProto = PlainDateTime.prototype;
-copyAccessors(PlainDateTimeProto, dateGetters(function (x) { return plainDateTimeOf(x).date; }));
+copyAccessors(PlainDateTimeProto, dateGetters(plainDateTimeOf));
 copyAccessors(PlainDateTimeProto, timeGetters(function (x) { return plainDateTimeOf(x).time; }));

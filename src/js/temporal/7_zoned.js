@@ -176,11 +176,11 @@ class ZonedDateTime extends $Object {
     var r = zonedOf(this);
     if (!isPartialTemporalObject(temporalZonedDateTimeLike)) throwType('with() needs a partial date-time object');
     var offsetNs = getOffsetNsFor(r.timeZone, r.ns), dt = getISODateTimeFor(r.timeZone, r.ns);
-    var fields = isoDateToFields(dt.date, 'date');
+    var fields = isoDateToFields(r.calendar, dt.date, 'date');
     for (var i = 0; i < 6; i++) fields[TIME_FIELDS[i]] = dt.time[TIME_FIELDS[i]];
     fields.offset = formatUTCOffsetNs(offsetNs);
     var partial = prepareCalendarFields(r.calendar, temporalZonedDateTimeLike, ['year', 'month', 'monthCode', 'day'], ['hour', 'minute', 'second', 'millisecond', 'microsecond', 'nanosecond', 'offset'], 'partial');
-    fields = mergeFields(fields, partial);
+    fields = mergeFields(r.calendar, fields, partial);
     var options = getOptionsObject(arguments[1]);
     var disambiguation = getDisambiguationOption(options);
     var offset = getOffsetOption(options, 'prefer');
@@ -262,7 +262,12 @@ class ZonedDateTime extends $Object {
   toPlainDateTime() { var r = zonedOf(this); return createPlainDateTime(getISODateTimeFor(r.timeZone, r.ns), r.calendar); }
 }
 ZonedDateTimeProto = ZonedDateTime.prototype;
-copyAccessors(ZonedDateTimeProto, dateGetters(function (x) { return zonedDateTimeOf(x).date; }));
+copyAccessors(ZonedDateTimeProto, dateGetters(function (x) {
+  var r = zonedOf(x), out = create(null);
+  out.date = getISODateTimeFor(r.timeZone, r.ns).date;
+  out.calendar = r.calendar;
+  return out;
+}));
 copyAccessors(ZonedDateTimeProto, timeGetters(function (x) { return zonedDateTimeOf(x).time; }));
 
 // ---------------------------------------------------------------- Temporal.PlainYearMonth (9)
@@ -292,7 +297,7 @@ function toPlainYearMonth(item, options) {
   getOverflowOption(getOptionsObject(options));
   var date = isoDate(parsed.year, parsed.month, parsed.day);
   if (!isoYearMonthWithinLimits(date)) throwRange('The month is out of range');
-  return createPlainYearMonth(calendarYearMonthFromFields(cal, isoDateToFields(date, 'year-month'), 'constrain'), cal);
+  return createPlainYearMonth(calendarYearMonthFromFields(cal, isoDateToFields(cal, date, 'year-month'), 'constrain'), cal);
 }
 function yearMonthToString(r, showCalendar) {
   var s = padISOYear(r.date.year) + '-' + pad(r.date.month, 2);
@@ -300,7 +305,7 @@ function yearMonthToString(r, showCalendar) {
   return s + formatCalendarAnnotation(r.calendar, showCalendar);
 }
 function firstOfMonth(r) {
-  var fields = isoDateToFields(r.date, 'year-month');
+  var fields = isoDateToFields(r.calendar, r.date, 'year-month');
   fields.day = 1;
   return calendarDateFromFields(r.calendar, fields, 'constrain');
 }
@@ -329,7 +334,7 @@ function addDurationToYearMonth(operation, r, like, options) {
   var overflow = getOverflowOption(getOptionsObject(options));
   if (d.date.weeks !== 0 || d.date.days !== 0 || d.time !== 0n) throwRange('Only years and months can be added to a year and month');
   var added = calendarDateAdd(r.calendar, firstOfMonth(r), d.date, overflow);
-  return createPlainYearMonth(calendarYearMonthFromFields(r.calendar, isoDateToFields(added, 'year-month'), overflow), r.calendar);
+  return createPlainYearMonth(calendarYearMonthFromFields(r.calendar, isoDateToFields(r.calendar, added, 'year-month'), overflow), r.calendar);
 }
 function yearMonthOf(x) { return slotOf(x, 'PlainYearMonth'); }
 
@@ -349,21 +354,21 @@ class PlainYearMonth extends $Object {
   static from(item) { return toPlainYearMonth(item, arguments[1]); }
   static compare(one, two) { return compareISODate(recordOf(toPlainYearMonth(one)).date, recordOf(toPlainYearMonth(two)).date); }
   get calendarId() { return yearMonthOf(this).calendar; }
-  get era() { yearMonthOf(this); return undefined; }
-  get eraYear() { yearMonthOf(this); return undefined; }
-  get year() { return yearMonthOf(this).date.year; }
-  get month() { return yearMonthOf(this).date.month; }
-  get monthCode() { return monthCode(yearMonthOf(this).date.month); }
-  get daysInYear() { return daysInYear(yearMonthOf(this).date.year); }
-  get daysInMonth() { var d = yearMonthOf(this).date; return daysInMonth(d.year, d.month); }
-  get monthsInYear() { yearMonthOf(this); return 12; }
-  get inLeapYear() { return isLeapYear(yearMonthOf(this).date.year); }
+  get era() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).era; }
+  get eraYear() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).eraYear; }
+  get year() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).year; }
+  get month() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).month; }
+  get monthCode() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).monthCode; }
+  get daysInYear() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).daysInYear; }
+  get daysInMonth() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).daysInMonth; }
+  get monthsInYear() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).monthsInYear; }
+  get inLeapYear() { var r = yearMonthOf(this); return calendarDate(r.calendar, r.date).inLeapYear; }
   with(temporalYearMonthLike) {
     var r = yearMonthOf(this);
     if (!isPartialTemporalObject(temporalYearMonthLike)) throwType('with() needs a partial year-month object');
-    var fields = isoDateToFields(r.date, 'year-month');
+    var fields = isoDateToFields(r.calendar, r.date, 'year-month');
     var partial = prepareCalendarFields(r.calendar, temporalYearMonthLike, ['year', 'month', 'monthCode'], [], 'partial');
-    fields = mergeFields(fields, partial);
+    fields = mergeFields(r.calendar, fields, partial);
     var overflow = getOverflowOption(getOptionsObject(arguments[1]));
     return createPlainYearMonth(calendarYearMonthFromFields(r.calendar, fields, overflow), r.calendar);
   }
@@ -382,9 +387,9 @@ class PlainYearMonth extends $Object {
   toPlainDate(item) {
     var r = yearMonthOf(this);
     if (!isObject(item)) throwType('toPlainDate needs an object with a day');
-    var fields = isoDateToFields(r.date, 'year-month');
+    var fields = isoDateToFields(r.calendar, r.date, 'year-month');
     var input = prepareCalendarFields(r.calendar, item, ['day'], [], []);
-    return createPlainDate(calendarDateFromFields(r.calendar, mergeFields(fields, input), 'constrain'), r.calendar);
+    return createPlainDate(calendarDateFromFields(r.calendar, mergeFields(r.calendar, fields, input), 'constrain'), r.calendar);
   }
 }
 PlainYearMonthProto = PlainYearMonth.prototype;
@@ -437,14 +442,14 @@ class PlainMonthDay extends $Object {
   }
   static from(item) { return toPlainMonthDay(item, arguments[1]); }
   get calendarId() { return monthDayOf(this).calendar; }
-  get monthCode() { return monthCode(monthDayOf(this).date.month); }
-  get day() { return monthDayOf(this).date.day; }
+  get monthCode() { var r = monthDayOf(this); return calendarDate(r.calendar, r.date).monthCode; }
+  get day() { var r = monthDayOf(this); return calendarDate(r.calendar, r.date).day; }
   with(temporalMonthDayLike) {
     var r = monthDayOf(this);
     if (!isPartialTemporalObject(temporalMonthDayLike)) throwType('with() needs a partial month-day object');
-    var fields = isoDateToFields(r.date, 'month-day');
+    var fields = isoDateToFields(r.calendar, r.date, 'month-day');
     var partial = prepareCalendarFields(r.calendar, temporalMonthDayLike, ['year', 'month', 'monthCode', 'day'], [], 'partial');
-    fields = mergeFields(fields, partial);
+    fields = mergeFields(r.calendar, fields, partial);
     var overflow = getOverflowOption(getOptionsObject(arguments[1]));
     return createPlainMonthDay(calendarMonthDayFromFields(r.calendar, fields, overflow), r.calendar);
   }
@@ -459,9 +464,9 @@ class PlainMonthDay extends $Object {
   toPlainDate(item) {
     var r = monthDayOf(this);
     if (!isObject(item)) throwType('toPlainDate needs an object with a year');
-    var fields = isoDateToFields(r.date, 'month-day');
+    var fields = isoDateToFields(r.calendar, r.date, 'month-day');
     var input = prepareCalendarFields(r.calendar, item, ['year'], [], []);
-    return createPlainDate(calendarDateFromFields(r.calendar, mergeFields(fields, input), 'constrain'), r.calendar);
+    return createPlainDate(calendarDateFromFields(r.calendar, mergeFields(r.calendar, fields, input), 'constrain'), r.calendar);
   }
 }
 PlainMonthDayProto = PlainMonthDay.prototype;

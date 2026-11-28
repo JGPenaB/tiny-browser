@@ -5,6 +5,7 @@
 #include "icu_bridge.h"
 #include <windows.h>
 #include <icu.h>
+#include <cmath>
 #include <cstring>
 #include <unordered_map>
 
@@ -725,6 +726,90 @@ JSFN(segment) {
     return V(a);
 }
 
+// ---------------------------------------------------------------- calendars (Temporal with the Intl era and month code proposal)
+// Days since 1970-01-01 are the currency here: ICU works in UTC milliseconds, Temporal in ISO dates.
+const double kMsPerDay = 86400000.0;
+// The ICU calendar of a CLDR calendar type, proleptic, in UTC, kept for the thread
+UCalendar* nonIsoCalendar(const std::string& type) {
+    thread_local std::unordered_map<std::string, UCalendar*> calendars;
+    auto it = calendars.find(type);
+    if (it != calendars.end()) return it->second;
+    std::string icuType = type == "gregory" ? "gregorian" : type == "ethioaa" ? "ethiopic-amete-alem" : type;
+    std::string locale = "en@calendar=" + icuType;
+    UErrorCode err = U_ZERO_ERROR;
+    UCalendar* cal = ucal_open(u"UTC", 3, locale.c_str(), UCAL_DEFAULT, &err);
+    if (U_FAILURE(err)) cal = nullptr;
+    else {
+        ucal_setGregorianChange(cal, -8.64e15, &err);
+        err = U_ZERO_ERROR;
+    }
+    calendars.emplace(type, cal);
+    return cal;
+}
+// ICU's extended year is the arithmetic year of the proposal for every calendar but the Chinese and Korean ones, whose
+// extended years count from their legendary epochs
+int32_t extendedYearOffset(const std::string& type) { return type == "chinese" ? 2637 : type == "dangi" ? 2333 : 0; }
+bool lunisolarMonths(const std::string& type) { return type == "chinese" || type == "dangi"; }
+// The month code of the month the calendar is set to: "M01".."M13", or with "L" for a leap month
+std::u16string monthCodeAt(UCalendar* cal, const std::string& type, UErrorCode& err) {
+    int32_t month = ucal_get(cal, UCAL_MONTH, &err);  // 0-based
+    int number = month + 1;
+    bool leap = false;
+    if (lunisolarMonths(type)) leap = ucal_get(cal, UCAL_IS_LEAP_MONTH, &err) != 0;
+    else if (type == "hebrew") {  // ICU numbers Tishri 0 ... Adar I 5, Adar (II) 6 ... Elul 12 in every year
+        if (month == 5) { number = 5; leap = true; }
+        else if (month > 5) number = month;
+    }
+    char buf[8];
+    snprintf(buf, sizeof buf, "M%02d%s", number, leap ? "L" : "");
+    return fromAsciiKey(buf);
+}
+// calendarYear(type, arithmeticYear): [newYearDay, nextNewYearDay, code, startDay, length, code, startDay, length, ...]
+// for every month of the year, in order; days count from 1970-01-01. Undefined for a calendar ICU does not have.
+JSFN(calendarYear) {
+    Vm& vm = ci.vm;
+    std::string type = toAscii(ustring(vm, ci.arg(0)));
+    UCalendar* cal = nonIsoCalendar(type);
+    if (!cal) return Value::undef();
+    int32_t year = (int32_t)vm.toNumber(ci.arg(1)) + extendedYearOffset(type);
+    UErrorCode err = U_ZERO_ERROR;
+    ucal_clear(cal);
+    ucal_set(cal, UCAL_EXTENDED_YEAR, year);
+    ucal_set(cal, UCAL_MONTH, 0);
+    if (lunisolarMonths(type)) ucal_set(cal, UCAL_IS_LEAP_MONTH, 0);
+    ucal_set(cal, UCAL_DATE, 1);
+    double start = std::floor(ucal_getMillis(cal, &err) / kMsPerDay + 0.5);
+    JSArray* a = vm.newArray();
+    std::vector<Value> held{V(a)};
+    RootScope keep(vm, held);
+    a->elems.push_back(Value::num(start));
+    a->elems.push_back(Value::undef());  // the next new year, filled in below
+    for (int guard = 0; guard < 14 && U_SUCCESS(err); guard++) {
+        ucal_setMillis(cal, start * kMsPerDay, &err);
+        if (ucal_get(cal, UCAL_EXTENDED_YEAR, &err) != year) break;
+        std::u16string code = monthCodeAt(cal, type, err);
+        int32_t length = ucal_getLimit(cal, UCAL_DATE, UCAL_ACTUAL_MAXIMUM, &err);
+        a->elems.push_back(V(vm.str(code)));
+        a->elems.push_back(Value::num(start));
+        a->elems.push_back(Value::num(length));
+        start += length;
+    }
+    a->elems[1] = Value::num(start);
+    if (U_FAILURE(err)) return Value::undef();
+    return V(a);
+}
+// calendarYearOf(type, day): the arithmetic year of the calendar date on that day
+JSFN(calendarYearOf) {
+    Vm& vm = ci.vm;
+    std::string type = toAscii(ustring(vm, ci.arg(0)));
+    UCalendar* cal = nonIsoCalendar(type);
+    if (!cal) return Value::undef();
+    UErrorCode err = U_ZERO_ERROR;
+    ucal_setMillis(cal, vm.toNumber(ci.arg(1)) * kMsPerDay, &err);
+    int32_t year = ucal_get(cal, UCAL_EXTENDED_YEAR, &err);
+    return U_FAILURE(err) ? Value::undef() : Value::num(year - extendedYearOffset(type));
+}
+
 }  // namespace
 
 JSObject* icuNatives(Vm& vm) {
@@ -757,6 +842,8 @@ JSObject* icuNatives(Vm& vm) {
     vm.defFn(o, "listFormat", listFormat, 5);
     vm.defFn(o, "displayName", displayName, 5);
     vm.defFn(o, "segment", segment, 3);
+    vm.defFn(o, "calendarYear", calendarYear, 2);
+    vm.defFn(o, "calendarYearOf", calendarYearOf, 2);
     return o;
 }
 
