@@ -1,0 +1,73 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Text and sizing test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 16px; line-height: 20px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  /* CSS Text 3 (spacing, indent, breaking), CSS Overflow 4 (text-overflow), CSS Sizing 4 (aspect-ratio) and
+     CSS Images 3 (object-fit, checked by eye below the results) */
+  .ls { letter-spacing: 2px; }
+  .ws { word-spacing: 5px; }
+  #indent { width: 300px; text-indent: 30px; }
+  .narrow { width: 100px; background: #eee; margin: 4px 0; }
+  #anywhere { overflow-wrap: anywhere; }
+  #breakall { word-break: break-all; }
+  #ellipsis { width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: #eee; }
+  #ratio { width: 200px; aspect-ratio: 2 / 1; background: #8af; }
+  #ratioTall { width: 200px; aspect-ratio: 4; background: #8af; }
+  #ratioClip { width: 200px; aspect-ratio: 4; overflow: hidden; background: #8af; }
+  .fit { width: 120px; height: 60px; border: 1px solid #888; background: #ffd; margin-right: 8px; }
+</style>
+</head>
+<body>
+<div><span id="plain">abcd</span> <span id="spaced" class="ls">abcd</span></div>
+<div style="white-space: nowrap"><span id="words">a b c</span> <span id="wordsSpaced" class="ws">a b c</span></div>
+<div id="indent"><span id="first">First</span> line<br><span id="second">Second</span> line</div>
+<div class="narrow" id="normalBox">Averyveryverylongwordthatdoesnotfit</div>
+<div class="narrow" id="anywhere">Averyveryverylongwordthatdoesnotfit</div>
+<div class="narrow" id="breakall">ab Averyveryverylongwordthatdoesnotfit</div>
+<div id="ellipsis">This line is far too long for its box</div>
+<div id="ratio"></div>
+<div id="ratioTall">one<br>two<br>three</div>
+<div id="ratioClip">one<br>two<br>three</div>
+<div id="results"></div>
+<p>object-fit: fill, contain, cover, none, scale-down (a 10 by 10 picture with a red corner, in 120 by 60 boxes)</p>
+<div>
+  <img class="fit" style="object-fit: fill" src="tile.png"><img class="fit" style="object-fit: contain" src="tile.png"><img class="fit" style="object-fit: cover" src="tile.png"><img class="fit" style="object-fit: none; object-position: left top" src="tile.png"><img class="fit" style="object-fit: scale-down" src="tile.png">
+</div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var $ = function (id) { return document.getElementById(id); };
+  var R = function (id) { return $(id).getBoundingClientRect(); };
+  var w = function (id) { return Math.round(R(id).width); };
+  var h = function (id) { return Math.round(R(id).height); };
+
+  eq('letter-spacing comes after every letter', w('spaced') - w('plain'), 8);
+  eq('word-spacing comes after every space', w('wordsSpaced') - w('words'), 10);
+  eq('text-indent moves the first line only', [R('first').left - R('indent').left, R('second').left - R('indent').left].map(Math.round).join(), '30,0');
+  eq('a long word sticks out without overflow-wrap', h('normalBox'), 20);
+  log('overflow-wrap: anywhere breaks it', h('anywhere') >= 60, h('anywhere'));
+  log('word-break: break-all breaks it, after what comes before', h('breakall') >= 60 && h('breakall') <= h('anywhere') + 20, h('breakall'));
+  eq('aspect-ratio gives the height', h('ratio'), 100);
+  eq('content taller than the ratio stretches the box', h('ratioTall'), 60);
+  eq('unless the box clips', h('ratioClip'), 50);
+
+  window.addEventListener('load', function () {
+    document.title = 'Text test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

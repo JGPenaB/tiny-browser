@@ -44,6 +44,8 @@ struct DItem {
     // its borders bw); Text: the text-shadow. Their colours are resolved.
     std::shared_ptr<const Shadows> shadows;
     uint8_t shadowParts = 0;  // Box: 1 the outer shadows, 2 the inset ones
+    uint8_t objectFit = 0;    // Image: Style::objectFit, with objectPos where the picture goes in the box
+    Len objectPos[2];
     int img = -1;  // image index, or widget index for K::Widget; for K::Image -1 is a picture that did not come (a grey
                    // box is shown) and -2 an img that represents nothing (HTML 15.4.2), which shows nothing
 };

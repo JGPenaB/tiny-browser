@@ -594,7 +594,22 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
                         rt->CreateBitmap(D2D1::SizeU(im.w, im.h), im.px.data(), im.w * 4, bp, &im.bmp);
                         im.gen = gen;
                     }
-                    if (im.bmp) rt->DrawBitmap(im.bmp.Get(), r, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    if (im.bmp && it.objectFit == 0) rt->DrawBitmap(im.bmp.Get(), r, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    else if (im.bmp) {  // object-fit and object-position (CSS Images 3, 5.5-5.6), clipped to the box
+                        float sx = it.w / im.w, sy = it.h / im.h, k = 1;
+                        switch (it.objectFit) {
+                            case 1: k = std::min(sx, sy); break;
+                            case 2: k = std::max(sx, sy); break;
+                            case 3: k = 1; break;
+                            case 4: k = std::min(1.f, std::min(sx, sy)); break;
+                        }
+                        float w = im.w * k, h = im.h * k;
+                        auto place = [](const Len& l, float room) { return l.u == Len::Pct ? room * l.v / 100.f + l.off : l.resolve(room); };
+                        float x = it.x + place(it.objectPos[0], it.w - w), y = it.y + place(it.objectPos[1], it.h - h);
+                        rt->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
+                        rt->DrawBitmap(im.bmp.Get(), D2D1::RectF(x, y, x + w, y + h), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                        rt->PopAxisAlignedClip();
+                    }
                 } else if (it.img == -1 && it.w > 2 && it.h > 2) {
                     br->SetColor(D2D1::ColorF(0xf1f3f4));
                     rt->FillRectangle(r, br);

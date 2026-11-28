@@ -2013,7 +2013,9 @@ std::string subst_vars(std::string_view v, const Style& s, int depth) {
 
 bool inherited_prop(std::string_view p) {
     return p == "color" || p == "fill" || p == "stroke" || istarts(p, "fill-") || istarts(p, "stroke-") || istarts(p, "font") || p == "line-height" || p == "text-align" || p == "white-space" ||
-           istarts(p, "list-style") || p == "text-transform" || p == "visibility" || istarts(p, "text-decoration");
+           istarts(p, "list-style") || p == "text-transform" || p == "visibility" || istarts(p, "text-decoration") ||
+           p == "letter-spacing" || p == "word-spacing" || p == "text-indent" || p == "overflow-wrap" || p == "word-wrap" ||
+           p == "word-break";
 }
 
 void copy_prop(Style& d, const Style& s, std::string_view p) {
@@ -2045,6 +2047,15 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
         d.strike = s.strike;
     } else if (istarts(p, "list-style")) d.listStyle = s.listStyle;
     else if (p == "text-transform") d.textTransform = s.textTransform;
+    else if (p == "letter-spacing") d.letterSpacing = s.letterSpacing;
+    else if (p == "word-spacing") d.wordSpacing = s.wordSpacing;
+    else if (p == "text-indent") d.textIndent = s.textIndent;
+    else if (p == "overflow-wrap" || p == "word-wrap") d.overflowWrap = s.overflowWrap;
+    else if (p == "word-break") d.wordBreak = s.wordBreak;
+    else if (p == "text-overflow") d.textOverflow = s.textOverflow;
+    else if (p == "aspect-ratio") d.aspectRatio = s.aspectRatio;
+    else if (p == "object-fit") d.objectFit = s.objectFit;
+    else if (p == "object-position") std::copy(s.objectPos, s.objectPos + 2, d.objectPos);
     else if (p == "vertical-align") d.vAlign = s.vAlign;
     else if (p == "box-sizing") d.borderBox = s.borderBox;
     else if (istarts(p, "margin")) std::copy(s.margin, s.margin + 4, d.margin);
@@ -2134,6 +2145,11 @@ void inherit(Style& s, const Style& p) {
     s.whiteSpace = p.whiteSpace;
     s.listStyle = p.listStyle;
     s.textTransform = p.textTransform;
+    s.letterSpacing = p.letterSpacing;
+    s.wordSpacing = p.wordSpacing;
+    s.textIndent = p.textIndent;
+    s.overflowWrap = p.overflowWrap;
+    s.wordBreak = p.wordBreak;
     s.hidden = p.hidden;
     s.vars = p.vars;
 }
@@ -2848,6 +2864,40 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
         for (auto& t : T) {
             int ls = list_kw(t);
             if (ls >= 0) s.listStyle = (uint8_t)ls;
+        }
+    } else if (prop == "letter-spacing" || prop == "word-spacing") {
+        Len len;
+        float px = 0;
+        if (lv != "normal") {
+            if (!parse_len(lv, fs, len, false) || len.u != Len::Px) return;
+            px = len.v;
+        }
+        (prop == "letter-spacing" ? s.letterSpacing : s.wordSpacing) = px;
+    } else if (prop == "text-indent") {
+        Len len;
+        if (!T.empty() && parse_len(T[0], fs, len, false)) s.textIndent = len;
+    } else if (prop == "overflow-wrap" || prop == "word-wrap") {
+        s.overflowWrap = lv == "break-word" || lv == "anywhere" ? 1 : 0;
+    } else if (prop == "word-break") {
+        s.wordBreak = lv == "break-all" ? 1 : lv == "keep-all" ? 2 : 0;
+        if (lv == "break-word") s.overflowWrap = 1;  // a legacy value: normal with overflow-wrap: anywhere
+    } else if (prop == "text-overflow") {
+        s.textOverflow = T.size() == 1 && T[0] == "ellipsis" ? 1 : T.size() == 2 && T[1] == "ellipsis" ? 1 : 0;
+    } else if (prop == "aspect-ratio") {  // auto | <ratio> | auto && <ratio>; the ratio applies to boxes that have none
+        s.aspectRatio = 0;
+        std::string r;
+        for (auto& t : T)
+            if (t != "auto") r += t;
+        size_t slash = r.find('/');
+        double a = atof(r.c_str()), b = slash == std::string::npos ? 1 : atof(r.c_str() + slash + 1);
+        if (!r.empty() && a > 0 && b > 0) s.aspectRatio = (float)(a / b);
+    } else if (prop == "object-fit") {
+        s.objectFit = lv == "contain" ? 1 : lv == "cover" ? 2 : lv == "none" ? 3 : lv == "scale-down" ? 4 : 0;
+    } else if (prop == "object-position") {
+        Len x, y;
+        if (parse_position(T, fs, x, y)) {
+            s.objectPos[0] = x;
+            s.objectPos[1] = y;
         }
     } else if (prop == "text-transform") {
         s.textTransform = lv == "uppercase" ? 1 : lv == "lowercase" ? 2 : lv == "capitalize" ? 3 : 0;

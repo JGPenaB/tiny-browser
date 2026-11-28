@@ -1,5 +1,7 @@
 #include "text.h"
 
+#include <dwrite_1.h>
+
 #include "css.h"
 
 using Microsoft::WRL::ComPtr;
@@ -79,8 +81,19 @@ float TextSystem::width(const Style& s, std::wstring_view t) {
     std::wstring k = e.key;
     k += L'\x1f';
     k.append(t);
+    // letter-spacing comes after every character (CSS Text 3, 8.2); word-spacing after every space (8.1)
+    auto spacing = [&]() {
+        float extra = 0;
+        if (s.letterSpacing != 0)
+            for (wchar_t ch : t)
+                if ((ch & 0xFC00) != 0xDC00) extra += s.letterSpacing;
+        if (s.wordSpacing != 0)
+            for (wchar_t ch : t)
+                if (ch == L' ' || ch == 0xA0) extra += s.wordSpacing;
+        return extra;
+    };
     auto it = widths_.find(k);
-    if (it != widths_.end()) return it->second;
+    if (it != widths_.end()) return it->second + spacing();
     float w = 0;
     ComPtr<IDWriteTextLayout> l;
     if (e.fmt && SUCCEEDED(f_->CreateTextLayout(t.data(), (UINT32)t.size(), e.fmt.Get(), 100000.f, 1000.f, &l))) {
@@ -90,7 +103,7 @@ float TextSystem::width(const Style& s, std::wstring_view t) {
     }
     if (widths_.size() > 400000) widths_.clear();
     widths_.emplace(std::move(k), w);
-    return w;
+    return w + spacing();
 }
 
 void TextSystem::metrics(const Style& s, float& asc, float& desc) {
@@ -108,6 +121,13 @@ ComPtr<IDWriteTextLayout> TextSystem::layout(const Style& s, std::wstring_view t
         DWRITE_TEXT_RANGE r{0, (UINT32)t.size()};
         if (underline) l->SetUnderline(TRUE, r);
         if (strike) l->SetStrikethrough(TRUE, r);
+        ComPtr<IDWriteTextLayout1> l1;
+        if ((s.letterSpacing != 0 || s.wordSpacing != 0) && SUCCEEDED(l.As(&l1))) {
+            if (s.letterSpacing != 0) l1->SetCharacterSpacing(0, s.letterSpacing, 0, r);
+            if (s.wordSpacing != 0)
+                for (UINT32 i = 0; i < (UINT32)t.size(); ++i)
+                    if (t[i] == L' ' || t[i] == 0xA0) l1->SetCharacterSpacing(0, s.letterSpacing + s.wordSpacing, 0, DWRITE_TEXT_RANGE{i, 1});
+        }
     }
     return l;
 }

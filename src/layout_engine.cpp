@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <deque>
 #include <cwctype>
 
 #include "css.h"
@@ -129,6 +130,7 @@ struct Box {
     float staticX = 0, staticY = 0;
     bool fixed = false, oof = false, replaced = false;
     bool fillItem = false;  // (Anon inside a replaced wrapper) the image/control takes the wrapper's width
+    bool firstLines = false;  // (Anon) its first line is the first line of its block: text-indent applies
     float naturalH = 0;  // the height of the content, whatever height the box itself was given
     // A box that clips its content: what it holds in the display list and the place kept for its scroll thumb.
     // placeScrolled() uses these once every box has its final size.
@@ -387,7 +389,12 @@ void flow(Ctx& c, Box& box, Node* e, Box* cb) {
     std::vector<Node*> run;
     bool pre = box.st && (box.st->whiteSpace == 1 || box.st->whiteSpace == 3);
     auto flush = [&] {
-        if (!run.empty() && meaningfulRun(run, pre)) box.kids.push_back(anonFor(box, e, std::move(run), cb));
+        if (!run.empty() && meaningfulRun(run, pre)) {
+            bool firstInBlock = true;
+            for (auto& k : box.kids) firstInBlock = firstInBlock && k->kind == BK::Marker;
+            box.kids.push_back(anonFor(box, e, std::move(run), cb));
+            box.kids.back()->firstLines = firstInBlock;
+        }
         run.clear();
     };
     for (Node* n : FlatKids(e)) {
@@ -1369,7 +1376,9 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
         float x;
     };
     std::vector<Placed> line;
-    float x = 0, y = y0;
+    std::deque<Item> pieces;  // items made while laying out: parts of words broken across lines, ellipses
+    float indent = b.firstLines ? bs.textIndent.resolve(avail) : 0;  // CSS Text 3, 8.1
+    float x = indent, y = y0;
     bool first = true;
     // the room of the current line between the floats (CSS 2 9.5): lineX0 and lineAvail replace x0 and avail
     float lineX0 = x0, lineAvail = avail;
@@ -1406,10 +1415,37 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
     auto commit = [&](bool forced) {
         while (!line.empty() && line.back().it->k == Item::Space) line.pop_back();
         if (line.empty() && !forced) {
-            x = 0;
+            x = first ? indent : 0;
             return;
         }
         float lineW = line.empty() ? 0 : line.back().x + line.back().it->w;
+        if (bs.textOverflow == 1 && bs.overflow != 0 && lineW > lineAvail + 0.5f) {
+            // text-overflow: ellipsis (CSS Overflow 4, 3.1): what does not fit ends in an ellipsis instead
+            const Style* last = line.back().it->st;
+            float ew = c.in.ts->width(*last, L"\u2026");
+            while (!line.empty() && line.back().x + line.back().it->w + ew > lineAvail + 0.5f) {
+                Placed p = line.back();
+                line.pop_back();
+                if (p.it->k != Item::Word || p.x + ew >= lineAvail) continue;
+                std::wstring keep = p.it->text;  // as much of the word as fits
+                while (!keep.empty() && p.x + c.in.ts->width(*p.it->st, keep) + ew > lineAvail + 0.5f) keep.pop_back();
+                if (keep.empty()) continue;
+                Item cut = *p.it;
+                cut.text = keep;
+                cut.w = c.in.ts->width(*cut.st, keep);
+                pieces.push_back(std::move(cut));
+                line.push_back({&pieces.back(), p.x});
+                break;
+            }
+            Item dots = line.empty() ? Item{} : *line.back().it;
+            dots.k = Item::Word;
+            dots.st = line.empty() ? last : dots.st;
+            dots.text = L"\u2026";
+            dots.w = ew;
+            pieces.push_back(std::move(dots));
+            line.push_back({&pieces.back(), line.empty() ? 0.f : line.back().x + line.back().it->w});
+            lineW = line.back().x + ew;
+        }
         float lh = bs.lh();
         float A = sasc + (lh - (sasc + sdesc)) / 2, D = lh - A;
         for (auto& p : line) {
@@ -1464,6 +1500,9 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                         }
                         DItem d;
                         d.k = it.svg >= 0 ? DItem::K::Svg : DItem::K::Image;
+                        d.objectFit = it.st->objectFit;
+                        d.objectPos[0] = it.st->objectPos[0];
+                        d.objectPos[1] = it.st->objectPos[1];
                         d.x = fx;
                         d.y = iy;
                         d.w = it.w;
@@ -1526,6 +1565,30 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
         x = 0;
         band();
     };
+    // A word too long for any line breaks where it has to (overflow-wrap: anywhere) or anywhere (word-break:
+    // break-all): the part that fits goes on this line, the rest on the next ones
+    auto breakWord = [&](Item& it) {
+        std::wstring rest = it.text;
+        while (!rest.empty()) {
+            float room = lineAvail - x;
+            size_t n = 0;
+            while (n < rest.size() && c.in.ts->width(*it.st, rest.substr(0, n + 1)) <= room + 0.01f) ++n;
+            if (n > 0 && n < rest.size() && (rest[n - 1] & 0xFC00) == 0xD800) --n;  // not inside a surrogate pair
+            if (n == 0 && line.empty()) n = rest.size() > 1 && (rest[0] & 0xFC00) == 0xD800 ? 2 : 1;
+            if (n == 0) {
+                commit(false);
+                continue;
+            }
+            Item part = it;
+            part.text = rest.substr(0, n);
+            part.w = c.in.ts->width(*it.st, part.text);
+            pieces.push_back(std::move(part));
+            line.push_back({&pieces.back(), x});
+            x += pieces.back().w;
+            rest.erase(0, n);
+            if (!rest.empty()) commit(false);
+        }
+    };
 
     for (auto& it : b.items) {
         switch (it.k) {
@@ -1584,7 +1647,16 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                     }
                 }
                 ensureW(c, it);
+                bool breakable = it.k == Item::Word && wraps(it.st) && it.text.size() > 1;
+                if (breakable && it.st->wordBreak == 1 && x + it.w > lineAvail + 0.01f) {  // fills this line first
+                    breakWord(it);
+                    break;
+                }
                 if (!line.empty() && x + it.w > lineAvail + 0.01f && it.brk && wraps(it.st)) commit(false);
+                if (breakable && it.st->overflowWrap == 1 && line.empty() && x + it.w > lineAvail + 0.01f) {
+                    breakWord(it);
+                    break;
+                }
                 if (it.k == Item::Word || atomicLike(it.k)) makeRoom(it.w);
                 line.push_back({&it, x});
                 x += it.w;
@@ -2427,6 +2499,13 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     if (b.forcedH >= 0) defH = std::max(0.f, b.forcedH - vpb);
     else if (own && !b.replaced && s->height.u == Len::Px) defH = std::max(0.f, s->height.v - (s->borderBox ? vpb : 0));
     float minH = (own && !b.replaced && s->minHeight.u == Len::Px) ? std::max(0.f, s->minHeight.v - (s->borderBox ? vpb : 0)) : 0;
+    if (own && !b.replaced && defH < 0 && s->aspectRatio > 0) {
+        // CSS Sizing 4, 5: the height the width and the ratio give (of the box box-sizing names), which the content
+        // may still stretch unless the box scrolls
+        float h = (s->borderBox ? contentW + hpb : contentW) / s->aspectRatio - (s->borderBox ? vpb : 0);
+        if (s->overflow != 0) defH = std::max(0.f, h);
+        else minH = std::max(minH, h);
+    }
     float maxH = (own && !b.replaced && s->maxHeight.u == Len::Px) ? std::max(0.f, s->maxHeight.v - (s->borderBox ? vpb : 0)) : -1;
     // CSS 2 section 10.7: a height is held to max-height first and then raised to min-height.
     auto bounded = [&](float h) { return std::max(maxH >= 0 ? std::min(h, maxH) : h, minH); };

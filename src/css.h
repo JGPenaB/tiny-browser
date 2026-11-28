@@ -180,6 +180,16 @@ struct Style {
     // 9 decimal-leading-zero 10 lower-greek
     uint8_t listStyle = 0;
     uint8_t textTransform = 0;  // 1 upper, 2 lower, 3 capitalize
+    // CSS Text 3 (inherited): letter-spacing and word-spacing in px (normal is 0), text-indent, overflow-wrap
+    // (1 break-word or anywhere: a word too long for its line may break anywhere), word-break (1 break-all)
+    float letterSpacing = 0, wordSpacing = 0;
+    Len textIndent{Len::Px, 0};
+    uint8_t overflowWrap = 0, wordBreak = 0;
+    uint8_t textOverflow = 0;  // CSS Overflow 4: 1 ellipsis, on a block that clips
+    float aspectRatio = 0;     // CSS Sizing 4: width / height, 0 for auto
+    // CSS Images 3, 5.5-5.6: how a picture fills its box: 0 fill, 1 contain, 2 cover, 3 none, 4 scale-down
+    uint8_t objectFit = 0;
+    Len objectPos[2] = {{Len::Pct, 50}, {Len::Pct, 50}};
     uint8_t vAlign = 0;         // 0 baseline 1 top 2 middle 3 bottom 4 sub 5 super
     bool borderBox = false, hidden = false;
     bool centerBlocks = false;  // text-align: -webkit-center (<center>, align=center) also centers blocks

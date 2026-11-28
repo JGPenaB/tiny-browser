@@ -47,7 +47,7 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html` and `media.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html` and `text.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
@@ -89,7 +89,8 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    Media Queries 4 grammar (types, `not`/`only`, `and`/`or`/`not` conditions, ranges, the viewport, resolution and
    preference features) in `@media`, `@import`, the `media` attribute and `matchMedia()` (`tests/pages/media.html`),
    `box-shadow` (outer and inset, blur approximated by layers), `text-shadow` and `outline` (`tests/pages/shadows.html`,
-   checked by eye). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
+   checked by eye), `letter-spacing`, `word-spacing`, `text-indent`, `overflow-wrap`, `word-break: break-all`,
+   `text-overflow: ellipsis`, `aspect-ratio` and `object-fit`/`object-position` (`tests/pages/text.html`). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
