@@ -5040,4 +5040,6 @@ bool parse_font(std::string_view value, const Style& parent, Style& out) {
     return value.find("var(") == std::string_view::npos && font_shorthand(out, parent, std::string(value));
 }
 
+bool css_supports(std::string_view condition) { return supports_condition(condition); }
+
 }  // namespace tb

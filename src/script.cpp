@@ -998,7 +998,9 @@ using Impl = ScriptHost::Impl;
 struct Entry {
     Impl& im;
     explicit Entry(Impl& i) : im(i) {
-        if (im.depth++ == 0) im.vm.deadlineTick = GetTickCount64() + 8000;
+        // 8 seconds; TB_SCRIPT_DEADLINE_MS (a debugging aid) gives slowed-down runs more
+        static const uint64_t limit = getenv("TB_SCRIPT_DEADLINE_MS") ? std::max(1000ull, strtoull(getenv("TB_SCRIPT_DEADLINE_MS"), nullptr, 10)) : 8000;
+        if (im.depth++ == 0) im.vm.deadlineTick = GetTickCount64() + limit;
     }
     ~Entry() {
         if (--im.depth) return;
@@ -1752,6 +1754,7 @@ JSFN(metric) {  // data: 0 width, 1 height, 2 left, 3 top, 4 scrollLeft and othe
 // __scrollTop(element[, offset]) (CSSOM View, scrollTop): how far the element is scrolled down. With an offset it
 // scrolls the element there, as far as it can go, and says whether it moved, which is when the caller owes the
 // element a scroll event. The root element stands for the page, and the shell tells the document about that.
+JSFN(cssSupportsFn) { return Value::boolean(css_supports(str8(ci.vm, ci.arg(0)))); }  // __cssSupports(condition)
 JSFN(scrollTopFn) {
     Impl& im = I(ci.vm);
     Node* n = toNode(ci.arg(0));
@@ -3516,7 +3519,13 @@ void ScriptHost::Impl::setup() {
     getter(G, "pageXOffset", viewportGet, nullptr, 3);
     vm.def(G, "devicePixelRatio", Value::i32(1), PF_ALL);
     vm.def(G, "name", V(vm.a.empty), PF_ALL);
-    vm.def(G, "isSecureContext", Value::boolean(url.rfind("https:", 0) == 0), PF_ALL);
+    {  // a potentially trustworthy origin (Secure Contexts, 3.1): https, wss, file, and the loopback hosts
+        Url u = Url::parse(url);
+        std::string h = lower(u.host);
+        bool loopback = h == "localhost" || (h.size() > 10 && h.compare(h.size() - 10, 10, ".localhost") == 0) || h.rfind("127.", 0) == 0 || h == "[::1]";
+        bool secure = u.scheme == "https" || u.scheme == "wss" || u.scheme == "file" || ((u.scheme == "http" || u.scheme == "ws") && loopback);
+        vm.def(G, "isSecureContext", Value::boolean(secure), PF_ALL);
+    }
 
     JSObject* perf = vm.newObject();
     vm.def(G, "performance", V(perf), PF_ALL);
@@ -3651,6 +3660,7 @@ void ScriptHost::Impl::setup() {
     vm.defFn(G, "__ceState", ceStateFn, 2);
     vm.defFn(G, "__isConstructor", isConstructorFn, 1);
     vm.defFn(G, "__scrollTop", scrollTopFn, 2);
+    vm.defFn(G, "__cssSupports", cssSupportsFn, 1);
     vm.defFn(G, "__domException", domExceptionSet, 1);
     webgl_install(vm, G, canvases);
     canvas2d_install(vm, G, canvases);

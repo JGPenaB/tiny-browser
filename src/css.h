@@ -399,6 +399,8 @@ bool parse_color(std::string_view v, Color& out);
 // The CSS `font` shorthand (CSS Fonts 4, 3.7) applied to a copy of `parent`, whose font size relative sizes are of.
 // False when the value is not a valid shorthand (it needs a size and a family), as for a canvas's font.
 bool parse_font(std::string_view value, const Style& parent, Style& out);
+// Whether a <supports-condition> holds, as @supports and CSS.supports() ask (CSS Conditional Rules 3, 2.1)
+bool css_supports(std::string_view condition);
 const char* display_name(Display d);
 // True for an element that layout sizes as one box whatever its `display` says: replaced elements and form controls
 // other than <button>, whose content is laid out like any other (HTML 15.5.3, button layout).

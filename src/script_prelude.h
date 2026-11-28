@@ -18,19 +18,59 @@ G.__domException(DOMException);  // what the engine's own DOM code throws
 delete G.__domException;
 
 // ---- event targets that are not DOM nodes (XMLHttpRequest, AbortSignal, MessagePort...)
+// DOM 2.7: listeners are kept per type, once each for a callback and capture; options once, passive and signal
+var listenerLists = new WeakMap(), immediatelyStopped = new WeakSet();
+var nativeStopImmediate = Event.prototype.stopImmediatePropagation;
+Event.prototype.stopImmediatePropagation = function () { immediatelyStopped.add(this); return nativeStopImmediate.call(this); };
+function flattenOptions(options) { return typeof options === 'boolean' ? options : !!(options && options.capture); }
 class EventTarget {
-  addEventListener(type, fn) { if (!fn) return; var m = this._ls || (this._ls = {}); (m[type] || (m[type] = [])).push(fn); }
-  removeEventListener(type, fn) { var a = this._ls && this._ls[type]; if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); } }
+  addEventListener(type, callback, options) {
+    if (callback === null || callback === undefined) return;
+    var capture = flattenOptions(options), once = false, passive = false, signal = null;
+    if (options && typeof options === 'object') { once = !!options.once; passive = !!options.passive; signal = options.signal || null; }
+    if (signal && signal.aborted) return;
+    type = String(type);
+    var map = listenerLists.get(this);
+    if (!map) listenerLists.set(this, map = new Map());
+    if (!map.has(type)) map.set(type, []);
+    var list = map.get(type);
+    for (var l of list) if (l.callback === callback && l.capture === capture) return;
+    list.push({ callback: callback, capture: capture, once: once, passive: passive, removed: false });
+    if (signal) { var self = this; signal.addEventListener('abort', function () { self.removeEventListener(type, callback, { capture: capture }); }); }
+  }
+  removeEventListener(type, callback, options) {
+    var capture = flattenOptions(options), map = listenerLists.get(this), list = map && map.get(String(type));
+    if (!list) return;
+    for (var i = 0; i < list.length; i++)
+      if (list[i].callback === callback && list[i].capture === capture) { list[i].removed = true; list.splice(i, 1); return; }
+  }
   dispatchEvent(e) {
-    if (!e.target) e.target = this;
+    if (!(e instanceof Event)) throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+    e.target = this;
     e.currentTarget = this;
+    e.eventPhase = 2;
     var h = this['on' + e.type];
-    if (typeof h === 'function') { try { h.call(this, e); } catch (err) { console.error(err); } }
-    var a = this._ls && this._ls[e.type];
-    if (a) for (var f of a.slice()) { try { typeof f === 'function' ? f.call(this, e) : f.handleEvent(e); } catch (err) { console.error(err); } }
+    if (typeof h === 'function') { try { if (h.call(this, e) === false) e.preventDefault(); } catch (err) { reportException(err); } }
+    var map = listenerLists.get(this), list = map && map.get(e.type);
+    if (list)
+      for (var l of list.slice()) {
+        if (l.removed || immediatelyStopped.has(e)) continue;
+        if (l.once) this.removeEventListener(e.type, l.callback, { capture: l.capture });
+        try {
+          if (typeof l.callback === 'function') l.callback.call(this, e);
+          else {
+            var he = l.callback.handleEvent;
+            if (typeof he !== 'function') throw new TypeError("'handleEvent' property of event listener should be a function");
+            he.call(l.callback, e);
+          }
+        } catch (err) { reportException(err); }
+      }
+    e.eventPhase = 0;
+    e.currentTarget = null;
     return !e.defaultPrevented;
   }
 }
+function reportException(err) { if (typeof G.reportError === 'function') G.reportError(err); else console.error(err); }
 Object.setPrototypeOf(Node.prototype, EventTarget.prototype);
 
 class AbortSignal extends EventTarget {
@@ -38,6 +78,12 @@ class AbortSignal extends EventTarget {
   throwIfAborted() { if (this.aborted) throw this.reason; }
   static abort(reason) { var s = new AbortSignal(); s.aborted = true; s.reason = reason; return s; }
   static timeout(ms) { var c = new AbortController(); setTimeout(function () { c.abort(new DOMException('The operation timed out.', 'TimeoutError')); }, ms); return c.signal; }
+  static any(signals) {  // DOM 3.2: aborted as soon as one of them is
+    var c = new AbortController(), list = Array.from(signals);
+    for (var x of list) if (x.aborted) { c.abort(x.reason); return c.signal; }
+    for (var y of list) y.addEventListener('abort', function () { c.abort(this.reason); }, { once: true });
+    return c.signal;
+  }
 }
 class AbortController {
   constructor() { this.signal = new AbortSignal(); }
@@ -647,18 +693,545 @@ performance.navigation = { type: 0, redirectCount: 0 };
 performance.memory = { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 };
 
 G.requestIdleCallback = function (cb) { return setTimeout(function () { cb({ didTimeout: false, timeRemaining: function () { return 10; } }); }, 1); };
-G.postMessage = function (data) { setTimeout(function () { var e = new Event('message'); e.data = data; e.origin = location.origin; e.source = G; G.dispatchEvent(e); }, 0); };
-G.structuredClone = function (v) { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); };
 G.reportError = function (e) { console.error(e); };
 G.open = function () { return null; };
-G.CSS = { supports: function () { return false; }, escape: function (s) { return String(s).replace(/[^a-zA-Z0-9_ -￿-]/g, function (c) { return '\\' + c; }); } };
+)JS"
+R"JS(
+// ---- structured cloning (HTML 2.7): what postMessage, MessagePort, BroadcastChannel and structuredClone copy
+function brand(fn, v) { try { fn.call(v); return true; } catch (e) { return false; } }
+var taTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Int8Array.prototype), Symbol.toStringTag).get;
+var abLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+var dvLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get;
+var errorNames = ['Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError'];
+function cloneError(what) { return new DOMException(what + ' could not be cloned.', 'DataCloneError'); }
+// A copy of value as another realm would receive it; transfer: the ArrayBuffers whose contents move instead
+function structuredCopy(value, transfer) {
+  var memory = new Map();
+  for (var t of transfer || []) {
+    if (!brand(abLength, t)) continue;  // MessagePorts are moved by the caller
+    if (memory.has(t)) throw new DOMException('ArrayBuffer at index ' + transfer.indexOf(t) + ' is a duplicate of an earlier ArrayBuffer.', 'DataCloneError');
+    if (t.detached) throw new DOMException('An ArrayBuffer is detached and could not be cloned.', 'DataCloneError');
+    memory.set(t, null);
+  }
+  for (var t2 of memory.keys()) memory.set(t2, t2.transfer());
+  function copy(v) {
+    if (typeof v === 'symbol') throw cloneError('Symbol()');
+    if (v === null || (typeof v !== 'object' && typeof v !== 'function')) return v;
+    if (typeof v === 'function') throw cloneError(String(v).slice(0, 60));
+    if (memory.has(v)) return memory.get(v);
+    var out;
+    if (brand(Boolean.prototype.valueOf, v)) out = Object(Boolean.prototype.valueOf.call(v));
+    else if (brand(Number.prototype.valueOf, v)) out = Object(Number.prototype.valueOf.call(v));
+    else if (brand(String.prototype.valueOf, v)) out = Object(String.prototype.valueOf.call(v));
+    else if (typeof BigInt === 'function' && brand(BigInt.prototype.valueOf, v)) out = Object(BigInt.prototype.valueOf.call(v));
+    else if (brand(Date.prototype.getTime, v)) out = new Date(Date.prototype.getTime.call(v));
+    else if (v instanceof RegExp) out = new RegExp(v.source, v.flags);
+    else if (brand(abLength, v)) {
+      if (v.detached) throw new DOMException('An ArrayBuffer is detached and could not be cloned.', 'DataCloneError');
+      out = v.resizable ? new ArrayBuffer(v.byteLength, { maxByteLength: v.maxByteLength }) : new ArrayBuffer(v.byteLength);
+      new Uint8Array(out).set(new Uint8Array(v));
+    } else if (taTag.call(v) !== undefined) {
+      var buf = copy(v.buffer);
+      out = new G[taTag.call(v)](buf, v.byteOffset, v.length);
+    } else if (brand(dvLength, v)) out = new DataView(copy(v.buffer), v.byteOffset, v.byteLength);
+    else if (brand(Map.prototype.has, v)) {
+      out = new Map();
+      memory.set(v, out);
+      for (var e of Map.prototype.entries.call(v)) out.set(copy(e[0]), copy(e[1]));
+      return out;
+    } else if (brand(Set.prototype.has, v)) {
+      out = new Set();
+      memory.set(v, out);
+      for (var s of Set.prototype.values.call(v)) out.add(copy(s));
+      return out;
+    } else if (v instanceof Error) {
+      var name = errorNames.indexOf(v.name) >= 0 ? v.name : 'Error';
+      out = Object.prototype.hasOwnProperty.call(v, 'message') ? new G[name](String(v.message)) : new G[name]();
+      if (typeof v.stack === 'string') Object.defineProperty(out, 'stack', { value: v.stack, writable: true, configurable: true });
+    } else if (v instanceof Blob) out = typeof File === 'function' && v instanceof File ? new File([v], v.name, { type: v.type, lastModified: v.lastModified }) : new Blob([v], { type: v.type });
+    else if (v instanceof ImageData) out = new ImageData(new Uint8ClampedArray(v.data), v.width, v.height);
+    else if (v instanceof DOMMatrixReadOnly) out = new (v instanceof DOMMatrix ? DOMMatrix : DOMMatrixReadOnly)([v.a, v.b, v.c, v.d, v.e, v.f]);
+    else if (v instanceof DOMPoint) out = new DOMPoint(v.x, v.y, v.z, v.w);
+    else if (v instanceof DOMRect) out = new DOMRect(v.x, v.y, v.width, v.height);
+    else if (v === G || (typeof Node === 'function' && v instanceof Node) || v instanceof EventTarget || v instanceof Event || v instanceof Promise ||
+             brand(WeakMap.prototype.has, v) || brand(WeakSet.prototype.has, v) || (typeof WeakRef === 'function' && brand(WeakRef.prototype.deref, v)) ||
+             v instanceof MessagePort) throw cloneError(Object.prototype.toString.call(v));
+    else if (Array.isArray(v)) {
+      out = new Array(v.length);
+      memory.set(v, out);
+      for (var k of Object.keys(v)) out[k] = copy(v[k]);
+      return out;
+    } else {
+      out = {};
+      memory.set(v, out);
+      for (var key of Object.keys(v)) out[key] = copy(v[key]);
+      return out;
+    }
+    memory.set(v, out);
+    return out;
+  }
+  return copy(value);
+}
+G.structuredClone = function structuredClone(value, options) {
+  if (arguments.length < 1) throw new TypeError("Failed to execute 'structuredClone' on 'Window': 1 argument required, but only 0 present.");
+  return structuredCopy(value, options && options.transfer ? Array.from(options.transfer) : []);
+};
+// The transfer list of postMessage(message, transfer) or postMessage(message, { transfer })
+function transferList(arg) {
+  var list = arg && typeof arg === 'object' && !(Symbol.iterator in arg) ? arg.transfer : arg;
+  return list === undefined || list === null ? [] : Array.from(list);
+}
+function messageEvent(init) {
+  return new MessageEvent('message', Object.assign({ data: null, origin: '', lastEventId: '', source: null, ports: [] }, init));
+}
+
+// ---- MessageChannel and MessagePort (HTML 9.4): two entangled ports; a port keeps what it is sent until started
+var portKey = {}, portState = new WeakMap();
+class MessagePort extends EventTarget {
+  constructor(key) {
+    if (key !== portKey) throw new TypeError('Illegal constructor');
+    super();
+    portState.set(this, { peer: null, queue: [], started: false, closed: false, onmessage: null, onmessageerror: null });
+  }
+  postMessage(message, transfer) {
+    var st = portState.get(this), list = transferList(transfer);
+    if (list.indexOf(this) >= 0) throw new DOMException('Port at index ' + list.indexOf(this) + ' is the source port.', 'DataCloneError');
+    var ports = list.filter(function (p) { return p instanceof MessagePort; });
+    var data = structuredCopy(message, list);
+    var moved = ports.map(movePort);
+    var peer = st.peer;
+    if (!peer || st.closed) return;
+    portState.get(peer).queue.push({ data: data, ports: moved });
+    deliver(peer);
+  }
+  start() { var st = portState.get(this); if (st.started) return; st.started = true; deliver(this); }
+  close() {
+    var st = portState.get(this);
+    st.closed = true;
+    if (st.peer) { portState.get(st.peer).peer = null; st.peer = null; }
+  }
+  get onmessage() { return portState.get(this).onmessage; }
+  set onmessage(f) { portState.get(this).onmessage = typeof f === 'function' ? f : null; this.start(); }
+  get onmessageerror() { return portState.get(this).onmessageerror; }
+  set onmessageerror(f) { portState.get(this).onmessageerror = typeof f === 'function' ? f : null; }
+}
+function newPort() { return new MessagePort(portKey); }
+// A port sent in a transfer list: a new port entangled with the same peer takes its place, and it is left unusable
+function movePort(p) {
+  var st = portState.get(p), np = newPort(), nst = portState.get(np);
+  nst.peer = st.peer; nst.queue = st.queue;
+  if (st.peer) portState.get(st.peer).peer = np;
+  st.peer = null; st.queue = []; st.closed = true;
+  return np;
+}
+function deliver(port) {
+  var st = portState.get(port);
+  if (!st.started || st.delivering) return;
+  st.delivering = true;
+  setTimeout(function next() {
+    st.delivering = false;
+    var m = st.queue.shift();
+    if (!m) return;
+    port.dispatchEvent(messageEvent({ data: m.data, ports: m.ports }));
+    if (st.queue.length) { st.delivering = true; setTimeout(next, 0); }
+  }, 0);
+}
 class MessageChannel {
   constructor() {
-    var a = new EventTarget(), b = new EventTarget();
-    function link(from, to) { from.postMessage = function (data) { setTimeout(function () { var e = new Event('message'); e.data = data; to.dispatchEvent(e); }, 0); }; from.start = from.close = function () {}; }
-    link(a, b); link(b, a); this.port1 = a; this.port2 = b;
+    var a = newPort(), b = newPort();
+    portState.get(a).peer = b; portState.get(b).peer = a;
+    Object.defineProperty(this, 'port1', { value: a, enumerable: true });
+    Object.defineProperty(this, 'port2', { value: b, enumerable: true });
   }
 }
+
+// window.postMessage(message, targetOrigin, transfer) (HTML 9.3.3): to this window, which is the only one there is
+G.postMessage = function postMessage(message, targetOrigin, transfer) {
+  if (arguments.length < 1) throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
+  var list;
+  if (targetOrigin && typeof targetOrigin === 'object') { list = transferList(targetOrigin); targetOrigin = targetOrigin.targetOrigin === undefined ? '/' : targetOrigin.targetOrigin; }
+  else { if (targetOrigin === undefined) throw new TypeError("Failed to execute 'postMessage' on 'Window': 2 arguments required."); list = transferList(transfer); }
+  targetOrigin = String(targetOrigin);
+  if (targetOrigin === '/') targetOrigin = location.origin;
+  else if (targetOrigin !== '*') {
+    try { targetOrigin = new URL(targetOrigin).origin; } catch (e) { throw new DOMException("Invalid target origin '" + targetOrigin + "' in a call to 'postMessage'.", 'SyntaxError'); }
+  }
+  var ports = list.filter(function (p) { return p instanceof MessagePort; });
+  var data = structuredCopy(message, list), moved = ports.map(movePort), origin = location.origin;
+  setTimeout(function () {
+    if (targetOrigin !== '*' && targetOrigin !== location.origin) return;
+    G.dispatchEvent(messageEvent({ data: data, origin: origin, source: G, ports: moved }));
+  }, 0);
+};
+
+// ---- BroadcastChannel (HTML 9.5): every other channel of the same name in this document
+var channelsByName = new Map(), channelState = new WeakMap();
+class BroadcastChannel extends EventTarget {
+  constructor(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required, but only 0 present.");
+    super();
+    name = String(name);
+    channelState.set(this, { name: name, closed: false, onmessage: null, onmessageerror: null });
+    if (!channelsByName.has(name)) channelsByName.set(name, new Set());
+    channelsByName.get(name).add(this);
+  }
+  get name() { return channelState.get(this).name; }
+  postMessage(message) {
+    var st = channelState.get(this);
+    if (st.closed) throw new DOMException("Failed to execute 'postMessage' on 'BroadcastChannel': Channel is closed", 'InvalidStateError');
+    var data = structuredCopy(message), origin = location.origin, self = this;
+    for (var other of channelsByName.get(st.name) || []) {
+      if (other === self) continue;
+      (function (dest) {
+        setTimeout(function () { if (!channelState.get(dest).closed) dest.dispatchEvent(messageEvent({ data: structuredCopy(data), origin: origin })); }, 0);
+      })(other);
+    }
+  }
+  close() { var st = channelState.get(this); st.closed = true; var set = channelsByName.get(st.name); if (set) set.delete(this); }
+  get onmessage() { return channelState.get(this).onmessage; }
+  set onmessage(f) { channelState.get(this).onmessage = typeof f === 'function' ? f : null; }
+  get onmessageerror() { return channelState.get(this).onmessageerror; }
+  set onmessageerror(f) { channelState.get(this).onmessageerror = typeof f === 'function' ? f : null; }
+}
+
+// ---- CSS (CSSOM 9.1, Conditional Rules 3, 8.1): supports() asks the style engine; escape() serialises an identifier
+var cssSupports = G.__cssSupports; delete G.__cssSupports;
+G.CSS = {
+  supports: function (a, b) {
+    if (arguments.length >= 2) {
+      var prop = String(a).trim();
+      return /^[-\w]+$/.test(prop) && cssSupports('(' + prop + ': ' + String(b) + ')');
+    }
+    var text = String(a);
+    return cssSupports(text) || cssSupports('(' + text + ')');
+  },
+  escape: function (ident) {
+    var s = String(ident), out = '';
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i), ch = s[i];
+      if (c === 0) out += '�';
+      else if ((c >= 1 && c <= 0x1f) || c === 0x7f || (c >= 0x30 && c <= 0x39 && (i === 0 || (i === 1 && s.charCodeAt(0) === 0x2d)))) out += '\\' + c.toString(16) + ' ';
+      else if (i === 0 && c === 0x2d && s.length === 1) out += '\\' + ch;
+      else if (c >= 0x80 || c === 0x2d || c === 0x5f || (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) out += ch;
+      else out += '\\' + ch;
+    }
+    return out;
+  }
+};
+)JS"
+R"JS(
+)JS"
+R"JS(
+// ---- Prioritized Task Scheduling (WICG): scheduler.postTask() and scheduler.yield(), TaskController, TaskSignal
+var taskPriorities = ['user-blocking', 'user-visible', 'background'];
+function checkPriority(p, where) {
+  if (taskPriorities.indexOf(p) < 0) throw new TypeError("Failed to execute '" + where + "': The provided value '" + p + "' is not a valid enum value of type TaskPriority.");
+  return p;
+}
+var signalPriority = new WeakMap();
+class TaskSignal extends AbortSignal {
+  constructor(key) { if (key !== portKey) throw new TypeError('Illegal constructor'); super(); this.onprioritychange = null; }
+  get priority() { return signalPriority.get(this) || 'user-visible'; }
+  static any(signals, init) {
+    var s = new TaskSignal(portKey), list = Array.from(signals);
+    var p = init && init.priority;
+    signalPriority.set(s, p instanceof TaskSignal ? p.priority : p ? checkPriority(p, 'any') : 'user-visible');
+    for (var x of list) if (x.aborted) { s.aborted = true; s.reason = x.reason; return s; }
+    for (var y of list) y.addEventListener('abort', function () { if (!s.aborted) { s.aborted = true; s.reason = this.reason; s.dispatchEvent(new Event('abort')); } });
+    return s;
+  }
+}
+class TaskPriorityChangeEvent extends Event {
+  constructor(type, init) {
+    if (!init || init.previousPriority === undefined) throw new TypeError("Failed to construct 'TaskPriorityChangeEvent': required member previousPriority is undefined.");
+    super(type, init);
+    Object.defineProperty(this, 'previousPriority', { value: checkPriority(init.previousPriority, 'TaskPriorityChangeEvent'), enumerable: true });
+  }
+}
+class TaskController extends AbortController {
+  constructor(init) {
+    super();
+    var s = new TaskSignal(portKey);
+    signalPriority.set(s, checkPriority(init && init.priority !== undefined ? String(init.priority) : 'user-visible', 'TaskController'));
+    Object.defineProperty(this, 'signal', { value: s, configurable: true });
+  }
+  setPriority(p) {
+    p = checkPriority(String(p), 'setPriority');
+    var s = this.signal, was = s.priority;
+    if (s._changing) throw new DOMException('Priority change is already in progress.', 'NotAllowedError');
+    if (p === was) return;
+    signalPriority.set(s, p);
+    s._changing = true;
+    try { s.dispatchEvent(new TaskPriorityChangeEvent('prioritychange', { previousPriority: was })); } finally { s._changing = false; }
+  }
+}
+var taskQueues = { 'user-blocking': [[], []], 'user-visible': [[], []], 'background': [[], []] };  // [continuations, tasks]
+var taskPumpDue = false, runningPriority = null;
+function pumpTasks() {
+  taskPumpDue = false;
+  for (var p of taskPriorities)
+    for (var q of taskQueues[p])
+      if (q.length) {
+        var t = q.shift();
+        if (!t.done) {
+          t.done = true;
+          runningPriority = t.priority();
+          try { t.resolve(t.callback()); } catch (e) { t.reject(e); } finally { runningPriority = null; }
+        }
+        schedulePump();
+        return;
+      }
+}
+function schedulePump() {
+  if (taskPumpDue) return;
+  for (var p of taskPriorities) for (var q of taskQueues[p]) if (q.length) { taskPumpDue = true; setTimeout(pumpTasks, 0); return; }
+}
+function queueTask(callback, options, continuation) {
+  options = options || {};
+  var signal = options.signal, explicit = options.priority !== undefined ? checkPriority(String(options.priority), 'postTask') : null;
+  var delay = Math.max(0, Number(options.delay) || 0);
+  return new Promise(function (resolve, reject) {
+    if (signal && signal.aborted) { reject(signal.reason); return; }
+    var task = { callback: callback, resolve: resolve, reject: reject, done: false,
+                 priority: function () { return explicit || (signal instanceof TaskSignal ? signal.priority : 'user-visible'); } };
+    if (signal) signal.addEventListener('abort', function () { if (!task.done) { task.done = true; reject(signal.reason); } });
+    var enqueue = function () { if (!task.done) { taskQueues[task.priority()][continuation ? 0 : 1].push(task); schedulePump(); } };
+    delay > 0 ? setTimeout(enqueue, delay) : enqueue();
+  });
+}
+class Scheduler {
+  constructor(key) { if (key !== portKey) throw new TypeError('Illegal constructor'); }
+  postTask(callback, options) {  // its argument errors reject the promise it returns (WebIDL 3.10.27)
+    try {
+      if (typeof callback !== 'function') throw new TypeError("Failed to execute 'postTask' on 'Scheduler': parameter 1 is not of type 'SchedulerPostTaskCallback'.");
+      return queueTask(callback, options, false);
+    } catch (e) { return Promise.reject(e); }
+  }
+  yield() { var p = runningPriority || 'user-visible'; return queueTask(function () {}, { priority: p }, true); }
+}
+
+// ---- Web Locks (W3C): navigator.locks, granted in this document
+var lockQueues = new Map(), heldLocks = [];
+class Lock {
+  constructor(key, name, mode) { if (key !== portKey) throw new TypeError('Illegal constructor'); Object.defineProperty(this, 'name', { value: name, enumerable: true }); Object.defineProperty(this, 'mode', { value: mode, enumerable: true }); }
+}
+function grantable(name, mode) {
+  var held = heldLocks.filter(function (h) { return h.name === name; });
+  return mode === 'shared' ? held.every(function (h) { return h.mode === 'shared'; }) : held.length === 0;
+}
+function grantLock(req) {
+  var lock = new Lock(portKey, req.name, req.mode), entry = { name: req.name, mode: req.mode, req: req };
+  heldLocks.push(entry);
+  setTimeout(function () {
+    var result;
+    try { result = Promise.resolve(req.callback(lock)); } catch (e) { result = Promise.reject(e); }
+    result.then(function (v) { releaseLock(entry); req.resolve(v); }, function (e) { releaseLock(entry); req.reject(e); });
+  }, 0);
+}
+function releaseLock(entry) {
+  var i = heldLocks.indexOf(entry);
+  if (i < 0) return;
+  heldLocks.splice(i, 1);
+  processLocks(entry.name);
+}
+function processLocks(name) {
+  var q = lockQueues.get(name) || [];
+  while (q.length && grantable(name, q[0].mode)) grantLock(q.shift());
+}
+class LockManager {
+  constructor(key) { if (key !== portKey) throw new TypeError('Illegal constructor'); }
+  request(name, options, callback) {
+    if (callback === undefined) { callback = options; options = {}; }
+    options = options || {};
+    return new Promise(function (resolve, reject) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to execute 'request' on 'LockManager': The callback provided as parameter 2 is not a function.");
+      name = String(name);
+      var mode = options.mode === undefined ? 'exclusive' : String(options.mode);
+      if (mode !== 'exclusive' && mode !== 'shared') throw new TypeError("The provided value '" + mode + "' is not a valid enum value of type LockMode.");
+      if (name[0] === '-') throw new DOMException("Names starting with '-' are reserved.", 'NotSupportedError');
+      if (options.steal && options.ifAvailable) throw new DOMException("The 'steal' and 'ifAvailable' options cannot be used together.", 'NotSupportedError');
+      if (options.steal && mode !== 'exclusive') throw new DOMException("The 'steal' option may only be used with 'exclusive' locks.", 'NotSupportedError');
+      if (options.signal && (options.steal || options.ifAvailable)) throw new DOMException("The 'signal' option may not be used with 'steal' or 'ifAvailable'.", 'NotSupportedError');
+      if (options.signal && options.signal.aborted) { reject(options.signal.reason); return; }
+      var req = { name: name, mode: mode, callback: callback, resolve: resolve, reject: reject };
+      if (!lockQueues.has(name)) lockQueues.set(name, []);
+      var q = lockQueues.get(name);
+      if (options.steal) {
+        for (var h of heldLocks.filter(function (h) { return h.name === name; })) { heldLocks.splice(heldLocks.indexOf(h), 1); h.req.reject(new DOMException('The lock was stolen.', 'AbortError')); }
+        q.unshift(req);
+      } else if (options.ifAvailable && !(q.length === 0 && grantable(name, mode))) {
+        setTimeout(function () { try { Promise.resolve(callback(null)).then(resolve, reject); } catch (e) { reject(e); } }, 0);
+        return;
+      } else q.push(req);
+      if (options.signal) options.signal.addEventListener('abort', function () {
+        var i = q.indexOf(req);
+        if (i >= 0) { q.splice(i, 1); reject(options.signal.reason); }
+      });
+      processLocks(name);
+    });
+  }
+  query() {
+    var held = heldLocks.map(function (h) { return { name: h.name, mode: h.mode, clientId: '' }; }), pending = [];
+    lockQueues.forEach(function (q) { q.forEach(function (r) { pending.push({ name: r.name, mode: r.mode, clientId: '' }); }); });
+    return Promise.resolve({ held: held, pending: pending });
+  }
+}
+
+// ---- Trusted Types (W3C): policies make TrustedHTML, TrustedScript and TrustedScriptURL; nothing requires them
+// here (no Content-Security-Policy require-trusted-types-for), so the sinks still take strings as well
+var trustedValue = new WeakMap();
+function trustedClass(name) {
+  var C = class {
+    constructor(key, v) { if (key !== portKey) throw new TypeError('Illegal constructor'); trustedValue.set(this, v); }
+    toString() { return trustedValue.get(this); }
+    toJSON() { return trustedValue.get(this); }
+  };
+  Object.defineProperty(C, 'name', { value: name });
+  return C;
+}
+var TrustedHTML = trustedClass('TrustedHTML'), TrustedScript = trustedClass('TrustedScript'), TrustedScriptURL = trustedClass('TrustedScriptURL');
+class TrustedTypePolicy {
+  constructor(key, name, options) { if (key !== portKey) throw new TypeError('Illegal constructor'); Object.defineProperty(this, 'name', { value: name, enumerable: true }); this._o = options; }
+}
+[['createHTML', TrustedHTML], ['createScript', TrustedScript], ['createScriptURL', TrustedScriptURL]].forEach(function (d) {
+  Object.defineProperty(TrustedTypePolicy.prototype, d[0], { value: function (input) {
+    var fn = this._o[d[0]];
+    if (typeof fn !== 'function') throw new TypeError("Failed to execute '" + d[0] + "' on 'TrustedTypePolicy': Policy " + this.name + "'s TrustedTypePolicyOptions did not specify a '" + d[0] + "' member.");
+    var r = fn.apply(undefined, [String(input)].concat(Array.prototype.slice.call(arguments, 1)));
+    return new d[1](portKey, r === null || r === undefined ? '' : String(r));
+  }, writable: true, configurable: true });
+});
+var defaultTrustedPolicy = null;
+class TrustedTypePolicyFactory {
+  constructor(key) { if (key !== portKey) throw new TypeError('Illegal constructor'); }
+  createPolicy(name, options) {
+    name = String(name);
+    if (name === 'default' && defaultTrustedPolicy) throw new TypeError("Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': Policy with name \"default\" already exists.");
+    var o = {};
+    for (var k of ['createHTML', 'createScript', 'createScriptURL']) if (options && options[k] !== undefined) o[k] = options[k];
+    var p = new TrustedTypePolicy(portKey, name, o);
+    if (name === 'default') defaultTrustedPolicy = p;
+    return p;
+  }
+  isHTML(v) { return v instanceof TrustedHTML && trustedValue.has(v); }
+  isScript(v) { return v instanceof TrustedScript && trustedValue.has(v); }
+  isScriptURL(v) { return v instanceof TrustedScriptURL && trustedValue.has(v); }
+  get emptyHTML() { return new TrustedHTML(portKey, ''); }
+  get emptyScript() { return new TrustedScript(portKey, ''); }
+  get defaultPolicy() { return defaultTrustedPolicy; }
+  getAttributeType(tagName, attribute, elementNs, attrNs) {
+    var tag = String(tagName).toLowerCase(), attr = String(attribute).toLowerCase();
+    if ((attrNs === undefined || attrNs === null || attrNs === '') && /^on/.test(attr)) return 'TrustedScript';
+    if (tag === 'iframe' && attr === 'srcdoc') return 'TrustedHTML';
+    if (tag === 'script' && attr === 'src') return 'TrustedScriptURL';
+    return null;
+  }
+  getPropertyType(tagName, property) {
+    var tag = String(tagName).toLowerCase(), prop = String(property);
+    if (prop === 'innerHTML' || prop === 'outerHTML') return 'TrustedHTML';
+    if (tag === 'iframe' && prop === 'srcdoc') return 'TrustedHTML';
+    if (tag === 'script' && prop === 'src') return 'TrustedScriptURL';
+    if (tag === 'script' && (prop === 'text' || prop === 'innerText' || prop === 'textContent')) return 'TrustedScript';
+    return null;
+  }
+}
+
+// ---- Media Session (W3C): what the page says it is playing, and the actions it handles
+class MediaMetadata {
+  constructor(init) {
+    init = init || {};
+    this.title = init.title === undefined ? '' : String(init.title);
+    this.artist = init.artist === undefined ? '' : String(init.artist);
+    this.album = init.album === undefined ? '' : String(init.album);
+    this.artwork = init.artwork || [];
+  }
+  get artwork() { return this._art; }
+  set artwork(list) {
+    this._art = Object.freeze(Array.from(list).map(function (a) {
+      if (!a || a.src === undefined) throw new TypeError("Failed to set 'artwork': required member src is undefined.");
+      return Object.freeze({ src: new URL(String(a.src), document.baseURI).href, sizes: a.sizes === undefined ? '' : String(a.sizes), type: a.type === undefined ? '' : String(a.type) });
+    }));
+  }
+}
+var mediaActions = ['play', 'pause', 'seekbackward', 'seekforward', 'previoustrack', 'nexttrack', 'skipad', 'stop', 'seekto', 'togglemicrophone',
+                    'togglecamera', 'hangup', 'previousslide', 'nextslide', 'enterpictureinpicture', 'voiceactivity'];
+class MediaSession {
+  constructor(key) { if (key !== portKey) throw new TypeError('Illegal constructor'); this._meta = null; this._state = 'none'; this._handlers = {}; }
+  get metadata() { return this._meta; }
+  set metadata(m) { if (m !== null && !(m instanceof MediaMetadata)) throw new TypeError("Failed to set the 'metadata' property on 'MediaSession': The provided value is not of type 'MediaMetadata'."); this._meta = m; }
+  get playbackState() { return this._state; }
+  set playbackState(s) { if (['none', 'paused', 'playing'].indexOf(s) >= 0) this._state = s; }
+  setActionHandler(action, handler) {
+    if (mediaActions.indexOf(action) < 0) throw new TypeError("Failed to execute 'setActionHandler' on 'MediaSession': The provided value '" + action + "' is not a valid enum value of type MediaSessionAction.");
+    this._handlers[action] = handler === null ? undefined : handler;
+  }
+  setPositionState(state) {
+    if (!state) return;
+    var d = state.duration, p = state.position === undefined ? 0 : state.position, r = state.playbackRate === undefined ? 1 : state.playbackRate;
+    if (d === undefined || d < 0 || isNaN(d)) throw new TypeError("Failed to execute 'setPositionState' on 'MediaSession': The provided duration cannot be less than zero.");
+    if (p < 0 || p > d) throw new TypeError("Failed to execute 'setPositionState' on 'MediaSession': The provided position cannot be greater than the duration.");
+    if (r === 0) throw new TypeError("Failed to execute 'setPositionState' on 'MediaSession': The provided playbackRate cannot be equal to zero.");
+  }
+  setMicrophoneActive() {}
+  setCameraActive() {}
+}
+
+// ---- view transitions (CSS View Transitions 1): the update runs, and the transition itself is skipped, as the
+// standard has it when a transition cannot be captured: ready rejects, finished follows the update
+class ViewTransition {
+  constructor(key, update) {
+    if (key !== portKey) throw new TypeError('Illegal constructor');
+    var done = Promise.resolve().then(function () { return typeof update === 'function' ? update() : undefined; }).then(function () {});
+    var ready = done.then(function () { throw new DOMException('Transition was skipped', 'AbortError'); });
+    ready.catch(function () {});
+    Object.defineProperty(this, 'updateCallbackDone', { value: done });
+    Object.defineProperty(this, 'ready', { value: ready });
+    Object.defineProperty(this, 'finished', { value: done });
+    Object.defineProperty(this, 'types', { value: new Set() });
+  }
+  skipTransition() {}
+}
+)JS"
+R"JS(
+)JS"
+R"JS(
+// ---- wiring the APIs above into the window, navigator and document
+G.scheduler = new Scheduler(portKey);
+var lockManager = new LockManager(portKey), mediaSession = new MediaSession(portKey), trustedTypesFactory = new TrustedTypePolicyFactory(portKey);
+if (isSecureContext) Object.defineProperty(navigator, 'locks', { get: function () { return lockManager; }, enumerable: true, configurable: true });  // [SecureContext]
+Object.defineProperty(navigator, 'mediaSession', { get: function () { return mediaSession; }, enumerable: true, configurable: true });
+Object.defineProperty(G, 'trustedTypes', { get: function () { return trustedTypesFactory; }, enumerable: true, configurable: true });
+[['Scheduler', Scheduler], ['TaskController', TaskController], ['TaskSignal', TaskSignal], ['TaskPriorityChangeEvent', TaskPriorityChangeEvent],
+ ['LockManager', LockManager], ['Lock', Lock], ['TrustedHTML', TrustedHTML], ['TrustedScript', TrustedScript], ['TrustedScriptURL', TrustedScriptURL],
+ ['TrustedTypePolicy', TrustedTypePolicy], ['TrustedTypePolicyFactory', TrustedTypePolicyFactory], ['MediaMetadata', MediaMetadata],
+ ['MediaSession', MediaSession], ['ViewTransition', ViewTransition], ['MessagePort', MessagePort], ['MessageChannel', MessageChannel],
+ ['BroadcastChannel', BroadcastChannel]].forEach(function (e) {
+  Object.defineProperty(G, e[0], { value: e[1], writable: true, configurable: true });
+});
+var docProto = Object.getPrototypeOf(document);
+function docGetter(name, get) { Object.defineProperty(docProto, name, { get: get, enumerable: true, configurable: true }); }
+docGetter('contentType', function () { return 'text/html'; });     // HTML documents (DOM 4.5)
+docGetter('prerendering', function () { return false; });          // Prerendering Revamped: never prerendered here
+docProto.onprerenderingchange = null;
+docProto.hasStorageAccess = function () { return Promise.resolve(true); };  // Storage Access API: a top-level document has it
+docProto.requestStorageAccess = function () { return Promise.resolve(); };
+docProto.hasUnpartitionedCookieAccess = function () { return Promise.resolve(true); };
+docProto.startViewTransition = function (arg) {
+  return new ViewTransition(portKey, typeof arg === 'function' ? arg : arg && typeof arg === 'object' ? arg.update : undefined);
+};
+docGetter('activeViewTransition', function () { return null; });
+// window: its position on the screen (CSSOM View 4.2) is not known here, so 0; origin (HTML 7.1); frameElement of a top-level window
+['screenX', 'screenY', 'screenLeft', 'screenTop'].forEach(function (n) { Object.defineProperty(G, n, { get: function () { return 0; }, enumerable: true, configurable: true }); });
+Object.defineProperty(G, 'origin', { get: function () { return location.origin; }, enumerable: true, configurable: true });
+Object.defineProperty(G, 'frameElement', { get: function () { return null; }, enumerable: true, configurable: true });
+Object.defineProperty(screen, 'availLeft', { value: 0, enumerable: true, configurable: true });
+Object.defineProperty(screen, 'availTop', { value: 0, enumerable: true, configurable: true });
+// Resource Timing 2: no entries are kept, so the buffer has nothing to clear
+performance.clearResourceTimings = function () {};
+performance.setResourceTimingBufferSize = function () {};
+performance.onresourcetimingbufferfull = null;
+)JS"
+R"JS(
 class DOMParser {
   parseFromString(text) { var d = inertDocument(); d.body.innerHTML = String(text); return d; }
 }

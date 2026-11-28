@@ -1,0 +1,206 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Web APIs test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+</style>
+</head>
+<body>
+<p>Web APIs sites look for: structured cloning, MessageChannel, postMessage, BroadcastChannel, CSS.supports,
+EventTarget, the scheduler, Web Locks, Trusted Types, view transitions and the media session.</p>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  function attempt(name, fn) { try { fn(); } catch (e) { log(name, false, 'threw ' + e); } }
+  function errName(fn) { try { fn(); return 'none'; } catch (e) { return e.name; } }
+  var later = [];  // checks that finish in later tasks
+  function soon(fn) { later.push(new Promise(function (res) { fn(res); })); }
+
+  attempt('structuredClone', function () {
+    var o = { d: new Date(5), r: /a.b/gi, m: new Map([[1, { x: 1 }]]), s: new Set(['a']), n: new Number(3), list: [1, , 3] };
+    o.self = o;
+    var c = structuredClone(o);
+    eq('dates, regexps, maps, sets, wrappers and cycles', [c !== o, c.self === c, c.d instanceof Date, c.d.getTime(), c.r.source + c.r.flags, c.m.get(1).x, c.s.has('a'),
+       typeof c.n, c.n + 0, c.list.length, 1 in c.list].join(), 'true,true,true,5,a.bgi,1,true,object,3,3,false');
+    var buf = new ArrayBuffer(8), a = new Uint8Array(buf, 2, 3), b = new Uint16Array(buf);
+    a[0] = 7;
+    var pair = structuredClone([a, b]);
+    eq('views keep sharing one buffer', [pair[0].buffer === pair[1].buffer, pair[0].byteOffset, pair[0][0], pair[0] instanceof Uint8Array].join(), 'true,2,7,true');
+    var e = structuredClone(new RangeError('boom'));
+    eq('errors', [e instanceof RangeError, e.message].join(), 'true,boom');
+    eq('what cannot be cloned', [errName(function () { structuredClone(function () {}); }), errName(function () { structuredClone(Symbol()); }),
+       errName(function () { structuredClone(document.body); })].join(), 'DataCloneError,DataCloneError,DataCloneError');
+    var t = new ArrayBuffer(4), moved = structuredClone(t, { transfer: [t] });
+    eq('transfer moves a buffer', [t.byteLength, moved.byteLength].join(), '0,4');
+    var proto = structuredClone(new (class X { constructor() { this.a = 1; } })());
+    eq('class instances come back as plain objects', [Object.getPrototypeOf(proto) === Object.prototype, proto.a].join(), 'true,1');
+  });
+
+  attempt('MessageChannel', function () {
+    var ch = new MessageChannel(), got = [];
+    eq('ports', [ch.port1 instanceof MessagePort, errName(function () { new MessagePort(); })].join(), 'true,TypeError');
+    ch.port2.addEventListener('message', function (e) { got.push(e.data.n); });
+    ch.port1.postMessage({ n: 1 });
+    ch.port1.postMessage({ n: 2 });
+    soon(function (done) {
+      setTimeout(function () {
+        var before = got.join();
+        ch.port2.start();
+        setTimeout(function () {
+          eq('messages wait until the port is started, then come in order', [before, got.join()].join('|'), '|1,2');
+          var inner = new MessageChannel(), seen = null;
+          ch.port1.onmessage = function (e) { var p = e.ports[0]; p.onmessage = function (m) { seen = m.data; }; };
+          ch.port2.postMessage('port', [inner.port2]);
+          setTimeout(function () {
+            inner.port1.postMessage('through');
+            setTimeout(function () { eq('a port sent through another keeps working', seen, 'through'); done(); }, 30);
+          }, 30);
+        }, 30);
+      }, 30);
+    });
+  });
+
+  attempt('postMessage', function () {
+    var events = [];
+    function onMessage(e) { events.push([e instanceof MessageEvent, e.data.v, e.source === window, e.origin === location.origin].join()); }
+    window.addEventListener('message', onMessage);
+    postMessage({ v: 1 }, '*');
+    postMessage({ v: 2 }, 'https://other.example');
+    eq('a bad target origin is a SyntaxError', errName(function () { postMessage(1, 'not a url'); }), 'SyntaxError');
+    soon(function (done) {
+      setTimeout(function () { window.removeEventListener('message', onMessage); eq('window.postMessage delivers to its own origin only', events.join('|'), 'true,1,true,true'); done(); }, 40);
+    });
+  });
+
+  attempt('BroadcastChannel', function () {
+    var a = new BroadcastChannel('t'), b = new BroadcastChannel('t'), c = new BroadcastChannel('other'), seen = [];
+    a.onmessage = function (e) { seen.push('a' + e.data); };
+    b.onmessage = function (e) { seen.push('b' + e.data); };
+    c.onmessage = function (e) { seen.push('c' + e.data); };
+    a.postMessage(1);
+    soon(function (done) {
+      setTimeout(function () {
+        a.close();
+        eq('other channels of the name get it; a closed one cannot post', [seen.join(), b.name, errName(function () { a.postMessage(2); })].join('|'), 'b1|t|InvalidStateError');
+        b.close(); c.close();
+        done();
+      }, 30);
+    });
+  });
+
+  attempt('CSS', function () {
+    eq('CSS.supports', [CSS.supports('display', 'grid'), CSS.supports('display', 'nonsense'), CSS.supports('(display: flex) and (color: red)'),
+       CSS.supports('display: flex'), CSS.supports('--x', 'anything'), CSS.supports('not (display: nonsense)')].join(), 'true,false,true,true,true,true');
+    eq('CSS.escape', [CSS.escape('1a'), CSS.escape('-'), CSS.escape('a b'), CSS.escape('-2x'), CSS.escape('é_-')].join('|'), '\\31 a|\\-|a\\ b|-\\32 x|é_-');
+  });
+
+  attempt('EventTarget', function () {
+    var t = new EventTarget(), n = 0, c = new AbortController(), order = [];
+    function f() { n++; }
+    t.addEventListener('x', f);
+    t.addEventListener('x', f);
+    t.addEventListener('y', f, { once: true });
+    t.addEventListener('z', f, { signal: c.signal });
+    t.dispatchEvent(new Event('x')); t.dispatchEvent(new Event('y')); t.dispatchEvent(new Event('y'));
+    c.abort();
+    t.dispatchEvent(new Event('z'));
+    eq('a listener is added once; once and signal remove it', n, 2);
+    t.addEventListener('w', { handleEvent: function (e) { order.push('object:' + (e.currentTarget === t)); } });
+    t.addEventListener('w', function (e) { order.push('stop'); e.stopImmediatePropagation(); });
+    t.addEventListener('w', function () { order.push('never'); });
+    var r = t.dispatchEvent(new Event('w', { cancelable: true }));
+    eq('handleEvent objects and stopImmediatePropagation', [order.join(), r].join('|'), 'object:true,stop|true');
+    var s1 = new AbortController(), any = AbortSignal.any([s1.signal, new AbortController().signal]);
+    s1.abort('why');
+    eq('AbortSignal.any', [any.aborted, any.reason].join(), 'true,why');
+  });
+
+  attempt('scheduler', function () {
+    var order = [];
+    var p = Promise.all([
+      scheduler.postTask(function () { order.push('background'); }, { priority: 'background' }),
+      scheduler.postTask(function () { order.push('visible'); return 42; }),
+      scheduler.postTask(function () { order.push('blocking'); }, { priority: 'user-blocking' })
+    ]);
+    var tc = new TaskController({ priority: 'background' }), changes = [];
+    tc.signal.addEventListener('prioritychange', function (e) { changes.push(e.previousPriority + '>' + tc.signal.priority); });
+    tc.setPriority('user-blocking');
+    var ac = new AbortController(), aborted = scheduler.postTask(function () { order.push('aborted'); }, { signal: ac.signal });
+    ac.abort();
+    var bad = scheduler.postTask(function () {}, { priority: 'urgent' }).then(function () { return 'none'; }, function (e) { return e.name; });
+    soon(function (done) {
+      p.then(function (r) {
+        return aborted.then(function () { return 'resolved'; }, function (e) { return e.name; }).then(function (a) {
+          return bad.then(function (b) { return scheduler.yield().then(function () {
+            eq('postTask runs by priority, gives the callback\'s result; aborts and bad options reject; yield resolves', [order.join(), r[1], a, b, changes.join()].join('|'),
+               'blocking,visible,background|42|AbortError|TypeError|background>user-blocking');
+          }); });
+        });
+      }).catch(function (e) { log('scheduler promises', false, String(e)); }).then(done);
+    });
+  });
+
+  if (navigator.locks) attempt('Web Locks', function () {  // [SecureContext]: not on a data: page
+    var order = [];
+    var first = navigator.locks.request('L', function (lock) {
+      order.push('1:' + lock.name + ':' + lock.mode);
+      return new Promise(function (r) { setTimeout(function () { order.push('1 done'); r('one'); }, 20); });
+    });
+    var second = navigator.locks.request('L', function () { order.push('2'); return 'two'; });
+    var maybe = navigator.locks.request('L', { ifAvailable: true }, function (lock) { order.push('ifAvailable:' + lock); });
+    soon(function (done) {
+      Promise.all([first, second, maybe]).then(function (r) {
+        eq('locks are granted one after the other; ifAvailable gets null while held', [order.join(), r[0], r[1]].join('|'), '1:L:exclusive,ifAvailable:null,1 done,2|one|two');
+        return navigator.locks.query().then(function (q) { eq('query', [q.held.length, q.pending.length].join(), '0,0'); });
+      }).catch(function (e) { log('locks', false, String(e)); }).then(done);
+    });
+  });
+
+  attempt('Trusted Types', function () {
+    var p = trustedTypes.createPolicy('test', { createHTML: function (s) { return s.replace(/</g, '&lt;'); } });
+    var h = p.createHTML('<b>x</b>');
+    var div = document.createElement('div');
+    div.innerHTML = h;
+    eq('a policy makes TrustedHTML that sinks take', [h instanceof TrustedHTML, trustedTypes.isHTML(h), trustedTypes.isHTML('s'), String(h), div.textContent, JSON.stringify({ h: h })].join('|'),
+       'true|true|false|&lt;b>x&lt;/b>|<b>x</b>|{"h":"&lt;b>x&lt;/b>"}');
+    trustedTypes.createPolicy('default', {});
+    eq('policy rules', [errName(function () { p.createScript('x'); }), errName(function () { trustedTypes.createPolicy('default', {}); }), trustedTypes.defaultPolicy.name,
+       trustedTypes.getPropertyType('div', 'innerHTML'), trustedTypes.getAttributeType('script', 'src'), String(trustedTypes.getAttributeType('div', 'title')), String(trustedTypes.emptyHTML)].join('|'),
+       'TypeError|TypeError|default|TrustedHTML|TrustedScriptURL|null|');
+  });
+
+  attempt('the rest', function () {
+    eq('document and window properties', [document.contentType, document.prerendering, window.origin === location.origin, window.frameElement, typeof screenX, typeof screen.availTop].join(),
+       'text/html,false,true,,number,number');
+    var called = false, vt = document.startViewTransition(function () { called = true; });
+    soon(function (done) {
+      vt.ready.then(function () { return 'resolved'; }, function (e) { return e.name; }).then(function (r) {
+        return vt.finished.then(function () { eq('a view transition runs its update; with nothing to animate it is skipped', [called, r === 'AbortError' || r === 'InvalidStateError'].join(), 'true,true'); });
+      }).then(done);
+    });
+    navigator.mediaSession.metadata = new MediaMetadata({ title: 'T', artwork: [{ src: 'https://example.com/a.png' }] });
+    navigator.mediaSession.setActionHandler('play', function () {});
+    eq('media session', [navigator.mediaSession.metadata.title, /a\.png$/.test(navigator.mediaSession.metadata.artwork[0].src),
+       errName(function () { navigator.mediaSession.setActionHandler('dance', null); })].join(), 'T,true,TypeError');
+  });
+
+  Promise.all(later).then(function () {
+    document.title = 'Web APIs test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>
