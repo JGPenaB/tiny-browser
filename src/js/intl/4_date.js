@@ -274,7 +274,7 @@ function timeClip(t) {
 var temporalInfo = natives.temporalInfo;
 function toFormattable(value) {
   var info = isObject(value) ? temporalInfo(value) : undefined;
-  return info !== undefined ? info : +value;
+  return info !== undefined && info.kind !== 'Duration' ? info : +value;
 }
 function daysFromCivil(y, m, d) {  // days since 1970-01-01 of a proleptic Gregorian date
   y -= m <= 2 ? 1 : 0;
@@ -406,6 +406,7 @@ natives.dateToLocaleString = function (x, locales, options, required, defaults) 
 };
 // The toLocaleString methods of Temporal (Temporal 15.11), called by Temporal with what it knows of the object
 natives.temporalToLocaleString = function (info, locales, options, required, defaults, timeZone) {
+  if (info.kind === 'Duration') return durationToLocaleString(info, locales, options);
   var r = slotOf(createDateTimeFormat(undefined, locales, options, required, defaults, timeZone), 'DateTimeFormat');
   if (info.kind === 'ZonedDateTime') {
     if (info.calendar !== 'iso8601' && info.calendar !== r.calendar) throwRange('The calendars differ');

@@ -58,6 +58,7 @@ function temporalInfo(r) {
   if (date !== undefined) { info.year = date.year; info.month = date.month; info.day = date.day; }
   if (t !== undefined) { info.hour = t.hour; info.minute = t.minute; info.second = t.second; info.millisecond = t.millisecond; }
   if (r.ns !== undefined) info.epochMs = $Number(floorDiv(r.ns, 1000000n));
+  if (r.v !== undefined) { info.v = list(); for (var i = 0; i < 10; i++) info.v[i] = r.v[i]; }  // a Duration's ten fields
   return info;
 }
 function intlToLocaleString(r, self, args, required, defaults, timeZone) {
@@ -260,9 +261,9 @@ function getDifferenceSettings(operation, options, group, disallowed, fallbackSm
   if (largestUnit === undefined) largestUnit = AUTO;
   if (arrayIndexOf(disallowed, largestUnit) >= 0) throwRange('largestUnit is not allowed here');
   validateUnit(smallestUnit, group);
-  if (smallestUnit === undefined) smallestUnit = fallbackSmallest;
 )JS",
-R"JS(  if (arrayIndexOf(disallowed, smallestUnit) >= 0) throwRange('smallestUnit is not allowed here');
+R"JS(  if (smallestUnit === undefined) smallestUnit = fallbackSmallest;
+  if (arrayIndexOf(disallowed, smallestUnit) >= 0) throwRange('smallestUnit is not allowed here');
   var defaultLargest = largerUnit(smallestLargestDefault, smallestUnit);
   if (largestUnit === AUTO) largestUnit = defaultLargest;
   if (largerUnit(largestUnit, smallestUnit) !== largestUnit) throwRange('largestUnit must be larger than smallestUnit');
@@ -1653,7 +1654,7 @@ class Duration extends $Object {
     return durationToString(rounded, precision.precision);
   }
   toJSON() { return durationToString(slotOf(this, 'Duration').v, AUTO); }
-  toLocaleString() { return durationToString(slotOf(this, 'Duration').v, AUTO); }
+  toLocaleString() { return intlToLocaleString(slotOf(this, 'Duration'), this, arguments); }
   valueOf() { throwType('Use Temporal.Duration.compare to compare durations'); }
 }
 DurationProto = Duration.prototype;
@@ -2721,9 +2722,11 @@ natives.protos = create(null);  // for protoFor when a constructor of another re
 for (var pi = 0; pi < classNames.length; pi++) natives.protos[classNames[pi]] = classes[classNames[pi]].prototype;
 // What Intl.DateTimeFormat needs of a Temporal object (ECMA-402 with Temporal, 15.6.22), or undefined for any other
 // value. Its fields are those of the ISO date and time; epochMs for an Instant or ZonedDateTime.
+// For Intl.DurationFormat, which takes a duration string as Temporal does
+natives.durationFromString = function (s) { return temporalInfo(recordOf(parseDurationString(s))); };
 natives.info = function (x) {
   var kind = kindOf(x);
-  if (kind === undefined || kind === 'Duration') return undefined;
+  if (kind === undefined) return undefined;
   return temporalInfo(recordOf(x));
 };
 // Date.prototype.toTemporalInstant (14.1.1): installed by the engine without building Temporal until it is first read

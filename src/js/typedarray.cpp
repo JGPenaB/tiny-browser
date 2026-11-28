@@ -566,7 +566,11 @@ JSFN(typedJoin) {  // data: 1 = toLocaleString
         if (k) out += sep;
         Value e = element(vm, t, k);
         if (e.isNullish()) continue;
-        out += vm.toString(locale ? vm.invoke(e, "toLocaleString") : e)->s;
+        if (locale) {  // ECMA-402 19.6.1: the locales and options go on to each element
+            Value args[2] = {ci.arg(0), ci.arg(1)};
+            e = vm.call(vm.get(e, "toLocaleString"), e, args, 2);
+        }
+        out += vm.toString(e)->s;
     }
     return vm.strv(std::move(out));
 }

@@ -513,7 +513,8 @@ JSFN(toLocaleString) {
         Value e = a.get(k);
         if (e.isNullish()) continue;
         Value fn = vm.get(e, PropKey::of(vm.atom("toLocaleString")));
-        out += vm.toStr16(vm.call(fn, e, nullptr, 0));
+        Value args[2] = {ci.arg(0), ci.arg(1)};  // ECMA-402 19.5.1: the locales and options go on to each element
+        out += vm.toStr16(vm.call(fn, e, args, 2));
     }
     return vm.strv(std::move(out));
 }

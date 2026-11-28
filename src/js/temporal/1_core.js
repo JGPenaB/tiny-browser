@@ -52,6 +52,7 @@ function temporalInfo(r) {
   if (date !== undefined) { info.year = date.year; info.month = date.month; info.day = date.day; }
   if (t !== undefined) { info.hour = t.hour; info.minute = t.minute; info.second = t.second; info.millisecond = t.millisecond; }
   if (r.ns !== undefined) info.epochMs = $Number(floorDiv(r.ns, 1000000n));
+  if (r.v !== undefined) { info.v = list(); for (var i = 0; i < 10; i++) info.v[i] = r.v[i]; }  // a Duration's ten fields
   return info;
 }
 function intlToLocaleString(r, self, args, required, defaults, timeZone) {

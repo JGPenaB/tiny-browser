@@ -193,7 +193,7 @@ class Duration extends $Object {
     return durationToString(rounded, precision.precision);
   }
   toJSON() { return durationToString(slotOf(this, 'Duration').v, AUTO); }
-  toLocaleString() { return durationToString(slotOf(this, 'Duration').v, AUTO); }
+  toLocaleString() { return intlToLocaleString(slotOf(this, 'Duration'), this, arguments); }
   valueOf() { throwType('Use Temporal.Duration.compare to compare durations'); }
 }
 DurationProto = Duration.prototype;

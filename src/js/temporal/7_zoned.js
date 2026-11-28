@@ -508,9 +508,11 @@ natives.protos = create(null);  // for protoFor when a constructor of another re
 for (var pi = 0; pi < classNames.length; pi++) natives.protos[classNames[pi]] = classes[classNames[pi]].prototype;
 // What Intl.DateTimeFormat needs of a Temporal object (ECMA-402 with Temporal, 15.6.22), or undefined for any other
 // value. Its fields are those of the ISO date and time; epochMs for an Instant or ZonedDateTime.
+// For Intl.DurationFormat, which takes a duration string as Temporal does
+natives.durationFromString = function (s) { return temporalInfo(recordOf(parseDurationString(s))); };
 natives.info = function (x) {
   var kind = kindOf(x);
-  if (kind === undefined || kind === 'Duration') return undefined;
+  if (kind === undefined) return undefined;
   return temporalInfo(recordOf(x));
 };
 // Date.prototype.toTemporalInstant (14.1.1): installed by the engine without building Temporal until it is first read

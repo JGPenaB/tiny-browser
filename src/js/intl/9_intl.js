@@ -7,7 +7,7 @@ function method(name, fn, length) {  // a built-in function: no prototype, not a
   defineProperty(f, 'length', { value: length, writable: false, enumerable: false, configurable: true });
   return f;
 }
-var classes = { DisplayNames: DisplayNames, ListFormat: ListFormat, Locale: Locale, PluralRules: PluralRules, RelativeTimeFormat: RelativeTimeFormat,
+var classes = { DisplayNames: DisplayNames, DurationFormat: DurationFormat, ListFormat: ListFormat, Locale: Locale, PluralRules: PluralRules, RelativeTimeFormat: RelativeTimeFormat,
                 Segmenter: Segmenter };
 var classNames = getOwnPropertyNames(classes);
 for (var ci = 0; ci < classNames.length; ci++) {

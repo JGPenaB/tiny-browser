@@ -149,6 +149,13 @@ void snapshotIntrinsics(Vm& vm) {
     }
     vm.pristine = V(snap);
 }
+// For Intl: a duration string read as Temporal reads one, which builds Temporal if it was not yet
+JSFN(durationFromString) {
+    Vm& vm = ci.vm;
+    Value fn = vm.get(V(temporalNatives(vm)), "durationFromString");
+    Value arg = ci.arg(0);
+    return vm.call(fn, Value::undef(), &arg, 1);
+}
 const std::u16string* joinParts(const char* const* parts, size_t count) {
     std::string joined;
     for (size_t i = 0; i < count; i++) joined += parts[i];
@@ -168,6 +175,7 @@ JSObject* bundleNatives(Vm& vm, Value& slot, const std::u16string* source) {
     vm.def(natives, "pristine", vm.pristine);
     vm.defFn(natives, "toLocaleString", temporalToLocaleString, 6);
     vm.defFn(natives, "temporalInfo", temporalInfo, 1);
+    vm.defFn(natives, "durationFromString", durationFromString, 1);
     auto src = std::shared_ptr<const std::u16string>(source, [](const std::u16string*) {});
     FuncProto* p = compileScript(vm, src, kBuiltinFile, false, nullptr);
     JSFunction* outer = vm.makeClosure(p, nullptr, nullptr);
