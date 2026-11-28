@@ -450,7 +450,7 @@ JSFN(dateBestPattern) {
     if (!g) vm.throwError(Err::RangeError, "The date format cannot be made");
     std::u16string skeleton = ustring(vm, ci.arg(1));
     UChar out[256];
-    int32_t n = udatpg_getBestPatternWithOptions(g, (const UChar*)skeleton.data(), (int32_t)skeleton.size(), UDATPG_MATCH_ALL_FIELDS_LENGTH, out, 256, &err);
+    int32_t n = udatpg_getBestPatternWithOptions(g, (const UChar*)skeleton.data(), (int32_t)skeleton.size(), UDATPG_MATCH_HOUR_FIELD_LENGTH, out, 256, &err);
     if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The date format cannot be made");
     return V(vm.str(fromUChars(out, n)));
 }
@@ -729,26 +729,23 @@ JSFN(segment) {
 // ---------------------------------------------------------------- calendars (Temporal with the Intl era and month code proposal)
 // Days since 1970-01-01 are the currency here: ICU works in UTC milliseconds, Temporal in ISO dates.
 const double kMsPerDay = 86400000.0;
-// The ICU calendar of a CLDR calendar type, proleptic, in UTC, kept for the thread
-UCalendar* nonIsoCalendar(const std::string& type) {
-    thread_local std::unordered_map<std::string, UCalendar*> calendars;
-    auto it = calendars.find(type);
-    if (it != calendars.end()) return it->second;
-    std::string icuType = type == "gregory" ? "gregorian" : type == "ethioaa" ? "ethiopic-amete-alem" : type;
-    std::string locale = "en@calendar=" + icuType;
-    UErrorCode err = U_ZERO_ERROR;
-    UCalendar* cal = ucal_open(u"UTC", 3, locale.c_str(), UCAL_DEFAULT, &err);
-    if (U_FAILURE(err)) cal = nullptr;
-    else {
-        ucal_setGregorianChange(cal, -8.64e15, &err);
-        err = U_ZERO_ERROR;
+// A new ICU calendar of a CLDR calendar type, proleptic, in UTC. Not kept: a kept one gave wrong Chinese years after
+// other years had been computed with it (test262 in one process), and the JavaScript side keeps the years it got.
+struct OwnedCalendar {
+    UCalendar* cal = nullptr;
+    explicit OwnedCalendar(const std::string& type) {
+        std::string icuType = type == "gregory" ? "gregorian" : type == "ethioaa" ? "ethiopic-amete-alem" : type;
+        std::string locale = "en@calendar=" + icuType;
+        UErrorCode err = U_ZERO_ERROR;
+        cal = ucal_open(u"UTC", 3, locale.c_str(), UCAL_DEFAULT, &err);
+        if (U_FAILURE(err)) cal = nullptr;
+        else ucal_setGregorianChange(cal, -8.64e15, &err);
     }
-    calendars.emplace(type, cal);
-    return cal;
-}
+    ~OwnedCalendar() { if (cal) ucal_close(cal); }
+};
 // ICU's extended year is the arithmetic year of the proposal for every calendar but the Chinese and Korean ones, whose
 // extended years count from their legendary epochs
-int32_t extendedYearOffset(const std::string& type) { return type == "chinese" ? 2637 : type == "dangi" ? 2333 : 0; }
+int32_t extendedYearOffset(const std::string& type) { return type == "chinese" ? 2637 : type == "dangi" ? 2333 : 0; }  // the others are computed in JavaScript
 bool lunisolarMonths(const std::string& type) { return type == "chinese" || type == "dangi"; }
 // The month code of the month the calendar is set to: "M01".."M13", or with "L" for a leap month
 std::u16string monthCodeAt(UCalendar* cal, const std::string& type, UErrorCode& err) {
@@ -769,7 +766,8 @@ std::u16string monthCodeAt(UCalendar* cal, const std::string& type, UErrorCode& 
 JSFN(calendarYear) {
     Vm& vm = ci.vm;
     std::string type = toAscii(ustring(vm, ci.arg(0)));
-    UCalendar* cal = nonIsoCalendar(type);
+    OwnedCalendar owned(type);
+    UCalendar* cal = owned.cal;
     if (!cal) return Value::undef();
     int32_t year = (int32_t)vm.toNumber(ci.arg(1)) + extendedYearOffset(type);
     UErrorCode err = U_ZERO_ERROR;
@@ -788,11 +786,16 @@ JSFN(calendarYear) {
         ucal_setMillis(cal, start * kMsPerDay, &err);
         if (ucal_get(cal, UCAL_EXTENDED_YEAR, &err) != year) break;
         std::u16string code = monthCodeAt(cal, type, err);
-        int32_t length = ucal_getLimit(cal, UCAL_DATE, UCAL_ACTUAL_MAXIMUM, &err);
+        // every month has 28 to 31 days: the next one starts on the first day past 28 that is a 1st
+        double next = start + 28;
+        for (; next < start + 32; next += 1) {
+            ucal_setMillis(cal, next * kMsPerDay, &err);
+            if (ucal_get(cal, UCAL_DATE, &err) == 1) break;
+        }
         a->elems.push_back(V(vm.str(code)));
         a->elems.push_back(Value::num(start));
-        a->elems.push_back(Value::num(length));
-        start += length;
+        a->elems.push_back(Value::num(next - start));
+        start = next;
     }
     a->elems[1] = Value::num(start);
     if (U_FAILURE(err)) return Value::undef();
@@ -802,7 +805,8 @@ JSFN(calendarYear) {
 JSFN(calendarYearOf) {
     Vm& vm = ci.vm;
     std::string type = toAscii(ustring(vm, ci.arg(0)));
-    UCalendar* cal = nonIsoCalendar(type);
+    OwnedCalendar owned(type);
+    UCalendar* cal = owned.cal;
     if (!cal) return Value::undef();
     UErrorCode err = U_ZERO_ERROR;
     ucal_setMillis(cal, vm.toNumber(ci.arg(1)) * kMsPerDay, &err);

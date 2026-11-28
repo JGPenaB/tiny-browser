@@ -74,8 +74,8 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
    devtools Console. Behavior follows the ECMAScript specification (ECMA-262) and is checked against the test262
-   conformance suite: see "Conformance" below. Temporal (ISO 8601 calendar, every IANA time zone) and Intl (ECMA-402,
-   every service) are there too. Still open: Temporal's other calendars (Japanese, Hebrew, Chinese and the rest).
+   conformance suite: see "Conformance" below. Temporal (every CLDR calendar, every IANA time zone) and Intl (ECMA-402,
+   every service) are there too.
 4. **Milestone 4 - DOM + Web APIs (in progress; required by Google results, YouTube and Reddit):** done so far: DOM
    bindings and events, classic and module scripts (import maps, `defer`, `nomodule`), timers + event loop, `fetch`/XHR with
    CORS, storage, cookies, MutationObserver, template contents, custom elements, shadow DOM (slots, scoped styles with
@@ -120,9 +120,11 @@ use them pay nothing. After changing those files, run `python tools/gen_js_parts
 set up (`prelude.cpp snapshotIntrinsics`), so a page that replaced `Array.prototype.sort` cannot change them.
 
 Locale data, time zone rules and the formatters themselves come from ICU, the Unicode library that Windows 10 (1903)
-and later ship as `icu.dll`; `src/js/icu.cpp` is the bridge. `intl402` test262, 2026-11-28: 1,575 of 3,394. Of the
-1,819 failures, 1,782 are Temporal tests for calendars other than ISO 8601; most of the rest need locale or time zone
-data newer than the ICU 72 of this Windows (the `gara` digits, `und-150` as `en-Latn-150`, the 2024 zone links).
+and later ship as `icu.dll`; `src/js/icu.cpp` is the bridge. Temporal's calendars follow the Intl era and month code
+proposal: the Hebrew, tabular Islamic, Coptic, Ethiopic, Indian and ISO-month calendars are computed in JavaScript
+(`src/js/temporal/3b_calendars.js`), the Chinese, Korean, Persian and Umm al-Qura ones are read from ICU.
+`intl402` test262, 2026-11-28: 3,349 of 3,394. What fails needs locale or calendar data newer than the ICU 72 of this
+Windows: a few Chinese new years a day off, the `gara` digits, `und-150` as `en-Latn-150`, the 2024 zone links.
 
 What still fails are proposals only, largest first: `import defer` and source-phase imports (about
 260), decorators (22).

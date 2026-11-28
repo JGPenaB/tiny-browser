@@ -64,11 +64,97 @@ function eraOf(calendar, date, year) {
   return undefined;
 }
 
+// The calendars with fixed rules are computed here, as Calendrical Calculations (Reingold and Dershowitz) gives
+// them; ICU is asked only about the ones that need observation or tables (Chinese, Korean, Persian, Umm al-Qura).
+// Days are counted from 1970-01-01, which is R.D. 719163.
+var RD_1970 = 719163;
+function monthList(codes, starts, lengths) {
+  var months = list();
+  for (var i = 0; i < codes.length; i++) { var m = create(null); m.code = codes[i]; m.start = starts[i]; m.length = lengths[i]; arrayPush(months, m); }
+  return months;
+}
+function yearRecord(start, end, codes, lengths) {
+  var info = create(null), starts = list(), at = start;
+  for (var i = 0; i < lengths.length; i++) { arrayPush(starts, at); at += lengths[i]; }
+  info.start = start; info.end = end; info.months = monthList(codes, starts, lengths);
+  return info;
+}
+var TWELVE = ['M01', 'M02', 'M03', 'M04', 'M05', 'M06', 'M07', 'M08', 'M09', 'M10', 'M11', 'M12'];
+// Tabular Hijri: 30-year cycles with 11 leap years; the civil epoch is 622-07-19 ISO, the astronomical one a day earlier
+function islamicNewYear(calendar, year) {
+  var epoch = (calendar === 'islamic-tbla' ? 227014 : 227015) - RD_1970;
+  return epoch + (year - 1) * 354 + floor((3 + 11 * year) / 30);
+}
+function islamicYear(calendar, year) {
+  var leap = ((14 + 11 * year) % 30 + 30) % 30 < 11, lengths = list();
+  for (var m = 1; m <= 12; m++) arrayPush(lengths, m === 12 && leap ? 30 : m % 2 === 1 ? 30 : 29);
+  return yearRecord(islamicNewYear(calendar, year), islamicNewYear(calendar, year + 1), TWELVE, lengths);
+}
+// Coptic and Ethiopic: twelve months of 30 days and one of 5, or 6 in a year that is 3 modulo 4
+function copticNewYear(calendar, year) {
+  if (calendar === 'coptic') return 103605 - RD_1970 + 365 * (year - 1) + floor(year / 4);
+  if (calendar === 'ethioaa') year -= 5500;  // the Amete Alem year counts 5500 years more
+  return 2796 - RD_1970 + 365 * (year - 1) + floor(year / 4);
+}
+function copticYear(calendar, year) {
+  var lengths = list(), codes = list(), leap = ((calendar === 'ethioaa' ? year - 5500 : year) % 4 + 4) % 4 === 3;
+  for (var m = 1; m <= 13; m++) { arrayPush(codes, m < 13 ? TWELVE[m - 1] : 'M13'); arrayPush(lengths, m < 13 ? 30 : leap ? 6 : 5); }
+  return yearRecord(copticNewYear(calendar, year), copticNewYear(calendar, year + 1), codes, lengths);
+}
+// Hebrew: the molad of Tishri with its postponements; years of 353 to 385 days
+function hebrewElapsedDays(year) {
+  var months = floor((235 * year - 234) / 19), parts = 12084 + 13753 * months, days = 29 * months + floor(parts / 25920);
+  return ((3 * (days + 1)) % 7 + 7) % 7 < 3 ? days + 1 : days;
+}
+function hebrewNewYear(year) {
+  var ny0 = hebrewElapsedDays(year - 1), ny1 = hebrewElapsedDays(year), ny2 = hebrewElapsedDays(year + 1);
+  var correction = ny2 - ny1 === 356 ? 2 : ny1 - ny0 === 382 ? 1 : 0;
+  return -1373427 - RD_1970 + ny1 + correction;
+}
+function hebrewYear(year) {
+  var start = hebrewNewYear(year), end = hebrewNewYear(year + 1), length = end - start, leap = ((7 * year + 1) % 19 + 19) % 19 < 7;
+  var codes = list(), lengths = list();
+  var add = function (code, days) { arrayPush(codes, code); arrayPush(lengths, days); };
+  add('M01', 30); add('M02', length % 10 === 5 ? 30 : 29); add('M03', length % 10 === 3 ? 29 : 30); add('M04', 29); add('M05', 30);
+  if (leap) add('M05L', 30);
+  add('M06', 29); add('M07', 30); add('M08', 29); add('M09', 30); add('M10', 29); add('M11', 30); add('M12', 29);
+  return yearRecord(start, end, codes, lengths);
+}
+// Indian national (Saka): the year starts on ISO March 22 of year + 78, March 21 in a leap year; Chaitra has 30 days
+// (31 in a leap year), the next five months 31 and the last six 30
+function indianNewYear(year) { var iso = year + 78; return epochDays(iso, 3, isLeapYear(iso) ? 21 : 22); }
+function indianYear(year) {
+  var leap = isLeapYear(year + 78), lengths = [leap ? 31 : 30, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 30];
+  return yearRecord(indianNewYear(year), indianNewYear(year + 1), TWELVE, lengths);
+}
+function arithmeticYearInfo(calendar, year) {
+  var offset = ISO_MONTH_CALENDARS[calendar];
+  if (offset !== undefined) {  // the months of ISO 8601
+    var iso = year - offset, lengths = list();
+    for (var m = 1; m <= 12; m++) arrayPush(lengths, daysInMonth(iso, m));
+    return yearRecord(epochDays(iso, 1, 1), epochDays(iso + 1, 1, 1), TWELVE, lengths);
+  }
+  if (calendar === 'islamic-civil' || calendar === 'islamic-tbla') return islamicYear(calendar, year);
+  if (calendar === 'coptic' || calendar === 'ethiopic' || calendar === 'ethioaa') return copticYear(calendar, year);
+  if (calendar === 'hebrew') return hebrewYear(year);
+  if (calendar === 'indian') return indianYear(year);
+  return undefined;
+}
+// A first guess at the arithmetic year of a day, which nonIsoDate then corrects by single years
+function calendarYearOfDay(calendar, day) {
+  if (calendar === 'islamic-civil' || calendar === 'islamic-tbla') return floor((day - islamicNewYear(calendar, 1)) / 354.36667) + 1;
+  if (calendar === 'coptic' || calendar === 'ethiopic' || calendar === 'ethioaa') return floor((day - copticNewYear(calendar, calendar === 'ethioaa' ? 5501 : 1)) / 365.25) + (calendar === 'ethioaa' ? 5501 : 1);
+  if (calendar === 'hebrew') return floor((day - hebrewNewYear(1)) / 365.24682) + 1;
+  if (calendar === 'indian') return dateFromEpochDays(day).year - 78;
+  return icu.calendarYearOf(calendar, day);
+}
 // The months of a calendar year: { start, end, months: [{ code, start, length }] }, days since 1970-01-01
 var YEAR_CACHE = new $Map();
 function calendarYearInfo(calendar, year) {
   var key = calendar + '|' + year, info = mapGet(YEAR_CACHE, key);
   if (info !== undefined) return info;
+  info = arithmeticYearInfo(calendar, year);
+  if (info !== undefined) { mapSet(YEAR_CACHE, key, info); return info; }
   var raw = icu.calendarYear(calendar, year);
   if (raw === undefined) throwRange('The ' + calendar + ' calendar is not available');
   var months = list();
@@ -91,7 +177,7 @@ function nonIsoDate(calendar, date) {
     r.daysInMonth = daysInMonth(date.year, date.month); r.daysInYear = daysInYear(date.year); r.monthsInYear = 12;
     r.inLeapYear = isLeapYear(date.year); r.dayOfYear = dayOfYear(date);
   } else {
-    var day = epochDays(date.year, date.month, date.day), year = icu.calendarYearOf(calendar, day), info = calendarYearInfo(calendar, year);
+    var day = epochDays(date.year, date.month, date.day), year = calendarYearOfDay(calendar, day), info = calendarYearInfo(calendar, year);
     while (day < info.start) info = calendarYearInfo(calendar, --year);
     while (day >= info.end) info = calendarYearInfo(calendar, ++year);
     var k = info.months.length - 1;

@@ -418,7 +418,10 @@ function toPlainMonthDay(item, options) {
   var parsed = parseISODateTime(item, ['monthDay']);
   var cal = canonicalizeCalendar(parsed.calendar === undefined ? 'iso8601' : parsed.calendar);
   getOverflowOption(getOptionsObject(options));
-  return createPlainMonthDay(isoDate(1972, parsed.month, parsed.day), cal);
+  if (cal === 'iso8601') return createPlainMonthDay(isoDate(1972, parsed.month, parsed.day), cal);
+  var date = isoDate(parsed.year, parsed.month, parsed.day);  // a string with another calendar has a year (10.5.1)
+  if (!isoDateWithinLimits(date)) throwRange('The date is out of range');
+  return createPlainMonthDay(calendarMonthDayFromFields(cal, isoDateToFields(cal, date, 'month-day'), 'constrain'), cal);
 }
 function monthDayToString(r, showCalendar) {
   var s = pad(r.date.month, 2) + '-' + pad(r.date.day, 2);
