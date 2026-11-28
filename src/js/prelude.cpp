@@ -3,6 +3,7 @@
 #include "builtins.h"
 #include "builtins_js.h"
 #include "temporal_js.h"
+#include "icu_bridge.h"
 
 namespace tb::js {
 
@@ -77,6 +78,7 @@ JSObject* temporalNatives(Vm& vm) {
     vm.defFn(natives, "protoFor", protoFor, 2);
     vm.defFn(natives, "toPrimitiveString", toPrimitiveString, 1);
     vm.defFn(natives, "toBigInt", toBigIntNative, 1);
+    vm.def(natives, "icu", V(icuNatives(vm)));
     static const std::u16string* source = [] {
         std::string joined;
         for (const char* part : kTemporalJsParts) joined += part;

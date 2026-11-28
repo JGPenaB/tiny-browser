@@ -1,13 +1,12 @@
 // Temporal (TC39 proposal, https://tc39.es/proposal-temporal/): the whole API written in JavaScript on top of the
-// engine. tools/gen_temporal.py turns this file into temporal_js.h; the engine compiles it the first time the global
-// `Temporal` is read (prelude.cpp makeTemporal). Section numbers in comments are those of the proposal.
+// engine. tools/gen_temporal.py turns these files into temporal_js.h; the engine compiles them the first time the
+// global `Temporal` is read (prelude.cpp temporalNatives). Section numbers in comments are those of the proposal.
 //
-// Supported: the ISO 8601 calendar; UTC, offset time zones (+01:00) and the Etc/GMT zones, which have fixed offsets.
-// Named time zones with daylight saving time need time zone data the engine does not have yet: they are refused
-// with a RangeError, as the proposal allows for an implementation without them.
+// Supported: the ISO 8601 calendar; UTC, offset time zones (+01:00) and the named time zones of the IANA database,
+// whose rules come from ICU (natives.icu, icu.cpp).
 (function (natives) {
 'use strict';
-var protoFor = natives.protoFor, toPrimitiveString = natives.toPrimitiveString, toBigIntNative = natives.toBigInt;
+var icu = natives.icu, protoFor = natives.protoFor, toPrimitiveString = natives.toPrimitiveString, toBigIntNative = natives.toBigInt;
 var $Object = Object, $TypeError = TypeError, $RangeError = RangeError, $BigInt = BigInt, $Number = Number, $String = String;
 var $Symbol = Symbol, $Map = Map, $WeakMap = WeakMap, $Math = Math, $Date = Date;
 var create = $Object.create, defineProperty = $Object.defineProperty, getOwnPropertyDescriptor = $Object.getOwnPropertyDescriptor,

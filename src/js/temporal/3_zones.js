@@ -1,21 +1,55 @@
 // ---------------------------------------------------------------- time zones (11)
-// The named time zones this engine knows: UTC under its other names, and the Etc/GMT zones with fixed offsets.
-// Each record is { id, primary, offsetMinutes }.
-var NAMED_ZONES = new $Map();
-(function () {
-  var utcNames = ['UTC', 'Etc/UTC', 'Etc/GMT', 'GMT', 'Etc/Universal', 'Etc/Zulu', 'Etc/UCT', 'UCT', 'Universal', 'Zulu', 'Etc/Greenwich',
-                  'Greenwich', 'GMT0', 'GMT+0', 'GMT-0', 'Etc/GMT0', 'Etc/GMT+0', 'Etc/GMT-0'];
-  for (var i = 0; i < utcNames.length; i++) mapSet(NAMED_ZONES, toLowerCase(utcNames[i]), { id: utcNames[i], primary: 'UTC', offsetMinutes: 0 });
-  for (var h = 1; h <= 14; h++) {  // Etc/GMT-14 to Etc/GMT+12: the sign is the reverse of the offset's
-    var minus = 'Etc/GMT-' + h;
-    mapSet(NAMED_ZONES, toLowerCase(minus), { id: minus, primary: minus, offsetMinutes: h * 60 });
-    if (h <= 12) {
-      var plus = 'Etc/GMT+' + h;
-      mapSet(NAMED_ZONES, toLowerCase(plus), { id: plus, primary: plus, offsetMinutes: -h * 60 });
-    }
+// The available named time zones are those of the IANA database as ICU has them, minus ICU's own legacy names.
+// Each record is { id, primary }: id is the name with its IANA case, primary the zone it is a link to (11.1.1).
+var ZONES;
+var UTC_NAMES = ['UTC', 'Etc/UTC', 'Etc/GMT', 'GMT', 'Etc/Universal', 'Etc/Zulu', 'Etc/UCT', 'UCT', 'Universal', 'Zulu', 'Etc/Greenwich',
+                 'Greenwich', 'GMT0', 'GMT+0', 'GMT-0', 'Etc/GMT0', 'Etc/GMT+0', 'Etc/GMT-0'];
+// Java's three-letter names, which ICU accepts but the IANA database does not have
+var NOT_IANA = ['ACT', 'AET', 'AGT', 'ART', 'AST', 'BET', 'BST', 'CAT', 'CNT', 'CST', 'CTT', 'EAT', 'ECT', 'IET', 'IST', 'JST', 'MIT', 'NET',
+                'NST', 'PLT', 'PNT', 'PRT', 'PST', 'SST', 'VST'];
+// Where CLDR (and so ICU) still calls a zone by a name that the IANA database has since made a link
+var IANA_PRIMARY = { 'Africa/Asmera': 'Africa/Asmara', 'America/Buenos_Aires': 'America/Argentina/Buenos_Aires',
+  'America/Catamarca': 'America/Argentina/Catamarca', 'America/Coral_Harbour': 'America/Atikokan', 'America/Cordoba': 'America/Argentina/Cordoba',
+  'America/Godthab': 'America/Nuuk', 'America/Indianapolis': 'America/Indiana/Indianapolis', 'America/Jujuy': 'America/Argentina/Jujuy',
+  'America/Louisville': 'America/Kentucky/Louisville', 'America/Mendoza': 'America/Argentina/Mendoza', 'Asia/Calcutta': 'Asia/Kolkata',
+  'Asia/Katmandu': 'Asia/Kathmandu', 'Asia/Rangoon': 'Asia/Yangon', 'Asia/Saigon': 'Asia/Ho_Chi_Minh', 'Atlantic/Faeroe': 'Atlantic/Faroe',
+  'Europe/Kiev': 'Europe/Kyiv', 'Pacific/Enderbury': 'Pacific/Kanton', 'Pacific/Ponape': 'Pacific/Pohnpei', 'Pacific/Truk': 'Pacific/Chuuk' };
+function zoneTable() {
+  if (ZONES !== undefined) return ZONES;
+  ZONES = new $Map();
+  var ids = icu.tzIds(), i;
+  for (i = 0; i < ids.length; i++) {
+    var id = ids[i];
+    if (strSlice(id, 0, 8) === 'SystemV/' || arrayIndexOf(NOT_IANA, id) >= 0) continue;
+    mapSet(ZONES, toLowerCase(id), { id: id, primary: undefined });
   }
-})();
-function namedZone(name) { return mapGet(NAMED_ZONES, toLowerCase(name)); }
+  for (i = 0; i < UTC_NAMES.length; i++) mapSet(ZONES, toLowerCase(UTC_NAMES[i]), { id: UTC_NAMES[i], primary: 'UTC' });
+  var keys = getOwnPropertyNames(IANA_PRIMARY);  // the IANA names, in case ICU lacks one
+  for (i = 0; i < keys.length; i++) {
+    var name = IANA_PRIMARY[keys[i]];
+    if (!mapHas(ZONES, toLowerCase(name))) mapSet(ZONES, toLowerCase(name), { id: name, primary: name });
+  }
+  return ZONES;
+}
+// GetAvailableNamedTimeZoneIdentifier (11.1.1)
+function namedZone(name) {
+  var record = mapGet(zoneTable(), toLowerCase(name));
+  if (record !== undefined && record.primary === undefined) {
+    var canonical = icu.tzCanonical(record.id);
+    if (canonical === undefined) canonical = record.id;
+    if (canonical === 'Etc/UTC' || canonical === 'Etc/GMT') canonical = 'UTC';
+    var renamed = IANA_PRIMARY[canonical];
+    record.primary = renamed !== undefined ? renamed : canonical;
+  }
+  return record;
+}
+// The name to ask ICU about: an IANA name that ICU only knows by its older one is asked by that
+function icuZone(timeZone) {
+  var primary = namedZone(timeZone).primary;
+  var keys = getOwnPropertyNames(IANA_PRIMARY);
+  for (var i = 0; i < keys.length; i++) if (IANA_PRIMARY[keys[i]] === primary) return keys[i];
+  return primary;
+}
 // ParseTimeZoneIdentifier (11.1.16): { name } or { offsetMinutes }
 function parseTimeZoneIdentifier(id) {
   var end = parseTimeZoneIdentifierAt(id, 0);
@@ -45,45 +79,93 @@ function toTimeZoneIdentifier(v) {
   if (zone === undefined) throwRange('Unknown time zone ' + parsed.name);
   return zone.id;
 }
-function zoneOffsetMinutes(timeZone) {
-  if (isSign(timeZone, 0)) return parseUTCOffsetNs(timeZone) / 6e10;
-  return namedZone(timeZone).offsetMinutes;
+function isUTC(timeZone) { return timeZone === 'UTC' || namedZone(timeZone).primary === 'UTC'; }
+// GetOffsetNanosecondsFor (11.1.9), as a Number
+function getOffsetNsFor(timeZone, epochNs) {
+  if (isSign(timeZone, 0)) return parseUTCOffsetNs(timeZone);
+  if (isUTC(timeZone)) return 0;
+  return icu.tzOffset(icuZone(timeZone), $Number(floorDiv(epochNs, 1000000n))) * 1e6;
 }
-// GetOffsetNanosecondsFor (11.1.9): every zone known here has one fixed offset
-function getOffsetNsFor(timeZone, epochNs) { return zoneOffsetMinutes(timeZone) * 6e10; }
 function getISODateTimeFor(timeZone, epochNs) {
   var parts = isoPartsFromEpoch(epochNs), t = parts.time;
   return balanceISODateTime(parts.date.year, parts.date.month, parts.date.day, t.hour, t.minute, t.second, t.millisecond, t.microsecond,
                             t.nanosecond + getOffsetNsFor(timeZone, epochNs));
 }
-// GetPossibleEpochNanoseconds (11.1.13)
+// GetPossibleEpochNanoseconds (11.1.13). For a named zone the candidates are the wall time less the offsets in force
+// a day before and a day after it; a candidate counts if the zone really has that offset then.
 function getPossibleEpochNs(timeZone, dt) {
-  var offsetMinutes = zoneOffsetMinutes(timeZone), t = dt.time;
-  var balanced = balanceISODateTime(dt.date.year, dt.date.month, dt.date.day, t.hour, t.minute - offsetMinutes, t.second, t.millisecond,
-                                    t.microsecond, t.nanosecond);
-  checkISODaysRange(balanced.date);
-  var ns = utcEpochNs(balanced.date, balanced.time);
-  if (!isValidEpochNs(ns)) throwRange('The date and time are out of range');
-  return [ns];
+  var t = dt.time, list;
+  if (isSign(timeZone, 0) || isUTC(timeZone)) {
+    var offsetMinutes = isSign(timeZone, 0) ? parseUTCOffsetNs(timeZone) / 6e10 : 0;
+    var balanced = balanceISODateTime(dt.date.year, dt.date.month, dt.date.day, t.hour, t.minute - offsetMinutes, t.second, t.millisecond,
+                                      t.microsecond, t.nanosecond);
+    checkISODaysRange(balanced.date);
+    list = [utcEpochNs(balanced.date, balanced.time)];
+  } else {
+    checkISODaysRange(dt.date);
+    var wall = utcEpochNs(dt.date, dt.time);
+    var before = getOffsetNsFor(timeZone, wall - nsPerDay), after = getOffsetNsFor(timeZone, wall + nsPerDay);
+    var offsets = before === after ? [before] : [before, after];
+    list = [];
+    for (var i = 0; i < offsets.length; i++) {
+      var candidate = wall - $BigInt(offsets[i]);
+      if (getOffsetNsFor(timeZone, candidate) === offsets[i]) arrayPush(list, candidate);
+    }
+    if (list.length === 2 && list[0] > list[1]) list = [list[1], list[0]];
+  }
+  for (var j = 0; j < list.length; j++) if (!isValidEpochNs(list[j])) throwRange('The date and time are out of range');
+  return list;
 }
-// DisambiguatePossibleEpochNanoseconds (11.1.12): with fixed offsets there is always exactly one
+// DisambiguatePossibleEpochNanoseconds (11.1.12)
 function disambiguate(possible, timeZone, dt, disambiguation) {
-  if (possible.length === 1) return possible[0];
-  if (possible.length !== 0) {
+  var n = possible.length;
+  if (n === 1) return possible[0];
+  if (n !== 0) {
     if (disambiguation === 'earlier' || disambiguation === 'compatible') return possible[0];
-    if (disambiguation === 'later') return possible[possible.length - 1];
+    if (disambiguation === 'later') return possible[n - 1];
     throwRange('The time is ambiguous in ' + timeZone);
   }
-  throwRange('The time does not exist in ' + timeZone);
+  if (disambiguation === 'reject') throwRange('The time does not exist in ' + timeZone);
+  var wall = utcEpochNs(dt.date, dt.time);
+  var nanoseconds = getOffsetNsFor(timeZone, wall + nsPerDay) - getOffsetNsFor(timeZone, wall - nsPerDay);
+  var shifted = addTime(dt.time, $BigInt(disambiguation === 'earlier' ? -nanoseconds : nanoseconds));
+  var moved = getPossibleEpochNs(timeZone, dateTime(addDaysToISODate(dt.date, shifted.days), shifted));
+  return disambiguation === 'earlier' ? moved[0] : moved[moved.length - 1];
 }
 function getEpochNsFor(timeZone, dt, disambiguation) { return disambiguate(getPossibleEpochNs(timeZone, dt), timeZone, dt, disambiguation); }
-function getStartOfDay(timeZone, date) { return getPossibleEpochNs(timeZone, dateTime(date, MIDNIGHT))[0]; }
+// GetStartOfDay (11.1.14): when midnight is skipped, the day starts at the transition that skips it
+function getStartOfDay(timeZone, date) {
+  var possible = getPossibleEpochNs(timeZone, dateTime(date, MIDNIGHT));
+  if (possible.length !== 0) return possible[0];
+  return getNamedTimeZoneTransition(timeZone, utcEpochNs(date, MIDNIGHT) - nsPerDay, true);
+}
+// GetNamedTimeZoneNextTransition and GetNamedTimeZonePreviousTransition (11.1.3, 11.1.4). ICU also reports changes
+// of a zone's abbreviation or of its split between standard and daylight time, which are not transitions here.
+function getNamedTimeZoneTransition(timeZone, epochNs, next) {
+  if (isUTC(timeZone)) return null;
+  var zone = icuZone(timeZone);
+  var ms = next ? $Number(floorDiv(epochNs, 1000000n)) : -$Number(floorDiv(-epochNs, 1000000n));
+  for (var guard = 0; guard < 1000; guard++) {
+    var at = icu.tzTransition(zone, ms, next);
+    if (at === null) return null;
+    var ns = $BigInt(at) * 1000000n;
+    if (next ? ns > nsMaxInstant : ns < nsMinInstant) return null;
+    if (icu.tzOffset(zone, at) !== icu.tzOffset(zone, at - 1)) return ns;
+    ms = at;
+  }
+  return null;
+}
 function timeZoneEquals(a, b) {
   if (a === b) return true;
   if (!isOffsetIdentifier(a) && !isOffsetIdentifier(b)) return namedZone(a).primary === namedZone(b).primary;
   return false;
 }
-function systemTimeZone() { return 'UTC'; }
+// SystemTimeZoneIdentifier (14.6.2)
+function systemTimeZone() {
+  var id = icu.defaultTimeZone();
+  var zone = id === undefined ? undefined : namedZone(id);
+  return zone === undefined ? 'UTC' : zone.primary;
+}
 
 // ---------------------------------------------------------------- calendars (12)
 function canonicalizeCalendar(id) {

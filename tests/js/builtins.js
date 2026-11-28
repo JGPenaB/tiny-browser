@@ -118,6 +118,7 @@ test("Temporal (a global built on first use)", function () {
   eq(Temporal.Duration.from({ hours: 25 }).round({ largestUnit: "day" }).toString(), "P1DT1H");
   eq(Temporal.Instant.fromEpochMilliseconds(0).toString(), "1970-01-01T00:00:00Z");
   eq(Temporal.ZonedDateTime.from("2020-01-01T10:00+01:00[+01:00]").withTimeZone("UTC").toString(), "2020-01-01T09:00:00+00:00[UTC]");
-  throws(() => Temporal.ZonedDateTime.from("2020-01-01T10:00[Europe/Paris]"), RangeError, "zones with daylight saving time are not known yet");
+  eq(Temporal.ZonedDateTime.from("2020-07-01T10:00[europe/paris]").toString(), "2020-07-01T10:00:00+02:00[Europe/Paris]");
+  eq(Temporal.ZonedDateTime.from("2020-03-29T02:30[Europe/Paris]").hour, 3, "a skipped time moves forward");
 });
 done();

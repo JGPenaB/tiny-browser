@@ -248,12 +248,13 @@ class ZonedDateTime extends $Object {
     return createZonedDateTime(getStartOfDay(r.timeZone, getISODateTimeFor(r.timeZone, r.ns).date), r.timeZone, r.calendar);
   }
   getTimeZoneTransition(directionParam) {
-    zonedOf(this);
+    var r = zonedOf(this);
     if (directionParam === undefined) throwType('getTimeZoneTransition needs a direction');
     var options = stringToOptions(directionParam, 'direction');
-    getOption(options, 'direction', ['next', 'previous'], undefined, true);
-    // offset zones have no transitions, and the named zones known here all keep one offset forever
-    return null;
+    var direction = getOption(options, 'direction', ['next', 'previous'], undefined, true);
+    if (isOffsetIdentifier(r.timeZone)) return null;
+    var transition = getNamedTimeZoneTransition(r.timeZone, r.ns, direction === 'next');
+    return transition === null ? null : createZonedDateTime(transition, r.timeZone, r.calendar);
   }
   toInstant() { return createInstant(zonedOf(this).ns); }
   toPlainDate() { var r = zonedOf(this); return createPlainDate(getISODateTimeFor(r.timeZone, r.ns).date, r.calendar); }
