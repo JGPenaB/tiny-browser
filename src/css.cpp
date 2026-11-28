@@ -402,6 +402,334 @@ float hue2rgb(float p, float q, float t) {
 
 }  // namespace
 
+// ---- CSS Color 4 and 5: the colour spaces beyond sRGB, all brought to sRGB in the end (clipped to its gamut)
+namespace {
+struct Vec3 {
+    double x, y, z;
+};
+Vec3 mul(const double m[9], Vec3 v) {
+    return {m[0] * v.x + m[1] * v.y + m[2] * v.z, m[3] * v.x + m[4] * v.y + m[5] * v.z, m[6] * v.x + m[7] * v.y + m[8] * v.z};
+}
+double srgbToLinear(double c) {
+    double a = std::fabs(c);
+    return (a <= 0.04045 ? c / 12.92 : std::copysign(std::pow((a + 0.055) / 1.055, 2.4), c));
+}
+double linearToSrgb(double c) {
+    double a = std::fabs(c);
+    return a <= 0.0031308 ? c * 12.92 : std::copysign(1.055 * std::pow(a, 1 / 2.4) - 0.055, c);
+}
+// the matrices of CSS Color 4, section 18 (sample code)
+const double kLinSrgbToXyz65[9] = {0.41239079926595934, 0.357584339383878, 0.1804807884018343, 0.21263900587151027, 0.715168678767756,
+                                   0.07219231536073371, 0.01933081871559182, 0.11919477979462598, 0.9505321522496607};
+const double kXyz65ToLinSrgb[9] = {3.2409699419045226, -1.537383177570094, -0.4986107602930034, -0.9692436362808796, 1.8759675015077202,
+                                   0.04155505740717559, 0.05563007969699366, -0.20397695888897652, 1.0569715142428786};
+const double kD50ToD65[9] = {0.955473421488075, -0.02309845494876471, 0.06325924320057072, -0.0283697093338637, 1.0099953980813041,
+                             0.021041441191917323, 0.012314014864481998, -0.020507649298898964, 1.330365926242124};
+const double kD65ToD50[9] = {1.0479297925449969, 0.022946870601609652, -0.05019226628920524, 0.02962780877005599, 0.9904344267538799,
+                             -0.017073799063418826, -0.009243040646204504, 0.015055191490298152, 0.7518742814281371};
+const double kLinP3ToXyz65[9] = {0.4865709486482162, 0.26566769316909306, 0.1982172852343625, 0.2289745640697488, 0.6917385218365064,
+                                 0.079286914093745, 0.0, 0.04511338185890264, 1.043944368900976};
+const double kLin2020ToXyz65[9] = {0.6369580483012914, 0.14461690358620832, 0.1688809751641721, 0.2627002120112671, 0.6779980715188708,
+                                   0.05930171646986196, 0.0, 0.028072693049087428, 1.060985057710791};
+const double kOklabToLms[9] = {1.0, 0.3963377773761749, 0.2158037573099136, 1.0, -0.1055613458156586, -0.0638541728258133,
+                               1.0, -0.0894841775298119, -1.2914855480194092};
+const double kLmsToXyz65[9] = {1.2268798758459243, -0.5578149944602171, 0.2813910456659647, -0.0405757452148008, 1.1122868032803170,
+                               -0.0717110580655164, -0.0763729366746601, -0.4214933324022432, 1.5869240198367816};
+const double kXyz65ToLms[9] = {0.8190224379967030, 0.3619062600528904, -0.1288737815209879, 0.0329836539323885, 0.9292868615863434,
+                               0.0361446663506424, 0.0481771893596242, 0.2642395317527308, 0.6335478284694309};
+const double kLmsToOklab[9] = {0.2104542683093140, 0.7936177747023054, -0.0040720430116193, 1.9779985324311684, -2.4285922420485799,
+                               0.4505937096174110, 0.0259040424655478, 0.7827717124575296, -0.8086757549230774};
+const double kD50White[3] = {0.3457 / 0.3585, 1.0, (1.0 - 0.3457 - 0.3585) / 0.3585};
+
+Vec3 labToXyz50(Vec3 lab) {
+    const double k = 24389.0 / 27, e = 216.0 / 24389;
+    double f1 = (lab.x + 16) / 116, f0 = lab.y / 500 + f1, f2 = f1 - lab.z / 200;
+    double x = std::pow(f0, 3) > e ? std::pow(f0, 3) : (116 * f0 - 16) / k;
+    double y = lab.x > k * e ? std::pow((lab.x + 16) / 116, 3) : lab.x / k;
+    double z = std::pow(f2, 3) > e ? std::pow(f2, 3) : (116 * f2 - 16) / k;
+    return {x * kD50White[0], y * kD50White[1], z * kD50White[2]};
+}
+Vec3 xyz50ToLab(Vec3 xyz) {
+    const double k = 24389.0 / 27, e = 216.0 / 24389;
+    double v[3] = {xyz.x / kD50White[0], xyz.y / kD50White[1], xyz.z / kD50White[2]};
+    double f[3];
+    for (int i = 0; i < 3; ++i) f[i] = v[i] > e ? std::cbrt(v[i]) : (k * v[i] + 16) / 116;
+    return {116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])};
+}
+Vec3 oklabToXyz65(Vec3 lab) {
+    Vec3 lms = mul(kOklabToLms, lab);
+    return mul(kLmsToXyz65, {lms.x * lms.x * lms.x, lms.y * lms.y * lms.y, lms.z * lms.z * lms.z});
+}
+Vec3 xyz65ToOklab(Vec3 xyz) {
+    Vec3 lms = mul(kXyz65ToLms, xyz);
+    return mul(kLmsToOklab, {std::cbrt(lms.x), std::cbrt(lms.y), std::cbrt(lms.z)});
+}
+Vec3 polarToLab(Vec3 lch) {  // L, C, H in degrees to L, a, b
+    double h = lch.z * 3.14159265358979323846 / 180;
+    return {lch.x, lch.y * std::cos(h), lch.y * std::sin(h)};
+}
+Vec3 labToPolar(Vec3 lab) {
+    double h = std::atan2(lab.z, lab.y) * 180 / 3.14159265358979323846;
+    return {lab.x, std::sqrt(lab.y * lab.y + lab.z * lab.z), h < 0 ? h + 360 : h};
+}
+Vec3 xyz65FromSrgb(const Color& c) { return mul(kLinSrgbToXyz65, {srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b)}); }
+Color srgbFromXyz65(Vec3 xyz, float alpha) {
+    Vec3 lin = mul(kXyz65ToLinSrgb, xyz);
+    auto ch = [](double v) { return (float)std::clamp(linearToSrgb(v), 0.0, 1.0); };
+    return {ch(lin.x), ch(lin.y), ch(lin.z), alpha};
+}
+
+// A hue: a number of degrees or an angle
+bool parse_hue(const std::string& t, double& deg) {
+    float v;
+    std::string_view u;
+    if (!parse_num(t, v, u)) return false;
+    if (u.empty() || u == "deg") deg = v;
+    else if (u == "grad") deg = v * 0.9;
+    else if (u == "rad") deg = v * 180 / 3.14159265358979323846;
+    else if (u == "turn") deg = v * 360;
+    else return false;
+    return true;
+}
+// The channels of a colour function: up to three values (none is 0), and the alpha after a slash
+bool color_channels(std::string_view inner, std::vector<std::string>& ch, float& alpha) {
+    std::string s(inner);
+    size_t slash = s.find('/');
+    std::string a = slash == std::string::npos ? std::string() : s.substr(slash + 1);
+    if (slash != std::string::npos) s = s.substr(0, slash);
+    for (auto& c : s)
+        if (c == ',') c = ' ';
+    ch = tokens(s);
+    alpha = 1;
+    if (!trim(a).empty()) {
+        float v;
+        std::string_view u;
+        std::string at = lower(trim(a));
+        if (at == "none") alpha = 0;
+        else if (!parse_num(at, v, u)) return false;
+        else alpha = std::clamp(u == "%" ? v / 100 : v, 0.f, 1.f);
+    }
+    return true;
+}
+// A channel as a number: a percentage maps 100% to `full`
+bool channel(const std::string& t, double full, double& out) {
+    if (t == "none") {
+        out = 0;
+        return true;
+    }
+    float v;
+    std::string_view u;
+    if (!parse_num(t, v, u)) return false;
+    if (u == "%") out = v / 100.0 * full;
+    else if (u.empty()) out = v;
+    else return false;
+    return true;
+}
+
+// The colour spaces color-mix() can interpolate in
+enum class MixSpace { Srgb, SrgbLinear, Lab, Oklab, Xyz, Lch, Oklch, Hsl, Hwb };
+Vec3 toSpace(MixSpace sp, const Color& c);
+Color fromSpace(MixSpace sp, Vec3 v, float alpha);
+}  // namespace
+
+// lab(), lch(), oklab(), oklch(), hwb() and color() (CSS Color 4, 8-10), color-mix() (CSS Color 5, 2)
+bool parse_color_function(const std::string& s, Color& out) {
+    size_t open = s.find('(');
+    if (open == std::string::npos || s.back() != ')') return false;
+    std::string fn = s.substr(0, open), inner = s.substr(open + 1, s.size() - open - 2);
+    if (fn == "color-mix") {
+        auto args = split_top(inner, ',');
+        if (args.size() != 3) return false;
+        auto how = tokens(lower(trim(args[0])));
+        if (how.size() < 2 || how[0] != "in") return false;
+        static const std::pair<const char*, MixSpace> spaces[] = {
+            {"srgb", MixSpace::Srgb}, {"srgb-linear", MixSpace::SrgbLinear}, {"lab", MixSpace::Lab}, {"oklab", MixSpace::Oklab},
+            {"xyz", MixSpace::Xyz}, {"xyz-d65", MixSpace::Xyz}, {"xyz-d50", MixSpace::Xyz}, {"lch", MixSpace::Lch},
+            {"oklch", MixSpace::Oklch}, {"hsl", MixSpace::Hsl}, {"hwb", MixSpace::Hwb}};
+        MixSpace sp{};
+        bool found = false;
+        for (auto& [n, v] : spaces)
+            if (how[1] == n) sp = v, found = true;
+        if (!found) return false;
+        std::string hueMethod = how.size() >= 4 ? how[2] : "shorter";
+        Color c[2];
+        double p[2] = {-1, -1};
+        for (int i = 0; i < 2; ++i) {  // <color> && <percentage>?
+            auto T = tokens(trim(args[i + 1]));
+            std::string color;
+            for (auto& t : T) {
+                float v;
+                std::string_view u;
+                if (parse_num(t, v, u) && u == "%") p[i] = v;
+                else color += (color.empty() ? "" : " ") + t;
+            }
+            if (!parse_color(color, c[i])) return false;
+        }
+        if (p[0] < 0 && p[1] < 0) p[0] = p[1] = 50;
+        else if (p[0] < 0) p[0] = 100 - p[1];
+        else if (p[1] < 0) p[1] = 100 - p[0];
+        double sum = p[0] + p[1];
+        if (sum <= 0) return false;
+        double t = p[1] / sum, alphaScale = std::min(1.0, sum / 100);
+        Vec3 a = toSpace(sp, c[0]), b = toSpace(sp, c[1]);
+        bool polar = sp == MixSpace::Lch || sp == MixSpace::Oklch || sp == MixSpace::Hsl || sp == MixSpace::Hwb;
+        // premultiplied by alpha (CSS Color 4, 12.3); the hue is not
+        auto pre = [&](Vec3 v, float al) {
+            if (polar) return sp == MixSpace::Hsl || sp == MixSpace::Hwb ? Vec3{v.x, v.y * al, v.z * al} : Vec3{v.x * al, v.y * al, v.z};
+            return Vec3{v.x * al, v.y * al, v.z * al};
+        };
+        float al = (float)(c[0].a * (1 - t) + c[1].a * t);
+        Vec3 pa = pre(a, c[0].a), pb = pre(b, c[1].a);
+        Vec3 m{pa.x + (pb.x - pa.x) * t, pa.y + (pb.y - pa.y) * t, pa.z + (pb.z - pa.z) * t};
+        if (polar) {  // the hue (x for hsl and hwb, z for lch and oklch) goes the way the method says (12.4)
+            double h1 = sp == MixSpace::Hsl || sp == MixSpace::Hwb ? a.x : a.z, h2 = sp == MixSpace::Hsl || sp == MixSpace::Hwb ? b.x : b.z;
+            double d = h2 - h1;
+            if (hueMethod == "shorter") {
+                if (d > 180) h1 += 360;
+                else if (d < -180) h2 += 360;
+            } else if (hueMethod == "longer") {
+                if (0 < d && d < 180) h1 += 360;
+                else if (-180 < d && d <= 0) h2 += 360;
+            } else if (hueMethod == "increasing" && d < 0) h2 += 360;
+            else if (hueMethod == "decreasing" && d > 0) h1 += 360;
+            double h = std::fmod(h1 + (h2 - h1) * t, 360.0);
+            if (sp == MixSpace::Hsl || sp == MixSpace::Hwb) m.x = h;
+            else m.z = h;
+        }
+        if (al > 0) {
+            if (polar && (sp == MixSpace::Hsl || sp == MixSpace::Hwb)) m = {m.x, m.y / al, m.z / al};
+            else if (polar) m = {m.x / al, m.y / al, m.z};
+            else m = {m.x / al, m.y / al, m.z / al};
+        }
+        out = fromSpace(sp, m, (float)(al * alphaScale));
+        return true;
+    }
+    std::vector<std::string> ch;
+    float alpha;
+    if (!color_channels(inner, ch, alpha)) return false;
+    if (fn == "color") {  // color(<space> c1 c2 c3 [/ alpha]?)
+        if (ch.size() != 4) return false;
+        double v[3];
+        for (int i = 0; i < 3; ++i)
+            if (!channel(ch[i + 1], 1, v[i])) return false;
+        const std::string& space = ch[0];
+        Vec3 xyz;
+        if (space == "srgb" || space == "srgb-linear" || space == "display-p3" || space == "rec2020") {
+            Vec3 lin = space == "srgb-linear" ? Vec3{v[0], v[1], v[2]} : Vec3{srgbToLinear(v[0]), srgbToLinear(v[1]), srgbToLinear(v[2])};
+            if (space == "rec2020") {  // its own transfer function
+                auto f = [](double c) {
+                    const double a = 1.09929682680944, b = 0.018053968510807;
+                    double x = std::fabs(c);
+                    return std::copysign(x < b * 4.5 ? x / 4.5 : std::pow((x + a - 1) / a, 1 / 0.45), c);
+                };
+                lin = {f(v[0]), f(v[1]), f(v[2])};
+            }
+            xyz = space == "display-p3" ? mul(kLinP3ToXyz65, lin) : space == "rec2020" ? mul(kLin2020ToXyz65, lin) : mul(kLinSrgbToXyz65, lin);
+        } else if (space == "xyz" || space == "xyz-d65") {
+            xyz = {v[0], v[1], v[2]};
+        } else if (space == "xyz-d50") {
+            xyz = mul(kD50ToD65, {v[0], v[1], v[2]});
+        } else
+            return false;
+        out = srgbFromXyz65(xyz, alpha);
+        return true;
+    }
+    if (ch.size() != 3) return false;
+    double a, b, c;
+    if (fn == "lab" || fn == "lch") {
+        if (!channel(ch[0], 100, a)) return false;
+        if (fn == "lab") {
+            if (!channel(ch[1], 125, b) || !channel(ch[2], 125, c)) return false;
+        } else if (!channel(ch[1], 150, b) || !parse_hue(ch[2] == "none" ? "0" : ch[2], c))
+            return false;
+        Vec3 lab = fn == "lab" ? Vec3{a, b, c} : polarToLab({a, b, c});
+        out = srgbFromXyz65(mul(kD50ToD65, labToXyz50(lab)), alpha);
+        return true;
+    }
+    if (fn == "oklab" || fn == "oklch") {
+        if (!channel(ch[0], 1, a)) return false;
+        if (fn == "oklab") {
+            if (!channel(ch[1], 0.4, b) || !channel(ch[2], 0.4, c)) return false;
+        } else if (!channel(ch[1], 0.4, b) || !parse_hue(ch[2] == "none" ? "0" : ch[2], c))
+            return false;
+        Vec3 lab = fn == "oklab" ? Vec3{a, b, c} : polarToLab({a, b, c});
+        out = srgbFromXyz65(oklabToXyz65(lab), alpha);
+        return true;
+    }
+    if (fn == "hwb") {
+        double h, w, bl;
+        if (!parse_hue(ch[0] == "none" ? "0" : ch[0], h) || !channel(ch[1], 100, w) || !channel(ch[2], 100, bl)) return false;
+        out = fromSpace(MixSpace::Hwb, {h, w, bl}, alpha);
+        return true;
+    }
+    return false;
+}
+
+namespace {
+Vec3 toSpace(MixSpace sp, const Color& c) {
+    switch (sp) {
+        case MixSpace::Srgb: return {c.r, c.g, c.b};
+        case MixSpace::SrgbLinear: return {srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b)};
+        case MixSpace::Xyz: return xyz65FromSrgb(c);
+        case MixSpace::Lab: return xyz50ToLab(mul(kD65ToD50, xyz65FromSrgb(c)));
+        case MixSpace::Lch: return labToPolar(xyz50ToLab(mul(kD65ToD50, xyz65FromSrgb(c))));
+        case MixSpace::Oklab: return xyz65ToOklab(xyz65FromSrgb(c));
+        case MixSpace::Oklch: return labToPolar(xyz65ToOklab(xyz65FromSrgb(c)));
+        case MixSpace::Hsl:
+        case MixSpace::Hwb: {
+            double mx = std::max({c.r, c.g, c.b}), mn = std::min({c.r, c.g, c.b}), d = mx - mn, h = 0;
+            if (d > 0) {
+                if (mx == c.r) h = std::fmod((c.g - c.b) / d, 6.0);
+                else if (mx == c.g) h = (c.b - c.r) / d + 2;
+                else h = (c.r - c.g) / d + 4;
+                h *= 60;
+                if (h < 0) h += 360;
+            }
+            if (sp == MixSpace::Hwb) return {h, mn * 100, (1 - mx) * 100};
+            double l = (mx + mn) / 2, s = d == 0 ? 0 : d / (1 - std::fabs(2 * l - 1));
+            return {h, s * 100, l * 100};
+        }
+    }
+    return {};
+}
+Color fromSpace(MixSpace sp, Vec3 v, float alpha) {
+    auto clip = [](double x) { return (float)std::clamp(x, 0.0, 1.0); };
+    switch (sp) {
+        case MixSpace::Srgb: return {clip(v.x), clip(v.y), clip(v.z), alpha};
+        case MixSpace::SrgbLinear: return {clip(linearToSrgb(v.x)), clip(linearToSrgb(v.y)), clip(linearToSrgb(v.z)), alpha};
+        case MixSpace::Xyz: return srgbFromXyz65(v, alpha);
+        case MixSpace::Lab: return srgbFromXyz65(mul(kD50ToD65, labToXyz50(v)), alpha);
+        case MixSpace::Lch: return srgbFromXyz65(mul(kD50ToD65, labToXyz50(polarToLab(v))), alpha);
+        case MixSpace::Oklab: return srgbFromXyz65(oklabToXyz65(v), alpha);
+        case MixSpace::Oklch: return srgbFromXyz65(oklabToXyz65(polarToLab(v)), alpha);
+        case MixSpace::Hsl:
+        case MixSpace::Hwb: {
+            double h = std::fmod(v.x, 360.0);
+            if (h < 0) h += 360;
+            double w = v.y / 100, bl = v.z / 100, s = v.y / 100, l = v.z / 100;
+            auto hslRgb = [&](double s, double l, double& r, double& g, double& b) {  // CSS Color 4, 7.1
+                auto f = [&](double n) {
+                    double k = std::fmod(n + h / 30, 12.0), a = s * std::min(l, 1 - l);
+                    return l - a * std::max(-1.0, std::min({k - 3, 9 - k, 1.0}));
+                };
+                r = f(0), g = f(8), b = f(4);
+            };
+            double r, g, b;
+            if (sp == MixSpace::Hsl) hslRgb(s, l, r, g, b);
+            else if (w + bl >= 1) r = g = b = w / (w + bl);
+            else {  // CSS Color 4, 8.1
+                hslRgb(1, 0.5, r, g, b);
+                r = r * (1 - w - bl) + w;
+                g = g * (1 - w - bl) + w;
+                b = b * (1 - w - bl) + w;
+            }
+            return {clip(r), clip(g), clip(b), alpha};
+        }
+    }
+    return {};
+}
+}  // namespace
+
 bool parse_color(std::string_view sv, Color& out) {
     std::string s = lower(trim(sv));
     if (s.empty()) return false;
@@ -430,6 +758,9 @@ bool parse_color(std::string_view sv, Color& out) {
         }
         return false;
     }
+    if (istarts(s, "lab(") || istarts(s, "lch(") || istarts(s, "oklab(") || istarts(s, "oklch(") || istarts(s, "hwb(") ||
+        istarts(s, "color(") || istarts(s, "color-mix("))
+        return parse_color_function(s, out);
     if (istarts(s, "light-dark(")) {
         auto args = split_top(std::string_view(s).substr(11, s.size() > 12 ? s.size() - 12 : 0), ',');
         return !args.empty() && parse_color(args[0], out);
@@ -448,6 +779,12 @@ bool parse_color(std::string_view sv, Color& out) {
             std::string_view u;
             if (T[i] == "none") {
                 v[i] = 0;
+                continue;
+            }
+            if (i == 0 && s[0] == 'h') {  // a hue: degrees, or an angle (CSS Color 4, 7.1)
+                double deg;
+                if (!parse_hue(T[i], deg)) return false;
+                v[i] = (float)deg;
                 continue;
             }
             if (!parse_num(T[i], v[i], u)) return false;
@@ -478,6 +815,18 @@ bool parse_color(std::string_view sv, Color& out) {
     for (auto& c : kColors)
         if (s == c.n) {
             out = rgb(c.v);
+            return true;
+        }
+    // system colours (CSS Color 4, 6.2), as a light page shows them
+    static const std::pair<const char*, uint32_t> systemColors[] = {
+        {"canvas", 0xffffff}, {"canvastext", 0x000000}, {"linktext", 0x0000ee}, {"visitedtext", 0x551a8b},
+        {"activetext", 0xff0000}, {"buttonface", 0xefefef}, {"buttontext", 0x000000}, {"buttonborder", 0x767676},
+        {"field", 0xffffff}, {"fieldtext", 0x000000}, {"highlight", 0x3390ff}, {"highlighttext", 0xffffff},
+        {"selecteditem", 0x3390ff}, {"selecteditemtext", 0xffffff}, {"mark", 0xffff00}, {"marktext", 0x000000},
+        {"graytext", 0x808080}, {"accentcolor", 0x0075ff}, {"accentcolortext", 0xffffff}};
+    for (auto& [n, v] : systemColors)
+        if (s == n) {
+            out = rgb(v);
             return true;
         }
     return false;

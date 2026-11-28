@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Colors test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  .sw { display: inline-block; width: 40px; height: 20px; margin: 2px; }
+</style>
+</head>
+<body>
+<div id="swatches"></div>
+<div id="results"></div>
+<script>
+  // CSS Color 4 and 5. Each colour with the sRGB value a reference browser's canvas gives for it
+  var cases = [
+    ['lab(50% 40 30)', [187, 88, 70]], ['lch(60 50 120)', [118, 156, 62]], ['oklab(0.7 0.1 -0.1)', [191, 129, 218]],
+    ['oklch(0.6 0.15 30)', [202, 87, 71]], ['hwb(200 20% 30%)', [51, 136, 179]], ['hsl(0.5turn 60% 40%)', [41, 163, 163]],
+    ['color(srgb 0.2 0.4 0.6)', [51, 102, 153]], ['color(display-p3 0.3 0.6 0.2)', [36, 155, 25]],
+    ['color(srgb-linear 0.2 0.4 0.6)', [124, 170, 203]], ['color(xyz-d65 0.3 0.4 0.2)', [139, 182, 107]],
+    ['color-mix(in srgb, red, blue)', [128, 0, 128]], ['color-mix(in srgb, red 30%, blue)', [77, 0, 179]],
+    ['color-mix(in oklab, white, black)', [99, 99, 99]], ['color-mix(in oklch, red, blue)', [186, 0, 194]],
+    ['color-mix(in hsl, red 25%, lime)', [128, 255, 0]], ['color-mix(in lab, red, yellow)', [255, 162, 0]],
+    ['Canvas', [255, 255, 255]], ['CanvasText', [0, 0, 0]], ['oklch(70% 0.1 200)', [64, 177, 183]], ['lab(80 -20 20)', [170, 209, 160]]];
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  var bad = [];
+  cases.forEach(function (c) {
+    var sw = document.createElement('span');
+    sw.className = 'sw';
+    sw.style.backgroundColor = c[0];
+    sw.title = c[0];
+    document.getElementById('swatches').appendChild(sw);
+    var got = getComputedStyle(sw).backgroundColor.match(/[\d.]+/g).slice(0, 3).map(Number);
+    var off = got.some(function (v, i) { return Math.abs(v - c[1][i]) > 2; });
+    if (off) bad.push(c[0] + ' gave ' + got.join(',') + ', want ' + c[1].join(','));
+  });
+  log('colour spaces, color-mix() and system colours come out as the reference does (within 2)', bad.length === 0, bad.join('; '));
+
+  window.addEventListener('load', function () {
+    document.title = 'Colors test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>
