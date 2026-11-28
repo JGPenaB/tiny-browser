@@ -2712,12 +2712,14 @@ tag(nowObject, 'Temporal.Now');
 hidden(Temporal, 'Now', nowObject);
 tag(Temporal, 'Temporal');
 natives.temporal = Temporal;
-// What Intl.DateTimeFormat needs of a Temporal object (ECMA-402 with Temporal, 15.6.22), or undefined for any other
+natives.protos = create(null);  // for protoFor when a constructor of another realm has no prototype object
+for (var pi = 0; pi < classNames.length; pi++) natives.protos[classNames[pi]] = classes[classNames[pi]].prototype;
+)JS",
+R"JS(// What Intl.DateTimeFormat needs of a Temporal object (ECMA-402 with Temporal, 15.6.22), or undefined for any other
 // value. Its fields are those of the ISO date and time; epochMs for an Instant or ZonedDateTime.
 natives.info = function (x) {
   var kind = kindOf(x);
-)JS",
-R"JS(  if (kind === undefined || kind === 'Duration') return undefined;
+  if (kind === undefined || kind === 'Duration') return undefined;
   return temporalInfo(recordOf(x));
 };
 // Date.prototype.toTemporalInstant (14.1.1): installed by the engine without building Temporal until it is first read

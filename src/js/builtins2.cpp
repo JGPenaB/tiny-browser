@@ -478,27 +478,13 @@ JSFN(strSearch) {
     if (patternMethod(ci, rx, vm.symSearch, Value::undef(), 1, viaSymbol)) return viaSymbol;
     return viaNewRegExp(vm, rx, "", vm.symSearch, thisStr(ci, "search"));
 }
-JSFN(strLocaleCompare) {
+JSFN(strLocaleCompare) {  // ECMA-402 20.1.1: through Intl.Collator
     JSString* s = thisStr(ci, "localeCompare");
     JSString* o = ci.vm.toString(ci.arg(0));
-    auto nfc = [](const std::u16string& in) {  // canonically equivalent strings compare equal (22.1.3.12)
-        bool ascii = true;
-        for (char16_t c : in) ascii = ascii && c < 128;
-        if (ascii || in.empty()) return in;
-        int guess = NormalizeString(NormalizationC, (LPCWSTR)in.data(), (int)in.size(), nullptr, 0);
-        if (guess <= 0) return in;
-        std::u16string out((size_t)guess, u'\0');
-        int n = NormalizeString(NormalizationC, (LPCWSTR)in.data(), (int)in.size(), (LPWSTR)out.data(), guess);
-        if (n <= 0) return in;
-        out.resize((size_t)n);
-        return out;
-    };
-    std::u16string x = nfc(s->s), y = nfc(o->s);
-    if (x == y) return Value::i32(0);
-    int r = CompareStringEx(LOCALE_NAME_USER_DEFAULT, 0, (LPCWSTR)x.data(), (int)x.size(), (LPCWSTR)y.data(), (int)y.size(), nullptr, nullptr, 0);
-    if (r == 0 || r == 2) return Value::i32(x < y ? -1 : 1);
-    return Value::i32(r - 2);
+    return callIntl(ci.vm, "localeCompare", {V(s), V(o), ci.arg(1), ci.arg(2)});
 }
+JSFN(strToLocaleLowerCase) { return callIntl(ci.vm, "changeCase", {V(thisStr(ci, "toLocaleLowerCase")), ci.arg(0), Value::boolean(false)}); }  // 20.1.2
+JSFN(strToLocaleUpperCase) { return callIntl(ci.vm, "changeCase", {V(thisStr(ci, "toLocaleUpperCase")), ci.arg(0), Value::boolean(true)}); }  // 20.1.3
 JSFN(strNormalize) {  // 22.1.3.15, with the operating system's normalization tables
     Vm& vm = ci.vm;
     JSString* s = thisStr(ci, "normalize");
@@ -582,7 +568,7 @@ void setupString(Vm& vm) {
         {"codePointAt", strCodePointAt, 1}, {"at", strAt, 1}, {"indexOf", strIndexOf, 1}, {"lastIndexOf", strLastIndexOf, 1},
         {"includes", strIncludes, 1}, {"startsWith", strStartsWith, 1}, {"endsWith", strEndsWith, 1}, {"slice", strSlice, 2},
         {"substring", strSubstring, 2}, {"substr", strSubstr, 2}, {"toLowerCase", strToLowerCase, 0},
-        {"toUpperCase", strToUpperCase, 0}, {"toLocaleLowerCase", strToLowerCase, 0}, {"toLocaleUpperCase", strToUpperCase, 0},
+        {"toUpperCase", strToUpperCase, 0}, {"toLocaleLowerCase", strToLocaleLowerCase, 0}, {"toLocaleUpperCase", strToLocaleUpperCase, 0},
         {"trim", strTrim, 0}, {"trimStart", strTrimStart, 0}, {"trimEnd", strTrimEnd, 0}, {"padStart", strPadStart, 1}, {"padEnd", strPadEnd, 1}, {"repeat", strRepeat, 1},
         {"concat", strConcat, 1}, {"split", strSplit, 2}, {"replace", strReplace, 2}, {"replaceAll", strReplaceAll, 2},
         {"match", strMatch, 1}, {"matchAll", strMatchAll, 1}, {"search", strSearch, 1}, {"localeCompare", strLocaleCompare, 1},

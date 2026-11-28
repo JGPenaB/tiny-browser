@@ -504,6 +504,8 @@ tag(nowObject, 'Temporal.Now');
 hidden(Temporal, 'Now', nowObject);
 tag(Temporal, 'Temporal');
 natives.temporal = Temporal;
+natives.protos = create(null);  // for protoFor when a constructor of another realm has no prototype object
+for (var pi = 0; pi < classNames.length; pi++) natives.protos[classNames[pi]] = classes[classNames[pi]].prototype;
 // What Intl.DateTimeFormat needs of a Temporal object (ECMA-402 with Temporal, 15.6.22), or undefined for any other
 // value. Its fields are those of the ISO date and time; epochMs for an Instant or ZonedDateTime.
 natives.info = function (x) {

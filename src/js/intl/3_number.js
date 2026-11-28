@@ -5,7 +5,8 @@ var FALLBACK = $Symbol('IntlLegacyConstructedSymbol');  // %Intl%.[[FallbackSymb
 // values of each relevant key.
 function resolveOptions(locales, options, coerce, descriptors, relevantKeys, localeData, modify) {
   var requested = canonicalizeLocaleList(locales);
-  options = coerce ? coerceOptionsToObject(options) : getOptionsObject(options);
+  if (coerce === 'require' && options === undefined) throwType('Options are required');
+  options = coerce === true ? coerceOptionsToObject(options) : getOptionsObject(options);
   var opt = record({ localeMatcher: getOption(options, 'localeMatcher', 'string', ['lookup', 'best fit'], 'best fit') });
   for (var i = 0; i < descriptors.length; i++) {
     var d = descriptors[i], value = getOption(options, d[1], d[2] === undefined ? 'string' : d[2], d[3], undefined);

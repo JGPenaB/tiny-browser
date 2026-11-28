@@ -559,6 +559,172 @@ JSFN(dateFormatRange) {
     return v;
 }
 
+// ---------------------------------------------------------------- collation, case, lists, names, segments
+// collator(locale, strength, caseLevel, shifted, numeric, caseFirst): a collator by its settings, kept per thread.
+// strength 0 primary to 2 tertiary; caseFirst "upper", "lower" or "false".
+UCollator* collator(Vm& vm, CallInfo& ci, int first) {
+    thread_local FormatterCache<UCollator, ucol_close> cache;
+    std::string locale = toAscii(ustring(vm, ci.arg(first)));
+    int strength = (int)vm.toNumber(ci.arg(first + 1));
+    bool caseLevel = vm.toBool(ci.arg(first + 2)), shifted = vm.toBool(ci.arg(first + 3)), numeric = vm.toBool(ci.arg(first + 4));
+    std::string caseFirst = toAscii(ustring(vm, ci.arg(first + 5)));
+    std::u16string key = fromAsciiKey(locale + "|" + std::to_string(strength) + (caseLevel ? "c" : "-") + (shifted ? "s" : "-") + (numeric ? "n" : "-") + caseFirst);
+    if (UCollator* c = cache.find(key)) return c;
+    UErrorCode err = U_ZERO_ERROR;
+    UCollator* c = ucol_open(icuLocale(locale).c_str(), &err);
+    if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The collator cannot be made");
+    ucol_setAttribute(c, UCOL_NORMALIZATION_MODE, UCOL_ON, &err);  // canonically equivalent strings compare equal
+    ucol_setAttribute(c, UCOL_STRENGTH, strength == 0 ? UCOL_PRIMARY : strength == 1 ? UCOL_SECONDARY : UCOL_TERTIARY, &err);
+    ucol_setAttribute(c, UCOL_CASE_LEVEL, caseLevel ? UCOL_ON : UCOL_OFF, &err);
+    ucol_setAttribute(c, UCOL_ALTERNATE_HANDLING, shifted ? UCOL_SHIFTED : UCOL_NON_IGNORABLE, &err);
+    ucol_setAttribute(c, UCOL_NUMERIC_COLLATION, numeric ? UCOL_ON : UCOL_OFF, &err);
+    ucol_setAttribute(c, UCOL_CASE_FIRST, caseFirst == "upper" ? UCOL_UPPER_FIRST : caseFirst == "lower" ? UCOL_LOWER_FIRST : UCOL_OFF, &err);
+    cache.put(key, c);
+    return c;
+}
+// collatorCompare(a, b, locale, strength, caseLevel, shifted, numeric, caseFirst): -1, 0 or 1
+JSFN(collatorCompare) {
+    Vm& vm = ci.vm;
+    UCollator* c = collator(vm, ci, 2);
+    std::u16string a = ustring(vm, ci.arg(0)), b = ustring(vm, ci.arg(1));
+    UCollationResult r = ucol_strcoll(c, (const UChar*)a.data(), (int32_t)a.size(), (const UChar*)b.data(), (int32_t)b.size());
+    return Value::num(r == UCOL_LESS ? -1 : r == UCOL_GREATER ? 1 : 0);
+}
+// collatorDefaults(locale): [punctuation ignored, case first ("upper", "lower" or "false")] by the locale's own tailoring
+JSFN(collatorDefaults) {
+    Vm& vm = ci.vm;
+    UErrorCode err = U_ZERO_ERROR;
+    UCollator* c = ucol_open(icuLocale(toAscii(ustring(vm, ci.arg(0)))).c_str(), &err);
+    JSArray* a = vm.newArray();
+    std::vector<Value> held{V(a)};
+    RootScope keep(vm, held);
+    bool shifted = U_SUCCESS(err) && ucol_getAttribute(c, UCOL_ALTERNATE_HANDLING, &err) == UCOL_SHIFTED;
+    UColAttributeValue caseFirst = U_SUCCESS(err) ? ucol_getAttribute(c, UCOL_CASE_FIRST, &err) : UCOL_OFF;
+    a->elems.push_back(Value::boolean(shifted));
+    a->elems.push_back(vm.strv(std::string_view(caseFirst == UCOL_UPPER_FIRST ? "upper" : caseFirst == UCOL_LOWER_FIRST ? "lower" : "false")));
+    if (c) ucol_close(c);
+    return V(a);
+}
+// changeCase(text, language, upper): the full case mapping of the language's rules (Turkish dotted i, Lithuanian ...)
+JSFN(changeCase) {
+    Vm& vm = ci.vm;
+    std::u16string text = ustring(vm, ci.arg(0));
+    std::string language = toAscii(ustring(vm, ci.arg(1)));
+    bool upper = vm.toBool(ci.arg(2));
+    std::u16string out(text.size() + 16, u'\0');
+    UErrorCode err = U_ZERO_ERROR;
+    auto run = [&] {
+        return upper ? u_strToUpper((UChar*)out.data(), (int32_t)out.size(), (const UChar*)text.data(), (int32_t)text.size(), language.c_str(), &err)
+                     : u_strToLower((UChar*)out.data(), (int32_t)out.size(), (const UChar*)text.data(), (int32_t)text.size(), language.c_str(), &err);
+    };
+    int32_t n = run();
+    if (err == U_BUFFER_OVERFLOW_ERROR) {
+        out.assign(n, u'\0');
+        err = U_ZERO_ERROR;
+        n = run();
+    }
+    if (U_FAILURE(err)) return V(vm.str(std::move(text)));
+    out.resize(n);
+    return V(vm.str(std::move(out)));
+}
+// listFormat(locale, type, width, items, parts): type 0 and, 1 or, 2 unit; width 0 long, 1 short, 2 narrow.
+// With parts, the fields of category UFIELD_CATEGORY_LIST (0 literal, 1 element).
+JSFN(listFormat) {
+    Vm& vm = ci.vm;
+    thread_local FormatterCache<UListFormatter, ulistfmt_close> cache;
+    std::string locale = toAscii(ustring(vm, ci.arg(0)));
+    int type = (int)vm.toNumber(ci.arg(1)), width = (int)vm.toNumber(ci.arg(2));
+    std::u16string key = fromAsciiKey(locale + "|" + std::to_string(type) + std::to_string(width));
+    UErrorCode err = U_ZERO_ERROR;
+    UListFormatter* f = cache.find(key);
+    if (!f) {
+        f = ulistfmt_openForType(icuLocale(locale).c_str(), (UListFormatterType)type, (UListFormatterWidth)width, &err);
+        if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The list format cannot be made");
+        cache.put(key, f);
+    }
+    std::vector<std::u16string> items;
+    Value list = ci.arg(3);
+    uint32_t n = vm.lengthOf(list);
+    for (uint32_t i = 0; i < n; i++) items.push_back(vm.toString(vm.get(list, PropKey::index(i)))->s);
+    std::vector<const UChar*> ptrs;
+    std::vector<int32_t> lens;
+    for (auto& s : items) { ptrs.push_back((const UChar*)s.data()); lens.push_back((int32_t)s.size()); }
+    UFormattedList* result = ulistfmt_openResult(&err);
+    ulistfmt_formatStringsToResult(f, ptrs.data(), lens.data(), (int32_t)items.size(), result, &err);
+    Value v = formattedValue(vm, ulistfmt_resultAsValue(result, &err), vm.toBool(ci.arg(4)), err);
+    ulistfmt_closeResult(result);
+    if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The list cannot be formatted");
+    return v;
+}
+// displayName(locale, kind, code, long, dialect): the name of a language, region, script, currency, calendar or date
+// field in the locale, or undefined when ICU has none of its own (it would only echo the code)
+JSFN(displayName) {
+    Vm& vm = ci.vm;
+    std::string locale = icuLocale(toAscii(ustring(vm, ci.arg(0))));
+    std::string kind = toAscii(ustring(vm, ci.arg(1)));
+    std::u16string code16 = ustring(vm, ci.arg(2));
+    std::string code = toAscii(code16);
+    bool full = vm.toBool(ci.arg(3)), dialect = vm.toBool(ci.arg(4));
+    UErrorCode err = U_ZERO_ERROR;
+    UChar out[512];
+    int32_t n = 0;
+    if (kind == "currency") {
+        UBool isChoice = false;
+        int32_t len = 0;
+        const UChar* name = ucurr_getName((const UChar*)code16.c_str(), locale.c_str(), full ? UCURR_LONG_NAME : UCURR_SYMBOL_NAME, &isChoice, &len, &err);
+        if (U_FAILURE(err) || err == U_USING_DEFAULT_WARNING) return Value::undef();
+        return V(vm.str(fromUChars(name, len)));
+    }
+    if (kind == "dateTimeField") {
+        static const struct { const char* name; UDateTimePatternField field; } fields[] = {
+            {"era", UDATPG_ERA_FIELD}, {"year", UDATPG_YEAR_FIELD}, {"quarter", UDATPG_QUARTER_FIELD}, {"month", UDATPG_MONTH_FIELD},
+            {"weekOfYear", UDATPG_WEEK_OF_YEAR_FIELD}, {"weekday", UDATPG_WEEKDAY_FIELD}, {"day", UDATPG_DAY_FIELD},
+            {"dayPeriod", UDATPG_DAYPERIOD_FIELD}, {"hour", UDATPG_HOUR_FIELD}, {"minute", UDATPG_MINUTE_FIELD}, {"second", UDATPG_SECOND_FIELD},
+            {"timeZoneName", UDATPG_ZONE_FIELD}};
+        UDateTimePatternGenerator* g = patternGenerator(toAscii(ustring(vm, ci.arg(0))), err);
+        for (auto& f : fields) {
+            if (code != f.name || !g) continue;
+            n = udatpg_getFieldDisplayName(g, f.field, full ? UDATPG_WIDE : UDATPG_ABBREVIATED, out, 512, &err);
+            return U_FAILURE(err) ? Value::undef() : V(vm.str(fromUChars(out, n)));
+        }
+        return Value::undef();
+    }
+    UDisplayContext contexts[] = {dialect ? UDISPCTX_DIALECT_NAMES : UDISPCTX_STANDARD_NAMES, full ? UDISPCTX_LENGTH_FULL : UDISPCTX_LENGTH_SHORT,
+                                  UDISPCTX_NO_SUBSTITUTE};
+    ULocaleDisplayNames* names = uldn_openForContext(locale.c_str(), contexts, 3, &err);
+    if (U_FAILURE(err)) return Value::undef();
+    if (kind == "language") n = uldn_localeDisplayName(names, icuLocale(code).c_str(), out, 512, &err);
+    else if (kind == "region") n = uldn_regionDisplayName(names, code.c_str(), out, 512, &err);
+    else if (kind == "script") n = uldn_scriptDisplayName(names, code.c_str(), out, 512, &err);
+    else if (kind == "calendar") n = uldn_keyValueDisplayName(names, "calendar", code.c_str(), out, 512, &err);
+    else err = U_ILLEGAL_ARGUMENT_ERROR;
+    uldn_close(names);
+    if (U_FAILURE(err) || n <= 0) return Value::undef();
+    return V(vm.str(fromUChars(out, n)));
+}
+// segment(locale, granularity, text): the boundaries of the text, as [index, ruleStatus, index, ruleStatus, ...]
+// beginning with 0; granularity 0 grapheme, 1 word, 2 sentence. A word segment is word-like when its status is not
+// UBRK_WORD_NONE (below 100).
+JSFN(segment) {
+    Vm& vm = ci.vm;
+    std::string locale = icuLocale(toAscii(ustring(vm, ci.arg(0))));
+    int granularity = (int)vm.toNumber(ci.arg(1));
+    std::u16string text = ustring(vm, ci.arg(2));
+    UErrorCode err = U_ZERO_ERROR;
+    UBreakIterator* it = ubrk_open(granularity == 0 ? UBRK_CHARACTER : granularity == 1 ? UBRK_WORD : UBRK_SENTENCE, locale.c_str(),
+                                   (const UChar*)text.data(), (int32_t)text.size(), &err);
+    if (U_FAILURE(err)) vm.throwError(Err::RangeError, "The text cannot be segmented");
+    JSArray* a = vm.newArray();
+    std::vector<Value> held{V(a)};
+    RootScope keep(vm, held);
+    for (int32_t pos = ubrk_first(it); pos != UBRK_DONE; pos = ubrk_next(it)) {
+        a->elems.push_back(Value::num(pos));
+        a->elems.push_back(Value::num(ubrk_getRuleStatus(it)));
+    }
+    ubrk_close(it);
+    return V(a);
+}
+
 }  // namespace
 
 JSObject* icuNatives(Vm& vm) {
@@ -585,6 +751,12 @@ JSObject* icuNatives(Vm& vm) {
     vm.defFn(o, "dateStylePattern", dateStylePattern, 3);
     vm.defFn(o, "dateFormat", dateFormat, 5);
     vm.defFn(o, "dateFormatRange", dateFormatRange, 6);
+    vm.defFn(o, "collatorCompare", collatorCompare, 8);
+    vm.defFn(o, "collatorDefaults", collatorDefaults, 1);
+    vm.defFn(o, "changeCase", changeCase, 3);
+    vm.defFn(o, "listFormat", listFormat, 5);
+    vm.defFn(o, "displayName", displayName, 5);
+    vm.defFn(o, "segment", segment, 3);
     return o;
 }
 

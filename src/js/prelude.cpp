@@ -85,6 +85,37 @@ JSFN(temporalInfo) {
     Value arg = ci.arg(0);
     return vm.call(info, Value::undef(), &arg, 1);
 }
+JSObject* temporalNatives(Vm& vm);
+JSObject* intlNatives(Vm& vm);
+// GetPrototypeFromConstructor (10.1.14) for the bundles built on first use: when newTarget comes from another realm
+// and has no prototype object, the default is the same intrinsic of that realm, which may have to be built there
+// first. Each bundle lists its prototypes by name in natives.protos.
+JSFN(bundleProtoFor) {
+    Vm& vm = ci.vm;
+    Value newTarget = ci.arg(0);
+    JSObject* fallback = ci.arg(1).asObject();
+    if (!newTarget.isObject()) return V(fallback);
+    Value p = vm.get(newTarget, "prototype");
+    if (p.isObject()) return p;
+    uint16_t realm = vm.functionRealm(newTarget.asObject());
+    if (realm == vm.currentRealm) return V(fallback);
+    for (int bundle = 0; bundle < 2; bundle++) {
+        Value natives = bundle == 0 ? vm.temporalNatives : vm.intlNatives;
+        if (!natives.isObject()) continue;
+        Value protos = vm.get(natives, "protos");
+        if (!protos.isObject()) continue;
+        std::vector<PropKey> keys;
+        vm.ownKeys(protos.asObject(), keys, true, false, false);
+        for (PropKey k : keys) {
+            if (vm.get(protos, k) != V(fallback)) continue;
+            RealmScope in(vm, realm);
+            JSObject* theirs = bundle == 0 ? temporalNatives(vm) : intlNatives(vm);
+            Value proto = vm.get(vm.get(V(theirs), "protos"), k);
+            return proto.isObject() ? proto : V(fallback);
+        }
+    }
+    return V(fallback);
+}
 const std::u16string* joinParts(const char* const* parts, size_t count) {
     std::string joined;
     for (size_t i = 0; i < count; i++) joined += parts[i];
@@ -96,7 +127,7 @@ JSObject* bundleNatives(Vm& vm, Value& slot, const std::u16string* source) {
     if (slot.isObject()) return slot.asObject();
     JSObject* natives = vm.newObject();
     slot = V(natives);
-    vm.defFn(natives, "protoFor", protoFor, 2);
+    vm.defFn(natives, "protoFor", bundleProtoFor, 2);
     vm.defFn(natives, "toPrimitiveString", toPrimitiveString, 1);
     vm.defFn(natives, "toPrimitiveNumber", toPrimitiveNumber, 1);
     vm.defFn(natives, "toBigInt", toBigIntNative, 1);
