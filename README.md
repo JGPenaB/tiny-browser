@@ -48,7 +48,7 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html`, `animations.html`, `webgl.html`, `canvas.html` and `replaced.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html`, `animations.html`, `webgl.html`, `canvas.html`, `replaced.html` and `apis.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`), as does `navigation.html` (the Navigation API). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
@@ -121,6 +121,13 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    `navigate()`, `reload()`, `traverseTo()`, `back()`, `forward()`, `updateCurrentEntry()`, the navigate event with
    `intercept()` for links, location changes, `pushState` and fragments, `currententrychange`, `navigatesuccess`,
    `navigateerror`; `tests/pages/navigation.html`, served by `tests/server.py`) lists this document's entries only.
+   Other Web APIs, each per its standard and checked against a reference browser in `tests/pages/apis.html`:
+   structured cloning (HTML 2.7: dates, regexps, maps, sets, buffers and views, errors, cycles, transfer), `postMessage`,
+   `MessageChannel`/`MessagePort`, `BroadcastChannel` (within the document), `CSS.supports()` and `CSS.escape()`,
+   `EventTarget` with `once`, `signal` and `handleEvent`, `AbortSignal.any()`, the task scheduler (`scheduler.postTask()`,
+   `scheduler.yield()`, `TaskController`), Web Locks (within the document), Trusted Types (policies; nothing requires
+   them, as no Content-Security-Policy is enforced), view transitions (the update runs; the transition is skipped),
+   the media session, and `isSecureContext` for https, file and loopback hosts.
    WebGL 1 (`canvas.getContext("webgl")`, Khronos WebGL 1.0) draws on the GPU's own OpenGL driver: each context renders
    into a framebuffer object of the canvas's size, GLSL ES 1.00 shaders are given to the driver as GLSL 1.20, and what a
    script drew is read back when it returns and shown as the canvas's picture (a canvas is a replaced element as big as
