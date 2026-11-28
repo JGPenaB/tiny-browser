@@ -123,6 +123,7 @@ struct Box {
     float minW = 0, maxW = 0;
     float contentMinW = 0;  // minW as the content alone makes it, before the box's own width and limits count
     size_t paintIdx = SIZE_MAX, clipIdx = SIZE_MAX;
+    size_t outlineIdx = SIZE_MAX;  // the outline, drawn round the border box once its size is known
     size_t bgFirst = SIZE_MAX, bgEnd = SIZE_MAX;  // the background image items, then (at bgEnd) the borders over them
     float forcedW = -1, forcedH = -1;  // border-box size imposed by the parent formatting context
     float staticX = 0, staticY = 0;
@@ -473,6 +474,7 @@ void syncBackground(Ctx& c, Box& b) {
 }
 
 void setHeight(Ctx& c, Box& b, float h) {
+    if (b.outlineIdx != SIZE_MAX) c.out.items[b.outlineIdx].h += h - b.h;
     b.h = h;
     if (b.paintIdx != SIZE_MAX) c.out.items[b.paintIdx].h = h;
     syncBackground(c, b);
@@ -1335,6 +1337,11 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center = fals
 void emitText(Ctx& c, float x, float y, float w, float h, const Style& st, const std::wstring& txt) {
     DItem d;
     d.k = DItem::K::Text;
+    if (st.textShadow) {  // CSS Text Decoration 3, 4: the colours resolved against the text's own
+        auto list = std::make_shared<Shadows>(*st.textShadow);
+        for (auto& sh : *list) sh.c = faded(sh.currentColor ? st.color : sh.c, st);
+        d.shadows = std::move(list);
+    }
     d.x = x;
     d.y = y;
     d.w = w;
@@ -2348,9 +2355,21 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         shapeIdx = push(c, std::move(d));
     }
     bool layers = own && !b.replaced && !s->hidden && s->bgImages && !s->bgImages->images.empty();
-    if (own && !b.replaced && !s->hidden && (!s->bg.transparent() || layers || b.b[0] > 0 || b.b[1] > 0 || b.b[2] > 0 || b.b[3] > 0)) {
+    std::shared_ptr<const Shadows> shadows;
+    if (own && !s->hidden && s->boxShadow) {  // currentcolor becomes the element's colour
+        auto list = std::make_shared<Shadows>(*s->boxShadow);
+        for (auto& sh : *list) {
+            if (sh.currentColor) sh.c = s->color;
+            sh.c = faded(sh.c, *s);
+        }
+        shadows = std::move(list);
+    }
+    if (own && !b.replaced && !s->hidden &&
+        (!s->bg.transparent() || layers || shadows || b.b[0] > 0 || b.b[1] > 0 || b.b[2] > 0 || b.b[3] > 0)) {
         DItem d;
         d.k = DItem::K::Box;
+        d.shadows = shadows;
+        d.shadowParts = layers ? 1 : 3;
         d.c = faded(s->bg, *s);
         d.radius = s->radius;
         for (int i = 0; i < 4; ++i) {
@@ -2387,6 +2406,8 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
             DItem borders;  // the borders over the images
             borders.k = DItem::K::Box;
             borders.radius = s->radius;
+            borders.shadows = shadows;
+            borders.shadowParts = 2;
             for (int i = 0; i < 4; ++i) {
                 borders.bw[i] = b.b[i];
                 borders.bc[i] = faded(s->borderColor[i], *s);
@@ -2521,6 +2542,22 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         e.x = d.x;
         e.y = d.y;
         push(c, std::move(e));
+    }
+    if (own && !s->hidden && s->outlineStyle && s->outlineWidth > 0 && &b != c.root) {  // CSS UI 4, 4
+        float w = s->outlineStyle == 2 ? std::max(2.f, s->outlineWidth) : s->outlineWidth, out = s->outlineOffset + w;
+        DItem d;
+        d.k = DItem::K::Box;
+        d.x = b.x - out;
+        d.y = b.y - out;
+        d.w = std::max(0.f, b.w + 2 * out);
+        d.h = std::max(0.f, b.h + 2 * out);
+        d.radius = s->radius > 0 ? std::max(0.f, s->radius + out) : 0;
+        Color oc = s->outlineColor.a < 0 ? (s->outlineStyle == 2 ? Color{0.1f, 0.45f, 0.9f, 1} : s->color) : s->outlineColor;
+        for (int i = 0; i < 4; ++i) {
+            d.bw[i] = w;
+            d.bc[i] = faded(oc, *s);
+        }
+        b.outlineIdx = push(c, std::move(d));
     }
     if (shapeIdx != SIZE_MAX) {
         DItem& d = c.out.items[shapeIdx];

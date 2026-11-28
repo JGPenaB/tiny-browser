@@ -87,7 +87,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    (`@layer`, CSS Cascade 5) and `@import` with `layer()`, `supports()` and media; the window's load event now waits
    for style sheets, their imports and pictures (`tests/pages/cascade.html`), and media queries evaluated by the
    Media Queries 4 grammar (types, `not`/`only`, `and`/`or`/`not` conditions, ranges, the viewport, resolution and
-   preference features) in `@media`, `@import`, the `media` attribute and `matchMedia()` (`tests/pages/media.html`). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
+   preference features) in `@media`, `@import`, the `media` attribute and `matchMedia()` (`tests/pages/media.html`),
+   `box-shadow` (outer and inset, blur approximated by layers), `text-shadow` and `outline` (`tests/pages/shadows.html`,
+   checked by eye). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),

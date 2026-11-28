@@ -18,7 +18,39 @@ struct Len {
     bool definite() const { return u == Px || u == Pct; }
 };
 
-using VarMap = std::unordered_map<std::string, std::string>;
+// An element's custom properties (CSS Variables 1): those it sets itself, over those of the nearest ancestor that
+// set any, which it shares rather than copies. A long chain is folded into one map.
+struct VarMap {
+    std::unordered_map<std::string, std::string> own;
+    std::shared_ptr<const VarMap> parent;
+    int depth = 0;
+    const std::string* find(const std::string& name) const {
+        for (const VarMap* m = this; m; m = m->parent.get()) {
+            auto it = m->own.find(name);
+            if (it != m->own.end()) return &it->second;
+        }
+        return nullptr;
+    }
+    size_t size() const {  // how many names have a value
+        std::unordered_map<std::string, bool> seen;
+        for (const VarMap* m = this; m; m = m->parent.get())
+            for (auto& kv : m->own) seen.emplace(kv.first, true);
+        return seen.size();
+    }
+    // A map over `under` with these declarations
+    static std::shared_ptr<const VarMap> over(std::shared_ptr<const VarMap> under, std::unordered_map<std::string, std::string> set) {
+        auto m = std::make_shared<VarMap>();
+        m->own = std::move(set);
+        if (under && under->depth >= 24) {  // fold the chain, the nearest values winning
+            for (const VarMap* u = under.get(); u; u = u->parent.get())
+                for (auto& [k, v] : u->own) m->own.emplace(k, v);
+        } else if (under) {
+            m->parent = std::move(under);
+            m->depth = m->parent->depth + 1;
+        }
+        return m;
+    }
+};
 
 // Background images (CSS Backgrounds 3, section 2), one entry per layer in each list; a shorter list repeats.
 struct GradientStop {
@@ -90,6 +122,15 @@ struct GridLine {
     std::string name;
     bool isAuto() const { return line == 0 && span == 0 && name.empty(); }
 };
+
+// One shadow of box-shadow (CSS Backgrounds 3, 7.1) or text-shadow (CSS Text Decoration 3, 4)
+struct Shadow {
+    float dx = 0, dy = 0, blur = 0, spread = 0;
+    Color c;
+    bool currentColor = true;  // no colour given: the element's color
+    bool inset = false;
+};
+using Shadows = std::vector<Shadow>;  // the first is painted on top
 
 // clip-path: a basic shape (CSS Shapes 1, 3.1) in a reference box (CSS Masking 1, 3.1)
 struct ClipShape {
@@ -187,6 +228,11 @@ struct Style {
     // Grid container and grid item
     std::shared_ptr<const GridTemplate> grid;  // null: no templates, auto tracks, rows filled first
     std::shared_ptr<const ClipShape> clipPath;  // null: none
+    std::shared_ptr<const Shadows> boxShadow, textShadow;  // null: none; text-shadow is inherited
+    // outline (CSS UI 4, 4): style 0 none, 1 drawn (solid, dashed and the rest are drawn solid), 2 auto
+    uint8_t outlineStyle = 0;
+    float outlineWidth = 3, outlineOffset = 0;
+    Color outlineColor{0, 0, 0, -1};  // alpha < 0: currentcolor
     GridLine gridRow[2], gridCol[2];           // grid-row-start / -end, grid-column-start / -end
     float gapRow = 0, gapCol = 0;
     // Flex item
@@ -351,8 +397,8 @@ private:
 
     std::vector<Added> sheets_;
     std::vector<IR> all_;
-    std::unordered_map<std::string, std::vector<uint32_t>> byId_, byClass_, byTag_;
-    std::vector<uint32_t> uni_;
+    std::unordered_map<std::string, std::vector<uint32_t>> byId_, byClass_, byTag_, byAttr_;
+    std::vector<uint32_t> uni_, root_;  // the rules every element is tried against; those only the root is
     // the rules for ::before and ::after, indexed the same way
     std::unordered_map<std::string, std::vector<uint32_t>> pseudoById_, pseudoByClass_, pseudoByTag_;
     std::vector<uint32_t> pseudoUni_;

@@ -357,6 +357,159 @@ void paint_background(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIt
     if (layer) rt->PopLayer();
 }
 
+void paintBox(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DItem& it) {
+    D2D1_RECT_F r = D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h);
+    const float* w = it.bw;
+    float rad = std::min(it.radius, std::min(it.w, it.h) / 2);
+    if (rad > 0.5f) {
+        bool uniform = w[0] == w[1] && w[1] == w[2] && w[2] == w[3];
+        if (!it.c.transparent()) {
+            br->SetColor(cf(it.c));
+            rt->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), br);
+        }
+        if (uniform && w[0] > 0 && !it.bc[0].transparent()) {
+            float h = w[0] / 2;
+            br->SetColor(cf(it.bc[0]));
+            rt->DrawRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(r.left + h, r.top + h, r.right - h, r.bottom - h), std::max(0.f, rad - h), std::max(0.f, rad - h)),
+                br, w[0]);
+            return;
+        }
+        if (uniform) return;
+    } else if (!it.c.transparent()) {
+        br->SetColor(cf(it.c));
+        rt->FillRectangle(r, br);
+    }
+    if (w[0] > 0 && !it.bc[0].transparent()) {
+        br->SetColor(cf(it.bc[0]));
+        rt->FillRectangle(D2D1::RectF(it.x, it.y, it.x + it.w, it.y + w[0]), br);
+    }
+    if (w[2] > 0 && !it.bc[2].transparent()) {
+        br->SetColor(cf(it.bc[2]));
+        rt->FillRectangle(D2D1::RectF(it.x, it.y + it.h - w[2], it.x + it.w, it.y + it.h), br);
+    }
+    if (w[3] > 0 && !it.bc[3].transparent()) {
+        br->SetColor(cf(it.bc[3]));
+        rt->FillRectangle(D2D1::RectF(it.x, it.y, it.x + w[3], it.y + it.h), br);
+    }
+    if (w[1] > 0 && !it.bc[1].transparent()) {
+        br->SetColor(cf(it.bc[1]));
+        rt->FillRectangle(D2D1::RectF(it.x + it.w - w[1], it.y, it.x + it.w, it.y + it.h), br);
+    }
+    return;
+}
+
+// ---- shadows (CSS Backgrounds 3, 7.1; CSS Text Decoration 3, 4). The blur is approximated by layers: the shape
+// drawn a few times, grown and shrunk across the blur radius, each layer faint, so that the edge fades from the full
+// colour inside to nothing outside as a Gaussian blur of half the radius roughly does.
+int blurLayers(float blur) { return blur < 0.5f ? 1 : std::clamp((int)std::ceil(blur * 0.75f), 2, 24); }
+// the alpha of each layer, so that where all of them overlap the shadow has its own colour
+float layerAlpha(float a, int n) { return n == 1 ? a : 1 - std::pow(1 - std::min(a, 0.999f), 1.f / (float)n); }
+// how far layer i of n is grown: from +blur (the faintest edge, outside) to -blur (inside)
+float layerGrowth(float blur, int i, int n) { return n == 1 ? 0 : blur * (1 - 2 * ((float)i + 0.5f) / (float)n); }
+
+Microsoft::WRL::ComPtr<ID2D1Geometry> roundedGeometry(ID2D1Factory* f, D2D1_RECT_F r, float rad) {
+    Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry> g;
+    f->CreateRoundedRectangleGeometry(D2D1::RoundedRect(r, std::max(0.f, rad), std::max(0.f, rad)), &g);
+    return g;
+}
+// a outside b: a path geometry of the area of a that b does not cover
+Microsoft::WRL::ComPtr<ID2D1Geometry> without(ID2D1Factory* f, ID2D1Geometry* a, ID2D1Geometry* b) {
+    Microsoft::WRL::ComPtr<ID2D1PathGeometry> path;
+    Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(f->CreatePathGeometry(&path)) || FAILED(path->Open(&sink))) return nullptr;
+    a->CombineWithGeometry(b, D2D1_COMBINE_MODE_EXCLUDE, nullptr, sink.Get());
+    sink->Close();
+    return path;
+}
+D2D1_RECT_F grow(D2D1_RECT_F r, float e) { return D2D1::RectF(r.left - e, r.top - e, r.right + e, r.bottom + e); }
+
+void paintBoxShadows(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DItem& it, bool inset) {
+    Microsoft::WRL::ComPtr<ID2D1Factory> f;
+    rt->GetFactory(&f);
+    float rad = std::min(it.radius, std::min(it.w, it.h) / 2);
+    D2D1_RECT_F box = D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h);
+    if (!inset) {
+        // an outer shadow shows only outside the border box (7.1.1): masked off where the box's own fill does not hide it
+        float reach = 0;
+        for (auto& s : *it.shadows)
+            if (!s.inset) reach = std::max(reach, std::fabs(s.dx) + std::fabs(s.dy) + std::max(0.f, s.spread) + 2 * s.blur + 2);
+        Microsoft::WRL::ComPtr<ID2D1Geometry> mask;
+        if (it.c.a < 0.999f) {
+            auto outer = roundedGeometry(f.Get(), grow(box, reach), 0);
+            auto inner = roundedGeometry(f.Get(), box, rad);
+            if (outer && inner) mask = without(f.Get(), outer.Get(), inner.Get());
+        }
+        if (mask) rt->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), mask.Get()), nullptr);
+        for (size_t k = it.shadows->size(); k-- > 0;) {  // the first shadow is on top
+            const Shadow& s = (*it.shadows)[k];
+            if (s.inset || s.c.a <= 0) continue;
+            D2D1_RECT_F shape = grow(D2D1::RectF(box.left + s.dx, box.top + s.dy, box.right + s.dx, box.bottom + s.dy), s.spread);
+            if (shape.right <= shape.left || shape.bottom <= shape.top) continue;
+            int n = blurLayers(s.blur);
+            br->SetColor(D2D1::ColorF(s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n)));
+            for (int i = 0; i < n; ++i) {
+                float e = layerGrowth(s.blur, i, n);
+                D2D1_RECT_F r = grow(shape, e);
+                if (r.right <= r.left || r.bottom <= r.top) continue;
+                float rr = rad > 0 ? std::max(0.f, rad + s.spread + e) : std::max(0.f, e);
+                if (rr > 0.5f) rt->FillRoundedRectangle(D2D1::RoundedRect(r, rr, rr), br);
+                else rt->FillRectangle(r, br);
+            }
+        }
+        if (mask) rt->PopLayer();
+        return;
+    }
+    // inset shadows (7.1.2): inside the padding box, the colour everywhere but a hole the shadow's shape makes
+    D2D1_RECT_F pad = D2D1::RectF(box.left + it.bw[3], box.top + it.bw[0], box.right - it.bw[1], box.bottom - it.bw[2]);
+    if (pad.right <= pad.left || pad.bottom <= pad.top) return;
+    float padRad = std::max(0.f, rad - std::max(std::max(it.bw[0], it.bw[1]), std::max(it.bw[2], it.bw[3])));
+    auto clip = roundedGeometry(f.Get(), pad, padRad);
+    if (!clip) return;
+    rt->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), clip.Get()), nullptr);
+    for (size_t k = it.shadows->size(); k-- > 0;) {
+        const Shadow& s = (*it.shadows)[k];
+        if (!s.inset || s.c.a <= 0) continue;
+        D2D1_RECT_F hole = grow(D2D1::RectF(pad.left + s.dx, pad.top + s.dy, pad.right + s.dx, pad.bottom + s.dy), -s.spread);
+        float reach = std::fabs(s.dx) + std::fabs(s.dy) + std::fabs(s.spread) + 2 * s.blur + 2;
+        auto outer = roundedGeometry(f.Get(), grow(pad, reach), 0);
+        int n = blurLayers(s.blur);
+        br->SetColor(D2D1::ColorF(s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n)));
+        for (int i = 0; i < n; ++i) {
+            float e = -layerGrowth(s.blur, i, n);  // the faintest layer has the largest hole
+            D2D1_RECT_F h = grow(hole, -e);
+            if (h.right <= h.left || h.bottom <= h.top) {
+                rt->FillRectangle(grow(pad, 1), br);
+                continue;
+            }
+            auto holeGeo = roundedGeometry(f.Get(), h, std::max(0.f, padRad - s.spread + e));
+            auto area = outer && holeGeo ? without(f.Get(), outer.Get(), holeGeo.Get()) : nullptr;
+            if (area) rt->FillGeometry(area.Get(), br);
+        }
+    }
+    rt->PopLayer();
+}
+
+void paintTextShadows(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DItem& it) {
+    for (size_t k = it.shadows->size(); k-- > 0;) {
+        const Shadow& s = (*it.shadows)[k];
+        if (s.c.a <= 0) continue;
+        // a blurred shadow: the text drawn faintly in the middle and round two circles inside the blur radius, which
+        // spreads it about as far as the blur does and fades it outwards
+        int n = s.blur < 0.5f ? 1 : 17;
+        br->SetColor(D2D1::ColorF(s.c.r, s.c.g, s.c.b, layerAlpha(s.c.a, n) * (n > 1 ? 0.6f : 1.f)));
+        for (int i = 0; i < n; ++i) {
+            float ox = 0, oy = 0;
+            if (i > 0) {
+                float t = (float)((i - 1) % 8) * 3.14159265f / 4 + (i > 8 ? 0.39f : 0), r = s.blur * (i > 8 ? 0.6f : 0.3f);
+                ox = std::cos(t) * r;
+                oy = std::sin(t) * r;
+            }
+            rt->DrawTextLayout(D2D1::Point2F(it.x + s.dx + ox, it.y + s.dy + oy), it.tl.Get(), br, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+    }
+}
+
 void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo, std::vector<ImageRes>& imgs,
                  float y0, float y1, uint64_t gen, WidgetPainter* wp) {
     std::vector<bool> clips;  // the open clips, innermost last: a clip-path layer (true) or a rectangle
@@ -398,52 +551,26 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
         }
         if (outer.empty() && (it.y > y1 || it.y + it.h < y0)) continue;  // inside a transform, positions say little
         switch (it.k) {
-            case DItem::K::Box: {
-                D2D1_RECT_F r = D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h);
-                const float* w = it.bw;
-                float rad = std::min(it.radius, std::min(it.w, it.h) / 2);
-                if (rad > 0.5f) {
-                    bool uniform = w[0] == w[1] && w[1] == w[2] && w[2] == w[3];
-                    if (!it.c.transparent()) {
-                        br->SetColor(cf(it.c));
-                        rt->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), br);
-                    }
-                    if (uniform && w[0] > 0 && !it.bc[0].transparent()) {
-                        float h = w[0] / 2;
-                        br->SetColor(cf(it.bc[0]));
-                        rt->DrawRoundedRectangle(
-                            D2D1::RoundedRect(D2D1::RectF(r.left + h, r.top + h, r.right - h, r.bottom - h), std::max(0.f, rad - h), std::max(0.f, rad - h)),
-                            br, w[0]);
-                        break;
-                    }
-                    if (uniform) break;
-                } else if (!it.c.transparent()) {
-                    br->SetColor(cf(it.c));
-                    rt->FillRectangle(r, br);
+            case DItem::K::Box:
+                if (it.shadows && (it.shadowParts & 1)) paintBoxShadows(rt, br, it, false);
+                if (it.shadows && (it.shadowParts & 2)) {  // the inset shadows go between the background and the borders
+                    DItem fill = it;
+                    for (Color& bc : fill.bc) bc = Color{};
+                    paintBox(rt, br, fill);
+                    paintBoxShadows(rt, br, it, true);
+                    DItem borders = it;
+                    borders.c = Color{};
+                    paintBox(rt, br, borders);
+                    break;
                 }
-                if (w[0] > 0 && !it.bc[0].transparent()) {
-                    br->SetColor(cf(it.bc[0]));
-                    rt->FillRectangle(D2D1::RectF(it.x, it.y, it.x + it.w, it.y + w[0]), br);
-                }
-                if (w[2] > 0 && !it.bc[2].transparent()) {
-                    br->SetColor(cf(it.bc[2]));
-                    rt->FillRectangle(D2D1::RectF(it.x, it.y + it.h - w[2], it.x + it.w, it.y + it.h), br);
-                }
-                if (w[3] > 0 && !it.bc[3].transparent()) {
-                    br->SetColor(cf(it.bc[3]));
-                    rt->FillRectangle(D2D1::RectF(it.x, it.y, it.x + w[3], it.y + it.h), br);
-                }
-                if (w[1] > 0 && !it.bc[1].transparent()) {
-                    br->SetColor(cf(it.bc[1]));
-                    rt->FillRectangle(D2D1::RectF(it.x + it.w - w[1], it.y, it.x + it.w, it.y + it.h), br);
-                }
+                paintBox(rt, br, it);
                 break;
-            }
             case DItem::K::Rect:
                 br->SetColor(cf(it.c));
                 rt->FillRectangle(D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h), br);
                 break;
             case DItem::K::Text:
+                if (it.shadows) paintTextShadows(rt, br, it);
                 br->SetColor(cf(it.c));
                 rt->DrawTextLayout(D2D1::Point2F(it.x, it.y), it.tl.Get(), br, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                 break;

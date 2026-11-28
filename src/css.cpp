@@ -2002,10 +2002,8 @@ std::string subst_vars(std::string_view v, const Style& s, int depth) {
         std::string name(trim(inner.substr(0, comma)));
         std::string fallback = comma != npos ? std::string(trim(inner.substr(comma + 1))) : std::string();
         std::string rep = fallback;
-        if (s.vars) {
-            auto it = s.vars->find(name);
-            if (it != s.vars->end()) rep = it->second;
-        }
+        if (s.vars)
+            if (const std::string* found = s.vars->find(name)) rep = *found;
         if (depth < 8 && rep.find("var(") != std::string::npos) rep = subst_vars(rep, s, depth + 1);
         out += rep;
         i = k < v.size() ? k + 1 : k;
@@ -2095,6 +2093,14 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
     else if (p == "justify-items") d.justifyItems = s.justifyItems;
     else if (p == "justify-self") d.justifySelf = s.justifySelf;
     else if (p == "clip-path") d.clipPath = s.clipPath;
+    else if (p == "box-shadow") d.boxShadow = s.boxShadow;
+    else if (p == "text-shadow") d.textShadow = s.textShadow;
+    else if (istarts(p, "outline")) {
+        d.outlineStyle = s.outlineStyle;
+        d.outlineWidth = s.outlineWidth;
+        d.outlineOffset = s.outlineOffset;
+        d.outlineColor = s.outlineColor;
+    }
     else if (istarts(p, "grid-row") || istarts(p, "grid-column") || p == "grid-area") {
         std::copy(s.gridRow, s.gridRow + 2, d.gridRow);
         std::copy(s.gridCol, s.gridCol + 2, d.gridCol);
@@ -2114,6 +2120,7 @@ void inherit(Style& s, const Style& p) {
     s.fillOpacity = p.fillOpacity;
     s.strokeOpacity = p.strokeOpacity;
     s.color = p.color;
+    s.textShadow = p.textShadow;
     s.fontSize = p.fontSize;
     s.weight = p.weight;
     s.italic = p.italic;
@@ -2607,6 +2614,40 @@ uint8_t content_distribution(const std::string& v) {  // as Style::justify
                                                                                  : t == "space-evenly" ? 5 : 0;
 }
 
+// box-shadow and text-shadow: none, or shadows of two to four lengths, a colour, and for a box inset
+bool parse_shadows(std::string_view v, float fs, bool box, std::shared_ptr<const Shadows>& out) {
+    std::string l = lower(trim(v));
+    if (l == "none") {
+        out = nullptr;
+        return true;
+    }
+    auto list = std::make_shared<Shadows>();
+    for (auto part : split_top(l, ',')) {
+        Shadow sh;
+        std::vector<float> lens;
+        for (auto& t : tokens(part)) {
+            Len len;
+            Color c;
+            if (box && t == "inset") sh.inset = true;
+            else if (parse_len(t, fs, len, false) && len.u == Len::Px) lens.push_back(len.v);
+            else if (t == "currentcolor") sh.currentColor = true;
+            else if (parse_color(t, c)) {
+                sh.c = c;
+                sh.currentColor = false;
+            } else
+                return false;
+        }
+        if (lens.size() < 2 || lens.size() > (box ? 4u : 3u)) return false;
+        sh.dx = lens[0];
+        sh.dy = lens[1];
+        sh.blur = lens.size() > 2 ? std::max(0.f, lens[2]) : 0;
+        sh.spread = lens.size() > 3 ? lens[3] : 0;
+        list->push_back(sh);
+    }
+    out = std::move(list);
+    return true;
+}
+
 // clip-path (CSS Masking 1, 3.1): none, or a basic shape and a reference box in either order. A url() to an SVG
 // clipPath is not kept: it clips nothing.
 bool parse_clip_path(std::string_view v, float fs, std::shared_ptr<const ClipShape>& out) {
@@ -2703,6 +2744,29 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
 
     if (prop == "content") {
         s.content = std::string(trim(val));
+    } else if (prop == "box-shadow" || prop == "-webkit-box-shadow" || prop == "text-shadow") {
+        std::shared_ptr<const Shadows> list;
+        if (parse_shadows(val, fs, prop != "text-shadow", list)) (prop == "text-shadow" ? s.textShadow : s.boxShadow) = std::move(list);
+    } else if (prop == "outline" || prop == "outline-style" || prop == "outline-width" || prop == "outline-color") {
+        // CSS UI 4, 4.1-4.4: the shorthand takes the three in any order
+        for (auto& t : tokens(lv)) {
+            Len len;
+            Color c;
+            if (prop != "outline-width" && prop != "outline-color" &&
+                in(t, {"none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset", "auto"}))
+                s.outlineStyle = t == "none" || t == "hidden" ? 0 : t == "auto" ? 2 : 1;
+            else if (prop != "outline-style" && prop != "outline-color" && (t == "thin" || t == "medium" || t == "thick"))
+                s.outlineWidth = t == "thin" ? 1.f : t == "medium" ? 3.f : 5.f;
+            else if (prop != "outline-style" && prop != "outline-color" && parse_len(t, fs, len, false) && len.u == Len::Px)
+                s.outlineWidth = std::max(0.f, len.v);
+            else if (prop != "outline-style" && prop != "outline-width" && (t == "currentcolor" || t == "invert" || t == "auto"))
+                s.outlineColor = Color{0, 0, 0, -1};
+            else if (prop != "outline-style" && prop != "outline-width" && parse_color(t, c))
+                s.outlineColor = c;
+        }
+    } else if (prop == "outline-offset") {
+        Len len;
+        if (parse_len(lv, fs, len, false) && len.u == Len::Px) s.outlineOffset = len.v;
     } else if (prop == "clip-path" || prop == "-webkit-clip-path") {
         std::shared_ptr<const ClipShape> shape;
         if (parse_clip_path(val, fs, shape)) s.clipPath = std::move(shape);
@@ -3228,6 +3292,36 @@ uint64_t key(int lvl, uint32_t spec, uint32_t order, uint8_t layerRank = 0) {
     return (uint64_t(lvl) << 60) | (uint64_t(layerRank) << 52) | (uint64_t(spec & 0x3FFFFFFF) << 22) | uint64_t(order & 0x3FFFFF);
 }
 
+// The buckets a compound can be found by (0 id, 1 class, 2 tag, 3 attribute name, 4 the root): an element that the
+// compound matches is in at least one of them. False when there is none and the rule has to be tried everywhere.
+// :is() and :where() are found by the buckets of all their arguments.
+using RuleKey = std::pair<int, std::string>;
+bool rule_keys(const Compound& c, std::vector<RuleKey>& out) {
+    if (!c.id.empty()) out.push_back({0, c.id});
+    else if (!c.classes.empty()) out.push_back({1, c.classes[0]});
+    else if (!c.tag.empty()) out.push_back({2, c.tag});
+    else if (!c.attrs.empty()) out.push_back({3, c.attrs[0].name});
+    else {
+        for (auto& p : c.pseudos) {
+            if (p.k == Pseudo::Root) {
+                out.push_back({4, {}});
+                return true;
+            }
+            if (p.k == Pseudo::Is && p.list) {
+                std::vector<RuleKey> all;
+                bool keyed = true;
+                for (auto& one : *p.list) keyed = keyed && rule_keys(one.parts.back(), all);
+                if (keyed) {
+                    out.insert(out.end(), all.begin(), all.end());
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
 uint8_t user_actions(const Selector& s) {
     uint8_t r = 0;
     for (auto& c : s.parts)
@@ -3465,6 +3559,8 @@ bool media_matches(std::string_view list, const MediaEnv& env) {
 void StyleEngine::build(float vw, float vh) {
     MediaEnv env{vw, vh, 1};
     all_.clear();
+    byAttr_.clear();
+    root_.clear();
     userActions_ = 0;
     byId_.clear();
     byClass_.clear();
@@ -3527,14 +3623,23 @@ void StyleEngine::build(float vw, float vh) {
             if (last.never) continue;
             userActions_ |= user_actions(r.sel);
             bool gen = last.pseudoElement != 0;
-            if (!last.id.empty())
-                (gen ? pseudoById_ : byId_)[last.id].push_back(idx);
-            else if (!last.classes.empty())
-                (gen ? pseudoByClass_ : byClass_)[last.classes[0]].push_back(idx);
-            else if (!last.tag.empty())
-                (gen ? pseudoByTag_ : byTag_)[last.tag].push_back(idx);
-            else
-                (gen ? pseudoUni_ : uni_).push_back(idx);
+            std::vector<RuleKey> keys;
+            if (gen || !rule_keys(last, keys)) {
+                if (!last.id.empty()) (gen ? pseudoById_ : byId_)[last.id].push_back(idx);
+                else if (!last.classes.empty()) (gen ? pseudoByClass_ : byClass_)[last.classes[0]].push_back(idx);
+                else if (!last.tag.empty()) (gen ? pseudoByTag_ : byTag_)[last.tag].push_back(idx);
+                else (gen ? pseudoUni_ : uni_).push_back(idx);
+                continue;
+            }
+            for (auto& [kind, k] : keys) {
+                switch (kind) {
+                    case 0: byId_[k].push_back(idx); break;
+                    case 1: byClass_[k].push_back(idx); break;
+                    case 2: byTag_[k].push_back(idx); break;
+                    case 3: byAttr_[k].push_back(idx); break;
+                    default: root_.push_back(idx); break;
+                }
+            }
         }
     }
 }
@@ -3692,6 +3797,8 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
     if (!e->id.empty()) addAll(byId_, e->id);
     for (auto& c : e->classes) addAll(byClass_, c);
     addAll(byTag_, e->name);
+    for (auto& [name, value] : e->attrs) addAll(byAttr_, name);
+    if (e->parent && e->parent->type == Node::T::Document) cand_.insert(cand_.end(), root_.begin(), root_.end());
     cand_.insert(cand_.end(), uni_.begin(), uni_.end());
     std::sort(cand_.begin(), cand_.end());
     cand_.erase(std::unique(cand_.begin(), cand_.end()), cand_.end());
@@ -3733,10 +3840,10 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
     for (auto& p : L)
         if (p.second->prop.size() > 2 && p.second->prop[0] == '-' && p.second->prop[1] == '-') anyVar = true;
     if (anyVar) {
-        auto m = s->vars ? std::make_shared<VarMap>(*s->vars) : std::make_shared<VarMap>();
+        std::unordered_map<std::string, std::string> set;
         for (auto& p : L)
-            if (p.second->prop.size() > 2 && p.second->prop[0] == '-' && p.second->prop[1] == '-') (*m)[p.second->prop] = p.second->val;
-        s->vars = std::move(m);
+            if (p.second->prop.size() > 2 && p.second->prop[0] == '-' && p.second->prop[1] == '-') set[p.second->prop] = p.second->val;
+        s->vars = VarMap::over(s->vars, std::move(set));
     }
     // Pass 1: font properties (em units elsewhere depend on font-size). Pass 2: the rest.
     for (auto& p : L)
@@ -3889,12 +3996,10 @@ void StyleEngine::computePseudo(Node* e, uint8_t kind, Cascade& L) {
     const Style& parent = *e->style;
     auto s = std::make_unique<Style>();
     inherit(*s, parent);
+    std::unordered_map<std::string, std::string> set;
     for (auto& p : L)
-        if (p.second->prop.size() > 2 && p.second->prop[0] == '-' && p.second->prop[1] == '-') {
-            auto m = s->vars ? std::make_shared<VarMap>(*s->vars) : std::make_shared<VarMap>();
-            (*m)[p.second->prop] = p.second->val;
-            s->vars = std::move(m);
-        }
+        if (p.second->prop.size() > 2 && p.second->prop[0] == '-' && p.second->prop[1] == '-') set[p.second->prop] = p.second->val;
+    if (!set.empty()) s->vars = VarMap::over(s->vars, std::move(set));
     for (auto& p : L)
         if (istarts(p.second->prop, "font")) apply(*s, parent, p.second->prop, p.second->val);
     for (auto& p : L) {

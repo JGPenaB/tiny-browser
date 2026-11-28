@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Shadows and outlines test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 24px; background: #f4f4f4; }
+  /* CSS Backgrounds 3, 7 (box-shadow), CSS Text Decoration 3, 4 (text-shadow), CSS UI 4, 4 (outline).
+     Checked by eye: each box says what it should show */
+  .b { display: inline-block; width: 150px; height: 80px; margin: 18px; vertical-align: top; background: #fff; font-size: 12px; padding: 6px; box-sizing: border-box; }
+  #hard { box-shadow: 8px 8px #333; }
+  #soft { box-shadow: 0 6px 16px rgba(0, 0, 0, .45); }
+  #spread { box-shadow: 0 0 0 6px #08f; }
+  #round { border-radius: 20px; box-shadow: 4px 4px 10px #f08; }
+  #inset { box-shadow: inset 6px 6px 10px rgba(0, 0, 0, .5); }
+  #two { box-shadow: 4px 4px #f00, 8px 8px #00f; }
+  #clear { background: transparent; border: 2px dashed #888; box-shadow: 10px 10px 6px #0a0; }
+  #ring { outline: 3px solid #e60; }
+  #offset { outline: 2px solid #08f; outline-offset: 6px; border-radius: 10px; }
+  #current { color: #a0a; outline: 4px solid; }
+  .t { font-size: 28px; font-weight: bold; margin: 12px 24px; }
+  #ts1 { text-shadow: 3px 3px #f80; }
+  #ts2 { text-shadow: 0 0 6px #08f; }
+  #ts3 { color: #fff; text-shadow: 1px 1px 2px #000, 0 0 12px #f0f; }
+</style>
+</head>
+<body>
+<div class="b" id="hard">a hard dark shadow 8px down and right</div>
+<div class="b" id="soft">a soft shadow below</div>
+<div class="b" id="spread">a 6px blue ring, no blur</div>
+<div class="b" id="round">round corners, a soft pink shadow</div>
+<div class="b" id="inset">a soft shadow inside, top left</div>
+<div class="b" id="two">red over blue, stepped</div>
+<div class="b" id="clear">a green shadow that does not show through the clear box</div>
+<div class="b" id="ring">an orange outline</div>
+<div class="b" id="offset">a blue outline 6px out, rounded</div>
+<div class="b" id="current">a purple outline in the text colour</div>
+<div class="t" id="ts1">Orange shadow behind</div>
+<div class="t" id="ts2">Blurred blue glow</div>
+<div class="t" id="ts3">White on dark, pink glow</div>
+</body>
+</html>

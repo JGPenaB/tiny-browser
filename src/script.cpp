@@ -938,6 +938,15 @@ struct Entry {
 };
 
 Impl& I(Vm& vm) { return *(Impl*)vm.hostData; }
+
+// Brings styles and boxes up to date for a script that reads them. The time this takes is the browser's, not the
+// script's: it does not count towards the limit that stops scripts which run too long.
+void layoutForScript(Impl& im) {
+    uint64_t t0 = GetTickCount64();
+    im.client.ensureLayout();
+    uint64_t deadline = im.vm.deadlineTick;
+    if (deadline) im.vm.deadlineTick = deadline + (GetTickCount64() - t0);
+}
 std::string str8(Vm& vm, Value v) { return utf16to8(vm.toStr16(v)); }
 Value val8(Vm& vm, std::string_view s) { return vm.strv(utf8to16(s)); }
 
@@ -1624,7 +1633,7 @@ struct Box {
     float x = 0, y = 0, w = 0, h = 0;
 };
 Box boxOf(Impl& im, Node* n) {
-    im.client.ensureLayout();
+    layoutForScript(im);
     Box b;
     if (n->hasBox) b = {n->bx, n->by, n->bw, n->bh};
     return b;
@@ -1644,7 +1653,7 @@ JSFN(getBoundingClientRect) {
 }
 JSFN(getClientRects) {  // one rectangle per box; none for an element that is not rendered (CSSOM View 6)
     Node* n = thisElem(ci);
-    I(ci.vm).client.ensureLayout();
+    layoutForScript(I(ci.vm));
     JSArray* a = ci.vm.newArray();
     Value keep = V(a);
     if (n->hasBox) a->elems.push_back(getBoundingClientRect(ci));
@@ -1672,7 +1681,7 @@ JSFN(scrollTopFn) {
     Impl& im = I(ci.vm);
     Node* n = toNode(ci.arg(0));
     if (!n || n->type != Node::T::Element) ci.vm.throwError(Err::TypeError, "scrollTop: not an Element");
-    im.client.ensureLayout();
+    layoutForScript(im);
     bool page = n == im.doc.html;
     float vw, vh, pageY;
     im.client.viewport(vw, vh, pageY);
@@ -2064,7 +2073,7 @@ std::string resolvedValue(const Node* n, const Style& s, const std::string& name
 
     if (name.rfind("--", 0) == 0) {  // a custom property
         if (s.vars)
-            if (auto it = s.vars->find(name); it != s.vars->end()) return it->second;
+            if (const std::string* found = s.vars->find(name)) return *found;
         return {};
     }
     static const char* sides[] = {"top", "right", "bottom", "left"};
@@ -2151,7 +2160,7 @@ JSFN(getComputedStyle) {
     Impl& im = I(vm);
     Node* n = toNode(ci.arg(0));
     if (!n || n->type != Node::T::Element) vm.throwError(Err::TypeError, "getComputedStyle: parameter 1 is not an Element");
-    im.client.ensureLayout();
+    layoutForScript(im);
     JSHost* h = vm.alloc<JSHost>();
     h->hostKind = HK_Computed;
     h->ptr = n;
