@@ -2882,12 +2882,12 @@ std::wstring resolve_family(std::string_view list) {
     return L"Times New Roman";
 }
 
-void font_shorthand(Style& s, const Style& parent, const std::string& val) {
+bool font_shorthand(Style& s, const Style& parent, const std::string& val) {
     std::string lv = lower(trim(val));
     if (in(lv, {"caption", "icon", "menu", "message-box", "small-caption", "status-bar"})) {
         s.family = resolve_family("system-ui");
         s.fontSize = 13.33f;
-        return;
+        return true;
     }
     auto T = tokens(val);
     bool italic = false;
@@ -2924,7 +2924,7 @@ void font_shorthand(Style& s, const Style& parent, const std::string& val) {
             if (lh.empty() && i + 1 < T.size()) lh = lower(T[++i]);
         }
         float v;
-        if (!font_size(sz, parent.fontSize, v)) return;
+        if (!font_size(sz, parent.fontSize, v)) return false;
         s.fontSize = v;
         s.italic = italic;
         s.weight = w;
@@ -2935,14 +2935,17 @@ void font_shorthand(Style& s, const Style& parent, const std::string& val) {
         ok = true;
         break;
     }
-    if (!ok) return;
+    if (!ok) return false;
     std::string fam;
     for (; i < T.size(); ++i) {
         if (!fam.empty()) fam += ' ';
         fam += T[i];
     }
-    if (!fam.empty()) s.family = resolve_family(fam);
+    if (fam.empty()) return false;
+    s.family = resolve_family(fam);
+    return true;
 }
+
 
 void set4(Len* arr, const std::vector<std::string>& t, float fs, bool allowAuto) {
     size_t n = t.size();
@@ -5030,6 +5033,11 @@ void StyleEngine::resolveAnimations(Node* e, Style& s) {
 bool selector_parse(std::string_view text, Selector& out) { return parse_selector(text, out) && !out.parts.empty(); }
 bool selector_matches(const Selector& s, const Node* e) {  // a pseudo-element is never an element the DOM can give
     return !s.parts.empty() && !s.parts.back().pseudoElement && match_at(s, (int)s.parts.size() - 1, e);
+}
+
+bool parse_font(std::string_view value, const Style& parent, Style& out) {
+    out = parent;
+    return value.find("var(") == std::string_view::npos && font_shorthand(out, parent, std::string(value));
 }
 
 }  // namespace tb

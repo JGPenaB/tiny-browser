@@ -972,8 +972,15 @@ struct ScriptHost::Impl {
         Node* nodeOf(Value v) override;
         Value wrapNode(Node* n) override { return im.wrap(n); }
         int imagePixels(Node* source, int& w, int& h, std::vector<uint8_t>& rgba) override {
-            if (source->name == "canvas") return webgl_canvas_pixels(im.vm, source, w, h, rgba) ? 1 : 0;
+            if (source->name == "canvas") {
+                bool clean = true;
+                if (canvas2d_pixels(im.vm, source, w, h, rgba, clean)) return w && h ? (clean ? 1 : 2) : 0;
+                return webgl_canvas_pixels(im.vm, source, w, h, rgba) ? 1 : 0;
+            }
             return source->name == "img" ? im.client.imagePixels(source, w, h, rgba) : 0;
+        }
+        int imageBGRA(Node* img, int& w, int& h, const uint8_t*& bgra, int& id) override {
+            return img->name == "img" ? im.client.imageBGRA(img, w, h, bgra, id) : 0;
         }
         [[noreturn]] void securityError(const char* message) override;
         void canvasPresented(Node* canvas, int w, int h, std::vector<uint8_t>&& bgra) override {
@@ -996,7 +1003,8 @@ struct Entry {
     ~Entry() {
         if (--im.depth) return;
         im.vm.runMicrotasks();
-        webgl_present(im.vm);  // what the script drew is shown once it has returned
+        canvas2d_present(im.vm);  // what the script drew is shown once it has returned
+        webgl_present(im.vm);
         im.vm.deadlineTick = 0;
         if (im.vm.terminated && !im.dead) {
             im.dead = true;
@@ -3645,6 +3653,7 @@ void ScriptHost::Impl::setup() {
     vm.defFn(G, "__scrollTop", scrollTopFn, 2);
     vm.defFn(G, "__domException", domExceptionSet, 1);
     webgl_install(vm, G, canvases);
+    canvas2d_install(vm, G, canvases);
     try {
         vm.eval(utf8to16(kScriptPrelude), "browser:prelude");
         cloneFn = vm.get(V(G), "structuredClone");
@@ -3659,6 +3668,7 @@ void ScriptHost::Impl::setup() {
 ScriptHost::ScriptHost(Document& doc, const std::string& url, Client& client) : impl_(std::make_unique<Impl>(doc, url, client)) { impl_->setup(); }
 ScriptHost::~ScriptHost() {
     webgl_release(impl_->vm);
+    canvas2d_release(impl_->vm);
     std::lock_guard<std::mutex> lk(impl_->net->mu);
     impl_->net->alive = false;  // results still on their way are dropped
 }

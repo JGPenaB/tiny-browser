@@ -399,15 +399,21 @@ R"JS(
 function prop(ctor, name, get, set) { Object.defineProperty(ctor.prototype, name, { get: get, set: set, configurable: true, enumerable: true }); }
 function textProp(ctor) { prop(ctor, 'text', function () { return this.textContent; }, function (v) { this.textContent = v; }); }
 [HTMLScriptElement, HTMLAnchorElement, HTMLOptionElement, HTMLTitleElement].forEach(textProp);
-// getContext (HTML 4.12.5.1): a WebGL 1 context, made the first time and the same one after; no other kind yet
-var webglContext = G.__webglContext;
-delete G.__webglContext;
+// getContext (HTML 4.12.5.1): a 2D or WebGL 1 context, made the first time and the same one after; null for
+// another kind than the canvas already has
+var webglContext = G.__webglContext, canvas2d = G.__canvas2d, canvasReset = G.__canvasReset, canvasDataURL = G.__canvasDataURL;
+delete G.__webglContext; delete G.__canvas2d; delete G.__canvasReset; delete G.__canvasDataURL;
+var canvasKinds = new WeakMap();
 HTMLCanvasElement.prototype.getContext = function (type, attributes) {
   type = String(type);
-  if (type === 'webgl' || type === 'experimental-webgl') return webglContext(this, type, attributes);
-  return null;
+  var kind = type === 'experimental-webgl' ? 'webgl' : type, had = canvasKinds.get(this);
+  if (had && had !== kind) return null;
+  var ctx = kind === '2d' ? canvas2d(this, attributes) : kind === 'webgl' ? webglContext(this, type, attributes) : null;
+  if (ctx) canvasKinds.set(this, kind);
+  return ctx;
 };
-// width and height reflect the attributes as unsigned longs with the bitmap's defaults (HTML 4.12.5)
+// width and height reflect the attributes as unsigned longs with the bitmap's defaults; setting either starts
+// the bitmap afresh, even with the size it had (HTML 4.12.5)
 [['width', 300], ['height', 150]].forEach(function (d) {
   Object.defineProperty(HTMLCanvasElement.prototype, d[0], {
     get: function () {
@@ -415,12 +421,70 @@ HTMLCanvasElement.prototype.getContext = function (type, attributes) {
       var n = m ? Number(m[1]) : NaN;
       return n >= 0 && n <= 2147483647 ? n : d[1];
     },
-    set: function (v) { v = v >>> 0; this.setAttribute(d[0], String(v > 2147483647 ? d[1] : v)); },
+    set: function (v) { v = v >>> 0; this.setAttribute(d[0], String(v > 2147483647 ? d[1] : v)); canvasReset(this); },
     enumerable: true, configurable: true
   });
 });
-HTMLCanvasElement.prototype.toDataURL = function () { return 'data:,'; };
-HTMLCanvasElement.prototype.toBlob = function (cb) { setTimeout(function () { cb(null); }, 0); };
+HTMLCanvasElement.prototype.toDataURL = function (type, quality) { return canvasDataURL(this, type, quality); };
+HTMLCanvasElement.prototype.toBlob = function (callback, type, quality) {
+  if (typeof callback !== 'function') throw new TypeError("Failed to execute 'toBlob' on 'HTMLCanvasElement': parameter 1 is not of type 'BlobCallback'.");
+  var url = canvasDataURL(this, type, quality);
+  setTimeout(function () {
+    if (url === 'data:,') { callback(null); return; }
+    var comma = url.indexOf(','), bytes = atob(url.slice(comma + 1)), data = new Uint8Array(bytes.length);
+    for (var i = 0; i < bytes.length; i++) data[i] = bytes.charCodeAt(i);
+    callback(new Blob([data], { type: url.slice(5, url.indexOf(';')) }));
+  }, 0);
+};
+// DOMMatrix (Geometry Interfaces 1, 6), the 2D part a canvas uses: a b c d e f, also named m11 m12 m21 m22 m41 m42
+class DOMMatrixReadOnly {
+  constructor(init) {
+    var v = [1, 0, 0, 1, 0, 0];
+    if (typeof init === 'string') {
+      var m = /matrix\(([^)]*)\)/.exec(init);
+      if (m) v = m[1].split(',').map(Number);
+    } else if (init && init.length === 6) v = Array.prototype.map.call(init, Number);
+    else if (init && init.length === 16) v = [init[0], init[1], init[4], init[5], init[12], init[13]].map(Number);
+    else if (init !== undefined) throw new TypeError("Failed to construct 'DOMMatrix': The sequence must contain 6 or 16 elements.");
+    this.a = v[0]; this.b = v[1]; this.c = v[2]; this.d = v[3]; this.e = v[4]; this.f = v[5];
+  }
+  get m11() { return this.a; } get m12() { return this.b; } get m21() { return this.c; } get m22() { return this.d; }
+  get m41() { return this.e; } get m42() { return this.f; }
+  get m13() { return 0; } get m14() { return 0; } get m23() { return 0; } get m24() { return 0; } get m31() { return 0; } get m32() { return 0; }
+  get m33() { return 1; } get m34() { return 0; } get m43() { return 0; } get m44() { return 1; }
+  get is2D() { return true; }
+  get isIdentity() { return this.a === 1 && this.b === 0 && this.c === 0 && this.d === 1 && this.e === 0 && this.f === 0; }
+  multiply(o) {
+    var m = new DOMMatrix([o.a, o.b, o.c, o.d, o.e, o.f]);
+    return new DOMMatrix([this.a * m.a + this.c * m.b, this.b * m.a + this.d * m.b, this.a * m.c + this.c * m.d, this.b * m.c + this.d * m.d,
+                          this.a * m.e + this.c * m.f + this.e, this.b * m.e + this.d * m.f + this.f]);
+  }
+  translate(x, y) { return this.multiply({ a: 1, b: 0, c: 0, d: 1, e: x || 0, f: y || 0 }); }
+  scale(x, y) { if (y === undefined) y = x === undefined ? 1 : x; return this.multiply({ a: x === undefined ? 1 : x, b: 0, c: 0, d: y, e: 0, f: 0 }); }
+  rotate(deg) { var r = (deg || 0) * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r); return this.multiply({ a: cs, b: sn, c: -sn, d: cs, e: 0, f: 0 }); }
+  inverse() {
+    var det = this.a * this.d - this.b * this.c;
+    if (!det) return new DOMMatrix([NaN, NaN, NaN, NaN, NaN, NaN]);
+    return new DOMMatrix([this.d / det, -this.b / det, -this.c / det, this.a / det, (this.c * this.f - this.d * this.e) / det, (this.b * this.e - this.a * this.f) / det]);
+  }
+  transformPoint(p) { p = p || {}; var x = p.x || 0, y = p.y || 0; return new DOMPoint(this.a * x + this.c * y + this.e, this.b * x + this.d * y + this.f, p.z || 0, p.w === undefined ? 1 : p.w); }
+  toFloat32Array() { return new Float32Array([this.a, this.b, 0, 0, this.c, this.d, 0, 0, 0, 0, 1, 0, this.e, this.f, 0, 1]); }
+  toFloat64Array() { return new Float64Array([this.a, this.b, 0, 0, this.c, this.d, 0, 0, 0, 0, 1, 0, this.e, this.f, 0, 1]); }
+  toString() { return 'matrix(' + [this.a, this.b, this.c, this.d, this.e, this.f].join(', ') + ')'; }
+  toJSON() { return { a: this.a, b: this.b, c: this.c, d: this.d, e: this.e, f: this.f, is2D: true, isIdentity: this.isIdentity }; }
+  static fromMatrix(o) { o = o || {}; return new this([o.a === undefined ? (o.m11 === undefined ? 1 : o.m11) : o.a, o.b === undefined ? (o.m12 || 0) : o.b, o.c === undefined ? (o.m21 || 0) : o.c,
+                                                       o.d === undefined ? (o.m22 === undefined ? 1 : o.m22) : o.d, o.e === undefined ? (o.m41 || 0) : o.e, o.f === undefined ? (o.m42 || 0) : o.f]); }
+}
+class DOMMatrix extends DOMMatrixReadOnly {
+  multiplySelf(o) { var m = this.multiply(o); this.a = m.a; this.b = m.b; this.c = m.c; this.d = m.d; this.e = m.e; this.f = m.f; return this; }
+  translateSelf(x, y) { return this.multiplySelf({ a: 1, b: 0, c: 0, d: 1, e: x || 0, f: y || 0 }); }
+  scaleSelf(x, y) { var m = this.scale(x, y); return this.multiplySelf({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }), Object.assign(this, { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e, f: m.f }); }
+  rotateSelf(deg) { var m = this.rotate(deg); return Object.assign(this, { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e, f: m.f }); }
+  invertSelf() { var m = this.inverse(); return Object.assign(this, { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e, f: m.f }); }
+}
+[['DOMMatrix', DOMMatrix], ['DOMMatrixReadOnly', DOMMatrixReadOnly], ['WebKitCSSMatrix', DOMMatrix]].forEach(function (e) {
+  Object.defineProperty(G, e[0], { value: e[1], writable: true, configurable: true });
+});
 HTMLMediaElement.prototype.play = function () { return Promise.reject(new DOMException('Media playback is not supported yet', 'NotSupportedError')); };
 HTMLMediaElement.prototype.pause = HTMLMediaElement.prototype.load = function () {};
 HTMLMediaElement.prototype.canPlayType = function () { return ''; };
@@ -506,8 +570,8 @@ var windowProto = Object.create(EventTarget.prototype);
 Object.setPrototypeOf(G, windowProto);
 named('Window').prototype = windowProto;
 ['Range', 'Selection', 'NamedNodeMap', 'Attr', 'DocumentType', 'ProcessingInstruction', 'CDATASection', 'XMLDocument', 'MediaQueryList', 'StyleSheet',
- 'CSSRule', 'CSSRuleList', 'StyleSheetList', 'MutationRecord', 'DOMRectList', 'DataTransfer', 'FileList', 'ValidityState', 'Touch', 'TextMetrics',
- 'CanvasRenderingContext2D', 'MediaError', 'TimeRanges', 'DOMImplementation', 'DOMStringMap', 'NodeIterator', 'Plugin', 'MimeType', 'PluginArray', 'MimeTypeArray'].forEach(function (n) { named(n); });
+ 'CSSRule', 'CSSRuleList', 'StyleSheetList', 'MutationRecord', 'DOMRectList', 'DataTransfer', 'FileList', 'ValidityState', 'Touch',
+ 'MediaError', 'TimeRanges', 'DOMImplementation', 'DOMStringMap', 'NodeIterator', 'Plugin', 'MimeType', 'PluginArray', 'MimeTypeArray'].forEach(function (n) { named(n); });
 // ImageData (HTML 4.12.5.1.15): width by height RGBA pixels in a Uint8ClampedArray
 class ImageData {
   #width; #height; #data;

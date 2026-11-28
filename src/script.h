@@ -55,6 +55,9 @@ public:
         // The decoded picture of an <img>: non-premultiplied RGBA rows from the top. 1, or 0 when it has none (yet),
         // 2 when it came from another origin than the document's (a script may not read it)
         virtual int imagePixels(Node* img, int& w, int& h, std::vector<uint8_t>& rgba) { return 0; }
+        // The same picture as the page keeps it: premultiplied BGRA rows, valid until the script returns, and a
+        // number that is the same for the same picture
+        virtual int imageBGRA(Node* img, int& w, int& h, const uint8_t*& bgra, int& id) { return 0; }
         // A canvas has new contents (a WebGL context drew): premultiplied BGRA rows from the top
         virtual void canvasPainted(Node* canvas, int w, int h, std::vector<uint8_t>&& bgra) {}
     };

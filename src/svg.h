@@ -39,6 +39,8 @@ struct SvgImage {
     size_t first = 0, count = 0;  // its shapes in the list they share
 };
 
+// The outline of an SVG path's d attribute (SVG 2, 9.3), with every point absolute
+void svg_path_data(const std::string& d, SvgShape& out);
 // The viewBox of an svg element, as width / height; 0 when it has none.
 float svg_aspect(const Node* svg);
 // Collects the shapes an svg element draws, appending them to `shapes`.

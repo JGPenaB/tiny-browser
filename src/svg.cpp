@@ -438,6 +438,8 @@ struct Builder {
 
 }  // namespace
 
+void svg_path_data(const std::string& d, SvgShape& out) { parsePath(d, out); }
+
 float svg_aspect(const Node* svg) {
     SvgImage img;
     parseViewBox(svg, img);

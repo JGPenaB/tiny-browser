@@ -784,7 +784,7 @@ public:
             const ImageRes& im = p->images[it->second];
             // no CORS fetches for pictures yet: only those of the document's own origin, or of data:, may be read
             const std::string& from = im.responseUrl.empty() ? im.url : im.responseUrl;
-            if (!istarts(from, "data:") && Url::parse(from).origin() != Url::parse(p->url).origin()) return 2;
+            bool foreign = !istarts(from, "data:") && Url::parse(from).origin() != Url::parse(p->url).origin();
             w = im.w;
             h = im.h;
             rgba.resize(im.px.size());
@@ -793,7 +793,21 @@ public:
                 for (int k = 0; k < 3; ++k) rgba[i + k] = a ? (uint8_t)std::min(255, (im.px[i + 2 - k] * 255 + a / 2) / a) : 0;
                 rgba[i + 3] = a;
             }
-            return 1;
+            return foreign ? 2 : 1;
+        }
+        int imageBGRA(Node* img, int& w, int& h, const uint8_t*& bgra, int& id) override {
+            Page* p = page();
+            if (!p) return 0;
+            std::string source = image_source(img);
+            auto it = source.empty() ? p->imgByUrl.end() : p->imgByUrl.find(resolve_url(p->doc->baseUrl, source));
+            if (it == p->imgByUrl.end() || it->second < 0 || p->images[it->second].w == 0) return 0;
+            const ImageRes& im = p->images[it->second];
+            const std::string& from = im.responseUrl.empty() ? im.url : im.responseUrl;
+            w = im.w;
+            h = im.h;
+            bgra = im.px.data();
+            id = it->second;
+            return !istarts(from, "data:") && Url::parse(from).origin() != Url::parse(p->url).origin() ? 2 : 1;
         }
         void canvasPainted(Node* canvas, int w, int h, std::vector<uint8_t>&& bgra) override {
             Page* p = page();

@@ -1,0 +1,258 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Canvas 2D test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  canvas { border: 1px solid #aaa; margin-right: 8px; vertical-align: top; }
+</style>
+</head>
+<body>
+<p>The 2D context of canvas (HTML 4.12.5.1). By eye: the first canvas has a red-to-blue bar, a green circle with a
+black ring, a dashed line, "Hello" in blue and a grey shadowed square; the second shows a checker pattern.</p>
+<canvas id="show" width="300" height="120"></canvas>
+<canvas id="pat" width="80" height="80"></canvas>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  function attempt(name, fn) { try { fn(); } catch (e) { log(name, false, 'threw ' + e); } }
+  function px(ctx, x, y) { return Array.prototype.join.call(ctx.getImageData(x, y, 1, 1).data); }
+  function fresh(w, h) { var c = document.createElement('canvas'); c.width = w || 40; c.height = h || 40; return c.getContext('2d'); }
+
+  attempt('the context', function () {
+    var c = document.createElement('canvas'), ctx = c.getContext('2d');
+    eq('getContext("2d") gives the same CanvasRenderingContext2D each time, and no other kind after', [ctx instanceof CanvasRenderingContext2D, c.getContext('2d') === ctx, ctx.canvas === c, String(c.getContext('webgl'))].join(), 'true,true,true,null');
+    eq('the defaults', [ctx.fillStyle, ctx.strokeStyle, ctx.lineWidth, ctx.font, ctx.globalAlpha, ctx.globalCompositeOperation, ctx.textAlign, ctx.textBaseline,
+                        ctx.lineCap, ctx.lineJoin, ctx.miterLimit, ctx.imageSmoothingEnabled, ctx.shadowColor, ctx.shadowBlur].join('|'),
+       '#000000|#000000|1|10px sans-serif|1|source-over|start|alphabetic|butt|miter|10|true|rgba(0, 0, 0, 0)|0');
+    ctx.fillStyle = 'red';
+    var a = ctx.fillStyle;
+    ctx.fillStyle = 'rgba(0, 0, 255, 0.5)';
+    var b = ctx.fillStyle;
+    ctx.fillStyle = 'not a colour';
+    eq('fillStyle serialises colours and ignores what is not one', [a, b, ctx.fillStyle].join('|'), '#ff0000|rgba(0, 0, 255, 0.5)|rgba(0, 0, 255, 0.5)');
+    ctx.lineWidth = -1; ctx.lineWidth = NaN; ctx.globalAlpha = 2; ctx.lineCap = 'nope';
+    eq('values out of range are ignored', [ctx.lineWidth, ctx.globalAlpha, ctx.lineCap].join(), '1,1,butt');
+    ctx.font = 'bold 20px Arial';
+    var f1 = ctx.font;
+    ctx.font = 'nonsense';
+    eq('font takes the CSS font shorthand', [f1, ctx.font].join('|'), 'bold 20px Arial|bold 20px Arial');
+  });
+
+  attempt('rectangles and pixels', function () {
+    var ctx = fresh();
+    eq('a new canvas is transparent black', px(ctx, 5, 5), '0,0,0,0');
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(0, 0, 20, 20);
+    eq('fillRect', [px(ctx, 5, 5), px(ctx, 30, 30)].join('|'), '255,0,0,255|0,0,0,0');
+    ctx.clearRect(0, 0, 10, 10);
+    eq('clearRect', [px(ctx, 5, 5), px(ctx, 15, 15)].join('|'), '0,0,0,0|255,0,0,255');
+    ctx.globalAlpha = 0.6;
+    ctx.fillStyle = '#0000ff';
+    ctx.fillRect(25, 25, 10, 10);
+    ctx.globalAlpha = 1;
+    eq('globalAlpha', px(ctx, 30, 30), '0,0,255,153');
+    var img = ctx.getImageData(0, 0, 2, 2);
+    eq('getImageData gives an ImageData', [img instanceof ImageData, img.width, img.height, img.data.length, img.data instanceof Uint8ClampedArray].join(), 'true,2,2,16,true');
+    var put = new ImageData(new Uint8ClampedArray([10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255]), 2, 2);
+    ctx.putImageData(put, 3, 3);
+    eq('putImageData puts pixels as they are', [px(ctx, 3, 3), px(ctx, 4, 4)].join('|'), '10,20,30,255|100,110,120,255');
+    ctx.putImageData(put, 3, 3, 1, 1, 1, 1);
+    var t = '';
+    try { ctx.getImageData(0, 0, 0, 5); } catch (e) { t = e.name; }
+    eq('getImageData of nothing is an IndexSizeError', t, 'IndexSizeError');
+    eq('createImageData', [ctx.createImageData(3, 2).data.length, ctx.createImageData(img).width].join(), '24,2');
+  });
+
+  attempt('paths', function () {
+    var ctx = fresh(60, 60);
+    ctx.fillStyle = '#00ff00';
+    ctx.beginPath();
+    ctx.arc(30, 30, 20, 0, Math.PI * 2);
+    ctx.fill();
+    eq('arc and fill', [px(ctx, 30, 30), px(ctx, 45, 30), px(ctx, 3, 3)].join('|'), '0,255,0,255|0,255,0,255|0,0,0,0');
+    eq('isPointInPath', [ctx.isPointInPath(30, 30), ctx.isPointInPath(2, 2), ctx.isPointInStroke(50, 30)].join(), 'true,false,true');
+    ctx.clearRect(0, 0, 60, 60);
+    ctx.beginPath();
+    ctx.moveTo(10, 10); ctx.lineTo(50, 10); ctx.lineTo(50, 50); ctx.closePath();
+    ctx.fill();
+    eq('lineTo and closePath make a triangle', [px(ctx, 45, 15), px(ctx, 15, 45)].join('|'), '0,255,0,255|0,0,0,0');
+    ctx.clearRect(0, 0, 60, 60);
+    ctx.beginPath();
+    ctx.rect(5, 5, 20, 20);
+    ctx.rect(10, 10, 10, 10);
+    ctx.fill('evenodd');
+    eq('fill rules', [px(ctx, 7, 7), px(ctx, 15, 15)].join('|'), '0,255,0,255|0,0,0,0');
+    ctx.clearRect(0, 0, 60, 60);
+    ctx.strokeStyle = '#000000';
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(0, 30); ctx.lineTo(60, 30);
+    ctx.stroke();
+    eq('stroke is as wide as lineWidth', [px(ctx, 30, 30), px(ctx, 30, 28), px(ctx, 30, 35)].join('|'), '0,0,0,255|0,0,0,255|0,0,0,0');
+    ctx.clearRect(0, 0, 60, 60);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(10, 50); ctx.arcTo(50, 50, 50, 10, 20); ctx.lineTo(50, 10);
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    eq('arcTo rounds the corner', [px(ctx, 50, 50), px(ctx, 44, 44)].join('|'), '0,0,0,0|0,0,0,255');
+    var p = new Path2D('M10 10 h20 v20 h-20 Z');
+    ctx.clearRect(0, 0, 60, 60);
+    ctx.fill(p);
+    eq('Path2D from SVG path data', [p instanceof Path2D, px(ctx, 20, 20), px(ctx, 40, 40)].join('|'), 'true|0,255,0,255|0,0,0,0');
+    var q = new Path2D();
+    q.addPath(p, { e: 25, f: 25 });
+    ctx.clearRect(0, 0, 60, 60);
+    ctx.fill(q);
+    eq('addPath with a transform', [px(ctx, 20, 20), px(ctx, 45, 45)].join('|'), '0,0,0,0|0,255,0,255');
+    ctx.clearRect(0, 0, 60, 60);
+    ctx.beginPath();
+    ctx.roundRect(5, 5, 50, 50, 20);
+    ctx.fill();
+    eq('roundRect', [px(ctx, 6, 6), px(ctx, 30, 30), px(ctx, 30, 6)].join('|'), '0,0,0,0|0,255,0,255|0,255,0,255');
+  });
+
+  attempt('transforms, state and clipping', function () {
+    var ctx = fresh(60, 60);
+    ctx.save();
+    ctx.translate(20, 20);
+    ctx.scale(2, 2);
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(0, 0, 5, 5);
+    var m = ctx.getTransform();
+    ctx.restore();
+    eq('translate and scale move what is drawn', [px(ctx, 25, 25), px(ctx, 32, 32), px(ctx, 10, 10)].join('|'), '255,0,0,255|0,0,0,0|0,0,0,0');
+    eq('getTransform is a DOMMatrix', [m instanceof DOMMatrix, m.a, m.e, m.f].join(), 'true,2,20,20');
+    eq('restore brings the state back', [ctx.fillStyle, ctx.getTransform().isIdentity].join(), '#000000,true');
+    ctx.setTransform(1, 0, 0, 1, 30, 0);
+    ctx.rotate(Math.PI / 2);
+    ctx.fillRect(10, 0, 10, 10);
+    ctx.resetTransform();
+    eq('rotate turns the axes', [px(ctx, 25, 15), px(ctx, 15, 15)].join('|'), '0,0,0,255|0,0,0,0');
+    ctx.clearRect(0, 0, 60, 60);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(10, 10, 20, 20);
+    ctx.clip();
+    ctx.fillStyle = '#0000ff';
+    ctx.fillRect(0, 0, 60, 60);
+    ctx.restore();
+    ctx.fillRect(50, 50, 5, 5);
+    eq('clip limits drawing until restore', [px(ctx, 20, 20), px(ctx, 5, 5), px(ctx, 52, 52)].join('|'), '0,0,255,255|0,0,0,0|0,0,0,255');
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillRect(15, 15, 5, 5);
+    ctx.globalCompositeOperation = 'source-over';
+    eq('destination-out erases', [px(ctx, 17, 17), px(ctx, 25, 25)].join('|'), '0,0,0,0|0,0,255,255');
+    ctx.globalCompositeOperation = 'destination-over';
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(0, 0, 60, 60);
+    ctx.globalCompositeOperation = 'source-over';
+    eq('destination-over goes under', [px(ctx, 25, 25), px(ctx, 5, 5)].join('|'), '0,0,255,255|255,0,0,255');
+    ctx.canvas.width = 60;
+    eq('setting the width clears the canvas and the state', [px(ctx, 5, 5), ctx.fillStyle].join('|'), '0,0,0,0|#000000');
+  });
+
+  attempt('styles', function () {
+    var ctx = fresh(100, 20);
+    var g = ctx.createLinearGradient(0, 0, 100, 0);
+    g.addColorStop(0, '#ff0000');
+    g.addColorStop(1, '#0000ff');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 100, 20);
+    var left = px(ctx, 1, 10).split(',').map(Number), right = px(ctx, 98, 10).split(',').map(Number);
+    eq('a linear gradient', [ctx.fillStyle === g, g instanceof CanvasGradient, left[0] > 240 && left[2] < 15, right[2] > 240 && right[0] < 15].join(), 'true,true,true,true');
+    var t = '';
+    try { g.addColorStop(2, 'red'); } catch (e) { t = e.name; }
+    var t2 = '';
+    try { g.addColorStop(0.5, 'nope'); } catch (e) { t2 = e.name; }
+    eq('addColorStop errors', [t, t2].join(), 'IndexSizeError,SyntaxError');
+    ctx.setLineDash([5]);
+    eq('an odd line dash list counts twice', ctx.getLineDash().join(), '5,5');
+    ctx.clearRect(0, 0, 100, 20);
+    ctx.shadowColor = '#000000';
+    ctx.shadowOffsetX = 10;
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(10, 5, 10, 10);
+    eq('a shadow is drawn under the shape, moved by its offset', [px(ctx, 15, 10), px(ctx, 25, 10), px(ctx, 45, 10)].join('|'), '255,0,0,255|0,0,0,255|0,0,0,0');
+  });
+
+  attempt('text', function () {
+    var ctx = fresh(200, 60);
+    ctx.font = '40px Arial';
+    var one = ctx.measureText('M'), two = ctx.measureText('MM');
+    eq('measureText', [one instanceof TextMetrics, one.width > 20, Math.abs(two.width - 2 * one.width) < 0.5, one.actualBoundingBoxAscent > 20, ctx.measureText('').width].join(), 'true,true,true,true,0');
+    ctx.fillStyle = '#000000';
+    ctx.fillText('M', 10, 45, undefined);  // an undefined maxWidth is no maxWidth
+    var row = ctx.getImageData(10, 40, 40, 1).data, inked = false, below = ctx.getImageData(10, 50, 40, 10).data, under = false;
+    for (var i = 3; i < row.length; i += 4) if (row[i] === 255) inked = true;
+    for (i = 3; i < below.length; i += 4) if (below[i]) under = true;
+    eq('fillText draws above the baseline', [inked, under].join(), 'true,false');
+    ctx.clearRect(0, 0, 200, 60);
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText('M', 100, 5);
+    var drawn = false;
+    for (var x = 60; x < 100; x += 2) if (px(ctx, x, 25) === '0,0,0,255') drawn = true;
+    eq('textAlign and textBaseline place it', [drawn, px(ctx, 105, 25)].join('|'), 'true|0,0,0,0');
+  });
+
+  attempt('images', function () {
+    var a = fresh(20, 20), b = fresh(40, 40);
+    a.fillStyle = '#ff00ff';
+    a.fillRect(0, 0, 20, 20);
+    b.drawImage(a.canvas, 10, 10);
+    b.drawImage(a.canvas, 0, 0, 20, 20, 30, 30, 5, 5);
+    eq('drawImage of a canvas', [px(b, 15, 15), px(b, 5, 5), px(b, 32, 32), px(b, 36, 36)].join('|'), '255,0,255,255|0,0,0,0|255,0,255,255|0,0,0,0');
+    var url = a.canvas.toDataURL();
+    eq('toDataURL', [url.slice(0, 22), document.createElement('canvas').toDataURL().length > 22, (function () { var c = document.createElement('canvas'); c.width = 0; return c.toDataURL(); })()].join('|'), 'data:image/png;base64,|true|data:,');
+    var pat = document.getElementById('pat').getContext('2d');
+    var tile = fresh(10, 10);
+    tile.fillStyle = '#333'; tile.fillRect(0, 0, 5, 5); tile.fillRect(5, 5, 5, 5);
+    pat.fillStyle = pat.createPattern(tile.canvas, 'repeat');
+    pat.fillRect(0, 0, 80, 80);
+    eq('a repeating pattern', [px(pat, 2, 2), px(pat, 7, 2), px(pat, 72, 72), px(pat, 77, 72)].join('|'), '51,51,51,255|0,0,0,0|51,51,51,255|0,0,0,0');
+  });
+
+  attempt('the picture shown', function () {
+    var ctx = document.getElementById('show').getContext('2d');
+    var g = ctx.createLinearGradient(10, 0, 290, 0);
+    g.addColorStop(0, 'red'); g.addColorStop(1, 'blue');
+    ctx.fillStyle = g;
+    ctx.fillRect(10, 10, 280, 15);
+    ctx.fillStyle = 'green';
+    ctx.beginPath(); ctx.arc(40, 70, 25, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = 'black'; ctx.stroke();
+    ctx.setLineDash([8, 4]); ctx.beginPath(); ctx.moveTo(80, 40); ctx.lineTo(290, 40); ctx.stroke(); ctx.setLineDash([]);
+    ctx.font = '28px Segoe UI'; ctx.fillStyle = 'blue'; ctx.fillText('Hello', 90, 90);
+    ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 6; ctx.shadowOffsetX = 4; ctx.shadowOffsetY = 4;
+    ctx.fillStyle = '#999'; ctx.fillRect(230, 60, 40, 40);
+  });
+
+  var img = new Image();
+  img.onload = function () {
+    attempt('a picture', function () {
+      var ctx = fresh(40, 20);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, 0, 0, 40, 20);
+      eq('drawImage of an <img>', [px(ctx, 5, 10), px(ctx, 35, 10)].join('|'), '255,0,0,255|0,0,255,255');
+    });
+    document.title = 'Canvas 2D test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  };
+  img.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII=';
+</script>
+</body>
+</html>

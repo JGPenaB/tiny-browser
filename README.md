@@ -10,7 +10,7 @@ JavaScript engine. The only dependencies are Windows system APIs:
 | Layout | Own block / inline / table / flexbox layout, inline-block, absolute / relative / fixed positioning, overflow clipping, boxes that scroll, CSS transforms (`src/layout_engine.cpp`) |
 | SVG | Inline SVG: paths, basic shapes, groups, `use` and symbols, transforms, fill and stroke, viewBox fitting, drawn as Direct2D geometry (`src/svg.cpp`) |
 | Rendering | Display list painted on the GPU with Direct2D 1.1 on a Direct3D 11 flip-model swap chain (`src/gpu.cpp`, `src/render.cpp`) |
-| WebGL | WebGL 1 on the GPU's OpenGL driver (opengl32 ships with Windows), GLSL ES shaders given to it as desktop GLSL (`src/webgl.cpp`) |
+| Canvas | The 2D context with Direct2D on its own Direct3D 11 device (`src/canvas2d.cpp`); WebGL 1 on the GPU's OpenGL driver (opengl32 ships with Windows), GLSL ES shaders given to it as desktop GLSL (`src/webgl.cpp`) |
 | Text | DirectWrite (shaping, font fallback, color emoji) with word-width caches (`src/text.cpp`) |
 | Networking | WinHTTP transport (HTTPS via SChannel, HTTP/2, gzip/deflate/brotli); our own redirect handling, GET/POST, Referer/Origin policy; plus `file:` and `data:` (`src/http.cpp`) |
 | Cookies | Own cookie jar: third-party cookies blocked, SameSite enforced, persistent cookies DPAPI-encrypted on disk (`src/http.cpp`) |
@@ -48,7 +48,7 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html`, `animations.html`, `webgl.html` and `replaced.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html`, `counters.html`, `grid.html`, `cascade.html`, `media.html`, `text.html`, `colors.html`, `values.html`, `fonts.html`, `sticky.html`, `animations.html`, `webgl.html`, `canvas.html` and `replaced.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`), as does `navigation.html` (the Navigation API). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
@@ -131,8 +131,15 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    that the driver never reads past what a script gave it are made: draws are checked against the buffers they read,
    pixel arrays against the sizes they must hold, new buffers, textures and renderbuffers hold zeros, and a picture from
    another origin cannot become a texture (pictures are not fetched with CORS yet, so that means any).
-   `tests/pages/webgl.html` (41 checks, compared with a reference browser). Not there yet: WebGL 2, the 2D canvas
-   context, `toDataURL`, context loss, antialiasing. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
+   `tests/pages/webgl.html` (41 checks, compared with a reference browser). Not there yet: WebGL 2, context loss,
+   antialiasing. The 2D context (`getContext("2d")`, HTML 4.12.5.1) draws with Direct2D on a Direct3D 11 device of
+   its own: paths (arcs, arcTo, ellipses, roundRect, Path2D with SVG path data), fill rules, strokes with caps,
+   joins, miter limits and dashes, transforms, save/restore, clipping, every composite operation and blend mode,
+   shadows, linear and radial gradients, patterns, text with alignment, baselines and `measureText`, `drawImage` of
+   pictures and canvases, `getImageData`/`putImageData`, and `toDataURL`/`toBlob` (PNG, JPEG). Pictures from another
+   origin can be drawn but make the canvas unreadable, as the standard says. `tests/pages/canvas.html` (41 checks,
+   compared with a reference browser); Chart.js charts render. Not there yet: conic gradients (drawn in their first
+   colour), `filter`, text direction from the element. CSS follows the W3C specifications, as JavaScript follows ECMA-262:
    `getComputedStyle` returns resolved values (CSSOM), `max-height` and `min-height` bound a box as CSS 2 section 10.7
    says, column flex containers shrink their items and flex containers size themselves to their items (Flexbox 9.7
    and 9.9), `overflow: auto` boxes scroll with the wheel and `scrollTop`, fixed boxes stay in the viewport, and
