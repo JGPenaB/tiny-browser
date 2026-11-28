@@ -877,60 +877,8 @@ bool parse_selector(std::string_view s, Selector& out) {
     return !out.parts.empty();
 }
 
-float media_len(std::string_view v) {
-    float n;
-    std::string_view u;
-    v = trim(v);
-    if (!parse_num(v, n, u)) return -1;
-    if (u == "em" || u == "rem") return n * 16;
-    return n;
-}
-
 int parse_media(std::string_view prelude, Sheet& sh) {
-    MediaQuery mq;
-    for (auto alt : split_top(prelude, ',')) {
-        std::string a = lower(trim(alt));
-        if (a.empty() || a == "all" || a == "screen") {
-            mq.alts.push_back({-1.f, -1.f});
-            continue;
-        }
-        if (istarts(a, "not ") || istarts(a, "print") || contains(a, "speech")) continue;
-        if (contains(a, "prefers-color-scheme") && contains(a, "dark")) continue;
-        if (contains(a, "prefers-reduced-motion") && contains(a, "reduce")) continue;
-        if (contains(a, "prefers-contrast") || contains(a, "forced-colors: active") || contains(a, "hover: none") ||
-            contains(a, "pointer: coarse") || contains(a, "portrait") || contains(a, "-webkit-min-device-pixel-ratio") ||
-            contains(a, "min-resolution"))
-            continue;
-        float mn = -1, mx = -1;
-        auto grab = [&](const char* key, float& dst) {
-            size_t p = a.find(key);
-            if (p == std::string::npos) return;
-            size_t c = a.find(':', p);
-            if (c == std::string::npos) return;
-            size_t e = a.find(')', c);
-            dst = media_len(std::string_view(a).substr(c + 1, (e == std::string::npos ? a.size() : e) - c - 1));
-        };
-        grab("min-width", mn);
-        grab("max-width", mx);
-        // Range syntax: (width >= 600px), (width < 900px)
-        for (size_t p = a.find("width"); p != std::string::npos; p = a.find("width", p + 5)) {
-            if (p > 0 && a[p - 1] == '-') continue;
-            size_t k = p + 5;
-            while (k < a.size() && isws(a[k])) ++k;
-            if (k >= a.size()) break;
-            bool ge = a.compare(k, 2, ">=") == 0, le = a.compare(k, 2, "<=") == 0;
-            bool gt = !ge && a[k] == '>', lt = !le && a[k] == '<';
-            if (!(ge || le || gt || lt)) continue;
-            k += (ge || le) ? 2 : 1;
-            size_t e = a.find(')', k);
-            float v = media_len(std::string_view(a).substr(k, (e == std::string::npos ? a.size() : e) - k));
-            if (v < 0) continue;
-            if (ge || gt) mn = v + (gt ? 0.02f : 0);
-            if (le || lt) mx = v - (lt ? 0.02f : 0);
-        }
-        mq.alts.push_back({mn, mx});
-    }
-    sh.media.push_back(std::move(mq));
+    sh.media.push_back(MediaQuery{std::string(trim(prelude))});
     return (int)sh.media.size() - 1;
 }
 
@@ -2032,11 +1980,6 @@ bool match_at(const Selector& s, int idx, const Node* e, int budget) {
     return false;
 }
 
-bool media_match(const MediaQuery& m, float vw) {
-    for (auto& a : m.alts)
-        if ((a.first < 0 || vw >= a.first) && (a.second < 0 || vw <= a.second)) return true;
-    return false;
-}
 
 std::string subst_vars(std::string_view v, const Style& s, int depth) {
     std::string out;
@@ -3308,7 +3251,219 @@ uint8_t user_actions(const Selector& s) {
 
 }  // namespace
 
-void StyleEngine::build(float vw) {
+// ---- Media Queries 4
+namespace {
+// A value in a media feature: a length in px, a number, a ratio or a resolution in dppx. False when it is none of
+// these (an identifier is matched by the caller).
+bool media_value(std::string_view v, const MediaEnv& env, double& out) {
+    std::string s = lower(trim(v));
+    size_t slash = s.find('/');
+    if (slash != std::string::npos) {  // <ratio>: a / b
+        double a = atof(s.substr(0, slash).c_str()), b = atof(s.substr(slash + 1).c_str());
+        if (b <= 0) return false;
+        out = a / b;
+        return true;
+    }
+    float n;
+    std::string_view u;
+    if (!parse_num(s, n, u)) return false;
+    static const std::pair<const char*, double> units[] = {
+        {"", 1}, {"px", 1}, {"em", 16}, {"rem", 16}, {"ex", 8}, {"ch", 8}, {"cm", 96 / 2.54}, {"mm", 96 / 25.4}, {"q", 96 / 101.6},
+        {"in", 96}, {"pt", 96.0 / 72}, {"pc", 16}, {"dppx", 1}, {"x", 1}, {"dpi", 1 / 96.0}, {"dpcm", 2.54 / 96}};
+    for (auto& [name, k] : units)
+        if (u == name) {
+            out = n * k;
+            return true;
+        }
+    if (u == "vw" || u == "svw" || u == "lvw" || u == "dvw") out = n * env.w / 100;
+    else if (u == "vh" || u == "svh" || u == "lvh" || u == "dvh") out = n * env.h / 100;
+    else if (u == "vmin") out = n * std::min(env.w, env.h) / 100;
+    else if (u == "vmax") out = n * std::max(env.w, env.h) / 100;
+    else return false;
+    return true;
+}
+// The value of a feature this engine knows, as a number (range features) or a word (discrete ones); -1 when the
+// feature is unknown
+int media_feature(const std::string& name, const MediaEnv& env, double& num, std::string& word) {
+    if (name == "width" || name == "device-width") num = env.w;
+    else if (name == "height" || name == "device-height") num = env.h;
+    else if (name == "aspect-ratio" || name == "device-aspect-ratio") num = env.h > 0 ? env.w / env.h : 0;
+    else if (name == "resolution" || name == "-webkit-device-pixel-ratio") num = env.dpr;
+    else if (name == "color") num = 8;
+    else if (name == "color-index" || name == "monochrome" || name == "grid") num = 0;
+    else {
+        static const std::pair<const char*, const char*> discrete[] = {
+            {"hover", "hover"}, {"any-hover", "hover"}, {"pointer", "fine"}, {"any-pointer", "fine"},
+            {"prefers-color-scheme", "light"}, {"prefers-reduced-motion", "no-preference"},
+            {"prefers-contrast", "no-preference"}, {"prefers-reduced-transparency", "no-preference"},
+            {"prefers-reduced-data", "no-preference"}, {"forced-colors", "none"}, {"inverted-colors", "none"},
+            {"color-gamut", "srgb"}, {"dynamic-range", "standard"}, {"video-dynamic-range", "standard"},
+            {"display-mode", "browser"}, {"scripting", "enabled"}, {"update", "fast"}, {"overflow-block", "scroll"},
+            {"overflow-inline", "scroll"}, {"orientation", ""}};
+        for (auto& [n, v] : discrete)
+            if (name == n) {
+                word = name == "orientation" ? (env.h >= env.w ? "portrait" : "landscape") : v;
+                return 1;
+            }
+        return -1;
+    }
+    return 0;
+}
+// 1 true, 0 false, -1 unknown (Media Queries 4, 3.2: what this engine cannot read is unknown, and false at the end)
+int media_condition(std::string_view v, const MediaEnv& env);
+int media_in_parens(std::string_view v, const MediaEnv& env) {
+    v = trim(v);
+    if (v.size() < 2 || v[0] != '(' || v.back() != ')') return -1;  // <general-enclosed>
+    std::string_view inner = trim(v.substr(1, v.size() - 2));
+    std::string li = lower(inner);
+    if (!inner.empty() && (inner[0] == '(' || istarts(li, "not ") || istarts(li, "not("))) return media_condition(inner, env);
+    // a feature: (name), (name: value), or a range with <, <=, >, >= or =
+    size_t op = inner.find_first_of("<>=");
+    size_t colon = inner.find(':');
+    auto compare = [](double a, const std::string& o, double b) {
+        const double eps = 1e-6;
+        if (o == "<") return a < b - eps;
+        if (o == "<=") return a <= b + eps;
+        if (o == ">") return a > b + eps;
+        if (o == ">=") return a >= b - eps;
+        return std::fabs(a - b) <= eps;
+    };
+    if (op == std::string::npos) {
+        std::string name = lower(trim(colon == std::string::npos ? inner : inner.substr(0, colon)));
+        std::string prefix;
+        if (istarts(name, "min-") || istarts(name, "max-")) {
+            prefix = name.substr(0, 3);
+            name = name.substr(4);
+        } else if (istarts(name, "-webkit-min-") || istarts(name, "-webkit-max-")) {
+            prefix = name.substr(8, 3);
+            name = "-webkit-" + name.substr(12);
+        }
+        double num = 0;
+        std::string word;
+        int kind = media_feature(name, env, num, word);
+        if (kind < 0) return -1;
+        if (colon == std::string::npos) {  // boolean context: anything but 0 and none
+            if (!prefix.empty()) return -1;
+            return kind == 0 ? num != 0 : (word != "none" && word != "no-preference");
+        }
+        std::string value = lower(trim(inner.substr(colon + 1)));
+        if (kind == 1) return prefix.empty() ? value == word : -1;
+        double want;
+        if (!media_value(value, env, want)) return -1;
+        if (prefix == "min") return compare(num, ">=", want);
+        if (prefix == "max") return compare(num, "<=", want);
+        return compare(num, "=", want);
+    }
+    // range form: value op name, name op value, or value op name op value
+    std::vector<std::string> parts, ops;
+    size_t i = 0, start = 0;
+    while (i < inner.size()) {
+        if (inner[i] == '<' || inner[i] == '>' || inner[i] == '=') {
+            parts.push_back(std::string(trim(inner.substr(start, i - start))));
+            std::string o(1, inner[i]);
+            if (i + 1 < inner.size() && inner[i + 1] == '=' && inner[i] != '=') o += '=', ++i;
+            ops.push_back(o);
+            start = ++i;
+            continue;
+        }
+        ++i;
+    }
+    parts.push_back(std::string(trim(inner.substr(start))));
+    if (parts.size() < 2 || parts.size() > 3) return -1;
+    size_t at = parts.size();  // which part is the feature's name
+    double num = 0;
+    std::string word;
+    for (size_t k = 0; k < parts.size(); ++k) {
+        double probe;
+        std::string name = lower(parts[k]);
+        if (!media_value(name, env, probe) && media_feature(name, env, num, word) == 0) at = k;
+    }
+    if (at == parts.size()) return -1;
+    bool ok = true;
+    for (size_t k = 0; k + 1 < parts.size(); ++k) {
+        double a = num, b = num;
+        if (k != at && !media_value(parts[k], env, a)) return -1;
+        if (k + 1 != at && !media_value(parts[k + 1], env, b)) return -1;
+        ok = ok && compare(a, ops[k], b);
+    }
+    return ok;
+}
+// <media-condition>: not <in-parens>, or <in-parens> joined by and, or by or
+int media_condition(std::string_view v, const MediaEnv& env) {
+    v = trim(v);
+    std::string l = lower(v);
+    if (istarts(l, "not ") || istarts(l, "not(")) {
+        int r = media_in_parens(v.substr(3), env);
+        return r < 0 ? -1 : !r;
+    }
+    std::vector<std::string_view> terms;
+    std::string op;
+    size_t i = 0, start = 0;
+    int depth = 0;
+    while (i < v.size()) {
+        char c = v[i];
+        if (c == '(') ++depth;
+        else if (c == ')') --depth;
+        else if (depth == 0 && isws(c)) {
+            size_t j = i;
+            while (j < v.size() && isws(v[j])) ++j;
+            size_t k = j;
+            while (k < v.size() && isalpha((unsigned char)v[k])) ++k;
+            std::string w = lower(v.substr(j, k - j));
+            if ((w == "and" || w == "or") && k < v.size() && (isws(v[k]) || v[k] == '(')) {
+                if (!op.empty() && op != w) return -1;  // and and or are not mixed without parentheses
+                op = w;
+                terms.push_back(v.substr(start, i - start));
+                start = i = k;
+                continue;
+            }
+        }
+        ++i;
+    }
+    terms.push_back(v.substr(start));
+    int result = op == "or" ? 0 : 1;
+    for (auto t : terms) {
+        int r = media_in_parens(t, env);
+        if (op == "or") result = (r == 1 || result == 1) ? 1 : (r < 0 || result < 0) ? -1 : 0;
+        else result = (r == 0 || result == 0) ? 0 : (r < 0 || result < 0) ? -1 : 1;
+    }
+    return result;
+}
+// <media-query>: a condition, or [not | only]? <media-type> [and <condition-without-or>]?
+bool media_query(std::string_view q, const MediaEnv& env) {
+    q = trim(q);
+    if (q.empty()) return false;
+    if (q[0] == '(' || istarts(lower(q), "not (") || istarts(lower(q), "not(")) return media_condition(q, env) == 1;
+    auto T = tokens(lower(q));
+    size_t i = 0;
+    bool negate = false;
+    if (T[i] == "not") negate = true, ++i;
+    else if (T[i] == "only") ++i;
+    if (i >= T.size()) return false;
+    std::string type = T[i++];
+    if (in(type, {"and", "or", "not", "only", "layer"})) return false;
+    bool typeOk = type == "all" || type == "screen";
+    int cond = 1;
+    if (i < T.size()) {
+        if (T[i] != "and") return false;
+        size_t at = lower(q).find(" and ");
+        cond = media_condition(q.substr(at + 5), env);
+        if (cond < 0) return false;  // an unknown condition makes the whole query false, not its negation true
+    }
+    bool r = typeOk && cond == 1;
+    return negate ? !r : r;
+}
+}  // namespace
+
+bool media_matches(std::string_view list, const MediaEnv& env) {
+    if (trim(list).empty()) return true;
+    for (auto q : split_top(list, ','))
+        if (media_query(q, env)) return true;
+    return false;
+}
+
+void StyleEngine::build(float vw, float vh) {
+    MediaEnv env{vw, vh, 1};
     all_.clear();
     userActions_ = 0;
     byId_.clear();
@@ -3357,12 +3512,12 @@ void StyleEngine::build(float vw) {
     for (auto& [sh, ua, scope, layer, gate] : sheets_) {
         bool gated = gate != nullptr;  // an import for media that never match (print) has no alternatives
         if (gated) hasMedia_ = true;
-        if (gated && !media_match(*gate, vw)) continue;
+        if (gated && !media_matches(gate->text, env)) continue;
         for (auto& r : sh->rules) {
             ++order;
             if (r.media >= 0) {
                 hasMedia_ = true;
-                if (!media_match(sh->media[r.media], vw)) continue;
+                if (!media_matches(sh->media[r.media].text, env)) continue;
             }
             uint8_t rank = 0;
             if (!ua) rank = tree[layerOf(fullName(layer, r.layer >= 0 ? sh->layers[r.layer] : std::string()))].rank;
@@ -3388,7 +3543,7 @@ void StyleEngine::compute(Document& d, float vw, float vh) {
     g_vw = vw;
     g_vh = vh;
     g_rootFont = 16;
-    build(vw);
+    build(vw, vh);
     Style root;
     root.family = resolve_family("serif");
     counters_.clear();

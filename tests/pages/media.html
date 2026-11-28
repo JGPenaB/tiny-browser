@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Media queries test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 14px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  span { color: rgb(0, 0, 0); }
+  /* Media Queries 4 in style sheets */
+  @media (prefers-color-scheme: light) and (hover) { #m1 { color: rgb(255, 0, 0); } }
+  @media not print { #m4 { color: rgb(255, 0, 0); } }
+  @media (unknown-feature: 1) { #m5 { color: rgb(255, 0, 0); } }
+  @media not (unknown-feature: 1) { #m6 { color: rgb(255, 0, 0); } }
+</style>
+<style media="print">#m2 { color: rgb(255, 0, 0); }</style>
+<style media="(hover: hover)">#m3 { color: rgb(255, 0, 0); }</style>
+</head>
+<body>
+<div><span id="m1">m1</span> <span id="m2">m2</span> <span id="m3">m3</span> <span id="m4">m4</span> <span id="m5">m5</span> <span id="m6">m6</span></div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var $ = function (id) { return document.getElementById(id); };
+  var red = function (id) { return getComputedStyle($(id)).color === 'rgb(255, 0, 0)'; };
+  // the viewport is what the queries are about; the expectations follow from it
+  var W = document.documentElement.clientWidth, H = innerHeight;
+  function mm(q) { return matchMedia(q).matches; }
+  function table(cases) {
+    var bad = cases.filter(function (c) { return mm(c[0]) !== c[1]; });
+    return bad.map(function (c) { return c[0] + ' should be ' + c[1]; }).join('; ');
+  }
+  eq('widths: min-, max- and ranges', table([
+    ['(min-width: ' + W + 'px)', true], ['(min-width: ' + (W + 1) + 'px)', false], ['(max-width: ' + (W - 1) + 'px)', false],
+    ['(width >= ' + W + 'px)', true], ['(width < ' + W + 'px)', false], ['(' + (W - 10) + 'px < width <= ' + W + 'px)', true],
+    ['(' + (W + 1) + 'px <= width)', false], ['(min-width: 20em)', W >= 320], ['(width = ' + W + 'px)', true]]), '');
+  eq('media types and their modifiers', table([
+    ['screen', true], ['print', false], ['not print', true], ['not screen', false], ['only screen', true], ['all', true],
+    ['screen and (min-width: 0px)', true], ['print and (min-width: 0px)', false], ['(min-width: ' + (W + 1) + 'px), screen', true]]), '');
+  eq('and, or, not and parentheses', table([
+    ['(min-width: 0px) and (max-width: ' + (W + 5) + 'px)', true], ['(min-width: ' + (W + 1) + 'px) or (hover: hover)', true],
+    ['not (min-width: ' + (W + 1) + 'px)', true], ['((hover: hover) and (pointer: fine)) or (print-nothing: 1)', true],
+    ['(hover) and (min-width: 0px) or (color)', false]]), '');
+  eq('discrete features', table([
+    ['(prefers-color-scheme: light)', true], ['(prefers-color-scheme: dark)', false], ['(hover: hover)', true], ['(hover: none)', false],
+    ['(pointer: fine)', true], ['(any-pointer: coarse)', false], ['(prefers-reduced-motion: no-preference)', true],
+    ['(prefers-reduced-motion: reduce)', false], ['(forced-colors: none)', true], ['(color)', true], ['(monochrome)', false],
+    ['(orientation: ' + (H >= W ? 'portrait' : 'landscape') + ')', true], ['(scripting: enabled)', true],
+    ['(min-resolution: 1dppx)', true], ['(-webkit-min-device-pixel-ratio: 1)', true], ['(min-aspect-ratio: 1/100000)', true]]), '');
+  eq('what is not understood is false, and so is its negation', table([
+    ['(unknown-feature)', false], ['not (unknown-feature)', false], ['(min-width: nonsense)', false], ['screen and', false]]), '');
+  eq('@media rules and the media attribute', ['m1', 'm2', 'm3', 'm4', 'm5', 'm6'].filter(red).join(), 'm1,m3,m4');
+
+  window.addEventListener('load', function () {
+    document.title = 'Media queries test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>

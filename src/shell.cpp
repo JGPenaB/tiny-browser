@@ -1044,6 +1044,7 @@ public:
             };
         // The page's sheets, in tree order: every <style>, and every linked sheet that has arrived, wherever it is
         // now. One inside a shadow tree styles that tree only.
+        std::deque<MediaQuery> mediaAttrs;  // kept until the styles are computed: the engine points into it
         std::vector<Node*> st{p.doc->root.get()};
         while (!st.empty()) {
             Node* n = st.back();
@@ -1062,7 +1063,11 @@ public:
                         requestLate(p, url, false);
                     }
                 }
-                if (sheet) addSheet(sheet, shadow_root_of(n), {}, nullptr, 0);
+                if (sheet) {
+                    const MediaQuery* gate = nullptr;  // the media attribute (HTML 4.2.4)
+                    if (const std::string* m = n->attr("media")) gate = &mediaAttrs.emplace_back(MediaQuery{*m});
+                    addSheet(sheet, shadow_root_of(n), {}, gate, 0);
+                }
             }
             if (n->shadow) st.push_back(n->shadow.get());
             for (auto it = n->kids.rbegin(); it != n->kids.rend(); ++it) st.push_back(it->get());

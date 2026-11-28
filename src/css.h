@@ -241,8 +241,14 @@ struct Decl {
     bool important = false;
 };
 struct MediaQuery {
-    std::vector<std::pair<float, float>> alts;  // (min-width, max-width), -1 = unbounded
+    std::string text;  // a <media-query-list> as written, evaluated against the viewport each time styles are computed
 };
+// What media queries are evaluated against: the viewport in CSS pixels and the device pixel ratio
+struct MediaEnv {
+    float w = 0, h = 0, dpr = 1;
+};
+// Whether a <media-query-list> matches (Media Queries 4); an empty list matches
+bool media_matches(std::string_view list, const MediaEnv& env);
 struct Rule {
     Selector sel;
     std::shared_ptr<std::vector<Decl>> decls;
@@ -326,7 +332,7 @@ private:
         std::string layer;
         const MediaQuery* media;
     };
-    void build(float vw);
+    void build(float vw, float vh);
     void computeTree(Node* e, const Style& parent);
     void computeElem(Node* e, const Style& parent);
     using Cascade = std::vector<std::pair<uint64_t, const Decl*>>;

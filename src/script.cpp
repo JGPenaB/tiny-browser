@@ -2354,19 +2354,10 @@ JSFN(scrollToFn) {
 JSFN(matchMediaFn) {
     Vm& vm = ci.vm;
     Impl& im = I(vm);
-    std::string q = lower(str8(vm, ci.arg(0)));
+    std::string q = str8(vm, ci.arg(0));
     float w, h, sy;
     im.client.viewport(w, h, sy);
-    bool ok = !contains(q, "print") && !contains(q, "prefers-color-scheme: dark") && !contains(q, "prefers-reduced-motion: reduce") && !contains(q, "hover: none") && !contains(q, "pointer: coarse");
-    auto bound = [&](const char* key, bool isMin) {
-        size_t p = q.find(key);
-        if (p == std::string::npos) return;
-        double v = atof(q.c_str() + p + strlen(key));
-        if (contains(std::string_view(q).substr(p, 40), "em")) v *= 16;
-        if (isMin ? w < v : w > v) ok = false;
-    };
-    bound("min-width:", true);
-    bound("max-width:", false);
+    bool ok = media_matches(q, MediaEnv{w, h, 1});  // CSSOM View 4.2
     JSObject* o = vm.newObject();
     vm.def(o, "matches", Value::boolean(ok), PF_ALL);
     vm.def(o, "media", ci.arg(0), PF_ALL);
