@@ -2,7 +2,7 @@
 import os, subprocess, sys, tempfile
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-exe = os.path.join(root, "build", "Release", "tinybrowser.exe")
+exe = os.environ.get("TB_EXE") or os.path.join(root, "build", "Release", "tinybrowser.exe")  # TB_EXE: another build to test
 jsdir = os.path.join(root, "tests", "js")
 harness = open(os.path.join(jsdir, "_harness.js"), encoding="utf-8").read()
 names = sys.argv[1:] or sorted(f[:-3] for f in os.listdir(jsdir) if f.endswith(".js") and not f.startswith("_"))

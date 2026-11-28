@@ -2590,6 +2590,11 @@ Value Vm::runFrames(size_t base) {
 #define NAMEK(x) utf16to8(K[x].asString()->s).c_str()
 
     for (;;) {
+        // An error no frame of this invocation handles goes on to the C++ caller. It is thrown again after the
+        // catch block has ended, not from inside it: on x64 Windows a catch block runs on top of the stack of the
+        // throw, so rethrowing there would make every level of native reentry keep its stack until the outermost
+        // handler, and an error deep in a recursion through getters or callbacks would overflow the stack.
+        bool propagate = false;
         try {
             if (resumeThrow) {
                 resumeThrow = false;
@@ -3943,11 +3948,15 @@ Value Vm::runFrames(size_t base) {
                 bool entry = frames.size() - 1 == base;
                 frames.pop_back();
                 stackTop = fbase;
-                if (entry) throw;
+                if (entry) {
+                    propagate = true;
+                    break;
+                }
                 pc = frames.back().pc;
                 stackTop = frames.back().regs + frames.back().code->nregs;
             }
         }
+        if (propagate) throw JSThrow{};
     }
 #undef LOAD_FRAME
 #undef R

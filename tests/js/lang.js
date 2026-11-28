@@ -84,6 +84,13 @@ test("exceptions", function () {
   function nested() { try { try { throw 1; } finally { log.push("inner"); } } catch (v) { return v + 1; } } eq(nested(), 2);
   function deep(n) { return n == 0 ? 0 : 1 + deep(n - 1); } eq(deep(5000), 5000);
   throws(function () { (function inf() { inf(); })(); }, RangeError, "stack overflow");
+  // recursion through native code (a getter, a proxy trap, a callback) ends in a RangeError, and an error thrown at
+  // the bottom of such a recursion reaches its handler, without running out of the process's stack
+  throws(function () { var o = {}; Object.defineProperty(o, "x", { get: function () { return this.x; } }); o.x; }, RangeError, "getter recursion");
+  throws(function () { var o = Object.create(new Proxy({}, { get: function (t, k, r) { return r.y; } })); o.y; }, RangeError, "proxy recursion");
+  throws(function () { (function f() { [1].map(f); })(); }, RangeError, "callback recursion");
+  (function () { var n = 0, o = {}; Object.defineProperty(o, "x", { get: function () { if (++n >= 8000) throw new Error("bottom"); return this.x; } });
+    try { o.x; } catch (e) { eq([e.message, n], ["bottom", 8000]); } })();
   throws(function () { null(); }, TypeError);
   throws(function () { ({}).missing(); }, TypeError);
 });
