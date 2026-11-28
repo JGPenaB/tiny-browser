@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>clip-path test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; }
+  /* CSS Masking 1, 3.1 with the basic shapes of CSS Shapes 1. Checked by eye: each box says what should show */
+  .cell { display: inline-block; width: 180px; margin: 6px; vertical-align: top; font-size: 12px; }
+  .b { width: 160px; height: 100px; background: linear-gradient(135deg, #08f, #f08); border: 6px solid #333; padding: 10px; color: #fff; }
+  #circle { clip-path: circle(); }
+  #circle40 { clip-path: circle(40px at 30px 30px); }
+  #ellipse { clip-path: ellipse(closest-side farthest-side); }
+  #inset { clip-path: inset(10px 20px round 15px); }
+  #triangle { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+  #star { clip-path: polygon(evenodd, 50% 0, 79% 90%, 2% 35%, 98% 35%, 21% 90%); }
+  #content { clip-path: inset(0) content-box; }
+  #margin { clip-path: circle(50%) margin-box; margin: 0 0 0 20px; }
+  #kids { clip-path: circle(45%); }
+  #kids div { position: relative; left: 60px; width: 150px; height: 40px; background: #0c0; }
+</style>
+</head>
+<body>
+<div class="cell"><div class="b" id="circle"></div>a circle as tall as the box, centred</div>
+<div class="cell"><div class="b" id="circle40"></div>a circle of 40px round a point near the top left</div>
+<div class="cell"><div class="b" id="ellipse"></div>an ellipse touching all four edges</div>
+<div class="cell"><div class="b" id="inset"></div>the box less 10px at top and bottom and 20px at the sides, round corners</div>
+<div class="cell"><div class="b" id="triangle"></div>a triangle pointing up</div>
+<div class="cell"><div class="b" id="star"></div>a five-pointed star with a hollow centre</div>
+<div class="cell"><div class="b" id="content"></div>only the content box: no border, no padding</div>
+<div class="cell"><div class="b" id="margin"></div>a circle round the margin box, so a little to the left</div>
+<div class="cell"><div class="b" id="kids"><div></div></div>a green bar inside, cut by the circle too</div>
+</body>
+</html>

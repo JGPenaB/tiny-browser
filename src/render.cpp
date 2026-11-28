@@ -195,6 +195,59 @@ Microsoft::WRL::ComPtr<ID2D1Brush> gradientBrush(ID2D1RenderTarget* rt, const Bg
     brush = rb;
     return brush;
 }
+// The shape of a clip-path in its reference box x y w h (CSS Shapes 1, 3.1)
+Microsoft::WRL::ComPtr<ID2D1Geometry> clipGeometry(ID2D1RenderTarget* rt, const ClipShape& s, float x, float y, float w, float h) {
+    Microsoft::WRL::ComPtr<ID2D1Factory> f;
+    rt->GetFactory(&f);
+    Microsoft::WRL::ComPtr<ID2D1Geometry> out;
+    switch (s.k) {
+        case ClipShape::Inset: {
+            float t = s.len[0].resolve(h), r = s.len[1].resolve(w), b = s.len[2].resolve(h), l = s.len[3].resolve(w);
+            D2D1_RECT_F rect = D2D1::RectF(x + l, y + t, std::max(x + l, x + w - r), std::max(y + t, y + h - b));
+            float rad = std::min(s.round.resolve(w), std::min(rect.right - rect.left, rect.bottom - rect.top) / 2);
+            Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry> g;
+            f->CreateRoundedRectangleGeometry(D2D1::RoundedRect(rect, rad, rad), &g);
+            out = g;
+            break;
+        }
+        case ClipShape::Circle:
+        case ClipShape::Ellipse: {
+            float cx = s.cx.resolve(w), cy = s.cy.resolve(h);
+            float sideX[2] = {std::min(cx, w - cx), std::max(cx, w - cx)}, sideY[2] = {std::min(cy, h - cy), std::max(cy, h - cy)};
+            float rx, ry;
+            if (s.k == ClipShape::Circle) {
+                // a percentage is of the box's diagonal over the square root of two
+                if (s.radiusKw[0] == 1) rx = std::min(sideX[0], sideY[0]);
+                else if (s.radiusKw[0] == 2) rx = std::max(sideX[1], sideY[1]);
+                else rx = s.len[0].resolve(std::sqrt(w * w + h * h) / 1.41421356f);
+                ry = rx;
+            } else {
+                rx = s.radiusKw[0] ? sideX[s.radiusKw[0] - 1] : s.len[0].resolve(w);
+                ry = s.radiusKw[1] ? sideY[s.radiusKw[1] - 1] : s.len[1].resolve(h);
+            }
+            Microsoft::WRL::ComPtr<ID2D1EllipseGeometry> g;
+            f->CreateEllipseGeometry(D2D1::Ellipse(D2D1::Point2F(x + cx, y + cy), std::max(0.f, rx), std::max(0.f, ry)), &g);
+            out = g;
+            break;
+        }
+        case ClipShape::Polygon: {
+            Microsoft::WRL::ComPtr<ID2D1PathGeometry> g;
+            Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+            if (FAILED(f->CreatePathGeometry(&g)) || FAILED(g->Open(&sink))) return out;
+            sink->SetFillMode(s.evenOdd ? D2D1_FILL_MODE_ALTERNATE : D2D1_FILL_MODE_WINDING);
+            for (size_t i = 0; i < s.points.size(); ++i) {
+                D2D1_POINT_2F p = D2D1::Point2F(x + s.points[i].first.resolve(w), y + s.points[i].second.resolve(h));
+                if (i == 0) sink->BeginFigure(p, D2D1_FIGURE_BEGIN_FILLED);
+                else sink->AddLine(p);
+            }
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink->Close();
+            out = g;
+            break;
+        }
+    }
+    return out;
+}
 }  // namespace
 
 void paint_background(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DItem& it, std::vector<ImageRes>& imgs, uint64_t gen) {
@@ -306,7 +359,7 @@ void paint_background(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, const DIt
 
 void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo, std::vector<ImageRes>& imgs,
                  float y0, float y1, uint64_t gen, WidgetPainter* wp) {
-    int clipDepth = 0;
+    std::vector<bool> clips;  // the open clips, innermost last: a clip-path layer (true) or a rectangle
     std::vector<D2D1_MATRIX_3X2_F> outer;  // the transforms in force around each open PushTransform
     for (auto& it : lo.items) {
         if (it.k == DItem::K::PushTransform) {
@@ -326,14 +379,20 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
             continue;
         }
         if (it.k == DItem::K::PushClip) {
-            rt->PushAxisAlignedClip(D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h), D2D1_ANTIALIAS_MODE_ALIASED);
-            ++clipDepth;
+            Microsoft::WRL::ComPtr<ID2D1Geometry> geometry = it.shape ? clipGeometry(rt, *it.shape, it.x, it.y, it.w, it.h) : nullptr;
+            if (geometry) {
+                rt->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), geometry.Get()), nullptr);
+            } else {
+                rt->PushAxisAlignedClip(D2D1::RectF(it.x, it.y, it.x + it.w, it.y + it.h), D2D1_ANTIALIAS_MODE_ALIASED);
+            }
+            clips.push_back(geometry != nullptr);
             continue;
         }
         if (it.k == DItem::K::PopClip) {
-            if (clipDepth > 0) {
-                rt->PopAxisAlignedClip();
-                --clipDepth;
+            if (!clips.empty()) {
+                if (clips.back()) rt->PopLayer();
+                else rt->PopAxisAlignedClip();
+                clips.pop_back();
             }
             continue;
         }
@@ -420,7 +479,10 @@ void paint_items(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br, LayoutOut& lo,
             default: break;
         }
     }
-    while (clipDepth-- > 0) rt->PopAxisAlignedClip();
+    for (; !clips.empty(); clips.pop_back()) {
+        if (clips.back()) rt->PopLayer();
+        else rt->PopAxisAlignedClip();
+    }
     if (!outer.empty()) rt->SetTransform(outer.front());
 }
 

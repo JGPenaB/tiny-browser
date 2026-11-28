@@ -2339,6 +2339,14 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     b.w = contentW + hpb;
     float ix = b.x + b.b[3] + b.p[3], iy = top + b.b[0] + b.p[0];
 
+    // clip-path (CSS Masking 1): everything the box paints is clipped to the shape; placed once the box's size is known
+    size_t shapeIdx = SIZE_MAX;
+    if (own && s->clipPath && &b != c.root) {
+        DItem d;
+        d.k = DItem::K::PushClip;
+        d.shape = s->clipPath;
+        shapeIdx = push(c, std::move(d));
+    }
     bool layers = own && !b.replaced && !s->hidden && s->bgImages && !s->bgImages->images.empty();
     if (own && !b.replaced && !s->hidden && (!s->bg.transparent() || layers || b.b[0] > 0 || b.b[1] > 0 || b.b[2] > 0 || b.b[3] > 0)) {
         DItem d;
@@ -2508,6 +2516,21 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         d.y = b.y + b.b[0];
         d.w = std::max(0.f, b.w - b.b[1] - b.b[3]);
         d.h = std::max(0.f, b.h - b.b[0] - b.b[2]);
+        DItem e;
+        e.k = DItem::K::PopClip;
+        e.x = d.x;
+        e.y = d.y;
+        push(c, std::move(e));
+    }
+    if (shapeIdx != SIZE_MAX) {
+        DItem& d = c.out.items[shapeIdx];
+        uint8_t box = s->clipPath->box;  // the reference box, from the border box out to the margins or in
+        float out[4] = {};
+        for (int i = 0; i < 4; ++i) out[i] = box == 3 ? b.m[i] : box == 0 ? 0 : -(b.b[i] + (box == 2 ? b.p[i] : 0));
+        d.x = b.x - out[3];
+        d.y = b.y - out[0];
+        d.w = std::max(0.f, b.w + out[1] + out[3]);
+        d.h = std::max(0.f, b.h + out[0] + out[2]);
         DItem e;
         e.k = DItem::K::PopClip;
         e.x = d.x;

@@ -1905,6 +1905,7 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
     else if (p == "align-self") d.alignSelf = s.alignSelf;
     else if (p == "justify-items") d.justifyItems = s.justifyItems;
     else if (p == "justify-self") d.justifySelf = s.justifySelf;
+    else if (p == "clip-path") d.clipPath = s.clipPath;
     else if (istarts(p, "grid-row") || istarts(p, "grid-column") || p == "grid-area") {
         std::copy(s.gridRow, s.gridRow + 2, d.gridRow);
         std::copy(s.gridCol, s.gridCol + 2, d.gridCol);
@@ -2417,6 +2418,81 @@ uint8_t content_distribution(const std::string& v) {  // as Style::justify
                                                                                  : t == "space-evenly" ? 5 : 0;
 }
 
+// clip-path (CSS Masking 1, 3.1): none, or a basic shape and a reference box in either order. A url() to an SVG
+// clipPath is not kept: it clips nothing.
+bool parse_clip_path(std::string_view v, float fs, std::shared_ptr<const ClipShape>& out) {
+    std::string l = lower(trim(v));
+    out = nullptr;
+    if (l == "none" || istarts(l, "url(")) return true;
+    auto shape = std::make_shared<ClipShape>();
+    bool any = false;
+    for (auto& t : tokens(l)) {
+        if (t == "border-box" || t == "padding-box" || t == "content-box" || t == "margin-box" || t == "fill-box" ||
+            t == "stroke-box" || t == "view-box") {
+            shape->box = t == "padding-box" ? 1 : t == "content-box" ? 2 : t == "margin-box" ? 3 : 0;
+            continue;
+        }
+        size_t open = t.find('(');
+        if (open == std::string::npos || t.back() != ')') return false;
+        std::string fn = t.substr(0, open), args = t.substr(open + 1, t.size() - open - 2);
+        any = true;
+        if (fn == "inset") {  // inset(<length-percentage>{1,4} [round <border-radius>]?)
+            shape->k = ClipShape::Inset;
+            std::vector<std::string> T = tokens(args), lens;
+            size_t i = 0;
+            for (; i < T.size() && T[i] != "round"; ++i) lens.push_back(T[i]);
+            if (lens.empty() || lens.size() > 4) return false;
+            Len L[4];
+            for (size_t k = 0; k < lens.size(); ++k)
+                if (!parse_len(lens[k], fs, L[k], false)) return false;
+            shape->len[0] = L[0];
+            shape->len[1] = lens.size() > 1 ? L[1] : L[0];
+            shape->len[2] = lens.size() > 2 ? L[2] : L[0];
+            shape->len[3] = lens.size() > 3 ? L[3] : shape->len[1];
+            if (i + 1 < T.size() && !parse_len(T[i + 1], fs, shape->round, false)) return false;
+        } else if (fn == "circle" || fn == "ellipse") {  // circle(<radius>? [at <position>]?)
+            shape->k = fn == "circle" ? ClipShape::Circle : ClipShape::Ellipse;
+            std::vector<std::string> T = tokens(args);
+            size_t i = 0;
+            int nRadii = fn == "circle" ? 1 : 2;
+            for (int r = 0; r < nRadii; ++r) {
+                if (i >= T.size() || T[i] == "at") {
+                    shape->radiusKw[r] = 1;
+                    continue;
+                }
+                if (T[i] == "closest-side") shape->radiusKw[r] = 1;
+                else if (T[i] == "farthest-side") shape->radiusKw[r] = 2;
+                else if (!parse_len(T[i], fs, shape->len[r], false)) return false;
+                ++i;
+            }
+            if (i < T.size()) {
+                if (T[i] != "at" || !parse_position(std::vector<std::string>(T.begin() + i + 1, T.end()), fs, shape->cx, shape->cy)) return false;
+            }
+        } else if (fn == "polygon") {  // polygon(<fill-rule>?, [<x> <y>]#)
+            shape->k = ClipShape::Polygon;
+            auto parts = split_top(args, ',');
+            for (size_t k = 0; k < parts.size(); ++k) {
+                std::string part = lower(trim(parts[k]));
+                if (k == 0 && (part == "evenodd" || part == "nonzero")) {
+                    shape->evenOdd = part == "evenodd";
+                    continue;
+                }
+                auto T = tokens(part);
+                std::pair<Len, Len> pt;
+                if (T.size() != 2 || !parse_len(T[0], fs, pt.first, false) || !parse_len(T[1], fs, pt.second, false)) return false;
+                shape->points.push_back(pt);
+            }
+            if (shape->points.size() < 3) return false;
+        } else
+            return false;
+    }
+    if (!any) {  // a reference box alone clips to that box
+        shape->k = ClipShape::Inset;
+    }
+    out = std::move(shape);
+    return true;
+}
+
 void apply(Style& s, const Style& parent, std::string_view prop, std::string_view raw) {
     std::string val = raw.find("var(") != npos ? subst_vars(raw, s, 0) : std::string(raw);
     std::string lv = lower(trim(val));
@@ -2438,6 +2514,9 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
 
     if (prop == "content") {
         s.content = std::string(trim(val));
+    } else if (prop == "clip-path" || prop == "-webkit-clip-path") {
+        std::shared_ptr<const ClipShape> shape;
+        if (parse_clip_path(val, fs, shape)) s.clipPath = std::move(shape);
     } else if (prop == "counter-reset") {
         s.counterReset = std::string(trim(val));
     } else if (prop == "counter-increment") {

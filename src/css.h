@@ -91,6 +91,18 @@ struct GridLine {
     bool isAuto() const { return line == 0 && span == 0 && name.empty(); }
 };
 
+// clip-path: a basic shape (CSS Shapes 1, 3.1) in a reference box (CSS Masking 1, 3.1)
+struct ClipShape {
+    enum K : uint8_t { Inset, Circle, Ellipse, Polygon } k = Inset;
+    Len len[4];               // inset: top right bottom left; circle: the radius in len[0]; ellipse: rx, ry
+    uint8_t radiusKw[2] = {}; // circle and ellipse: 0 a length, 1 closest-side, 2 farthest-side
+    Len cx{Len::Pct, 50}, cy{Len::Pct, 50};
+    Len round;                // inset: the corners' radius
+    std::vector<std::pair<Len, Len>> points;  // polygon
+    bool evenOdd = false;
+    uint8_t box = 0;          // 0 border-box, 1 padding-box, 2 content-box, 3 margin-box
+};
+
 // An SVG paint (SVG 2, section 13.2): none, a colour, or currentcolor, the element's own `color`.
 struct Paint {
     enum K : uint8_t { None, Rgb, Current } k = None;
@@ -174,6 +186,7 @@ struct Style {
     uint8_t justifySelf = 255;     // 255 = auto
     // Grid container and grid item
     std::shared_ptr<const GridTemplate> grid;  // null: no templates, auto tracks, rows filled first
+    std::shared_ptr<const ClipShape> clipPath;  // null: none
     GridLine gridRow[2], gridCol[2];           // grid-row-start / -end, grid-column-start / -end
     float gapRow = 0, gapCol = 0;
     // Flex item

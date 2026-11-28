@@ -81,7 +81,8 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    `<ol start>` and `<li value>` as the HTML hints; `tests/pages/counters.html`), and grid layout (CSS Grid 1: track lists with `fr`, `minmax()`, `fit-content()`,
    `repeat()` including `auto-fill` and `auto-fit`, named lines and areas, the `grid-template` and `grid` shorthands,
    line, span and area placement, auto-placement by rows or columns, sparse or dense, implicit tracks, the track
-   sizing algorithm, and box alignment of tracks and items; `tests/pages/grid.html`). Still open: subgrid, SVG text, clip paths and masks, find-in-page, zoom, downloads, text selection.
+   sizing algorithm, and box alignment of tracks and items; `tests/pages/grid.html`). `clip-path` with the basic shapes (`inset()`, `circle()`, `ellipse()`, `polygon()`) in a reference box
+   (`tests/pages/clippath.html`, checked by eye). Still open: subgrid, SVG text, `clip-path: url()` and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
