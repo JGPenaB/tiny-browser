@@ -158,6 +158,14 @@ struct ScriptHost::Impl {
     std::unordered_map<Node*, JSHost*> wrappers;               // one JavaScript object per node, kept for the page's life
     std::unordered_map<Node*, std::unique_ptr<Node>> orphans;  // nodes that are not in the tree (new or removed)
     std::unordered_map<const void*, std::vector<Listener>> listeners;  // keyed by node; the window uses `this`
+    // Event handlers (HTML 8.1.8.1), keyed like listeners, then by name ("onclick"): a function a script set, or
+    // one compiled from the content attribute (`code`), which a change of the attribute throws away
+    struct Handler {
+        Value fn;
+        std::string code;
+        bool fromAttr = false;
+    };
+    std::unordered_map<const void*, std::unordered_map<std::string, Handler>> handlers;
     std::vector<Timer> timers;
     std::unordered_map<std::string, std::vector<Selector>> selectorCache;
     Store localStore, sessionStore;
@@ -487,6 +495,11 @@ struct ScriptHost::Impl {
     }
     void attrChanged(Node* n, const std::string& name) {
         changed();
+        if (name.size() > 2 && name[0] == 'o' && name[1] == 'n') {  // the content attribute replaces the handler
+            if (auto it = handlers.find(n); it != handlers.end()) it->second.erase(name);
+            if (n == doc.body && windowForwarded(name))
+                if (auto it = handlers.find(this); it != handlers.end()) it->second.erase(name);
+        }
         record("attributes", n, nullptr, nullptr, &name);
         if (name == "src" && n->name == "script" && connected(n)) startScript(n);
     }
@@ -806,26 +819,37 @@ struct ScriptHost::Impl {
             reportError();
         }
     }
-    // The handler set as el.onclick = fn, or written as an onclick="..." attribute.
-    Value handlerFor(const void* key, Value cur, const std::string& type) {
-        std::string name = "on" + type;
-        PropKey k = PropKey::of(vm.atom(name));
-        JSObject* o = cur.asObject();
-        if (Prop* p = o->find(k)) return (p->flags & PF_ACC) ? Value::undef() : p->val;
-        const Node* n = key == this ? doc.body : (const Node*)key;
-        if (key == this && type != "load" && type != "unload" && type != "resize" && type != "scroll" && type != "beforeunload") return Value::undef();
-        if (!n || n->type != Node::T::Element) return Value::undef();
-        const std::string* code = n->attr(name);
-        if (!code) return Value::undef();
+    // The window's handlers that <body> and <frameset> attributes set (WindowEventHandlers, HTML 8.1.8.2)
+    static bool windowForwarded(const std::string& name) {
+        static const char* const names[] = {"onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange", "onlanguagechange",
+                                            "onmessage", "onmessageerror", "onoffline", "ononline", "onpagehide", "onpagereveal",
+                                            "onpageshow", "onpageswap", "onpopstate", "onrejectionhandled", "onstorage",
+                                            "onunhandledrejection", "onunload", "onblur", "onerror", "onfocus", "onload",
+                                            "onresize", "onscroll"};
+        for (const char* n : names)
+            if (name == n) return true;
+        return false;
+    }
+    // The handler of an event target (HTML 8.1.8.1, "getting the current value of the event handler"): what a
+    // script set, or else the content attribute compiled (once for each value it has); null when there is none
+    Value handlerValue(const void* key, const std::string& name) {
+        auto& slot = handlers[key];
+        auto it = slot.find(name);
+        if (it != slot.end() && !it->second.fromAttr) return it->second.fn;
+        const Node* n = key == this ? (windowForwarded(name) ? doc.body : nullptr) : (const Node*)key;
+        const std::string* code = n && n->type == Node::T::Element ? n->attr(name) : nullptr;
+        if (!code) return Value::null();
+        if (it != slot.end() && it->second.code == *code) return it->second.fn;
         Value f = Value::null();
         try {
             f = vm.compileFunction(u"event", utf8to16(*code), name);
         } catch (JSThrow&) {
             reportError();
         }
-        o->add(k, f, PF_W | PF_C);
+        slot[name] = Handler{f, *code, true};
         return f;
     }
+    Value handlerFor(const void* key, Value, const std::string& type) { return handlerValue(key, "on" + type); }
     bool fire(Node* target, Value ev) {
         JSHost* e = (JSHost*)ev.asObject();
         std::string type = utf16to8(vm.toStr16(vm.get(ev, "type")));
@@ -2344,6 +2368,33 @@ JSFN(viewportGet) {  // data: 0 innerWidth, 1 innerHeight, 2 scrollY, 3 scrollX
     return Value::num(std::round(which == 0 ? w : which == 1 ? h : which == 2 ? sy : 0));
 }
 JSFN(windowSelfFn) { return V(ci.vm.global); }
+// onclick and the other event handler IDL attributes (HTML 8.1.8.1); the callee's name says which
+const void* handlerKey(CallInfo& ci) {
+    Impl& im = I(ci.vm);
+    if (Node* n = toNode(ci.thisv)) return n;
+    if (ci.thisv.isNullish() || (ci.thisv.isObject() && ci.thisv.asObject() == ci.vm.global)) return &im;
+    illegal(ci, "an event target");
+}
+std::string handlerName(CallInfo& ci) {
+    std::string n = utf16to8(ci.callee->name->s);
+    return n.substr(n.find(' ') + 1);  // "get onclick"
+}
+// <body> stands in for the window for the window's own handlers (HTML 8.1.8.2)
+const void* handlerOwner(CallInfo& ci, const std::string& name) {
+    Impl& im = I(ci.vm);
+    const void* key = handlerKey(ci);
+    return key == im.doc.body && Impl::windowForwarded(name) ? (const void*)&im : key;
+}
+JSFN(handlerGet) {
+    std::string name = handlerName(ci);
+    return I(ci.vm).handlerValue(handlerOwner(ci, name), name);
+}
+JSFN(handlerSet) {
+    std::string name = handlerName(ci);
+    Value v = ci.arg(0);
+    I(ci.vm).handlers[handlerOwner(ci, name)][name] = Impl::Handler{v.isObject() ? v : Value::null(), "", false};
+    return Value::undef();
+}
 JSFN(scrollToFn) {
     Vm& vm = ci.vm;
     Impl& im = I(vm);
@@ -2876,6 +2927,8 @@ void ScriptHost::Impl::setup() {
         for (auto& w : wrappers) g.mark(w.second);
         for (auto& l : listeners)
             for (auto& e : l.second) g.mark(e.fn);
+        for (auto& h : handlers)
+            for (auto& e : h.second) g.mark(e.second.fn);
         for (auto& t : timers) {
             g.mark(t.fn);
             for (Value v : t.args) g.mark(v);
@@ -3251,6 +3304,41 @@ void ScriptHost::Impl::setup() {
     // so `var top = ...` in a page script leaves them as they are. self, parent and frames are [Replaceable].
     for (const char* n : {"window", "top"}) vm.defineAccessor(G, PropKey::of(vm.atom(n)), V(vm.newNative(windowSelfFn, n, 0)), Value::undef(), PF_E);
     for (const char* n : {"self", "parent", "frames"}) vm.def(G, n, V(G), PF_W | PF_C | PF_E);
+    {
+        // event handler IDL attributes: GlobalEventHandlers on elements, the document and the window,
+        // WindowEventHandlers on the window (and, forwarded to it, on <body>)
+        static const char* const global[] = {
+            "onabort", "onauxclick", "onbeforeinput", "onbeforetoggle", "onblur", "oncancel", "oncanplay", "oncanplaythrough",
+            "onchange", "onclick", "onclose", "oncontextlost", "oncontextmenu", "oncontextrestored", "oncopy", "oncuechange",
+            "oncut", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave", "ondragover", "ondragstart", "ondrop",
+            "ondurationchange", "onemptied", "onended", "onerror", "onfocus", "onformdata", "oninput", "oninvalid", "onkeydown",
+            "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata", "onloadstart", "onmousedown", "onmouseenter",
+            "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onpaste", "onpause", "onplay", "onplaying",
+            "onprogress", "onratechange", "onreset", "onresize", "onscroll", "onscrollend", "onsecuritypolicyviolation",
+            "onseeked", "onseeking", "onselect", "onslotchange", "onstalled", "onsubmit", "onsuspend", "ontimeupdate", "ontoggle",
+            "onvolumechange", "onwaiting", "onwheel", "onanimationstart", "onanimationend", "onanimationiteration",
+            "onanimationcancel", "ontransitionrun", "ontransitionstart", "ontransitionend", "ontransitioncancel",
+            "onpointerdown", "onpointerup", "onpointermove", "onpointerover", "onpointerout", "onpointerenter",
+            "onpointerleave", "onpointercancel", "ongotpointercapture", "onlostpointercapture", "onselectstart",
+            "onselectionchange"};
+        static const char* const window[] = {"onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange",
+                                             "onlanguagechange", "onmessage", "onmessageerror", "onoffline", "ononline",
+                                             "onpagehide", "onpagereveal", "onpageshow", "onpageswap", "onpopstate",
+                                             "onrejectionhandled", "onstorage", "onunhandledrejection", "onunload"};
+        auto handler = [&](JSObject* o, const char* name) {
+            std::string g = std::string("get ") + name, s = std::string("set ") + name;
+            vm.defineAccessor(o, PropKey::of(vm.atom(name)), V(vm.newNative(handlerGet, g.c_str(), 0)), V(vm.newNative(handlerSet, s.c_str(), 1)),
+                              PF_C | PF_E);
+        };
+        for (const char* n : global) {
+            handler(elementProto, n);
+            handler(documentProto, n);
+            handler(G, n);
+        }
+        for (const char* n : window) handler(G, n);
+        handler(documentProto, "onreadystatechange");
+        handler(documentProto, "onvisibilitychange");
+    }
     vm.def(G, "document", wrap(docNode()), PF_C | PF_E);
     method(G, "setTimeout", setTimeoutFn, 2);
     method(G, "setInterval", setIntervalFn, 2);

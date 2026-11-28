@@ -197,6 +197,22 @@
     window.removeEventListener('ping', spy, true);
     eq('a load event on an element does not reach the window', seen.join(), 'ping');
   })();
+  // HTML 8.1.8: event handler attributes
+  (function () {
+    var d = document.createElement('div'), calls = [];
+    var before = [d.onclick, window.onhashchange, document.onreadystatechange === null, 'onclick' in d, d.hasOwnProperty('onclick')].join();
+    d.setAttribute('onclick', 'window.__handlerRan = (window.__handlerRan || 0) + 1');
+    var compiled = typeof d.onclick === 'function' && d.onclick === d.onclick;
+    d.click();
+    d.onclick = function () { calls.push('set'); };
+    d.click();
+    d.setAttribute('onclick', 'window.__handlerRan += 10');
+    d.click();
+    d.onclick = 5;
+    var cleared = d.onclick;
+    eq('event handlers: null at first, compiled once from the attribute, set by script, replaced by the attribute again',
+       [before, compiled, window.__handlerRan, calls.join(), cleared].join('|'), ',,true,true,false|true|11|set|');
+  })();
   // HTML 7.2.2: window and top are [LegacyUnforgeable], self is [Replaceable]
   (function () {
     var d = Object.getOwnPropertyDescriptor(window, 'top');
