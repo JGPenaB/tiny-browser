@@ -47,7 +47,7 @@ notch down) and typing, so pages can be tested without a window; cookies stay in
 layout samples.
 
 The page tests are in `tests/pages/`. Each prints `PASS` and `FAIL` lines and a `SUMMARY` into `<out.png>.txt`.
-`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html` and `selectors.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
+`dom.html`, `components.html`, `layout.html`, `svg.html`, `generated.html`, `floats.html`, `selectors.html` and `counters.html` are opened as `file:` URLs; `net.html`, `modules.html`, `late.html` and `history.html`
 come from the test server (`http://localhost:8765/pages/...`). `layout.html` also wants
 `--do "wheel:300,300,-120;click:300,300;click:300,122;click:620,124"`: the wheel must log `WHEEL 100 of 100`, the
 first click `CLICK wheel 6`, the second click, which lands on a row that was scrolled out of view, nothing, and the
@@ -76,7 +76,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
    `clear` and block formatting contexts (CSS 2 9.5; `tests/pages/floats.html`), the Selectors 4 pseudo-classes: `:is()`,
    `:where()`, `:not()` and `:has()` with selector lists, the of-type ones, `:hover`, `:active`, `:focus`,
    `:focus-within`, `:focus-visible`, `:target`, `:lang()` and the form states (`tests/pages/selectors.html`); a page is
-   styled again only when a state its rules look at changes. Still open: grid, conic gradients, SVG text, clip paths and masks, counters, find-in-page, zoom, downloads, text selection.
+   styled again only when a state its rules look at changes; counters (CSS Lists 3: `counter-reset`, `counter-increment`,
+   `counter-set`, `counter()` and `counters()` in `content`, and the `list-item` counter that list markers show, with
+   `<ol start>` and `<li value>` as the HTML hints; `tests/pages/counters.html`). Still open: grid, conic gradients, SVG text, clip paths and masks, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),

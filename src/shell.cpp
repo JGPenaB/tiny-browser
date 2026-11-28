@@ -54,6 +54,7 @@ blockquote,figure{margin:1em 40px}
 ul,ol,menu,dir{padding-left:40px}
 li ul,li ol,ul ul,ol ul,ul ol,ol ol{margin:0}
 ol{list-style-type:decimal}
+ol,ul,menu{counter-reset:list-item}
 ul ul,ol ul{list-style-type:circle}
 ul ul ul,ol ul ul,ul ol ul{list-style-type:square}
 dd{margin-left:40px}

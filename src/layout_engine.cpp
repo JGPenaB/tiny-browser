@@ -118,7 +118,7 @@ struct Box {
     float x = 0, y = 0, w = 0, h = 0;  // border box
     float m[4] = {}, b[4] = {}, p[4] = {};
     float firstBaseline = -1;
-    int ordinal = 0, span = 1;
+    int span = 1;
     bool intrinsicDone = false;
     float minW = 0, maxW = 0;
     float contentMinW = 0;  // minW as the content alone makes it, before the box's own width and limits count
@@ -381,9 +381,6 @@ std::unique_ptr<Box> buildBox(Ctx& c, Node* e, Box* cb) {
 
 void flow(Ctx& c, Box& box, Node* e, Box* cb) {
     std::vector<Node*> run;
-    int ordinal = 1;
-    if (e->name == "ol")
-        if (auto s = e->attr("start")) ordinal = atoi(s->c_str());
     bool pre = box.st && (box.st->whiteSpace == 1 || box.st->whiteSpace == 3);
     auto flush = [&] {
         if (!run.empty() && meaningfulRun(run, pre)) box.kids.push_back(anonFor(box, e, std::move(run), cb));
@@ -405,12 +402,7 @@ void flow(Ctx& c, Box& box, Node* e, Box* cb) {
         }
         if (blockLevel(d) || (d == Display::Inline && containsBlock(n))) {
             flush();
-            auto ch = buildBox(c, n, cb);
-            if (d == Display::ListItem) {
-                if (auto v = n->attr("value")) ordinal = atoi(v->c_str());
-                ch->ordinal = ordinal++;
-            }
-            box.kids.push_back(std::move(ch));
+            box.kids.push_back(buildBox(c, n, cb));
         } else {
             run.push_back(n);
         }
@@ -950,20 +942,6 @@ void intrinsic(Ctx& c, Box& b) {
 // ---------------------------------------------------------------- layout
 
 void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center = false);
-
-std::wstring roman(int n, bool upper) {
-    static const std::pair<int, const wchar_t*> t[] = {{1000, L"m"}, {900, L"cm"}, {500, L"d"}, {400, L"cd"}, {100, L"c"}, {90, L"xc"},
-                                                        {50, L"l"},   {40, L"xl"},  {10, L"x"},  {9, L"ix"},   {5, L"v"},   {4, L"iv"}, {1, L"i"}};
-    std::wstring r;
-    for (auto& [v, s] : t)
-        while (n >= v) {
-            r += s;
-            n -= v;
-        }
-    if (upper)
-        for (auto& ch : r) ch = (wchar_t)towupper(ch);
-    return r;
-}
 
 void emitText(Ctx& c, float x, float y, float w, float h, const Style& st, const std::wstring& txt) {
     DItem d;
@@ -2016,18 +1994,9 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     if (own && b.node && !b.replaced) setBox(c, b.node, b.x, b.y, b.w, b.h);
 
     if (b.kind == BK::Block && own && s->display == Display::ListItem && s->listStyle != 4 && !s->hidden) {
-        std::wstring m;
-        int o = b.ordinal;
-        switch (s->listStyle) {
-            case 0: m = L"•"; break;
-            case 1: m = L"◦"; break;
-            case 2: m = L"▪"; break;
-            case 3: m = std::to_wstring(o) + L"."; break;
-            case 5: m = std::wstring(1, wchar_t(L'a' + (std::max(1, o) - 1) % 26)) + L"."; break;
-            case 6: m = std::wstring(1, wchar_t(L'A' + (std::max(1, o) - 1) % 26)) + L"."; break;
-            case 7: m = roman(std::max(1, o), false) + L"."; break;
-            case 8: m = roman(std::max(1, o), true) + L"."; break;
-        }
+        // the list-item counter in the list style, with a full stop after a number (CSS Lists 3, 3.1)
+        std::wstring m = widen(counter_text(s->listItem, s->listStyle));
+        if (s->listStyle > 2) m += L".";
         float a, d;
         c.in.ts->metrics(*s, a, d);
         float mw = c.in.ts->width(*s, m);

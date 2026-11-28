@@ -2107,7 +2107,9 @@ int list_kw(std::string_view t) {
     if (t == "disc") return 0;
     if (t == "circle") return 1;
     if (t == "square") return 2;
-    if (t == "decimal" || t == "decimal-leading-zero") return 3;
+    if (t == "decimal") return 3;
+    if (t == "decimal-leading-zero") return 9;
+    if (t == "lower-greek") return 10;
     if (t == "none") return 4;
     if (t == "lower-alpha" || t == "lower-latin") return 5;
     if (t == "upper-alpha" || t == "upper-latin") return 6;
@@ -2137,6 +2139,12 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
 
     if (prop == "content") {
         s.content = std::string(trim(val));
+    } else if (prop == "counter-reset") {
+        s.counterReset = std::string(trim(val));
+    } else if (prop == "counter-increment") {
+        s.counterIncrement = std::string(trim(val));
+    } else if (prop == "counter-set") {
+        s.counterSet = std::string(trim(val));
     } else if (prop == "display") {
         Display d;
         if (parse_display(lv, d)) {
@@ -2565,6 +2573,10 @@ void hints(const Node* e, std::vector<Decl>& out) {
             add("background-color", *c);
         }
     }
+    if (n == "ol")
+        if (auto st = e->attr("start")) add("counter-reset", "list-item " + std::to_string(atoi(st->c_str()) - 1));
+    if (n == "li")
+        if (auto v = e->attr("value")) add("counter-set", "list-item " + std::to_string(atoi(v->c_str())));
     if (n == "ul" || n == "ol" || n == "li")
         if (auto t = e->attr("type")) {
             std::string v = *t;
@@ -2648,6 +2660,8 @@ void StyleEngine::compute(Document& d, float vw, float vh) {
     build(vw);
     Style root;
     root.family = resolve_family("serif");
+    counters_.clear();
+    depth_ = 0;
     if (d.html) computeTree(d.html, root);
 }
 
@@ -2660,8 +2674,124 @@ void StyleEngine::computeTree(Node* e, const Style& parent) {
     }
     if (e->shadow)  // children no slot takes are not rendered: FlatKids leaves them out, and they keep no style
         for (auto& k : e->kids) k->style.reset();
+    ++depth_;
     for (Node* k : FlatKids(e))
         if (k->type == Node::T::Element && k != e->before.get() && k != e->after.get()) computeTree(k, *e->style);
+    if (e->after) {  // ::after comes after the children in tree order, so its counters are known only now
+        applyCounters(*e->after->style, false, depth_);
+        std::string text;
+        if (!generatedText(e, *e->after->style, text)) e->after.reset();
+        else if (!text.empty()) {
+            auto t = std::make_unique<Node>();
+            t->type = Node::T::Text;
+            t->text = std::move(text);
+            e->after->append(std::move(t));
+        }
+    }
+    --depth_;
+    while (!counters_.empty() && counters_.back().depth > depth_) counters_.pop_back();
+}
+
+namespace {
+// The counters a counter-reset, counter-increment or counter-set value names, each with its number (CSS Lists 3, 4)
+std::vector<std::pair<std::string, int>> counter_list(std::string_view v, int dflt) {
+    std::vector<std::pair<std::string, int>> out;
+    size_t i = 0;
+    while (i < v.size()) {
+        while (i < v.size() && isws(v[i])) ++i;
+        size_t st = i;
+        while (i < v.size() && !isws(v[i])) ++i;
+        std::string_view w = v.substr(st, i - st);
+        if (w.empty()) break;
+        if (w.size() > 9 && w.substr(0, 9) == "reversed(" && w.back() == ')') w = w.substr(9, w.size() - 10);
+        bool number = isdigit_(w[0]) || ((w[0] == '-' || w[0] == '+') && w.size() > 1 && isdigit_(w[1]));
+        if (number) {
+            if (!out.empty()) out.back().second = atoi(std::string(w).c_str());
+        } else if (w != "none")
+            out.push_back({std::string(w), dflt});
+    }
+    return out;
+}
+}  // namespace
+
+// Resets, then increments, then sets (CSS Lists 3, 4.5). A list item increments list-item by one unless its
+// counter-increment names that counter.
+void StyleEngine::applyCounters(Style& s, bool listItem, int depth) {
+    // An element takes over its previous sibling's counters only where its parent has none of that name (4.5.1):
+    // a nested reset ends with the element that made it
+    for (size_t i = counters_.size(); i-- > 0 && counters_[i].depth == depth;) {
+        bool outer = false;
+        for (size_t j = 0; j < i && !outer; ++j) outer = counters_[j].depth < depth && counters_[j].name == counters_[i].name;
+        if (outer) counters_.erase(counters_.begin() + (std::ptrdiff_t)i);
+    }
+    for (auto& [name, v] : counter_list(s.counterReset, 0)) {
+        for (size_t i = counters_.size(); i-- > 0;)
+            if (counters_[i].name == name) {
+                if (counters_[i].depth == depth) counters_.erase(counters_.begin() + (std::ptrdiff_t)i);  // a sibling's
+                break;
+            }
+        counters_.push_back({name, v, depth});
+    }
+    auto innermost = [&](const std::string& name) -> Counter& {
+        for (size_t i = counters_.size(); i-- > 0;)
+            if (counters_[i].name == name) return counters_[i];
+        counters_.push_back({name, 0, depth});  // none in scope: the element makes one
+        return counters_.back();
+    };
+    bool namesListItem = false;
+    for (auto& [name, v] : counter_list(s.counterIncrement, 1)) {
+        namesListItem = namesListItem || name == "list-item";
+        innermost(name).value += v;
+    }
+    if (listItem && !namesListItem) innermost("list-item").value += 1;
+    for (auto& [name, v] : counter_list(s.counterSet, 0)) innermost(name).value = v;
+    if (listItem) s.listItem = innermost("list-item").value;
+}
+
+std::string counter_text(int value, uint8_t style) {
+    auto alphabetic = [](int v, const char* const* digits, int n) {  // bijective base n: a, b, ... z, aa, ab ...
+        std::vector<const char*> r;
+        for (; v > 0; v = (v - 1) / n) r.push_back(digits[(v - 1) % n]);
+        std::string s;
+        for (auto it = r.rbegin(); it != r.rend(); ++it) s += *it;
+        return s;
+    };
+    static const char* const lower[] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+                                        "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"};
+    static const char* const upper[] = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+                                        "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"};
+    static const char* const greek[] = {"\xCE\xB1", "\xCE\xB2", "\xCE\xB3", "\xCE\xB4", "\xCE\xB5", "\xCE\xB6", "\xCE\xB7", "\xCE\xB8",
+                                        "\xCE\xB9", "\xCE\xBA", "\xCE\xBB", "\xCE\xBC", "\xCE\xBD", "\xCE\xBE", "\xCE\xBF", "\xCF\x80",
+                                        "\xCF\x81", "\xCF\x83", "\xCF\x84", "\xCF\x85", "\xCF\x86", "\xCF\x87", "\xCF\x88", "\xCF\x89"};
+    switch (style) {
+        case 0: return "\xE2\x80\xA2";
+        case 1: return "\xE2\x97\xA6";
+        case 2: return "\xE2\x96\xAA";
+        case 4: return "";
+        case 5:
+        case 6:
+        case 10:
+            if (value >= 1) return alphabetic(value, style == 5 ? lower : style == 6 ? upper : greek, style == 10 ? 24 : 26);
+            break;
+        case 7:
+        case 8:
+            if (value >= 1 && value <= 3999) {
+                static const std::pair<int, const char*> t[] = {{1000, "m"}, {900, "cm"}, {500, "d"}, {400, "cd"}, {100, "c"}, {90, "xc"},
+                                                                {50, "l"},   {40, "xl"},  {10, "x"},  {9, "ix"},   {5, "v"},   {4, "iv"}, {1, "i"}};
+                std::string r;
+                for (auto& [v, s] : t)
+                    for (; value >= v; value -= v) r += s;
+                if (style == 8)
+                    for (auto& ch : r) ch = (char)toupper((unsigned char)ch);
+                return r;
+            }
+            break;
+        case 9:
+            if (value >= 0 && value < 10) return "0" + std::to_string(value);  // the minus sign counts towards the padding
+
+            break;
+    }
+    return std::to_string(value);
 }
 
 void StyleEngine::computeElem(Node* e, const Style& parent) {
@@ -2744,6 +2874,7 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
         else if (s->display == Display::InlineFlex) s->display = Display::Flex;
     }
     e->style = std::move(s);
+    if (e->style->display != Display::None) applyCounters(*e->style, e->style->display == Display::ListItem, depth_);
 
     // ::before and ::after (CSS 2 12.1): their rules cascade like the element's own, over its style
     e->before.reset();
@@ -2810,8 +2941,10 @@ std::string css_string_value(std::string_view s, size_t& i) {
     return out;
 }
 // The text `content` generates for an element's ::before or ::after (CSS Generated Content 3, 1.1), or false when it
-// generates no box: none, normal, or a value this engine cannot read. Counters are not kept yet; they make no text.
-bool generated_text(const Node* e, std::string_view v, std::string& out) {
+// generates no box: none, normal, or a value this engine cannot read. `counter` gives the values of a counter in
+// scope, outermost first.
+bool generated_text(const Node* e, std::string_view v, const std::function<std::vector<int>(const std::string&)>& counter,
+                    std::string& out) {
     std::string_view t = trim(v);
     std::string lv = lower(t);
     if (lv.empty() || lv == "none" || lv == "normal") return false;
@@ -2830,7 +2963,25 @@ bool generated_text(const Node* e, std::string_view v, std::string& out) {
             i = close + 1;
             if (word == "attr") {
                 if (auto a = e->attr(lower(arg))) out += *a;
-            } else if (word != "counter" && word != "counters" && word != "url" && word != "image-set" && word != "linear-gradient")
+            } else if (word == "counter" || word == "counters") {  // CSS Lists 3, 4.8
+                auto args = split_top(arg, ',');
+                size_t want = word == "counter" ? 1 : 2;
+                if (args.size() < want || args.size() > want + 1) return false;
+                std::string sep;
+                if (word == "counters") {
+                    std::string_view a = trim(args[1]);
+                    size_t k = 0;
+                    if (a.empty() || (a[0] != '"' && a[0] != '\'')) return false;
+                    sep = css_string_value(a, k);
+                }
+                int style = 3;
+                if (args.size() > want) style = list_kw(lower(trim(args[want])));
+                if (style < 0) style = 3;  // a style defined by @counter-style, which is not kept: decimal
+                std::vector<int> values = counter(std::string(trim(args[0])));
+                if (values.empty()) values.push_back(0);  // none in scope: a new one at 0
+                if (word == "counter") values.erase(values.begin(), values.end() - 1);
+                for (size_t k = 0; k < values.size(); ++k) out += (k ? sep : "") + counter_text(values[k], (uint8_t)style);
+            } else if (word != "url" && word != "image-set" && word != "linear-gradient")
                 return false;
             continue;
         }
@@ -2872,8 +3023,13 @@ void StyleEngine::computePseudo(Node* e, uint8_t kind, Cascade& L) {
         if (s->display == Display::Inline || s->display == Display::InlineBlock) s->display = Display::Block;
         else if (s->display == Display::InlineFlex) s->display = Display::Flex;
     }
+    std::string content = lower(trim(s->content));
+    if (s->display == Display::None || content.empty() || content == "none" || content == "normal") return;
     std::string text;
-    if (s->display == Display::None || !generated_text(e, s->content, text)) return;
+    if (kind == 1) {
+        applyCounters(*s, false, depth_ + 1);
+        if (!generatedText(e, *s, text)) return;
+    }
     auto box = std::make_unique<Node>();
     box->type = Node::T::Element;
     box->name = kind == 1 ? "::before" : "::after";
@@ -2886,6 +3042,16 @@ void StyleEngine::computePseudo(Node* e, uint8_t kind, Cascade& L) {
         box->append(std::move(t));
     }
     (kind == 1 ? e->before : e->after) = std::move(box);
+}
+
+bool StyleEngine::generatedText(Node* e, const Style& s, std::string& out) {
+    auto values = [&](const std::string& name) {
+        std::vector<int> r;
+        for (auto& c : counters_)
+            if (c.name == name) r.push_back(c.value);
+        return r;
+    };
+    return generated_text(e, s.content, values, out);
 }
 
 // Selector access for the scripting layer (querySelector, matches, closest).

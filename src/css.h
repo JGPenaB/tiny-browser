@@ -83,7 +83,9 @@ struct Style {
     uint8_t textAlign = 0;      // 0 left, 1 right, 2 center
     bool underline = false, strike = false;
     uint8_t whiteSpace = 0;     // 0 normal, 1 pre, 2 nowrap, 3 pre-wrap, 4 pre-line
-    uint8_t listStyle = 0;      // 0 disc 1 circle 2 square 3 decimal 4 none 5 lower-alpha 6 upper-alpha 7 lower-roman 8 upper-roman
+    // 0 disc 1 circle 2 square 3 decimal 4 none 5 lower-alpha 6 upper-alpha 7 lower-roman 8 upper-roman
+    // 9 decimal-leading-zero 10 lower-greek
+    uint8_t listStyle = 0;
     uint8_t textTransform = 0;  // 1 upper, 2 lower, 3 capitalize
     uint8_t vAlign = 0;         // 0 baseline 1 top 2 middle 3 bottom 4 sub 5 super
     bool borderBox = false, hidden = false;
@@ -132,6 +134,9 @@ struct Style {
 
     // `content` as written (CSS Generated Content 3); it applies to ::before and ::after, which layout makes boxes for
     std::string content;
+    // counter-reset, counter-increment and counter-set as written (CSS Lists 3, 4), which styling applies in tree order
+    std::string counterReset, counterIncrement, counterSet;
+    int listItem = 0;  // a list item's value of the list-item counter, which its marker shows
 
     float lh() const { return lhPx >= 0 ? lhPx : lhFactor * fontSize; }
 };
@@ -213,6 +218,9 @@ const char* display_name(Display d);
 // other than <button>, whose content is laid out like any other (HTML 15.5.3, button layout).
 bool replaced_like(const Node* n);
 std::string color_str(const Color& c);
+// A counter value in a counter style (CSS Counter Styles 3, 6): `style` is a Style::listStyle code. Values a style
+// cannot show fall back to decimal.
+std::string counter_text(int value, uint8_t style);
 bool selector_parse(std::string_view text, Selector& out);
 bool selector_matches(const Selector& s, const Node* e);
 
@@ -247,6 +255,17 @@ private:
     void computeElem(Node* e, const Style& parent);
     using Cascade = std::vector<std::pair<uint64_t, const Decl*>>;
     void computePseudo(Node* e, uint8_t kind, Cascade& L);
+    // CSS Lists 3, 4.5: the counters in scope where styling has got to in tree order, innermost last. A counter lives
+    // while styling is inside the parent of the element that made it; `depth` is that element's depth.
+    struct Counter {
+        std::string name;
+        int value;
+        int depth;
+    };
+    void applyCounters(Style& s, bool listItem, int depth);
+    bool generatedText(Node* e, const Style& s, std::string& out);
+    std::vector<Counter> counters_;
+    int depth_ = 0;
 
     std::vector<Added> sheets_;
     std::vector<IR> all_;

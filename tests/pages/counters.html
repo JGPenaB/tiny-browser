@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Counters test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 16px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  /* CSS Lists 3, 4. Each generated text is measured against a span holding the text it should be; roman numerals
+     are used because digits all have the same width */
+  .row { white-space: nowrap; }
+  i { font-style: normal; }
+  .basic { counter-reset: n; }
+  .basic i::before { counter-increment: n; content: counter(n, upper-roman); }
+  .sec { counter-reset: s; }
+  .h { display: inline-block; margin-right: 8px; }
+  .sec > .h::before { counter-increment: s; content: counters(s, ".", upper-roman); }
+  .start { counter-reset: m 4; }
+  .start i::before { counter-increment: m; content: counter(m, upper-roman); }
+  .start i.set::before { counter-set: m 10; }
+  .start i.two::before { counter-increment: m 2; }
+  .free i::before { counter-increment: f; content: counter(f, upper-roman); }
+  .after { counter-reset: k; }
+  .after i { counter-increment: k; }
+  .after i.none { display: none; }
+  .after::after { content: counter(k, upper-roman); }
+  ol.lr { list-style: none; display: flow-root; padding: 0; }
+  ol.lr li { float: left; margin-right: 8px; }
+  /* <li value> is a presentational hint for counter-set (HTML 15.3.8); Chromium does not apply it to counter(list-item) */
+  ol.lr li::before { content: counter(list-item, upper-roman); }
+  .styles { counter-reset: a 7 b 3 c 27 d 4000 e -2; }
+  #dlz::before { content: counter(a, decimal-leading-zero); }
+  #gr::before { content: counter(b, lower-greek); }
+  #al::before { content: counter(c, lower-alpha); }
+  #big::before { content: counter(d, upper-roman); }
+  #neg::before { content: counter(e, decimal-leading-zero); }
+  #none::before { content: "[" counter(b, none) "]"; }
+  #unknown::before { content: counter(zz); }
+  /* markers are checked by eye: the list should read 4. 5. 9. 10. then aa. */
+  ol.marks li.alpha { list-style-type: lower-alpha; }
+</style>
+</head>
+<body>
+<div class="row basic"><i id="b1"></i> <i id="b2"></i> <i id="b3"></i></div>
+<div class="row"><span id="lb1">I</span> <span id="lb2">II</span> <span id="lb3">III</span></div>
+<div class="sec"><div class="h" id="s1"></div><div class="sec"><div class="h" id="s11"></div><div class="h" id="s12"></div></div><div class="h" id="s2"></div></div>
+<div class="row"><span id="ls1">I</span> <span id="ls11">I.I</span> <span id="ls12">I.II</span> <span id="ls2">II</span></div>
+<div class="row start"><i id="m1"></i> <i id="m2" class="set"></i> <i id="m3" class="two"></i></div>
+<div class="row"><span id="lm1">V</span> <span id="lm2">X</span> <span id="lm3">XII</span></div>
+<div class="row free"><i id="f1"></i> <i id="f2"></i></div>
+<div class="row"><span id="lf1">I</span> <span id="lf2">I</span></div>
+<div class="row"><span class="after" id="a1"><i></i><i class="none"></i><i></i><i></i></span> <span id="la1">III</span></div>
+<ol class="lr" start="4"><li id="o1"></li><li id="o2"></li><li id="o3" value="9"></li><li id="o4"></li></ol>
+<div class="row"><span id="lo1">IV</span> <span id="lo2">V</span> <span id="lo3">IX</span> <span id="lo4">X</span></div>
+<div class="row styles"><span id="dlz"></span> <span id="gr"></span> <span id="al"></span> <span id="big"></span> <span id="neg"></span> <span id="none"></span> <span id="unknown"></span></div>
+<div class="row"><span id="ldlz">07</span> <span id="lgr">&#x3B3;</span> <span id="lal">aa</span> <span id="lbig">4000</span> <span id="lneg">-2</span> <span id="lnone">[]</span> <span id="lunknown">0</span></div>
+<ol class="marks" start="4"><li>four</li><li>five</li><li value="9">nine</li><li>ten</li><li class="alpha" value="27">aa</li></ol>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  var $ = function (id) { return document.getElementById(id); };
+  var w = function (id) { return Math.round($(id).getBoundingClientRect().width * 10) / 10; };
+  // each generated text against the span that holds what it should say
+  function same(name, ids) {
+    var bad = ids.filter(function (id) { return w(id) !== w('l' + id); });
+    log(name, bad.length === 0, bad.map(function (id) { return id + ' ' + w(id) + ' vs ' + w('l' + id); }).join('; '));
+  }
+  same('counter-reset, counter-increment, counter()', ['b1', 'b2', 'b3']);
+  same('nested counters and counters() with a separator', ['s1', 's11', 's12', 's2']);
+  same('a reset to a number, counter-set, an increment of 2', ['m1', 'm2', 'm3']);
+  same('without a reset each element makes its own counter', ['f1', 'f2']);
+  same('::after sees what the children counted, an element with display: none counts nothing', ['a1']);
+  same('list-item: <ol start> and <li value>', ['o1', 'o2', 'o3', 'o4']);
+  same('counter styles: decimal-leading-zero, lower-greek, lower-alpha past z, roman out of range, negative, none, a counter nobody made', ['dlz', 'gr', 'al', 'big', 'neg', 'none', 'unknown']);
+
+  window.addEventListener('load', function () {
+    document.title = 'Counters test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>
