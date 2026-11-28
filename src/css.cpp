@@ -1637,6 +1637,7 @@ void copy_prop(Style& d, const Style& s, std::string_view p) {
         d.zAuto = s.zAuto;
     } else if (istarts(p, "overflow")) d.overflow = s.overflow;
     else if (p == "float") d.floatSide = s.floatSide;
+    else if (p == "clear") d.clear = s.clear;
     else if (p == "border-radius") d.radius = s.radius;
     else if (p == "flex") {
         d.flexGrow = s.flexGrow;
@@ -1920,7 +1921,10 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
         s.content = std::string(trim(val));
     } else if (prop == "display") {
         Display d;
-        if (parse_display(lv, d)) s.display = d;
+        if (parse_display(lv, d)) {
+            s.display = d;
+            s.flowRoot = lv == "flow-root" || lv == "block flow-root";
+        }
     } else if (prop == "color") {
         Color c;
         if (lv == "currentcolor") s.color = parent.color;
@@ -2058,6 +2062,8 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
         if (prop == "overflow" || o > s.overflow || o == 0) s.overflow = o;
     } else if (prop == "float") {
         s.floatSide = (lv == "left" || lv == "inline-start") ? 1 : (lv == "right" || lv == "inline-end") ? 2 : 0;
+    } else if (prop == "clear") {
+        s.clear = (lv == "left" || lv == "inline-start") ? 1 : (lv == "right" || lv == "inline-end") ? 2 : lv == "both" ? 3 : 0;
     } else if (prop == "fill" || prop == "stroke") {
         // <paint> (SVG 2, section 13.2). A paint server (url()) is not drawn yet: its fallback colour is used, or none.
         Paint& paint = prop == "fill" ? s.fill : s.stroke;
@@ -2489,8 +2495,9 @@ void StyleEngine::computeElem(Node* e, const Style& parent) {
     if (s->opacity0 && !s->animated) s->hidden = true;
     s->alpha = parent.alpha * (s->opacity0 ? 1.f : s->opacity);  // an animated element that starts at 0 is shown as it will end
     if (s->masked) s->bg = Color{};
-    // Out-of-flow boxes are blockified.
-    if (s->position == 2 || s->position == 3) {
+    // Out-of-flow boxes are blockified (CSS 2 9.7); an absolutely positioned box does not float.
+    if (s->position == 2 || s->position == 3) s->floatSide = 0;
+    if (s->position == 2 || s->position == 3 || s->floatSide) {
         if (s->display == Display::Inline || s->display == Display::InlineBlock) s->display = Display::Block;
         else if (s->display == Display::InlineFlex) s->display = Display::Flex;
     }

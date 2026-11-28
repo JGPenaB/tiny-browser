@@ -146,7 +146,42 @@ struct Ctx {
     // The content height of the block whose lines are being laid out, when it is definite: what a percentage height
     // of a replaced element on those lines is resolved against (CSS 2 section 10.5). -1 when it is not definite.
     float lineBlockH = -1;
+    // The floats of the block formatting context being laid out (CSS 2 9.5): their margin boxes, in document
+    // coordinates. A box that makes a context of its own lays its floats out in a list of its own.
+    struct Float {
+        uint8_t side;  // 1 left, 2 right
+        float x0, x1, y0, y1;
+    };
+    std::vector<Float>* floats = nullptr;
 };
+
+// The room the floats leave between x0 and x1 for something from y to y + h: [left, right]
+std::pair<float, float> floatBand(const Ctx& c, float y, float h, float x0, float x1) {
+    float L = x0, R = x1;
+    if (!c.floats) return {L, R};
+    for (const auto& f : *c.floats) {
+        if (f.y1 <= y || f.y0 >= y + std::max(h, 0.01f) || f.x1 <= x0 || f.x0 >= x1) continue;
+        if (f.side == 1) L = std::max(L, f.x1);
+        else R = std::min(R, f.x0);
+    }
+    return {L, R};
+}
+// The first float bottom below y among the floats beside y: where the room can grow. Infinity when none is.
+float nextFloatBottom(const Ctx& c, float y, float x0, float x1) {
+    float best = INFINITY;
+    if (!c.floats) return best;
+    for (const auto& f : *c.floats)
+        if (f.y1 > y && f.y0 <= y && f.x1 > x0 && f.x0 < x1) best = std::min(best, f.y1);
+    return best;
+}
+// Where clearance puts a box (CSS 2 9.5.2): below the floats of the sides it clears
+float clearBelow(const Ctx& c, uint8_t clear) {
+    float y = -INFINITY;
+    if (!c.floats || !clear) return y;
+    for (const auto& f : *c.floats)
+        if (f.side & clear) y = std::max(y, f.y1);
+    return y;
+}
 
 Mark mark(Ctx& c) { return {c.out.items.size(), c.out.links.size(), c.boxed.size(), c.out.widgets.size()}; }
 
@@ -962,6 +997,23 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
     std::vector<Placed> line;
     float x = 0, y = y0;
     bool first = true;
+    // the room of the current line between the floats (CSS 2 9.5): lineX0 and lineAvail replace x0 and avail
+    float lineX0 = x0, lineAvail = avail;
+    auto band = [&]() {
+        auto [L, R] = floatBand(c, y, bs.lh(), x0, x0 + avail);
+        lineX0 = L;
+        lineAvail = std::max(0.f, R - L);
+    };
+    // a line too narrow for what comes next moves down below a float, while one is beside it
+    auto makeRoom = [&](float need) {
+        for (int guard = 0; guard < 100 && line.empty() && need > lineAvail + 0.01f && lineAvail < avail; ++guard) {
+            float next = nextFloatBottom(c, y, x0, x0 + avail);
+            if (!std::isfinite(next)) break;
+            y = next;
+            band();
+        }
+    };
+    band();
 
     auto vshift = [](const Style* s) { return s->vAlign == 4 ? s->fontSize * 0.25f : s->vAlign == 5 ? -s->fontSize * 0.4f : 0.f; };
     auto baseOf = [&](Item& it) -> float {
@@ -1003,13 +1055,13 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
         }
         float baseline = y + A, lineH = A + D;
         float off = 0;
-        if (bs.textAlign == 1) off = avail - lineW;
-        else if (bs.textAlign == 2) off = (avail - lineW) / 2;
+        if (bs.textAlign == 1) off = lineAvail - lineW;
+        else if (bs.textAlign == 2) off = (lineAvail - lineW) / 2;
         if (off < 0) off = 0;
         size_t i = 0;
         while (i < line.size()) {
             Item& it = *line[i].it;
-            float fx = x0 + off + line[i].x;
+            float fx = lineX0 + off + line[i].x;
             if (it.k == Item::Gap) {
                 ++i;
                 continue;
@@ -1098,6 +1150,7 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
         y += lineH;
         line.clear();
         x = 0;
+        band();
     };
 
     for (auto& it : b.items) {
@@ -1133,7 +1186,8 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                 it.w = ab.m[3] + ab.w + ab.m[1];
                 it.h = ab.y + ab.h + ab.m[2];
                 it.base = (ab.firstBaseline >= 0 && ab.st->overflow == 0) ? ab.firstBaseline : it.h;
-                if (!line.empty() && x + it.w > avail + 0.01f && wraps(&bs)) commit(false);
+                if (!line.empty() && x + it.w > lineAvail + 0.01f && wraps(&bs)) commit(false);
+                makeRoom(it.w);
                 line.push_back({&it, x});
                 x += it.w;
                 break;
@@ -1156,7 +1210,8 @@ float layoutInline(Ctx& c, Box& b, float x0, float y0, float avail) {
                     }
                 }
                 ensureW(c, it);
-                if (!line.empty() && x + it.w > avail + 0.01f && it.brk && wraps(it.st)) commit(false);
+                if (!line.empty() && x + it.w > lineAvail + 0.01f && it.brk && wraps(it.st)) commit(false);
+                if (it.k == Item::Word || atomicLike(it.k)) makeRoom(it.w);
                 line.push_back({&it, x});
                 x += it.w;
             }
@@ -1685,6 +1740,45 @@ void applyTransform(Ctx& c, Box& b, size_t pushIdx, const Mark& m0) {
     push(c, std::move(pop));
 }
 
+// A float (CSS 2 9.5.1): its width shrinks to fit (10.3.5), then it goes as high as it may and as far to its side as
+// the floats already placed let it, and joins them.
+void placeFloat(Ctx& c, Box& k, float ix, float contentW, float top) {
+    const Style* ks = k.node->style.get();
+    float hm = k.m[1] + k.m[3], hpb = hpbOf(k);
+    float bw;  // the border box width
+    if (ks->width.definite() && !k.replaced) bw = ks->width.resolve(contentW) + (ks->borderBox ? 0 : hpb);
+    else {
+        intrinsic(c, k);
+        bw = std::min(std::max(k.minW, contentW), k.maxW) - hm;
+        if (ks->maxWidth.definite()) bw = std::min(bw, ks->maxWidth.resolve(contentW) + (ks->borderBox ? 0 : hpb));
+        if (ks->minWidth.definite()) bw = std::max(bw, ks->minWidth.resolve(contentW) + (ks->borderBox ? 0 : hpb));
+    }
+    bw = std::max(bw, hpb);
+    float outer = bw + hm;
+    if (c.floats) {  // a float is not higher than an earlier one (9.5.1 rule 5)
+        for (const auto& f : *c.floats) top = std::max(top, f.y0);
+    }
+    if (ks->clear) top = std::max(top, clearBelow(c, ks->clear));
+    float x = ix;
+    for (int guard = 0; guard < 200; ++guard) {
+        auto [L, R] = floatBand(c, top, 1, ix, ix + contentW);
+        if (R - L >= outer || (L == ix && R == ix + contentW)) {
+            x = ks->floatSide == 1 ? L : R - outer;
+            break;
+        }
+        float next = nextFloatBottom(c, top, ix, ix + contentW);
+        if (!std::isfinite(next)) {
+            x = ks->floatSide == 1 ? L : R - outer;
+            break;
+        }
+        top = next;
+    }
+    k.forcedW = bw;
+    layoutBox(c, k, x, top + k.m[0], outer);
+    k.forcedW = -1;
+    if (c.floats) c.floats->push_back({ks->floatSide, x, x + outer, top, k.y + k.h + k.m[2]});
+}
+
 void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     edges(b, cw);
     const Style* s = b.st;
@@ -1709,6 +1803,13 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     }
     float hpb = hpbOf(b), vpb = vpbOf(b);
     bool normal = own && b.kind != BK::Cell && !b.oof;
+    // A box that makes a block formatting context of its own (CSS 2 9.4.1) has floats of its own
+    std::vector<Ctx::Float> ownFloats;
+    std::vector<Ctx::Float>* outerFloats = c.floats;
+    bool bfcRoot = &b == c.root || b.forcedW >= 0 ||
+                   (own && (b.oof || b.kind == BK::Cell || b.kind == BK::Table || b.kind == BK::Flex || b.replaced || s->floatSide ||
+                            s->overflow != 0 || s->flowRoot || s->display == Display::InlineBlock));
+    if (bfcRoot) c.floats = &ownFloats;
     bool autoW = true;
     float contentW;
     if (b.forcedW >= 0) {
@@ -1858,9 +1959,36 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
                     continue;
                 }
                 edges(*k, contentW);
+                const Style* ks = k->node && k->node->style ? k->node->style.get() : nullptr;
+                if (ks && ks->floatSide && k->kind != BK::Anon) {
+                    placeFloat(c, *k, ix, contentW, firstKid ? y : y + pend);
+                    continue;
+                }
                 float mt = k->m[0];
                 float gap = firstKid ? mt : collapse(pend, mt);
-                layoutBox(c, *k, ix, y + gap, contentW, s && s->centerBlocks);
+                float top = y + gap, kx = ix, kw = contentW;
+                if (ks && ks->clear && k->kind != BK::Anon) {  // clearance (CSS 2 9.5.2): the border edge below the floats
+                    float below = clearBelow(c, ks->clear);
+                    if (below > top) top = below;
+                }
+                // a box that makes its own formatting context does not overlap the floats: it narrows or moves down
+                bool avoids = k->kind != BK::Anon && (k->kind == BK::Table || k->kind == BK::Flex || k->replaced ||
+                                                      (ks && (ks->overflow != 0 || ks->flowRoot)));
+                if (avoids && c.floats && !c.floats->empty()) {
+                    for (int guard = 0; guard < 100; ++guard) {
+                        auto [L, R] = floatBand(c, top, 1, ix, ix + contentW);
+                        float need = ks && ks->width.definite() ? ks->width.resolve(contentW) + (ks->borderBox ? 0 : hpbOf(*k)) + k->m[1] + k->m[3] : 0;
+                        if (R - L >= need || (L == ix && R == ix + contentW)) {
+                            kx = L;
+                            kw = R - L;
+                            break;
+                        }
+                        float next = nextFloatBottom(c, top, ix, ix + contentW);
+                        if (!std::isfinite(next)) break;
+                        top = next;
+                    }
+                }
+                layoutBox(c, *k, kx, top, kw, s && s->centerBlocks);
                 y = k->y + k->h;
                 pend = k->m[2];
                 firstKid = false;
@@ -1869,6 +1997,10 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
             contentH = firstKid ? 0 : std::max(0.f, y + pend - iy);
             c.lineBlockH = outerLineBlockH;
         }
+    }
+    if (bfcRoot) {  // the context's floats are inside it: its height takes them in (CSS 2 10.6.7)
+        for (const auto& f : ownFloats) contentH = std::max(contentH, f.y1 - iy);
+        c.floats = outerFloats;
     }
     b.naturalH = contentH;
     contentH = bounded(defH >= 0 ? defH : contentH);

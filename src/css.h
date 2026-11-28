@@ -109,7 +109,9 @@ struct Style {
     int zIndex = 0;
     bool zAuto = true;
     uint8_t overflow = 0;  // 0 visible, 1 hidden/clip, 2 auto/scroll
-    uint8_t floatSide = 0; // 1 left, 2 right (parsed; float layout is not implemented yet)
+    uint8_t floatSide = 0; // 1 left, 2 right (CSS 2 9.5)
+    uint8_t clear = 0;     // 1 left, 2 right, 3 both (CSS 2 9.5.2)
+    bool flowRoot = false; // display: flow-root: the box makes a block formatting context of its own
     float radius = 0;      // border-radius in px (uniform)
     bool opacity0 = false, animated = false;
     // opacity: the element's own value, and `alpha`, that value times the ancestors'. There is no compositor yet,

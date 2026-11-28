@@ -1,0 +1,69 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Floats test</title>
+<style>
+  body { font-family: Segoe UI, sans-serif; margin: 16px; font-size: 16px; line-height: 20px; }
+  .ok { color: #1a7f37; } .bad { color: #c5221f; font-weight: bold; }
+  /* each case in a context of its own, so that no float reaches into the next case */
+  .box { width: 400px; background: #f4f4f4; margin-bottom: 30px; display: flow-root; }
+  .open { display: block; }
+  .fl { float: left; width: 100px; height: 50px; background: #fa8; }
+  .fr { float: right; width: 80px; height: 30px; background: #8af; }
+</style>
+</head>
+<body>
+<!-- CSS 2 9.5: a float goes to its side, and the lines beside it are shortened -->
+<div class="box" id="c1"><div class="fl" id="f1"></div><span id="t1">first</span> words words words words words words words words words words words words words words words words words words <span id="t1end">end</span></div>
+<div class="box" id="c2"><div class="fr" id="f2"></div><span id="t2">first</span></div>
+<div class="box" id="c3"><div class="fl" id="f3a"></div><div class="fl" id="f3b"></div><div class="fl" id="f3c"></div><div class="fl" id="f3d"></div></div>
+<div class="box" id="c4"><div class="fl" id="f4"></div><div id="cleared" style="clear: left; height: 10px; background: #0c0"></div></div>
+<div class="box" id="c6" style="overflow: hidden"><div class="fl" id="f6"></div></div>
+<div class="box" id="c7" style="display: flow-root"><div class="fl" id="f7"></div></div>
+<div class="box" id="c8"><div class="fl" id="f8"></div><div id="bfc" style="overflow: hidden; height: 20px; background: #0c0"></div></div>
+<div class="box" id="c9"><div id="shrink" style="float: left; background: #fd0"><span id="shrinkText">abc</span></div></div>
+<div class="box" id="c10"><div class="fl" id="f10a"></div><div class="fr" id="f10b"></div><span id="t10">between</span></div>
+<div class="box" style="height: 60px"><div class="box open" id="c5"><div class="fl" id="f5"></div></div></div>
+<div id="results"></div>
+<script>
+  var pass = 0, fail = 0;
+  var results = document.getElementById('results');
+  function log(name, ok, detail) {
+    ok ? pass++ : fail++;
+    var row = document.createElement('div');
+    row.className = ok ? 'ok' : 'bad';
+    row.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' (' + detail + ')' : '');
+    results.appendChild(row);
+    console.log(row.textContent);
+  }
+  function eq(name, actual, expected) { log(name, actual === expected, actual === expected ? '' : 'got ' + JSON.stringify(actual) + ', want ' + JSON.stringify(expected)); }
+  var $ = function (id) { return document.getElementById(id); };
+  var r = function (id) { return $(id).getBoundingClientRect(); };
+  var rel = function (id, of) { var a = r(id), b = r(of); return [Math.round(a.left - b.left), Math.round(a.top - b.top)].join(); };
+  var h = function (id) { return Math.round(r(id).height); };
+  var w = function (id) { return Math.round(r(id).width); };
+
+  eq('a left float sits at the top left', rel('f1', 'c1'), '0,0');
+  eq('the first line starts after a left float', rel('t1', 'c1'), '100,-1');
+  log('the lines below the float have the whole width again', r('t1end').top - r('c1').top >= 50 && r('t1end').left - r('c1').left < 100, rel('t1end', 'c1'));
+  eq('a right float sits at the top right', rel('f2', 'c2'), '320,0');
+  eq('the text beside a right float starts at the left', rel('t2', 'c2'), '0,-1');
+  eq('left floats line up: 2nd', rel('f3b', 'c3'), '100,0');
+  eq('left floats line up: 4th', rel('f3d', 'c3'), '300,0');
+  eq('clear: left goes below the float', rel('cleared', 'c4'), '0,50');
+  eq('a block holds only its in-flow content: floats stick out', h('c5'), 0);
+  eq('overflow: hidden takes its floats in', h('c6'), 50);
+  eq('display: flow-root takes its floats in', h('c7'), 50);
+  eq('a block with its own context goes beside the float', rel('bfc', 'c8'), '100,0');
+  eq('and is as wide as the room left', w('bfc'), 300);
+  eq('a float with auto width shrinks to its content', w('shrink'), w('shrinkText'));
+  eq('text between a left and a right float', rel('t10', 'c10'), '100,-1');
+
+  window.addEventListener('load', function () {
+    document.title = 'Floats test: ' + pass + ' passed, ' + fail + ' failed';
+    console.log('SUMMARY ' + pass + ' passed, ' + fail + ' failed');
+  });
+</script>
+</body>
+</html>
