@@ -958,7 +958,7 @@ std::unique_ptr<LoadResult> load_page(const std::string& url, const std::string*
             }
             FetchResult f = fetch(j.text, subStyle);
             cssNet[i] = {j.text, f.contentType.empty() ? "text/css" : f.contentType, f.error, f.status, f.body.size(), f.ms};
-            if (f.error.empty() && f.status < 400) sheets[i] = parse_sheet(bytes_to_utf8(f.body, f.contentType));
+            if (f.error.empty() && f.status < 400) sheets[i] = parse_sheet(bytes_to_utf8(f.body, f.contentType), j.text);
         } else {
             size_t k = i - nCss;
             FetchResult f = fetch(imgUrls[k], subImage);

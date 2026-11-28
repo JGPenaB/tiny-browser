@@ -3,6 +3,7 @@
 
 #include "css.h"
 #include "layout.h"
+#include "url.h"
 #include "text.h"
 
 namespace tb {
@@ -122,6 +123,7 @@ struct Box {
     float minW = 0, maxW = 0;
     float contentMinW = 0;  // minW as the content alone makes it, before the box's own width and limits count
     size_t paintIdx = SIZE_MAX, clipIdx = SIZE_MAX;
+    size_t bgFirst = SIZE_MAX, bgEnd = SIZE_MAX;  // the background image items, then (at bgEnd) the borders over them
     float forcedW = -1, forcedH = -1;  // border-box size imposed by the parent formatting context
     float staticX = 0, staticY = 0;
     bool fixed = false, oof = false, replaced = false;
@@ -428,9 +430,22 @@ void unionBox(Ctx& c, Node* n, float x, float y, float w, float h) {
     n->bh = bt - n->by;
 }
 
+// The background image items and the borders over them have the box's own geometry
+void syncBackground(Ctx& c, Box& b) {
+    if (b.bgFirst == SIZE_MAX || b.paintIdx == SIZE_MAX) return;
+    const DItem& box = c.out.items[b.paintIdx];
+    for (size_t i = b.bgFirst; i <= b.bgEnd && i < c.out.items.size(); ++i) {
+        c.out.items[i].x = box.x;
+        c.out.items[i].y = box.y;
+        c.out.items[i].w = box.w;
+        c.out.items[i].h = box.h;
+    }
+}
+
 void setHeight(Ctx& c, Box& b, float h) {
     b.h = h;
     if (b.paintIdx != SIZE_MAX) c.out.items[b.paintIdx].h = h;
+    syncBackground(c, b);
     if (b.clipIdx != SIZE_MAX) c.out.items[b.clipIdx].h = std::max(0.f, h - b.b[0] - b.b[2]);
     if (b.node && b.kind != BK::Anon) b.node->bh = h;
 }
@@ -1674,6 +1689,7 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     edges(b, cw);
     const Style* s = b.st;
     b.paintIdx = b.clipIdx = SIZE_MAX;
+    b.bgFirst = b.bgEnd = SIZE_MAX;
     b.firstBaseline = -1;
     bool own = s && b.kind != BK::Anon && b.kind != BK::Marker;
     Mark m0 = mark(c);
@@ -1756,16 +1772,52 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
     b.w = contentW + hpb;
     float ix = b.x + b.b[3] + b.p[3], iy = top + b.b[0] + b.p[0];
 
-    if (own && !b.replaced && !s->hidden && (!s->bg.transparent() || b.b[0] > 0 || b.b[1] > 0 || b.b[2] > 0 || b.b[3] > 0)) {
+    bool layers = own && !b.replaced && !s->hidden && s->bgImages && !s->bgImages->images.empty();
+    if (own && !b.replaced && !s->hidden && (!s->bg.transparent() || layers || b.b[0] > 0 || b.b[1] > 0 || b.b[2] > 0 || b.b[3] > 0)) {
         DItem d;
         d.k = DItem::K::Box;
         d.c = faded(s->bg, *s);
         d.radius = s->radius;
         for (int i = 0; i < 4; ++i) {
-            d.bw[i] = b.b[i];
+            d.bw[i] = layers ? 0 : b.b[i];  // with images over the colour, the borders come after them
             d.bc[i] = faded(s->borderColor[i], *s);
         }
         b.paintIdx = push(c, std::move(d));
+        if (layers) {
+            // the images, the last layer first (CSS Backgrounds 3, 2.2); placed once the box's height is known
+            b.bgFirst = c.out.items.size();
+            for (size_t i = s->bgImages->images.size(); i-- > 0;) {
+                const BgImage& im = s->bgImages->images[i];
+                if (im.k == BgImage::None) continue;
+                auto paint = std::make_shared<BgPaint>();
+                paint->bg = s->bgImages;
+                paint->layer = i;
+                paint->radius = s->radius;
+                for (int k = 0; k < 4; ++k) {
+                    paint->b[k] = b.b[k];
+                    paint->p[k] = b.p[k];
+                }
+                if (im.k == BgImage::Url && c.in.imgByUrl) {
+                    auto it = c.in.imgByUrl->find(resolve_url(c.in.doc->baseUrl, im.url));
+                    if (it != c.in.imgByUrl->end()) paint->img = it->second;
+                    if (paint->img < 0) continue;  // not here yet
+                }
+                DItem bgItem;
+                bgItem.k = DItem::K::Background;
+                bgItem.c = Color{0, 0, 0, s->alpha};
+                bgItem.bg = std::move(paint);
+                push(c, std::move(bgItem));
+            }
+            b.bgEnd = c.out.items.size();
+            DItem borders;  // the borders over the images
+            borders.k = DItem::K::Box;
+            borders.radius = s->radius;
+            for (int i = 0; i < 4; ++i) {
+                borders.bw[i] = b.b[i];
+                borders.bc[i] = faded(s->borderColor[i], *s);
+            }
+            push(c, std::move(borders));
+        }
     }
     bool clips = own && !b.replaced && s->overflow != 0 && &b != c.root && !(b.node && b.node->name == "body");
     if (clips) {
@@ -1827,6 +1879,7 @@ void layoutBox(Ctx& c, Box& b, float cx, float top, float cw, bool center) {
         d.y = b.y;
         d.w = b.w;
         d.h = b.h;
+        syncBackground(c, b);
     }
     if (own && b.node && !b.replaced) setBox(c, b.node, b.x, b.y, b.w, b.h);
 

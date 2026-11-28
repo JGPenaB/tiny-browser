@@ -6,6 +6,7 @@
 
 #include <unordered_map>
 
+#include "css.h"
 #include "dom.h"
 #include "svg.h"
 
@@ -27,7 +28,8 @@ struct DItem {
     // PushTransform holds a transform for everything up to its PopTransform: a b c d in bw[0..3], e f in w h, and
     // the transform origin in x y (document coordinates), so x' = origin + M (x - origin) + (e, f).
     // Svg draws LayoutOut::svgs[img] into the item's box.
-    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform, Svg };
+    // Background paints one layer of a background image (bg) in the clip box x y w h.
+    enum class K : uint8_t { Box, Text, Image, Rect, Widget, PushClip, PopClip, PushTransform, PopTransform, Svg, Background };
     K k = K::Rect;
     int16_t layer = 0;  // paint layer: 0 = normal flow, >0 positioned (z-index + 1), <0 behind
     float x = 0, y = 0, w = 0, h = 0;
@@ -36,8 +38,21 @@ struct DItem {
     float bw[4] = {};
     Color bc[4];
     Microsoft::WRL::ComPtr<IDWriteTextLayout> tl;
+    std::shared_ptr<const struct BgPaint> bg;
     int img = -1;  // image index, or widget index for K::Widget; for K::Image -1 is a picture that did not come (a grey
                    // box is shown) and -2 an img that represents nothing (HTML 15.4.2), which shows nothing
+};
+
+// One background layer as layout placed it (CSS Backgrounds 3, 3.3-3.9): the image, the first tile and its size, and
+// whether tiles repeat across and down. Painted in the item's box, which is the background painting area.
+// The item's box is the border box; where the tiles go is worked out when it is painted (render.cpp), because the box
+// may still move or change height after layout has emitted the item.
+struct BgPaint {
+    std::shared_ptr<const Background> bg;
+    size_t layer = 0;
+    int img = -1;            // the picture of a url() image: an index into the page's images, -1 while it has not come
+    float b[4] = {}, p[4] = {};  // the box's border and padding widths, for the origin and clip boxes
+    float radius = 0;        // its rounded corners, which the background is clipped to
 };
 
 struct LinkArea {
@@ -77,6 +92,7 @@ struct LayoutInput {
     float scrollY = 0;  // how far the page is scrolled: where the viewport is, and with it every fixed box
     const std::vector<ImageRes>* images = nullptr;
     const std::unordered_map<const Node*, int>* imgNode = nullptr;
+    const std::unordered_map<std::string, int>* imgByUrl = nullptr;  // every picture by its URL, -1 while on its way
 };
 
 LayoutOut layout_document(const LayoutInput& in);

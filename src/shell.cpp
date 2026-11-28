@@ -899,7 +899,7 @@ public:
                     if (!d.ok) d.net.error = "decode failed";
                     CoUninitialize();
                 } else if (d.ok)
-                    d.sheet = std::make_unique<Sheet>(parse_sheet(bytes_to_utf8(f.body, f.contentType)));
+                    d.sheet = std::make_unique<Sheet>(parse_sheet(bytes_to_utf8(f.body, f.contentType), url));
                 {
                     std::lock_guard<std::mutex> g(late->lock);
                     late->done.push_back(std::move(d));
@@ -981,6 +981,17 @@ public:
             Node* n = st.back();
             st.pop_back();
             if (n->is("img")) bindImage(p, n, false);
+            // the pictures of background-image (CSS Backgrounds 3, 2.1), on ::before and ::after boxes too
+            for (const Node* box : {static_cast<const Node*>(n), static_cast<const Node*>(n->before.get()), static_cast<const Node*>(n->after.get())}) {
+                if (!box || !box->style || !box->style->bgImages) continue;
+                for (auto& im : box->style->bgImages->images) {
+                    if (im.k != BgImage::Url || im.url.empty()) continue;
+                    std::string url = resolve_url(p.doc->baseUrl, im.url);
+                    if (p.imgByUrl.count(url)) continue;
+                    p.imgByUrl[url] = -1;
+                    requestLate(p, url, true);
+                }
+            }
             if (n->shadow) st.push_back(n->shadow.get());
             for (auto& k : n->kids) st.push_back(k.get());
         }
@@ -1043,6 +1054,7 @@ public:
         in.scrollY = t.scroll;
         in.images = &p.images;
         in.imgNode = &p.imgNode;
+        in.imgByUrl = &p.imgByUrl;
         p.lo = layout_document(in);
         p.tLayout = now_ms() - t0;
         p.layoutW = vw;

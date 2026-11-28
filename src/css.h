@@ -19,6 +19,37 @@ struct Len {
 
 using VarMap = std::unordered_map<std::string, std::string>;
 
+// Background images (CSS Backgrounds 3, section 2), one entry per layer in each list; a shorter list repeats.
+struct GradientStop {
+    Color c;
+    Len pos;  // Len::Auto: between the stops around it (CSS Images 3, 3.5.3)
+};
+struct BgImage {  // none, a picture, or a gradient (CSS Images 3, section 3)
+    enum K : uint8_t { None, Url, Linear, Radial, Conic } k = None;
+    bool repeating = false;
+    std::string url;
+    float angle = 180;     // linear: degrees clockwise from "to top"
+    uint8_t toCorner = 0;  // linear "to" a corner: 1 top, 2 right, 4 bottom, 8 left (0: the angle says)
+    bool circle = false;   // radial
+    uint8_t extent = 0;    // radial: 0 farthest-corner, 1 closest-side, 2 closest-corner, 3 farthest-side, 4 rx and ry
+    Len rx, ry, cx{Len::Pct, 50}, cy{Len::Pct, 50};
+    std::vector<GradientStop> stops;
+};
+struct BgPos {
+    Len x{Len::Pct, 0}, y{Len::Pct, 0};  // a percentage aligns that point of the image with that point of the area
+};
+struct BgSize {
+    uint8_t mode = 0;  // 0 the lengths (Len::Auto: auto), 1 cover, 2 contain
+    Len w, h;
+};
+struct Background {
+    std::vector<BgImage> images;  // the first is painted on top
+    std::vector<BgPos> pos;
+    std::vector<BgSize> size;
+    std::vector<uint16_t> repeat;        // low byte x, high byte y: 0 repeat, 1 no-repeat, 2 space, 3 round
+    std::vector<uint8_t> origin, clip;   // 0 border-box, 1 padding-box, 2 content-box, 3 text (clip only)
+};
+
 // An SVG paint (SVG 2, section 13.2): none, a colour, or currentcolor, the element's own `color`.
 struct Paint {
     enum K : uint8_t { None, Rgb, Current } k = None;
@@ -42,6 +73,7 @@ struct Style {
     Display display = Display::Inline;
     Color color{0, 0, 0, 1};
     Color bg{};
+    std::shared_ptr<const Background> bgImages;  // null: no background-image
     float fontSize = 16;
     uint16_t weight = 400;
     bool italic = false;
@@ -145,7 +177,8 @@ struct Sheet {
 // seen, except the host through :host. Set while such a rule is matched; null for the document's own rules.
 extern const Node* g_selectorScope;
 
-Sheet parse_sheet(std::string_view css);
+// base: the URL of the sheet, which the url()s in it are relative to (empty for a sheet in the page itself)
+Sheet parse_sheet(std::string_view css, const std::string& base = {});
 std::vector<Decl> parse_decls(std::string_view body);
 bool parse_color(std::string_view v, Color& out);
 const char* display_name(Display d);

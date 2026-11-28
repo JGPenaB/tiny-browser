@@ -1,4 +1,5 @@
 ﻿#include "css.h"
+#include "url.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -944,10 +945,423 @@ std::vector<Decl> parse_decls(std::string_view body) {
     return out;
 }
 
-Sheet parse_sheet(std::string_view css) {
+// ============================================================================
+// Backgrounds (CSS Backgrounds 3, section 2) and gradients (CSS Images 3, section 3)
+// ============================================================================
+namespace {
+
+std::string_view strip_fn(std::string_view t, std::string_view name) {  // the arguments of name(...), or empty
+    if (t.size() < name.size() + 2 || t.substr(0, name.size()) != name || t[name.size()] != '(' || t.back() != ')') return {};
+    return t.substr(name.size() + 1, t.size() - name.size() - 2);
+}
+// url(x), url("x") or url('x'): the URL as written
+bool parse_url_token(std::string_view raw, std::string& out) {
+    std::string_view t = trim(raw);
+    if (t.size() < 5 || lower(t.substr(0, 4)) != "url(" || t.back() != ')') return false;
+    std::string_view in = trim(t.substr(4, t.size() - 5));
+    if (in.size() >= 2 && (in[0] == '"' || in[0] == '\'') && in.back() == in[0]) in = in.substr(1, in.size() - 2);
+    out = std::string(in);
+    return true;
+}
+bool parse_stops(const std::vector<std::string_view>& args, size_t first, float fs, std::vector<GradientStop>& out) {
+    for (size_t i = first; i < args.size(); ++i) {
+        auto T = tokens(trim(args[i]));
+        if (T.empty()) return false;
+        Color c;
+        if (!parse_color(T[0], c)) {
+            Len hint;  // a colour hint (CSS Images 4, 3.5.3) between two stops: the midpoint is not moved
+            if (T.size() == 1 && parse_len(T[0], fs, hint, false)) continue;
+            return false;
+        }
+        GradientStop st;
+        st.c = c;
+        if (T.size() >= 2 && !parse_len(T[1], fs, st.pos, false)) return false;
+        out.push_back(st);
+        if (T.size() == 3) {  // a stop with two positions is two stops of the same colour
+            GradientStop second = st;
+            if (!parse_len(T[2], fs, second.pos, false)) return false;
+            out.push_back(second);
+        }
+    }
+    return out.size() >= 1;
+}
+// <position> for background-position and gradient centres (CSS Values 4, 9.2): keywords, lengths, percentages, and
+// edge offsets such as "right 10px bottom 20%"
+bool parse_position(const std::vector<std::string>& T, float fs, Len& x, Len& y) {
+    auto kw = [](const std::string& t, bool& horizontal, float& pct) {
+        if (t == "left") { horizontal = true; pct = 0; return true; }
+        if (t == "right") { horizontal = true; pct = 100; return true; }
+        if (t == "top") { horizontal = false; pct = 0; return true; }
+        if (t == "bottom") { horizontal = false; pct = 100; return true; }
+        if (t == "center") { horizontal = true; pct = 50; return true; }
+        return false;
+    };
+    Len a, b;
+    x = Len{Len::Pct, 50};
+    y = Len{Len::Pct, 50};
+    if (T.empty() || T.size() > 4) return false;
+    if (T.size() <= 2) {
+        bool h1 = true, h2 = false;
+        float p1 = 0, p2 = 50;
+        bool k1 = kw(T[0], h1, p1), k2 = T.size() == 2 && kw(T[1], h2, p2);
+        if (!k1 && !parse_len(T[0], fs, a, false)) return false;
+        if (T.size() == 2 && !k2 && !parse_len(T[1], fs, b, false)) return false;
+        if (T.size() == 1) {
+            if (!k1) { x = a; return true; }
+            if (T[0] == "top" || T[0] == "bottom") y = Len{Len::Pct, p1};
+            else x = Len{Len::Pct, p1};
+            return true;
+        }
+        if (k1 && !h1 && T[0] != "center") {  // "top left": the vertical keyword first
+            y = Len{Len::Pct, p1};
+            if (k2) x = Len{Len::Pct, p2};
+            else return false;
+            return true;
+        }
+        x = k1 ? Len{Len::Pct, p1} : a;
+        if (k2) {
+            if (h2 && T[1] != "center") {  // "center left"
+                y = x;
+                x = Len{Len::Pct, p2};
+            } else y = Len{Len::Pct, p2};
+        } else y = b;
+        return true;
+    }
+    // three or four values: keyword [offset] keyword [offset]
+    size_t i = 0;
+    for (int axis = 0; axis < 2 && i < T.size(); ++axis) {
+        bool h;
+        float p;
+        if (!kw(T[i], h, p)) return false;
+        std::string word = T[i++];
+        Len off{Len::Px, 0};
+        bool hasOff = i < T.size() && parse_len(T[i], fs, off, false);
+        if (hasOff) ++i;
+        Len v{Len::Pct, p};
+        if (hasOff) {  // an offset from the right or bottom edge counts back from 100%
+            if (off.u == Len::Pct) v.v = word == "right" || word == "bottom" ? 100 - off.v : off.v;
+            else v.off = word == "right" || word == "bottom" ? -off.v : off.v;
+        }
+        bool vertical = word == "top" || word == "bottom";
+        (vertical ? y : x) = v;
+    }
+    return i == T.size();
+}
+bool parse_gradient(std::string_view raw, float fs, BgImage& g) {
+    std::string lv = lower(trim(raw));
+    std::string_view args;
+    std::string_view t = lv;
+    g.repeating = false;
+    if (t.substr(0, 10) == "repeating-") {
+        g.repeating = true;
+        t = t.substr(10);
+    }
+    if (!(args = strip_fn(t, "linear-gradient")).empty() || t == "linear-gradient()") {
+        g.k = BgImage::Linear;
+        auto parts = split_top(args, ',');
+        size_t first = 0;
+        auto T = tokens(trim(parts[0]));
+        if (!T.empty() && T[0] == "to") {
+            g.toCorner = 0;
+            for (size_t i = 1; i < T.size(); ++i) {
+                if (T[i] == "top") g.toCorner |= 1;
+                else if (T[i] == "right") g.toCorner |= 2;
+                else if (T[i] == "bottom") g.toCorner |= 4;
+                else if (T[i] == "left") g.toCorner |= 8;
+                else return false;
+            }
+            if (g.toCorner == 1) g.angle = 0, g.toCorner = 0;
+            else if (g.toCorner == 2) g.angle = 90, g.toCorner = 0;
+            else if (g.toCorner == 4) g.angle = 180, g.toCorner = 0;
+            else if (g.toCorner == 8) g.angle = 270, g.toCorner = 0;
+            first = 1;
+        } else if (T.size() == 1) {
+            double rad;
+            if (parse_angle(T[0], rad)) {
+                g.angle = (float)(rad * 180.0 / 3.14159265358979323846);
+                first = 1;
+            }
+        }
+        return parse_stops(parts, first, fs, g.stops);
+    }
+    if (!(args = strip_fn(t, "radial-gradient")).empty()) {
+        g.k = BgImage::Radial;
+        auto parts = split_top(args, ',');
+        auto T = tokens(trim(parts[0]));
+        size_t first = 0;
+        Color probe;
+        if (!T.empty() && !parse_color(T[0], probe)) {
+            first = 1;
+            size_t at = T.size();
+            for (size_t i = 0; i < T.size(); ++i)
+                if (T[i] == "at") at = i;
+            std::vector<Len> sizes;
+            for (size_t i = 0; i < at; ++i) {
+                const std::string& w = T[i];
+                if (w == "circle") g.circle = true;
+                else if (w == "ellipse") g.circle = false;
+                else if (w == "closest-side") g.extent = 1;
+                else if (w == "closest-corner") g.extent = 2;
+                else if (w == "farthest-side") g.extent = 3;
+                else if (w == "farthest-corner") g.extent = 0;
+                else {
+                    Len l;
+                    if (!parse_len(w, fs, l, false)) return false;
+                    sizes.push_back(l);
+                }
+            }
+            if (sizes.size() == 1) { g.extent = 4; g.rx = g.ry = sizes[0]; g.circle = true; }
+            else if (sizes.size() == 2) { g.extent = 4; g.rx = sizes[0]; g.ry = sizes[1]; }
+            else if (sizes.size() > 2) return false;
+            if (at < T.size()) {
+                std::vector<std::string> pos(T.begin() + at + 1, T.end());
+                if (!parse_position(pos, fs, g.cx, g.cy)) return false;
+            }
+        }
+        return parse_stops(parts, first, fs, g.stops);
+    }
+    if (!(args = strip_fn(t, "conic-gradient")).empty()) {
+        g.k = BgImage::Conic;  // painted as its first colour: Direct2D has no conic gradients
+        auto parts = split_top(args, ',');
+        Color probe;
+        auto T = tokens(trim(parts[0]));
+        return parse_stops(parts, !T.empty() && !parse_color(T[0], probe) ? 1 : 0, fs, g.stops);
+    }
+    return false;
+}
+// One background image: none, url(), or a gradient
+bool parse_bg_image(std::string_view raw, float fs, BgImage& out) {
+    std::string_view t = trim(raw);
+    std::string lv = lower(t);
+    if (lv == "none") { out.k = BgImage::None; return true; }
+    if (parse_url_token(t, out.url)) { out.k = BgImage::Url; return true; }
+    if (lv.find("gradient(") != std::string::npos) return parse_gradient(t, fs, out);
+    if (lv.rfind("image-set(", 0) == 0 || lv.rfind("-webkit-image-set(", 0) == 0) {  // CSS Images 4, 2.4: the first image
+        size_t a = t.find('('), b = t.rfind(')');
+        auto opts = split_top(t.substr(a + 1, b - a - 1), ',');
+        auto T = tokens(trim(opts[0]));
+        if (T.empty()) return false;
+        std::string first = T[0];
+        if (!first.empty() && (first[0] == '"' || first[0] == '\'')) { out.k = BgImage::Url; out.url = first.substr(1, first.size() - 2); return true; }
+        return parse_bg_image(first, fs, out);
+    }
+    return false;
+}
+bool parse_bg_repeat(const std::vector<std::string>& T, uint16_t& out) {
+    auto one = [](const std::string& t) -> int { return t == "repeat" ? 0 : t == "no-repeat" ? 1 : t == "space" ? 2 : t == "round" ? 3 : -1; };
+    if (T.size() == 1) {
+        if (T[0] == "repeat-x") { out = 0 | (1 << 8); return true; }
+        if (T[0] == "repeat-y") { out = 1 | (0 << 8); return true; }
+        int r = one(T[0]);
+        if (r < 0) return false;
+        out = (uint16_t)(r | (r << 8));
+        return true;
+    }
+    if (T.size() == 2) {
+        int a = one(T[0]), b = one(T[1]);
+        if (a < 0 || b < 0) return false;
+        out = (uint16_t)(a | (b << 8));
+        return true;
+    }
+    return false;
+}
+bool parse_bg_size(const std::vector<std::string>& T, float fs, BgSize& out) {
+    if (T.size() == 1 && (T[0] == "cover" || T[0] == "contain")) { out.mode = T[0] == "cover" ? 1 : 2; return true; }
+    if (T.empty() || T.size() > 2) return false;
+    out.mode = 0;
+    if (!parse_len(T[0], fs, out.w, true)) return false;
+    out.h = Len{};
+    if (T.size() == 2 && !parse_len(T[1], fs, out.h, true)) return false;
+    return true;
+}
+int box_keyword(const std::string& t) { return t == "border-box" ? 0 : t == "padding-box" ? 1 : t == "content-box" ? 2 : t == "text" ? 3 : -1; }
+// The `background` shorthand (CSS Backgrounds 3, 3.10): comma-separated layers, the colour in the last one only
+bool parse_background(std::string_view raw, float fs, Background& bg, Color& color, bool& hasColor) {
+    auto layers = split_top(raw, ',');
+    for (size_t li = 0; li < layers.size(); ++li) {
+        BgImage img;
+        BgPos pos;
+        BgSize size;
+        uint16_t repeat = 0;
+        int origin = -1, clip = -1;
+        auto T = tokens(trim(layers[li]));
+        std::vector<std::string> lowerT;
+        for (auto& t : T) lowerT.push_back(lower(t));
+        size_t i = 0;
+        bool haveImage = false, havePos = false, haveRepeat = false;
+        while (i < T.size()) {
+            const std::string& w = lowerT[i];
+            Color c;
+            if (!haveImage && parse_bg_image(T[i], fs, img)) { haveImage = true; ++i; continue; }
+            if (li + 1 == layers.size() && parse_color(w, c)) { color = c; hasColor = true; ++i; continue; }
+            if (!haveRepeat) {
+                uint16_t r;
+                if (i + 1 < T.size() && parse_bg_repeat({lowerT[i], lowerT[i + 1]}, r)) { repeat = r; haveRepeat = true; i += 2; continue; }
+                if (parse_bg_repeat({w}, r)) { repeat = r; haveRepeat = true; ++i; continue; }
+            }
+            int bk = box_keyword(w);
+            if (bk >= 0) {
+                if (origin < 0) origin = clip = bk;
+                else clip = bk;
+                ++i;
+                continue;
+            }
+            if (w == "scroll" || w == "fixed" || w == "local") { ++i; continue; }  // background-attachment: not kept
+            if (!havePos) {  // <position> [ / <size> ]
+                size_t j = i;
+                std::vector<std::string> posT;
+                while (j < T.size() && lowerT[j] != "/" && posT.size() < 4) {
+                    Len probe;
+                    bool h;
+                    const std::string& x = lowerT[j];
+                    bool isKw = x == "left" || x == "right" || x == "top" || x == "bottom" || x == "center";
+                    if (!isKw && !parse_len(x, fs, probe, false)) break;
+                    (void)h;
+                    posT.push_back(x);
+                    ++j;
+                }
+                if (!posT.empty()) {
+                    // take the longest prefix that is a position
+                    size_t n = posT.size();
+                    while (n > 0 && !parse_position(std::vector<std::string>(posT.begin(), posT.begin() + n), fs, pos.x, pos.y)) --n;
+                    if (n == 0) return false;
+                    i += n;
+                    havePos = true;
+                    if (i < T.size() && lowerT[i] == "/") {
+                        ++i;
+                        std::vector<std::string> sizeT;
+                        while (i < T.size() && sizeT.size() < 2) {
+                            Len probe;
+                            const std::string& x = lowerT[i];
+                            if (x != "auto" && x != "cover" && x != "contain" && !parse_len(x, fs, probe, false)) break;
+                            sizeT.push_back(x);
+                            ++i;
+                            if (x == "cover" || x == "contain") break;
+                        }
+                        if (!parse_bg_size(sizeT, fs, size)) return false;
+                    }
+                    continue;
+                }
+            }
+            return false;
+        }
+        bg.images.push_back(img);
+        bg.pos.push_back(pos);
+        bg.size.push_back(size);
+        bg.repeat.push_back(repeat);
+        bg.origin.push_back((uint8_t)(origin < 0 ? 1 : origin));
+        bg.clip.push_back((uint8_t)(clip < 0 ? 0 : clip));
+    }
+    return true;
+}
+// A background longhand: its comma-separated values into the list of the Background it changes
+bool apply_bg_longhand(std::string_view prop, std::string_view raw, float fs, Background& bg) {
+    auto items = split_top(raw, ',');
+    if (prop == "background-image") {
+        bg.images.clear();
+        for (auto v : items) {
+            BgImage img;
+            if (!parse_bg_image(v, fs, img)) return false;
+            bg.images.push_back(img);
+        }
+        return true;
+    }
+    if (prop == "background-position" || prop == "background-position-x" || prop == "background-position-y") {
+        std::vector<BgPos> out;
+        for (size_t k = 0; k < items.size(); ++k) {
+            auto v = items[k];
+            BgPos p = k < bg.pos.size() ? bg.pos[k] : BgPos{};
+            std::vector<std::string> T;
+            for (auto& t : tokens(trim(v))) T.push_back(lower(t));
+            Len x, y;
+            if (prop == "background-position") {
+                if (!parse_position(T, fs, x, y)) return false;
+                p.x = x;
+                p.y = y;
+            } else {
+                if (T.empty() || !parse_position(T, fs, x, y)) return false;
+                bool vertical = prop == "background-position-y";
+                if (vertical) p.y = T[0] == "top" || T[0] == "bottom" || T[0] == "center" ? y : x;
+                else p.x = x;
+            }
+            out.push_back(p);
+        }
+        bg.pos = std::move(out);
+        return true;
+    }
+    if (prop == "background-size") {
+        std::vector<BgSize> out;
+        for (auto v : items) {
+            std::vector<std::string> T;
+            for (auto& t : tokens(trim(v))) T.push_back(lower(t));
+            BgSize s;
+            if (!parse_bg_size(T, fs, s)) return false;
+            out.push_back(s);
+        }
+        bg.size = std::move(out);
+        return true;
+    }
+    if (prop == "background-repeat") {
+        std::vector<uint16_t> out;
+        for (auto v : items) {
+            std::vector<std::string> T;
+            for (auto& t : tokens(trim(v))) T.push_back(lower(t));
+            uint16_t r;
+            if (!parse_bg_repeat(T, r)) return false;
+            out.push_back(r);
+        }
+        bg.repeat = std::move(out);
+        return true;
+    }
+    if (prop == "background-origin" || prop == "background-clip") {
+        std::vector<uint8_t> out;
+        for (auto v : items) {
+            int k = box_keyword(lower(trim(v)));
+            if (k < 0 || (k == 3 && prop == "background-origin")) return false;
+            out.push_back((uint8_t)k);
+        }
+        (prop == "background-origin" ? bg.origin : bg.clip) = std::move(out);
+        return true;
+    }
+    return true;  // background-attachment, -blend-mode: not kept
+}
+
+// Makes the URLs in a style sheet's declarations absolute: they are relative to the sheet (CSS Values 4, 4.5.1)
+void absolutize_urls(std::string& val, const std::string& base) {
+    std::string out;
+    size_t i = 0;
+    while (true) {
+        size_t at = val.find("url(", i);
+        if (at == std::string::npos) break;
+        size_t close = val.find(')', at);
+        if (close == std::string::npos) break;
+        std::string inner(trim(std::string_view(val).substr(at + 4, close - at - 4)));
+        char q = 0;
+        if (inner.size() >= 2 && (inner[0] == '"' || inner[0] == '\'') && inner.back() == inner[0]) {
+            q = inner[0];
+            inner = inner.substr(1, inner.size() - 2);
+        }
+        out += val.substr(i, at - i);
+        if (inner.rfind("data:", 0) == 0 || inner.empty() || inner[0] == '#') out += val.substr(at, close + 1 - at);
+        else out += "url(\"" + resolve_url(base, inner) + "\")";
+        (void)q;
+        i = close + 1;
+    }
+    if (i == 0) return;
+    out += val.substr(i);
+    val = std::move(out);
+}
+
+}  // namespace
+
+Sheet parse_sheet(std::string_view css, const std::string& base) {
     Sheet sh;
     std::string clean = strip_comments(css);
     parse_block(clean, -1, sh, 0);
+    if (!base.empty())
+        for (auto& r : sh.rules)
+            for (auto& d : *r.decls)
+                if (d.val.find("url(") != std::string::npos) absolutize_urls(d.val, base);
     return sh;
 }
 
@@ -1167,7 +1581,10 @@ bool inherited_prop(std::string_view p) {
 
 void copy_prop(Style& d, const Style& s, std::string_view p) {
     if (p == "color") d.color = s.color;
-    else if (istarts(p, "background")) d.bg = s.bg;
+    else if (istarts(p, "background")) {
+        if (p == "background" || p == "background-color") d.bg = s.bg;
+        if (p != "background-color") d.bgImages = s.bgImages;
+    }
     else if (p == "font-size") d.fontSize = s.fontSize;
     else if (p == "font-weight") d.weight = s.weight;
     else if (p == "font-style") d.italic = s.italic;
@@ -1513,23 +1930,18 @@ void apply(Style& s, const Style& parent, std::string_view prop, std::string_vie
         if (lv == "currentcolor") s.bg = s.color;
         else if (parse_color(lv, c)) s.bg = c;
     } else if (prop == "background") {
-        s.bg = Color{};
-        for (auto& t : T) {
-            Color c;
-            if (parse_color(t, c)) {
-                s.bg = c;
-            } else if (contains(t, "gradient(")) {
-                size_t a = t.find('('), b = t.rfind(')');
-                if (a == std::string::npos || b == std::string::npos) continue;
-                for (auto arg : split_top(std::string_view(t).substr(a + 1, b - a - 1), ',')) {
-                    auto at = tokens(arg);
-                    if (!at.empty() && parse_color(at[0], c)) {
-                        s.bg = c;
-                        break;
-                    }
-                }
-            }
+        auto bg = std::make_shared<Background>();
+        Color c{};
+        bool hasColor = false;
+        if (parse_background(trim(val), fs, *bg, c, hasColor)) {
+            s.bg = hasColor ? c : Color{};
+            bool any = false;
+            for (auto& im : bg->images) any = any || im.k != BgImage::None;
+            s.bgImages = any ? std::shared_ptr<const Background>(std::move(bg)) : nullptr;
         }
+    } else if (istarts(prop, "background-")) {
+        auto bg = s.bgImages ? std::make_shared<Background>(*s.bgImages) : std::make_shared<Background>();
+        if (apply_bg_longhand(prop, trim(val), fs, *bg)) s.bgImages = std::move(bg);  // the longhands may come before the image
     } else if (prop == "font-size") {
         float v;
         if (font_size(lv, parent.fontSize, v)) s.fontSize = v;

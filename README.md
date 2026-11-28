@@ -69,8 +69,9 @@ Data lives in `%APPDATA%\TinyBrowser\` (`bookmarks.tsv`, `passwords.dat`, `cooki
 1. **Milestone 1 (done):** static HTML/CSS rendering on the GPU, tabs, history, bookmarks, DPAPI vault, devtools.
 2. **Milestone 2 (mostly done):** flexbox, inline-block, positioning, overflow clipping, rounded corners, interactive forms with
    GET/POST, own cookie jar, password save + autofill, meta refresh, `::before` and `::after` with `content` (strings, escapes,
-   `attr()`, quotes; `tests/pages/generated.html`). Still open: floats, grid, background images, SVG text, gradients, clip
-   paths and masks, counters, `:hover`, find-in-page, zoom, downloads, text selection.
+   `attr()`, quotes; `tests/pages/generated.html`), background images and gradients in layers (linear, radial and
+   repeating; position, size, repeat, origin, clip; `tests/pages/backgrounds.html` is checked by eye). Still open: floats,
+   grid, conic gradients, SVG text, clip paths and masks, counters, `:hover`, find-in-page, zoom, downloads, text selection.
 3. **Milestone 3 - JavaScript engine (built):** lexer, parser, bytecode compiler, register VM, garbage collector, rope
    strings; classes, generators, async/await, Promises, destructuring, the core standard library, typed arrays, own RegExp
    engine, ES modules (`import`, `export`, `import()`, top-level await, cycles, import attributes with JSON modules),
